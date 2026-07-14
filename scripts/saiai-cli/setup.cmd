@@ -55,7 +55,7 @@ powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Comma
 if errorlevel 1 goto failed
 
 powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ^
-  "$ErrorActionPreference='Stop'; $m=Get-Content -LiteralPath $env:MANIFEST -Raw ^| ConvertFrom-Json; if ([int]$m.manifest_schema -ne 1) { throw 'Unsupported manifest schema' }; if ([int]$m.bootstrap_schema_version -ne 2) { throw 'Incompatible bootstrap schema' }; $p=$m.assets.PSObject.Properties[$env:ASSET]; if ($null -eq $p) { throw 'Asset missing from manifest' }; $sha=[string]$p.Value.sha256; $size=[long]$p.Value.size; if ($sha -notmatch '^[0-9a-f]{64}$' -or $size -le 0) { throw 'Invalid asset metadata' }; [IO.File]::WriteAllLines($env:EXPECTED,@($sha,$size.ToString([Globalization.CultureInfo]::InvariantCulture)))"
+  "$ErrorActionPreference='Stop'; $m=Get-Content -LiteralPath $env:MANIFEST -Raw | ConvertFrom-Json; if ([int]$m.manifest_schema -ne 1) { throw 'Unsupported manifest schema' }; if ([int]$m.bootstrap_schema_version -ne 2) { throw 'Incompatible bootstrap schema' }; $p=$m.assets.PSObject.Properties[$env:ASSET]; if ($null -eq $p) { throw 'Asset missing from manifest' }; $sha=[string]$p.Value.sha256; $size=[long]$p.Value.size; if ($sha -notmatch '^[0-9a-f]{64}$' -or $size -le 0) { throw 'Invalid asset metadata' }; [IO.File]::WriteAllLines($env:EXPECTED,@($sha,$size.ToString([Globalization.CultureInfo]::InvariantCulture)))"
 if errorlevel 1 goto failed
 set "EXPECTED_SIZE="
 set /p EXPECTED_SHA256=<"%EXPECTED%"
