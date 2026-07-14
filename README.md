@@ -28,6 +28,8 @@ curl -fsSL "https://raw.githubusercontent.com/yuns2023/saiai-client/${tag}/scrip
 
 安装器只安装二进制，不接收 API Key，也不初始化产品。若目标位置已有不同的 `saiai`，会一次性保留为 `saiai-previous`（Windows 为 `saiai-previous.exe`），便于 Preview 回退。
 
+安装完成时，安装器会打印带绝对路径的下一步命令；第一次使用请直接执行该命令，不依赖当前终端是否已刷新 `PATH`。之后新开的终端可直接使用 `saiai claude` 或 `saiai codex`。
+
 当前 Preview 尚未配置 Windows/macOS 正式代码签名，系统可能显示未知发布者提示；请只使用本仓 tag 与对应 manifest，正式发布前会另行建立签名和更新密钥流程。
 
 ## 使用方式

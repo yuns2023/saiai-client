@@ -77,7 +77,7 @@ test -x "${install_dir}/saiai"
 cmp -s "${asset}" "${install_dir}/saiai"
 cmp -s "${previous}" "${install_dir}/saiai-previous"
 test ! -e "${invoked}"
-grep -Fq "Next: saiai claude or saiai codex" "${output}"
+grep -Fq "Next: ${install_dir}/saiai claude or ${install_dir}/saiai codex" "${output}"
 
 run_install
 test -x "${install_dir}/saiai"

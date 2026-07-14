@@ -200,4 +200,5 @@ case ":${PATH:-}:" in
   *":${INSTALL_DIR}:"*) ;;
   *) echo "Add ${INSTALL_DIR} to PATH, or run ${install_path} directly." >&2 ;;
 esac
-echo "Next: saiai claude or saiai codex" >&2
+echo "Next: ${install_path} claude or ${install_path} codex" >&2
+echo "Explicit setup: ${install_path} setup claude or ${install_path} setup codex" >&2

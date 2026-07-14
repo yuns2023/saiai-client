@@ -164,7 +164,8 @@ def main() -> int:
             )
             installed = install / "saiai"
             wrapper = run_checked(["bash", str(setup_sh), "install"], environment)
-            if "Next: saiai claude or saiai codex" not in wrapper.stdout + wrapper.stderr:
+            expected_next = f"Next: {installed} claude or {installed} codex"
+            if expected_next not in wrapper.stdout + wrapper.stderr:
                 raise AssertionError("install-only wrapper omitted V2 next-step guidance")
             if not installed.is_file() or installed.read_bytes() != binary.read_bytes():
                 raise AssertionError("install-only wrapper did not install the selected binary exactly")

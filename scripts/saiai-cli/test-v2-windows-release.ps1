@@ -46,11 +46,11 @@ Assert-Saiai ((Get-Sha256 $binary) -ceq [string]$entry.Value.sha256) "Windows as
 Assert-Saiai ((Get-Item -LiteralPath $binary).Length -eq [long]$entry.Value.size) "Windows asset size differs from manifest"
 
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ("saiai-v2-windows-release-" + [guid]::NewGuid().ToString("N"))
-$home = Join-Path $temporary "home"
+$testHome = Join-Path $temporary "home"
 $localAppData = Join-Path $temporary "local-app-data"
 $appData = Join-Path $temporary "roaming-app-data"
 $install = Join-Path $temporary "install"
-$null = New-Item -ItemType Directory -Path $home, $localAppData, $appData, $install -Force
+$null = New-Item -ItemType Directory -Path $testHome, $localAppData, $appData, $install -Force
 $downloadBase = ([Uri](Resolve-Path -LiteralPath $bundle).Path).AbsoluteUri.TrimEnd('/')
 
 $saved = @{}
@@ -60,17 +60,17 @@ foreach ($name in @("HOME", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "SAIAI_INS
 $savedUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
 
 try {
-    $env:HOME = $home
-    $env:USERPROFILE = $home
+    $env:HOME = $testHome
+    $env:USERPROFILE = $testHome
     $env:LOCALAPPDATA = $localAppData
     $env:APPDATA = $appData
     $env:SAIAI_INSTALL_DIR = $install
     $env:SAIAI_DOWNLOAD_BASE = $downloadBase
 
     $sentinels = [ordered]@{
-        (Join-Path $home ".saiai\sentinel") = "legacy-saiai`n"
-        (Join-Path $home ".claude\sentinel") = "legacy-claude`n"
-        (Join-Path $home ".codex\sentinel") = "legacy-codex`n"
+        (Join-Path $testHome ".saiai\sentinel") = "legacy-saiai`n"
+        (Join-Path $testHome ".claude\sentinel") = "legacy-claude`n"
+        (Join-Path $testHome ".codex\sentinel") = "legacy-codex`n"
     }
     $utf8 = [Text.UTF8Encoding]::new($false)
     foreach ($pair in $sentinels.GetEnumerator()) {
@@ -90,7 +90,7 @@ try {
         "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
         "-EncodedCommand", $encoded
     )
-    Assert-Saiai ($powerShellOutput.Contains("Next: saiai claude or saiai codex")) "PowerShell wrapper omitted V2 guidance"
+    Assert-Saiai ($powerShellOutput.Contains("Next: & `"$installed`" claude or & `"$installed`" codex")) "PowerShell wrapper omitted V2 guidance"
 
     Assert-Saiai (Test-Path -LiteralPath $installed -PathType Leaf) "PowerShell wrapper did not install saiai.exe"
     Assert-Saiai ((Get-Sha256 $installed) -ceq (Get-Sha256 $binary)) "PowerShell wrapper changed the binary"

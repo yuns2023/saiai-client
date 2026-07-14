@@ -179,8 +179,8 @@ function Invoke-Saiai {
         Add-SaiaiPath -Directory $installDirectory
 
         Write-Host "SAIAI V2 installed at $installPath" -ForegroundColor Green
-        Write-Host "Next: saiai claude or saiai codex" -ForegroundColor Green
-        Write-Host "Explicit setup: saiai setup claude or saiai setup codex" -ForegroundColor Green
+        Write-Host "Next: & `"$installPath`" claude or & `"$installPath`" codex" -ForegroundColor Green
+        Write-Host "Explicit setup: & `"$installPath`" setup claude or & `"$installPath`" setup codex" -ForegroundColor Green
         return 0
     }
     finally {
