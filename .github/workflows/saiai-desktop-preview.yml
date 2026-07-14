@@ -173,6 +173,7 @@ jobs:
   release:
     needs: verify
     if: startsWith(github.ref, 'refs/tags/')
+    environment: release
     timeout-minutes: 60
     permissions:
       contents: write
