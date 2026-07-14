@@ -1,0 +1,35 @@
+[package]
+name = "saiai-desktop"
+version = "0.9.0-preview.1"
+description = "Tauri 2 desktop UI for the SAIAI V2 client"
+authors = ["SAIAI Contributors"]
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+homepage = "https://saiai.top"
+readme = "../README.md"
+publish = false
+
+[lib]
+# Keep the library name distinct from the binary name on Windows.
+name = "saiai_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+saiai-core = { path = "../../saiai-core" }
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2.11", features = [] }
+tempfile = "3"
+
+[dev-dependencies]
+serde_json = "1"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

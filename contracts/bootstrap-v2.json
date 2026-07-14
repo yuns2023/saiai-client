@@ -1,0 +1,87 @@
+{
+  "contract": "top.saiai.client.bootstrap",
+  "contract_version": 1,
+  "bootstrap_schema_version": 2,
+  "request": {
+    "method": "GET",
+    "path_suffix": "/api/v1/client/bootstrap",
+    "authentication": {
+      "scheme": "Bearer",
+      "required": true
+    },
+    "redirects_allowed": false,
+    "billable": false
+  },
+  "response": {
+    "success_status": 200,
+    "maximum_body_bytes": 1048576,
+    "content_type": "application/json",
+    "envelope": {
+      "required": [
+        "code",
+        "data"
+      ],
+      "code": {
+        "type": "integer",
+        "const": 0
+      },
+      "data": {
+        "required": [
+          "schema_version",
+          "gateway_version",
+          "capabilities"
+        ],
+        "schema_version": {
+          "type": "integer",
+          "const": 2
+        },
+        "gateway_version": {
+          "type": "string",
+          "maximum_utf8_bytes": 128,
+          "safe_display_ascii_only": true
+        },
+        "capabilities": {
+          "fields": {
+            "claude": "boolean",
+            "codex": "boolean",
+            "codex_responses": "boolean",
+            "codex_websockets": "boolean",
+            "openai_messages_dispatch": "boolean"
+          },
+          "missing_boolean_default": false,
+          "unknown_fields_ignored": true
+        }
+      },
+      "unknown_fields_ignored": true
+    }
+  },
+  "product_requirements": {
+    "claude": [
+      "claude"
+    ],
+    "codex": [
+      "codex",
+      "codex_responses"
+    ]
+  },
+  "semantics": {
+    "codex_websockets": "Enables the optional Codex Responses WebSocket transport for this credential.",
+    "openai_messages_dispatch": "Informational OpenAI Messages compatibility only; it never satisfies native Claude setup.",
+    "credential_scope": "Capabilities describe only the authenticated API key used for this request."
+  },
+  "example_success": {
+    "code": 0,
+    "message": "success",
+    "data": {
+      "schema_version": 2,
+      "gateway_version": "example-gateway",
+      "capabilities": {
+        "claude": true,
+        "codex": false,
+        "codex_responses": false,
+        "codex_websockets": false,
+        "openai_messages_dispatch": false
+      }
+    }
+  }
+}

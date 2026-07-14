@@ -1,0 +1,43 @@
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+.github_pat
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Rust
+target/
+**/target/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Node and Tauri
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+**/src-tauri/gen/
+coverage/
+
+# Logs, captures, and local backups
+*.log
+*.pcap
+*.pcapng
+*.mitm
+*.flow
+*.bak
+*.orig
+*~
