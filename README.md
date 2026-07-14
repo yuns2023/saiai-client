@@ -32,6 +32,9 @@ curl -fsSL "https://raw.githubusercontent.com/yuns2023/saiai-client/${tag}/scrip
 
 当前 Preview 尚未配置 Windows/macOS 正式代码签名，系统可能显示未知发布者提示；请只使用本仓 tag 与对应 manifest，正式发布前会另行建立签名和更新密钥流程。
 
+Windows 的安装、按产品初始化、PATH、更新和 revoke 完整流程见
+[Windows 使用指南](docs/WINDOWS.md)。
+
 ## 使用方式
 
 先安装你实际要使用的官方客户端，然后运行对应入口：
