@@ -84,6 +84,8 @@ pnpm build
 
 Preview 版本为 `0.9.0-preview.1`，bundle identifier 为 `top.saiai.desktop`。Updater artifacts 当前关闭，macOS 本地 Preview 构建使用 ad-hoc signing。正式分发必须使用对应平台的发布签名；启用 updater 前必须先确定签名、密钥保管和回滚策略。
 
+Linux Preview 有一个已知的上游依赖告警：Tauri 2 的 GTK3 链当前解析到 `glib 0.18.5`，受 [GHSA-wrw7-89jp-8q8g](https://github.com/advisories/GHSA-wrw7-89jp-8q8g) 影响。SAIAI 及当前解析的依赖源码没有直接调用告警涉及的 `VariantStrIter` API，但告警保持开启；Linux 包仅作为 Preview，不进入稳定版或自动更新渠道。Tauri 上游的现状见 [tauri#12048](https://github.com/tauri-apps/tauri/issues/12048) 与 [tauri#12564](https://github.com/tauri-apps/tauri/issues/12564)。Windows 和 macOS bundle 不包含这个仅限 GTK3 target 的依赖。
+
 Desktop 与 CLI 可以作为独立 release assets 分发，但二者必须来自兼容的 V2 contract 版本。Desktop 可读取 CLI 已创建的状态，`saiai ui` 也可以打开已安装的 Desktop bundle。
 
 客户端整体设计见 [../../docs/CLIENT_DESIGN.md](../../docs/CLIENT_DESIGN.md)，Gateway 能力发现协议见 [../../docs/GATEWAY_BOOTSTRAP.md](../../docs/GATEWAY_BOOTSTRAP.md)。
