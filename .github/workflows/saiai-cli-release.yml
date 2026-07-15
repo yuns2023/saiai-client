@@ -274,8 +274,40 @@ jobs:
             --bundle dist \
             --setup-sh dist/setup.sh
 
+      - name: Verify immutable release preconditions
+        id: immutable_release_preflight
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/saiai-cli/verify-github-release-draft.py \
+            --dist dist \
+            --local-only
+
+          release_json="$(mktemp)"
+          trap 'rm -f "$release_json"' EXIT
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" \
+            >"$release_json" 2>/dev/null; then
+            if python3 -c 'import json, sys; raise SystemExit(0 if json.load(sys.stdin).get("draft") is True else 1)' \
+              <"$release_json"; then
+              echo "already_published=false" >>"$GITHUB_OUTPUT"
+            else
+              python3 scripts/saiai-cli/verify-github-release-draft.py \
+                --dist dist \
+                --tag "$GITHUB_REF_NAME" \
+                --state published \
+                <"$release_json"
+              echo "already_published=true" >>"$GITHUB_OUTPUT"
+            fi
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=1" >/dev/null
+            echo "already_published=false" >>"$GITHUB_OUTPUT"
+          fi
+
       - name: Upload immutable release draft
         id: immutable_release_draft
+        if: steps.immutable_release_preflight.outputs.already_published != 'true'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: SAIAI CLI V2 Preview ${{ github.ref_name }}
@@ -283,20 +315,58 @@ jobs:
           prerelease: true
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: dist/*
+          files: |
+            dist/manifest.json
+            dist/saiai-linux-aarch64
+            dist/saiai-linux-x86_64
+            dist/saiai-macos-aarch64
+            dist/saiai-macos-x86_64
+            dist/saiai-windows-aarch64.exe
+            dist/saiai-windows-x86_64.exe
+            dist/setup.cmd
+            dist/setup.ps1
+            dist/setup.sh
 
       - name: Verify and publish immutable release
+        if: steps.immutable_release_preflight.outputs.already_published != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_ID: ${{ steps.immutable_release_draft.outputs.id }}
         run: |
-          test -n "$RELEASE_ID"
-          gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" |
-            python3 scripts/saiai-cli/verify-github-release-draft.py \
-              --dist dist \
-              --tag "$GITHUB_REF_NAME"
-          gh release edit "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --draft=false \
-            --prerelease
+          set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
+          release_endpoint="repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}"
+          release_json="$(mktemp)"
+          trap 'rm -f "$release_json"' EXIT
+
+          gh api "$release_endpoint" >"$release_json"
+          if ! python3 scripts/saiai-cli/verify-github-release-draft.py \
+            --dist dist \
+            --tag "$GITHUB_REF_NAME" \
+            --state draft \
+            <"$release_json"; then
+            if [ "$(gh api "$release_endpoint" --jq '.draft' 2>/dev/null || true)" = "true" ]; then
+              gh api --method DELETE "$release_endpoint"
+            fi
+            exit 1
+          fi
+
+          publish_status=0
+          payload='{"draft":false,"prerelease":true}'
+          printf '%s' "$payload" |
+            gh api --method PATCH "$release_endpoint" --input - >/dev/null || publish_status=$?
+
+          for attempt in 1 2 3 4 5; do
+            if gh api "$release_endpoint" >"$release_json" &&
+              python3 scripts/saiai-cli/verify-github-release-draft.py \
+                --dist dist \
+                --tag "$GITHUB_REF_NAME" \
+                --state published \
+                <"$release_json"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "immutable release postcondition failed (publish status $publish_status)" >&2
+          exit 1

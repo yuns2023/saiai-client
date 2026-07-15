@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify every GitHub draft-release asset before immutable publication."""
+"""Verify local and remote GitHub release state around immutable publication."""
 
 from __future__ import annotations
 
@@ -27,7 +27,10 @@ MAX_RESPONSE_BYTES = 2_000_000
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dist", required=True, type=Path)
-    parser.add_argument("--tag", required=True)
+    parser.add_argument("--tag")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--local-only", action="store_true")
+    mode.add_argument("--state", choices=("draft", "published"))
     return parser.parse_args()
 
 
@@ -65,12 +68,19 @@ def verify_local_dist(dist: Path) -> dict[str, Path]:
 
 
 def verify_release(
-    release: dict[str, Any], files: dict[str, Path], expected_tag: str
+    release: dict[str, Any],
+    files: dict[str, Path],
+    expected_tag: str,
+    expected_state: str,
 ) -> None:
-    require(release.get("draft") is True, "release is not a draft")
     require(release.get("prerelease") is True, "release is not a prerelease")
-    if "immutable" in release:
-        require(release["immutable"] is False, "draft is already immutable")
+    if expected_state == "draft":
+        require(release.get("draft") is True, "release is not a draft")
+        if "immutable" in release:
+            require(release["immutable"] is False, "draft is already immutable")
+    else:
+        require(release.get("draft") is False, "release is still a draft")
+        require(release.get("immutable") is True, "published release is not immutable")
     require(release.get("tag_name") == expected_tag, "release tag differs")
 
     assets = release.get("assets")
@@ -98,11 +108,16 @@ def main() -> int:
     args = arguments()
     try:
         files = verify_local_dist(args.dist)
-        verify_release(load_release(), files, args.tag)
+        if not args.local_only:
+            require(bool(args.tag), "--tag is required when verifying a release")
+            verify_release(load_release(), files, args.tag, args.state)
     except (OSError, ValueError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
-    print(f"PASS: verified {len(files)} draft assets for {args.tag}")
+    if args.local_only:
+        print(f"PASS: verified exact local release set ({len(files)} files)")
+    else:
+        print(f"PASS: verified {len(files)} {args.state} assets for {args.tag}")
     return 0
 
 

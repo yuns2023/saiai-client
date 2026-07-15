@@ -60,10 +60,19 @@ class ReleaseDraftVerifierTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def run_verifier(
-        self, release: dict[str, Any] | None = None
+        self, release: dict[str, Any] | None = None, state: str = "draft"
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(VERIFIER), "--dist", str(self.dist), "--tag", TAG],
+            [
+                sys.executable,
+                str(VERIFIER),
+                "--dist",
+                str(self.dist),
+                "--tag",
+                TAG,
+                "--state",
+                state,
+            ],
             input=json.dumps(release if release is not None else self.release),
             text=True,
             capture_output=True,
@@ -75,10 +84,42 @@ class ReleaseDraftVerifierTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("verified 10 draft assets", result.stdout)
 
+    def test_accepts_exact_immutable_published_release(self) -> None:
+        release = copy.deepcopy(self.release)
+        release["draft"] = False
+        release["immutable"] = True
+        result = self.run_verifier(release, state="published")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("verified 10 published assets", result.stdout)
+
+    def test_accepts_exact_local_set_without_remote_input(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(VERIFIER),
+                "--dist",
+                str(self.dist),
+                "--local-only",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_rejects_published_release(self) -> None:
         release = copy.deepcopy(self.release)
         release["draft"] = False
         self.assertNotEqual(self.run_verifier(release).returncode, 0)
+
+    def test_rejects_mutable_published_release(self) -> None:
+        release = copy.deepcopy(self.release)
+        release["draft"] = False
+        release["immutable"] = False
+        self.assertNotEqual(
+            self.run_verifier(release, state="published").returncode,
+            0,
+        )
 
     def test_rejects_wrong_tag(self) -> None:
         release = copy.deepcopy(self.release)
