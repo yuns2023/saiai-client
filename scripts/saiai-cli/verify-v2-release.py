@@ -302,7 +302,14 @@ def verify_workflows_are_public_only() -> None:
             f"[target.{target}]" in cargo_config,
             f"Cargo linker configuration omits static Linux target: {target}",
         )
-    require(cargo_config.count('linker = "musl-gcc"') == 2, "musl linkers are not pinned")
+    require(
+        cargo_config.count('linker = "cc"') == 2,
+        "Rust musl linkers must use native cc with the bundled self-contained CRT",
+    )
+    require(
+        'linker = "musl-gcc"' not in cargo_config,
+        "musl-gcc as the Rust linker can produce a dynamically loaded musl binary",
+    )
 
     for workflow_name in ("ci.yml", "saiai-cli-release.yml"):
         workflow = workflows[workflow_name]
