@@ -21,7 +21,7 @@ CORE_DIR = ROOT / "tools" / "saiai-core"
 CLI_DIR = ROOT / "tools" / "saiai-cli"
 DESKTOP_DIR = ROOT / "tools" / "saiai-desktop"
 CONTRACT_PATH = ROOT / "contracts" / "bootstrap-v2.json"
-CLI_VERSION = "0.9.0"
+CLI_VERSION = "0.9.1"
 DESKTOP_VERSION = "0.9.0-preview.1"
 ASSETS = (
     "saiai-linux-x86_64",
@@ -270,7 +270,7 @@ def verify_workflows_are_public_only() -> None:
         for name in ("ci.yml", "saiai-cli-release.yml", "saiai-desktop-preview.yml")
     }
     combined = "\n".join(workflows.values())
-    require(combined.count("toolchain: '1.97.0'") == 8, "workflow Rust toolchains are not pinned")
+    require(combined.count("toolchain: '1.97.0'") == 9, "workflow Rust toolchains are not pinned")
     for forbidden in (
         "back" + "end/",
         "front" + "end/",
@@ -296,12 +296,50 @@ def verify_workflows_are_public_only() -> None:
     for runner in ("ubuntu-22.04", "windows-latest"):
         require(runner in ci, f"public CI omits standard runner: {runner}")
 
+    cargo_config = (ROOT / ".cargo" / "config.toml").read_text(encoding="utf-8")
+    for target in ("x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"):
+        require(
+            f"[target.{target}]" in cargo_config,
+            f"Cargo linker configuration omits static Linux target: {target}",
+        )
+    require(
+        cargo_config.count('linker = "cc"') == 2,
+        "Rust musl linkers must use native cc with the bundled self-contained CRT",
+    )
+    require(
+        'linker = "musl-gcc"' not in cargo_config,
+        "musl-gcc as the Rust linker can produce a dynamically loaded musl binary",
+    )
+
+    for workflow_name in ("ci.yml", "saiai-cli-release.yml"):
+        workflow = workflows[workflow_name]
+        for target in ("x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"):
+            require(target in workflow, f"{workflow_name} omits static Linux target: {target}")
+        for forbidden_target in ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"):
+            require(
+                forbidden_target not in workflow,
+                f"{workflow_name} still builds host-glibc target: {forbidden_target}",
+            )
+        require(
+            "verify-linux-portability.py" in workflow,
+            f"{workflow_name} does not enforce Linux release portability",
+        )
+
+    subprocess.run(
+        [sys.executable, str(SCRIPT_DIR / "test-linux-portability.py")],
+        check=True,
+    )
+
     cli = workflows["saiai-cli-release.yml"]
     require("saiai-v*" in cli, "CLI tag trigger is missing")
     require("workflow_dispatch:" in cli, "CLI manual Preview trigger is missing")
     require("Package validation bundle" in cli, "CLI validation bundle job is missing")
     require("contents: write" in cli, "CLI tag job cannot publish")
     require("prerelease: true" in cli, "CLI tagged build is not a Preview prerelease")
+    require(
+        cli.count("verify-linux-portability.py") == 3,
+        "CLI release does not verify each Linux build and both assembled bundles",
+    )
     for asset in ASSETS:
         require(f"asset: {asset}" in cli, f"CLI matrix omits {asset}")
     for wrapper in WRAPPERS:
