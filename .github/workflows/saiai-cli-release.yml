@@ -63,10 +63,10 @@ jobs:
       matrix:
         include:
           - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             asset: saiai-linux-x86_64
           - os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             asset: saiai-linux-aarch64
           - os: macos-15-intel
             target: x86_64-apple-darwin
@@ -98,11 +98,25 @@ jobs:
           toolchain: '1.97.0'
           targets: ${{ matrix.target }}
 
+      - name: Install musl build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
       - name: Test native Windows resolver
         if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo test --locked --manifest-path tools/saiai-core/Cargo.toml --target ${{ matrix.target }} client_program::tests::windows
 
+      - name: Build static Linux release binary
+        if: runner.os == 'Linux'
+        env:
+          CC: musl-gcc
+          CARGO_BUILD_JOBS: 2
+        run: cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml --release --target ${{ matrix.target }}
+
       - name: Build release binary
+        if: runner.os != 'Linux'
         run: cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml --release --target ${{ matrix.target }}
 
       - name: Smoke-test native Windows V2 runtime
@@ -129,6 +143,10 @@ jobs:
             --asset "${{ matrix.asset }}" \
             --wrappers-dir dist \
             --output dist/manifest.json
+
+      - name: Verify Linux release portability
+        if: runner.os == 'Linux'
+        run: python3 scripts/saiai-cli/verify-linux-portability.py "dist/${{ matrix.asset }}"
 
       - name: Smoke-test native Unix bundle
         if: runner.os != 'Windows'
@@ -191,6 +209,9 @@ jobs:
           find release-assets -maxdepth 2 -type f -exec cp {} dist/ \;
           cp scripts/saiai-cli/setup.sh scripts/saiai-cli/setup.ps1 scripts/saiai-cli/setup.cmd dist/
           chmod +x dist/setup.sh dist/saiai-linux-* dist/saiai-macos-*
+          python3 scripts/saiai-cli/verify-linux-portability.py \
+            dist/saiai-linux-x86_64 \
+            dist/saiai-linux-aarch64
           python3 scripts/saiai-cli/generate-manifest.py \
             --dist dist \
             --cargo-toml tools/saiai-cli/Cargo.toml \
@@ -241,6 +262,9 @@ jobs:
           find release-assets -maxdepth 2 -type f -exec cp {} dist/ \;
           cp scripts/saiai-cli/setup.sh scripts/saiai-cli/setup.ps1 scripts/saiai-cli/setup.cmd dist/
           chmod +x dist/setup.sh dist/saiai-linux-* dist/saiai-macos-*
+          python3 scripts/saiai-cli/verify-linux-portability.py \
+            dist/saiai-linux-x86_64 \
+            dist/saiai-linux-aarch64
           python3 scripts/saiai-cli/generate-manifest.py \
             --dist dist \
             --cargo-toml tools/saiai-cli/Cargo.toml \

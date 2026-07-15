@@ -22,8 +22,9 @@ SH
 chmod +x "${asset}"
 sha256="$(sha256sum "${asset}" | awk '{print $1}')"
 size="$(wc -c <"${asset}" | tr -d '[:space:]')"
-printf '{"manifest_schema":1,"bootstrap_schema_version":2,"version":"0.9.0","assets":{"saiai-linux-x86_64":{"sha256":"%s","size":%s}}}\n' \
-  "${sha256}" "${size}" >"${fixtures}/manifest.json"
+version="$(awk -F '"' '/^[[:space:]]*version[[:space:]]*=/{print $2; exit}' "${script_dir}/../../tools/saiai-cli/Cargo.toml")"
+printf '{"manifest_schema":1,"bootstrap_schema_version":2,"version":"%s","assets":{"saiai-linux-x86_64":{"sha256":"%s","size":%s}}}\n' \
+  "${version}" "${sha256}" "${size}" >"${fixtures}/manifest.json"
 
 cat >"${fake_bin}/uname" <<'SH'
 #!/usr/bin/env bash
