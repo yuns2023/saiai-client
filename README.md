@@ -6,10 +6,10 @@ SAIAI Client 是面向 Claude Code 与 Codex 的全新 V2-only 本地客户端�
 
 ## 安装 Preview
 
-CLI Release 使用六个平台资产和一个带 SHA-256/size 的 manifest。以 `0.9.1` 为例，Windows PowerShell 可以直接从同一 tag 安装：
+CLI Release 使用六个平台资产和一个带 SHA-256/size 的 manifest。以 `0.9.2` 为例，Windows PowerShell 可以直接从同一 tag 安装：
 
 ```powershell
-$tag = "saiai-v0.9.1"
+$tag = "saiai-v0.9.2"
 $env:SAIAI_DOWNLOAD_BASE = "https://github.com/yuns2023/saiai-client/releases/download/$tag"
 irm "https://raw.githubusercontent.com/yuns2023/saiai-client/$tag/scripts/saiai-cli/setup.ps1" | iex
 Invoke-Saiai
@@ -19,7 +19,7 @@ Remove-Item Env:SAIAI_DOWNLOAD_BASE
 Linux 或 macOS：
 
 ```bash
-tag=saiai-v0.9.1
+tag=saiai-v0.9.2
 curl -fsSL "https://raw.githubusercontent.com/yuns2023/saiai-client/${tag}/scripts/saiai-cli/setup.sh" \
   | SAIAI_DOWNLOAD_BASE="https://github.com/yuns2023/saiai-client/releases/download/${tag}" bash
 ```

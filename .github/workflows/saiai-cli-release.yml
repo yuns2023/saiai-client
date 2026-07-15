@@ -274,11 +274,29 @@ jobs:
             --bundle dist \
             --setup-sh dist/setup.sh
 
-      - name: Publish immutable release assets
+      - name: Upload immutable release draft
+        id: immutable_release_draft
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: SAIAI CLI V2 Preview ${{ github.ref_name }}
+          draft: true
           prerelease: true
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: dist/*
+
+      - name: Verify and publish immutable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.immutable_release_draft.outputs.id }}
+        run: |
+          test -n "$RELEASE_ID"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" |
+            python3 scripts/saiai-cli/verify-github-release-draft.py \
+              --dist dist \
+              --tag "$GITHUB_REF_NAME"
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --prerelease

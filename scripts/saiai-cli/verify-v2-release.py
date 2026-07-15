@@ -21,7 +21,7 @@ CORE_DIR = ROOT / "tools" / "saiai-core"
 CLI_DIR = ROOT / "tools" / "saiai-cli"
 DESKTOP_DIR = ROOT / "tools" / "saiai-desktop"
 CONTRACT_PATH = ROOT / "contracts" / "bootstrap-v2.json"
-CLI_VERSION = "0.9.1"
+CLI_VERSION = "0.9.2"
 DESKTOP_VERSION = "0.9.0-preview.1"
 ASSETS = (
     "saiai-linux-x86_64",
@@ -329,6 +329,10 @@ def verify_workflows_are_public_only() -> None:
         [sys.executable, str(SCRIPT_DIR / "test-linux-portability.py")],
         check=True,
     )
+    subprocess.run(
+        [sys.executable, str(SCRIPT_DIR / "test-github-release-draft.py")],
+        check=True,
+    )
 
     cli = workflows["saiai-cli-release.yml"]
     require("saiai-v*" in cli, "CLI tag trigger is missing")
@@ -336,6 +340,15 @@ def verify_workflows_are_public_only() -> None:
     require("Package validation bundle" in cli, "CLI validation bundle job is missing")
     require("contents: write" in cli, "CLI tag job cannot publish")
     require("prerelease: true" in cli, "CLI tagged build is not a Preview prerelease")
+    require("draft: true" in cli, "immutable CLI release is not uploaded as a draft")
+    require(
+        "verify-github-release-draft.py" in cli,
+        "immutable CLI draft assets are not verified before publication",
+    )
+    require(
+        'gh release edit "$GITHUB_REF_NAME"' in cli and "--draft=false" in cli,
+        "immutable CLI release draft is not explicitly published after verification",
+    )
     require(
         cli.count("verify-linux-portability.py") == 3,
         "CLI release does not verify each Linux build and both assembled bundles",

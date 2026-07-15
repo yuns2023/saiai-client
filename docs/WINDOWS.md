@@ -1,6 +1,6 @@
-# Windows 使用指南（V2 Preview 0.9.1）
+# Windows 使用指南（V2 Preview 0.9.2）
 
-本页适用于 SAIAI CLI V2 Preview `0.9.1`。公开 V2 客户端只维护 schema 2
+本页适用于 SAIAI CLI V2 Preview `0.9.2`。公开 V2 客户端只维护 schema 2
 状态，不读取、不导入旧模式配置。Windows Release 提供 AMD64 和 ARM64
 二进制；PowerShell 安装器只安装 CLI，不初始化 Claude 或 Codex，也不接收
 API Key。
@@ -21,18 +21,18 @@ Get-Command codex -ErrorAction SilentlyContinue
 
 ## 2. 安装 SAIAI CLI
 
-Gateway 已镜像匹配的 `0.9.1` bundle 时，可以在 PowerShell 中运行：
+Gateway 已镜像匹配的 `0.9.2` bundle 时，可以在 PowerShell 中运行：
 
 ```powershell
 irm https://api.saiai.top/saiai-cli/setup.ps1 | iex
 Invoke-Saiai install
 ```
 
-也可以固定到本仓的 `saiai-v0.9.1` Release。脚本、manifest 和二进制必须
+也可以固定到本仓的 `saiai-v0.9.2` Release。脚本、manifest 和二进制必须
 来自同一个 tag：
 
 ```powershell
-$tag = "saiai-v0.9.1"
+$tag = "saiai-v0.9.2"
 $env:SAIAI_DOWNLOAD_BASE = "https://github.com/yuns2023/saiai-client/releases/download/$tag"
 try {
     irm "https://raw.githubusercontent.com/yuns2023/saiai-client/$tag/scripts/saiai-cli/setup.ps1" | iex
@@ -137,7 +137,7 @@ Claude/Codex 进程再重试。
 
 ## 5. 更新与 Preview 签名说明
 
-CLI `0.9.1` 没有 `saiai update` 命令。更新时先退出通过 SAIAI 启动的
+CLI `0.9.2` 没有 `saiai update` 命令。更新时先退出通过 SAIAI 启动的
 Claude/Codex，再重新运行第 2 节的安装流程：
 
 - 使用 Gateway 镜像时，脚本和 manifest 应来自同一个 Gateway origin；
