@@ -6,10 +6,10 @@ SAIAI Client 是面向 Claude Code 与 Codex 的全新 V2-only 本地客户端�
 
 ## 安装 Preview
 
-CLI Release 使用六个平台资产和一个带 SHA-256/size 的 manifest。以 `0.9.1` 为例，Windows PowerShell 可以直接从同一 tag 安装：
+CLI Release 使用六个平台资产和一个带 SHA-256/size 的 manifest。以 `0.9.2` 为例，Windows PowerShell 可以直接从同一 tag 安装：
 
 ```powershell
-$tag = "saiai-v0.9.1"
+$tag = "saiai-v0.9.2"
 $env:SAIAI_DOWNLOAD_BASE = "https://github.com/yuns2023/saiai-client/releases/download/$tag"
 irm "https://raw.githubusercontent.com/yuns2023/saiai-client/$tag/scripts/saiai-cli/setup.ps1" | iex
 Invoke-Saiai
@@ -19,7 +19,7 @@ Remove-Item Env:SAIAI_DOWNLOAD_BASE
 Linux 或 macOS：
 
 ```bash
-tag=saiai-v0.9.1
+tag=saiai-v0.9.2
 curl -fsSL "https://raw.githubusercontent.com/yuns2023/saiai-client/${tag}/scripts/saiai-cli/setup.sh" \
   | SAIAI_DOWNLOAD_BASE="https://github.com/yuns2023/saiai-client/releases/download/${tag}" bash
 ```
@@ -28,7 +28,7 @@ curl -fsSL "https://raw.githubusercontent.com/yuns2023/saiai-client/${tag}/scrip
 
 安装器只安装二进制，不接收 API Key，也不初始化产品。若目标位置已有不同的 `saiai`，会一次性保留为 `saiai-previous`（Windows 为 `saiai-previous.exe`），便于 Preview 回退。
 
-`0.9.1` 起的 Linux x86_64 和 ARM64 资产为静态 musl 二进制，不依赖宿主系统的 GLIBC 版本。发布流程会拒绝包含动态解释器、共享库依赖或 `GLIBC_*`/`GLIBCXX_*`/`CXXABI_*` 版本引用的 Linux 资产。
+`0.9.2` 起的 Linux x86_64 和 ARM64 资产为静态 musl 二进制，不依赖宿主系统的 GLIBC 版本。发布流程会拒绝包含动态解释器、共享库依赖或 `GLIBC_*`/`GLIBCXX_*`/`CXXABI_*` 版本引用的 Linux 资产。
 
 安装完成时，安装器会打印带绝对路径的下一步命令；第一次使用请直接执行该命令，不依赖当前终端是否已刷新 `PATH`。之后新开的终端可直接使用 `saiai claude` 或 `saiai codex`。
 
