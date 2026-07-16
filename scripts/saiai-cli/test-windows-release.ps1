@@ -58,6 +58,7 @@ try {
 
     . $setupPowerShell
     $result = Invoke-Saiai "https://gateway.example.test" $testKey
+    Assert-Saiai ($result -is [int]) "PowerShell wrapper returned a non-scalar exit code"
     Assert-Saiai ($result -eq 0) "PowerShell wrapper failed"
     $installed = Join-Path $install "saiai.exe"
     Assert-Saiai (Test-Path -LiteralPath $installed -PathType Leaf) "PowerShell wrapper did not install saiai.exe"
@@ -69,6 +70,7 @@ try {
     Assert-Saiai ([string]$settings.env.ANTHROPIC_BASE_URL -ceq "https://gateway.example.test") "PowerShell wrapper did not apply the gateway"
 
     $second = Invoke-Saiai "https://new-gateway.example.test" "TEST_ONLY_WINDOWS_REPLACEMENT_KEY"
+    Assert-Saiai ($second -is [int]) "Repeat PowerShell wrapper returned a non-scalar exit code"
     Assert-Saiai ($second -eq 0) "Repeat PowerShell wrapper failed"
     $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
     Assert-Saiai ([string]$settings.env.ANTHROPIC_BASE_URL -ceq "https://new-gateway.example.test") "Repeat setup did not replace the gateway"

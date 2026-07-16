@@ -182,8 +182,12 @@ function Invoke-Saiai {
         }
 
         Add-SaiaiPath -Directory $installDirectory
-        & $installPath @provided
-        return $LASTEXITCODE
+        # Keep the native client's human-readable stdout visible without
+        # mixing it into this function's scalar exit-code result. PowerShell
+        # otherwise captures both values when callers assign Invoke-Saiai.
+        & $installPath @provided | Out-Host
+        $nativeExitCode = $LASTEXITCODE
+        return [int]$nativeExitCode
     }
     finally {
         Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
