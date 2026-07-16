@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Install or reuse the SAIAI config client, then apply the requested config.
+# Install or reuse SAIAI, configure the requested client, and start the Claude
+# local proxy service for the Claude setup path.
 
 set -euo pipefail
 
@@ -11,11 +12,13 @@ Usage:
 
 The wrapper checks the release manifest on every run. It downloads the binary
 only when the installed binary differs, then always applies the supplied config.
+Claude setup also starts or refreshes the per-user local proxy service.
 
 Environment:
   SAIAI_DOWNLOAD_BASE  Flat manifest/asset base URL
                        (default: https://api.saiai.top/saiai-cli)
   SAIAI_INSTALL_DIR    Install directory (default: ~/.local/bin)
+  SAIAI_SKIP_START=1   Configure Claude without starting the proxy service
 EOF
 }
 
@@ -88,8 +91,8 @@ with open(path, "r", encoding="utf-8") as handle:
     manifest = json.load(handle)
 if manifest.get("manifest_schema") != 1:
     raise SystemExit("unsupported SAIAI manifest schema")
-if manifest.get("client_mode") != "global-config":
-    raise SystemExit("release is not a SAIAI global-config client")
+if manifest.get("client_mode") != "local-proxy":
+    raise SystemExit("release is not a SAIAI local-proxy client")
 if manifest.get("configuration_schema_version") != 1:
     raise SystemExit("unsupported SAIAI configuration schema")
 entry = manifest.get("assets", {}).get(asset)
@@ -111,7 +114,7 @@ const fs = require("node:fs");
 const [path, asset] = process.argv.slice(2);
 const manifest = JSON.parse(fs.readFileSync(path, "utf8"));
 if (manifest.manifest_schema !== 1) throw new Error("unsupported SAIAI manifest schema");
-if (manifest.client_mode !== "global-config") throw new Error("release is not a SAIAI global-config client");
+if (manifest.client_mode !== "local-proxy") throw new Error("release is not a SAIAI local-proxy client");
 if (manifest.configuration_schema_version !== 1) throw new Error("unsupported SAIAI configuration schema");
 const entry = manifest.assets?.[asset];
 if (!entry || typeof entry !== "object") throw new Error(`manifest does not contain ${asset}`);
@@ -198,4 +201,11 @@ case ":${PATH:-}:" in
   *) echo "Add ${INSTALL_DIR} to PATH when you want to run saiai directly." >&2 ;;
 esac
 
-"${install_path}" "$@"
+if [ "${1:-}" = "init-codex" ]; then
+  "${install_path}" "$@"
+else
+  "${install_path}" init "$@"
+  if [ "${SAIAI_SKIP_START:-0}" != "1" ]; then
+    "${install_path}" start
+  fi
+fi

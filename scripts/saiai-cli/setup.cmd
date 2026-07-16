@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 
-rem Install or reuse the SAIAI config client, then apply the requested config.
+rem Install or reuse SAIAI, apply config, and start the Claude local proxy.
 if "%~2"=="" goto usage
 
 set "ARCH=%PROCESSOR_ARCHITECTURE%"
@@ -54,7 +54,7 @@ powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Comma
 if errorlevel 1 goto failed
 
 powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ^
-  "$ErrorActionPreference='Stop'; $m=Get-Content -LiteralPath $env:MANIFEST -Raw ^| ConvertFrom-Json; if ([int]$m.manifest_schema -ne 1) { throw 'Unsupported manifest schema' }; if ([string]$m.client_mode -cne 'global-config') { throw 'Release is not a global-config client' }; if ([int]$m.configuration_schema_version -ne 1) { throw 'Unsupported configuration schema' }; $p=$m.assets.PSObject.Properties[$env:ASSET]; if ($null -eq $p) { throw 'Asset missing from manifest' }; $sha=[string]$p.Value.sha256; $size=[long]$p.Value.size; $version=[string]$m.version; if ($sha -notmatch '^[0-9a-f]{64}$' -or $size -le 0) { throw 'Invalid asset metadata' }; [IO.File]::WriteAllLines($env:EXPECTED,@($sha,$size.ToString([Globalization.CultureInfo]::InvariantCulture),$version))"
+  "$ErrorActionPreference='Stop'; $m=Get-Content -LiteralPath $env:MANIFEST -Raw ^| ConvertFrom-Json; if ([int]$m.manifest_schema -ne 1) { throw 'Unsupported manifest schema' }; if ([string]$m.client_mode -cne 'local-proxy') { throw 'Release is not a local-proxy client' }; if ([int]$m.configuration_schema_version -ne 1) { throw 'Unsupported configuration schema' }; $p=$m.assets.PSObject.Properties[$env:ASSET]; if ($null -eq $p) { throw 'Asset missing from manifest' }; $sha=[string]$p.Value.sha256; $size=[long]$p.Value.size; $version=[string]$m.version; if ($sha -notmatch '^[0-9a-f]{64}$' -or $size -le 0) { throw 'Invalid asset metadata' }; [IO.File]::WriteAllLines($env:EXPECTED,@($sha,$size.ToString([Globalization.CultureInfo]::InvariantCulture),$version))"
 if errorlevel 1 goto failed
 set /p EXPECTED_SHA256=<"%EXPECTED%"
 set "EXPECTED_SIZE="
@@ -96,8 +96,20 @@ if errorlevel 1 goto failed
 echo Installed SAIAI %RELEASE_VERSION% at %INSTALL_PATH%.
 
 :configure
+if /I "%~1"=="init-codex" goto configure_codex
+"%INSTALL_PATH%" init %*
+set "SAIAI_EXIT=%ERRORLEVEL%"
+if not "%SAIAI_EXIT%"=="0" goto configured
+if "%SAIAI_SKIP_START%"=="1" goto configured
+"%INSTALL_PATH%" start
+set "SAIAI_EXIT=%ERRORLEVEL%"
+goto configured
+
+:configure_codex
 "%INSTALL_PATH%" %*
 set "SAIAI_EXIT=%ERRORLEVEL%"
+
+:configured
 rd /s /q "%TEMP_ROOT%" >nul 2>nul
 exit /b %SAIAI_EXIT%
 

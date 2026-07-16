@@ -102,7 +102,7 @@ jobs:
         if: runner.os != 'Linux'
         run: cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml --release --target ${{ matrix.target }}
 
-      - name: Smoke-test native Windows config runtime
+      - name: Smoke-test native Windows local proxy runtime
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |

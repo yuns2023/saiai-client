@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the deterministic SAIAI global-config client manifest."""
+"""Generate the deterministic SAIAI managed-local-proxy client manifest."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 MANIFEST_SCHEMA = 1
-CLIENT_MODE = "global-config"
+CLIENT_MODE = "local-proxy"
 CONFIGURATION_SCHEMA_VERSION = 1
 DEFAULT_ASSETS = (
     "saiai-linux-x86_64",
