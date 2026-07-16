@@ -1,6 +1,6 @@
 # SAIAI Client
 
-SAIAI Client `1.0.0` 是一个纯配置客户端。它把 SAIAI Gateway 地址和 API Key
+SAIAI Client `1.0.1` 是一个纯配置客户端。它把 SAIAI Gateway 地址和 API Key
 写入 Claude Code 或 Codex CLI 的全局配置；不启动本地代理，不创建隔离 home、
 generation、CA 或常驻服务。
 

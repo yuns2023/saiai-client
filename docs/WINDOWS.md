@@ -1,6 +1,6 @@
-# Windows 使用指南（SAIAI 1.0.0）
+# Windows 使用指南（SAIAI 1.0.1）
 
-SAIAI `1.0.0` 是全局配置工具，不需要管理员权限、后台服务、本地代理或 CA。
+SAIAI `1.0.1` 是全局配置工具，不需要管理员权限、后台服务、本地代理或 CA。
 
 ## 一键配置 Claude Code
 
@@ -23,7 +23,7 @@ Gateway 地址或 Key 变更时可以直接重复执行同一形式的命令。
 claude
 ```
 
-VSCode Claude Code 使用同一份用户级配置。不要再运行 `saiai claude`；1.0.0
+VSCode Claude Code 使用同一份用户级配置。不要再运行 `saiai claude`；1.0.1
 没有隔离 home 或启动器。
 
 ## 路径

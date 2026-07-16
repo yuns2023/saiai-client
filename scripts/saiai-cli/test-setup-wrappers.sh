@@ -23,7 +23,7 @@ SH
 chmod +x "${asset}"
 sha256="$(sha256sum "${asset}" | awk '{print $1}')"
 size="$(wc -c <"${asset}" | tr -d '[:space:]')"
-printf '{"client_mode":"global-config","configuration_schema_version":1,"manifest_schema":1,"version":"1.0.0","assets":{"saiai-linux-x86_64":{"sha256":"%s","size":%s}}}\n' \
+printf '{"client_mode":"global-config","configuration_schema_version":1,"manifest_schema":1,"version":"1.0.1","assets":{"saiai-linux-x86_64":{"sha256":"%s","size":%s}}}\n' \
   "${sha256}" "${size}" >"${fixtures}/manifest.json"
 
 cat >"${fake_bin}/uname" <<'SH'
