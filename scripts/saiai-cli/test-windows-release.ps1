@@ -27,7 +27,7 @@ $manifest = Get-Content -LiteralPath (Join-Path $bundle "manifest.json") -Raw | 
 Assert-Saiai ([int]$manifest.manifest_schema -eq 1) "Windows manifest schema differs"
 Assert-Saiai ([string]$manifest.client_mode -ceq "global-config") "Windows manifest mode differs"
 Assert-Saiai ([int]$manifest.configuration_schema_version -eq 1) "Windows configuration schema differs"
-Assert-Saiai ($null -eq $manifest.bootstrap_schema_version) "Windows manifest still claims V2 bootstrap"
+Assert-Saiai ($null -eq $manifest.PSObject.Properties["bootstrap_schema_version"]) "Windows manifest still claims V2 bootstrap"
 $entry = $manifest.assets.PSObject.Properties[$AssetName]
 Assert-Saiai ($null -ne $entry) "Windows asset is absent from manifest"
 Assert-Saiai ((Get-Sha256 $binary) -ceq [string]$entry.Value.sha256) "Windows asset hash differs"

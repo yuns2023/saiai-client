@@ -42,12 +42,12 @@ try {
     Assert-Saiai ([string]$settings.env.CLAUDE_CODE_OAUTH_TOKEN -ceq $testKey) "API key differs"
     Assert-Saiai ([string]$settings.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS -ceq "600000") "Timeout differs"
     Assert-Saiai ([string]$settings.env.KEEP_ME -ceq "yes") "Unrelated env was lost"
-    Assert-Saiai ($null -eq $settings.env.ANTHROPIC_AUTH_TOKEN) "Conflicting auth token remains"
-    Assert-Saiai ($null -eq $settings.env.HTTP_PROXY) "Conflicting proxy remains"
+    Assert-Saiai ($null -eq $settings.env.PSObject.Properties["ANTHROPIC_AUTH_TOKEN"]) "Conflicting auth token remains"
+    Assert-Saiai ($null -eq $settings.env.PSObject.Properties["HTTP_PROXY"]) "Conflicting proxy remains"
     Assert-Saiai (@($settings.permissions.allow) -contains "Read") "Unrelated settings were lost"
 
     $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
-    Assert-Saiai ($null -eq $state.oauthAccount) "oauthAccount remains"
+    Assert-Saiai ($null -eq $state.PSObject.Properties["oauthAccount"]) "oauthAccount remains"
     Assert-Saiai ([string]$state.userID -ceq "kept") "Machine identity was lost"
     Assert-Saiai (-not (Test-Path -LiteralPath $credentialsPath)) "OAuth credentials remain"
     Assert-Saiai (-not (Test-Path -LiteralPath $caPath)) "Old SAIAI CA remains"
