@@ -1,99 +1,85 @@
 # SAIAI Client
 
-SAIAI Client 是面向 Claude Code 与 Codex 的全新 V2-only 本地客户端。它提供命令行入口和 Tauri 2 桌面界面，让两个产品按需初始化、使用彼此独立的凭据，并在平台标准目录中维护隔离状态。
+SAIAI Client `1.0.0` 是一个纯配置客户端。它把 SAIAI Gateway 地址和 API Key
+写入 Claude Code 或 Codex CLI 的全局配置；不启动本地代理，不创建隔离 home、
+generation、CA 或常驻服务。
 
-当前版本为 Preview，配置 schema 固定为 2。这个公开项目不包含旧模式实现，也不迁移旧配置。
+## 一键配置
 
-## 安装 Preview
-
-CLI Release 使用六个平台资产和一个带 SHA-256/size 的 manifest。以 `0.9.2` 为例，Windows PowerShell 可以直接从同一 tag 安装：
-
-```powershell
-$tag = "saiai-v0.9.2"
-$env:SAIAI_DOWNLOAD_BASE = "https://github.com/yuns2023/saiai-client/releases/download/$tag"
-irm "https://raw.githubusercontent.com/yuns2023/saiai-client/$tag/scripts/saiai-cli/setup.ps1" | iex
-Invoke-Saiai
-Remove-Item Env:SAIAI_DOWNLOAD_BASE
-```
-
-Linux 或 macOS：
+WebUI 会生成已经包含当前 Gateway 地址和 API Key 的一行命令。macOS / Linux
+形式如下：
 
 ```bash
-tag=saiai-v0.9.2
-curl -fsSL "https://raw.githubusercontent.com/yuns2023/saiai-client/${tag}/scripts/saiai-cli/setup.sh" \
-  | SAIAI_DOWNLOAD_BASE="https://github.com/yuns2023/saiai-client/releases/download/${tag}" bash
+curl -fsSL https://api.saiai.top/saiai-cli/setup.sh | bash -s -- 'https://api.saiai.top' 'YOUR_API_KEY'
 ```
 
-当相同 bundle 已镜像到 Gateway 后，安装命令可以缩短为 `irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai` 或 `curl -fsSL https://api.saiai.top/saiai-cli/setup.sh | bash`。不要在 Gateway 尚未发布匹配 manifest 时混用两个来源。
+PowerShell：
 
-安装器只安装二进制，不接收 API Key，也不初始化产品。若目标位置已有不同的 `saiai`，会一次性保留为 `saiai-previous`（Windows 为 `saiai-previous.exe`），便于 Preview 回退。
-
-`0.9.2` 起的 Linux x86_64 和 ARM64 资产为静态 musl 二进制，不依赖宿主系统的 GLIBC 版本。发布流程会拒绝包含动态解释器、共享库依赖或 `GLIBC_*`/`GLIBCXX_*`/`CXXABI_*` 版本引用的 Linux 资产。
-
-安装完成时，安装器会打印带绝对路径的下一步命令；第一次使用请直接执行该命令，不依赖当前终端是否已刷新 `PATH`。之后新开的终端可直接使用 `saiai claude` 或 `saiai codex`。
-
-当前 Preview 尚未配置 Windows/macOS 正式代码签名，系统可能显示未知发布者提示；请只使用本仓 tag 与对应 manifest，正式发布前会另行建立签名和更新密钥流程。
-
-Windows 的安装、按产品初始化、PATH、更新和 revoke 完整流程见
-[Windows 使用指南](docs/WINDOWS.md)。
-
-## 使用方式
-
-先安装你实际要使用的官方客户端，然后运行对应入口：
-
-```text
-saiai claude
-saiai codex
+```powershell
+irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai 'https://api.saiai.top' 'YOUR_API_KEY'
 ```
 
-某个产品第一次启动时，SAIAI 只询问该产品需要的 API Key。第一个完成初始化的产品还会确定共享 Gateway URL；之后初始化另一产品时复用该地址，但使用自己的 Key。
+命令可以反复执行。Base URL 或 Key 改变时会覆盖 SAIAI 管理的值并保留无关
+配置。由于一键命令直接包含 Key，Key 会出现在剪贴板、终端命令和 shell 历史
+中；客户端自身不会把 Key 打印到输出。
 
-需要显式初始化时，可以使用：
+wrapper 每次只下载很小的 `manifest.json`。如果本机二进制 SHA-256 已等于
+manifest 中的当前版本，就跳过二进制下载，但仍会重新应用配置。
 
-```text
-saiai setup claude
-saiai setup codex
-```
+## Claude Code 行为
 
-常用维护命令：
+Claude 初始化写入用户级 `settings.json`：
 
-```text
+- `ANTHROPIC_BASE_URL`
+- `CLAUDE_CODE_OAUTH_TOKEN`
+- `CLAUDE_STREAM_IDLE_TIMEOUT_MS=600000`
+- 当前 SAIAI 功能开关
+
+写入时会移除会覆盖认证、provider、model、proxy 和 CA 的冲突环境变量，移除
+`.claude.json` 中的 `oauthAccount`，备份后删除 `.credentials.json` 以及旧的
+`saiai-ca.crt`。其他 JSON 字段和机器本地身份值保持不变。
+
+默认路径是 `~/.claude/settings.json`、`~/.claude.json` 和
+`~/.claude/.credentials.json`。设置 `CLAUDE_CONFIG_DIR` 时，以上文件全部跟随该
+目录。配置完成后直接运行 `claude`，VSCode 中的 Claude Code 也读取同一份全局
+配置；不再使用 `saiai claude`。
+
+可执行以下命令检查配置，Key 值不会显示：
+
+```bash
 saiai doctor
-saiai claude revoke
-saiai codex revoke
-saiai revoke --all
-saiai ui
 ```
 
-- Claude 与 Codex 都是可选产品，未配置其中一个不是错误。
-- 单产品 revoke 不影响另一产品；`revoke --all` 清理全部 V2 状态。
-- Gateway 或本地状态异常时，先运行 `saiai doctor`，不要把包含凭据的文件粘贴到公开问题中。
+## Codex CLI
 
-## 设计边界
-
-- Native client 将 API Key 交给本地 Rust 处理，提交后清除 UI 临时值，并且不通过状态、doctor 或 Desktop IPC 结果返回。
-- 初始化只调用不产生模型用量的 Gateway bootstrap 端点。
-- Claude 使用每次安装生成的本地 CA；项目不分发共享 CA 私钥。
-- 配置、数据和运行状态存放在平台标准应用目录中。
-- schema 2 状态不提供迁移器；无法验证的状态通过 `saiai revoke --all` 后重新初始化。
-
-详细设计见 [客户端设计](docs/CLIENT_DESIGN.md)，Gateway 实现方见 [bootstrap contract](docs/GATEWAY_BOOTSTRAP.md)。
-
-## 并行体验说明
-
-Preview 期间，旧模式只保留在私有旧仓中供并行体验。两个项目各自维护状态；本仓不会读取、导入或兼容旧模式。公开 V2 binary 本身不包含旧命令；如安装前已有旧 binary，可用安装器保留的 `saiai-previous` 显式启动它。是否停用旧模式不影响本仓的 V2 contract。
-
-## 仓库结构
-
-```text
-tools/saiai-core/       V2 状态、凭据和初始化事务
-tools/saiai-cli/        V2 命令行入口与客户端启动逻辑
-tools/saiai-desktop/    Tauri 2 + Vue 桌面界面
-docs/                   公开设计与 Gateway contract
+```bash
+saiai init-codex https://api.saiai.top/v1 YOUR_API_KEY
+saiai init-codex https://api.saiai.top/v1 YOUR_API_KEY --websockets
 ```
 
-Desktop 的开发说明见 [tools/saiai-desktop/README.md](tools/saiai-desktop/README.md)。贡献代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)；安全问题请按 [SECURITY.md](SECURITY.md) 私下报告。
+该命令合并 `~/.codex/config.toml` 和 `~/.codex/auth.json`，保留不属于 SAIAI
+管理范围的字段。
 
-## License
+## 发布资产
 
-本项目使用 [MIT License](LICENSE)。
+固定的六个二进制资产名为：
+
+- `saiai-linux-x86_64`
+- `saiai-linux-aarch64`
+- `saiai-macos-x86_64`
+- `saiai-macos-aarch64`
+- `saiai-windows-x86_64.exe`
+- `saiai-windows-aarch64.exe`
+
+Linux 资产使用静态 musl，避免旧发行版上的 GLIBC 版本错误。release 还包含
+`manifest.json` 与三个 wrapper。详细行为见
+[客户端设计](docs/CLIENT_DESIGN.md) 和 [Windows 指南](docs/WINDOWS.md)。
+
+## 本地验证
+
+```bash
+cargo fmt --manifest-path tools/saiai-cli/Cargo.toml --check
+cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml
+bash scripts/saiai-cli/test-setup-wrappers.sh
+python3 scripts/saiai-cli/verify-release.py
+```

@@ -31,29 +31,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
-          workspaces: |
-            tools/saiai-core -> target
-            tools/saiai-cli -> target
+          workspaces: tools/saiai-cli -> target
 
       - name: Format
-        run: |
-          cargo fmt --manifest-path tools/saiai-core/Cargo.toml --check
-          cargo fmt --manifest-path tools/saiai-cli/Cargo.toml --check
+        run: cargo fmt --manifest-path tools/saiai-cli/Cargo.toml --check
 
       - name: Lint
-        run: |
-          cargo clippy --locked --manifest-path tools/saiai-core/Cargo.toml --all-targets -- -D warnings
-          cargo clippy --locked --manifest-path tools/saiai-cli/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --locked --manifest-path tools/saiai-cli/Cargo.toml --all-targets -- -D warnings
 
       - name: Test
-        run: |
-          cargo test --locked --manifest-path tools/saiai-core/Cargo.toml
-          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml
+        run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml
 
       - name: Verify standalone release contract
         run: |
           bash scripts/saiai-cli/test-setup-wrappers.sh
-          python3 scripts/saiai-cli/verify-v2-release.py
+          python3 scripts/saiai-cli/verify-release.py
 
   build:
     needs: verify
@@ -88,11 +80,6 @@ jobs:
         with:
           python-version: '3.12'
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        with:
-          node-version: '24'
-
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: '1.97.0'
@@ -103,10 +90,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
-
-      - name: Test native Windows resolver
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: cargo test --locked --manifest-path tools/saiai-core/Cargo.toml --target ${{ matrix.target }} client_program::tests::windows
 
       - name: Build static Linux release binary
         if: runner.os == 'Linux'
@@ -119,11 +102,11 @@ jobs:
         if: runner.os != 'Linux'
         run: cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml --release --target ${{ matrix.target }}
 
-      - name: Smoke-test native Windows V2 runtime
+      - name: Smoke-test native Windows config runtime
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
-          & "$PWD/scripts/saiai-cli/test-v2-windows-runtime.ps1" `
+          & "$PWD/scripts/saiai-cli/test-windows-runtime.ps1" `
             -BinaryPath "$PWD/tools/saiai-cli/target/${{ matrix.target }}/release/saiai.exe"
 
       - name: Prepare release fixture
@@ -163,7 +146,7 @@ jobs:
             echo "Skipping cross-built ${{ matrix.asset }} on $(uname -m)"
             exit 0
           fi
-          python3 scripts/saiai-cli/test-v2-release-bundle.py \
+          python3 scripts/saiai-cli/test-release-bundle.py \
             --bundle dist \
             --setup-sh dist/setup.sh \
             --asset "${{ matrix.asset }}"
@@ -172,7 +155,7 @@ jobs:
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
-          & "$PWD/scripts/saiai-cli/test-v2-windows-release.ps1" `
+          & "$PWD/scripts/saiai-cli/test-windows-release.ps1" `
             -BundleDir dist `
             -SetupPs1 dist/setup.ps1 `
             -SetupCmd dist/setup.cmd `
@@ -217,8 +200,8 @@ jobs:
             --cargo-toml tools/saiai-cli/Cargo.toml \
             --wrappers-dir dist \
             --output dist/manifest.json
-          python3 scripts/saiai-cli/verify-v2-release.py
-          python3 scripts/saiai-cli/test-v2-release-bundle.py \
+          python3 scripts/saiai-cli/verify-release.py
+          python3 scripts/saiai-cli/test-release-bundle.py \
             --bundle dist \
             --setup-sh dist/setup.sh
 
@@ -270,7 +253,7 @@ jobs:
             --cargo-toml tools/saiai-cli/Cargo.toml \
             --wrappers-dir dist \
             --output dist/manifest.json
-          python3 scripts/saiai-cli/test-v2-release-bundle.py \
+          python3 scripts/saiai-cli/test-release-bundle.py \
             --bundle dist \
             --setup-sh dist/setup.sh
 
@@ -310,9 +293,9 @@ jobs:
         if: steps.immutable_release_preflight.outputs.already_published != 'true'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          name: SAIAI CLI V2 Preview ${{ github.ref_name }}
+          name: SAIAI CLI ${{ github.ref_name }}
           draft: true
-          prerelease: true
+          prerelease: false
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
@@ -353,7 +336,7 @@ jobs:
           fi
 
           publish_status=0
-          payload='{"draft":false,"prerelease":true}'
+          payload='{"draft":false,"prerelease":false}'
           printf '%s' "$payload" |
             gh api --method PATCH "$release_endpoint" --input - >/dev/null || publish_status=$?
 

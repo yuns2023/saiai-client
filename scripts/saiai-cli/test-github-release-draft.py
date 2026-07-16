@@ -50,7 +50,7 @@ class ReleaseDraftVerifierTests(unittest.TestCase):
             )
         self.release: dict[str, Any] = {
             "draft": True,
-            "prerelease": True,
+            "prerelease": False,
             "immutable": False,
             "tag_name": TAG,
             "assets": assets,
@@ -124,6 +124,11 @@ class ReleaseDraftVerifierTests(unittest.TestCase):
     def test_rejects_wrong_tag(self) -> None:
         release = copy.deepcopy(self.release)
         release["tag_name"] = "saiai-v9.8.8"
+        self.assertNotEqual(self.run_verifier(release).returncode, 0)
+
+    def test_rejects_prerelease(self) -> None:
+        release = copy.deepcopy(self.release)
+        release["prerelease"] = True
         self.assertNotEqual(self.run_verifier(release).returncode, 0)
 
     def test_rejects_missing_remote_asset(self) -> None:
