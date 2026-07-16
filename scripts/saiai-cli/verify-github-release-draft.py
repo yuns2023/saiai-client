@@ -73,7 +73,7 @@ def verify_release(
     expected_tag: str,
     expected_state: str,
 ) -> None:
-    require(release.get("prerelease") is True, "release is not a prerelease")
+    require(release.get("prerelease") is False, "release is marked as a prerelease")
     if expected_state == "draft":
         require(release.get("draft") is True, "release is not a draft")
         if "immutable" in release:

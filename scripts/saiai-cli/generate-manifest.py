@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the deterministic SAIAI V2 flat-distribution manifest."""
+"""Generate the deterministic SAIAI global-config client manifest."""
 
 from __future__ import annotations
 
@@ -13,7 +13,8 @@ from pathlib import Path
 
 
 MANIFEST_SCHEMA = 1
-BOOTSTRAP_SCHEMA_VERSION = 2
+CLIENT_MODE = "global-config"
+CONFIGURATION_SCHEMA_VERSION = 1
 DEFAULT_ASSETS = (
     "saiai-linux-x86_64",
     "saiai-linux-aarch64",
@@ -83,7 +84,8 @@ def build_manifest(
         raise ValueError("release asset list contains duplicates")
     result: dict[str, object] = {
         "manifest_schema": MANIFEST_SCHEMA,
-        "bootstrap_schema_version": BOOTSTRAP_SCHEMA_VERSION,
+        "client_mode": CLIENT_MODE,
+        "configuration_schema_version": CONFIGURATION_SCHEMA_VERSION,
         "version": version,
         "assets": {name: metadata(dist / name) for name in assets},
     }

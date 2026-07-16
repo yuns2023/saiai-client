@@ -1,9 +1,9 @@
 [package]
 name = "saiai"
-version = "0.9.2"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.97"
-description = "Clean, isolated SAIAI client launcher for Claude Code and Codex"
+description = "One-command SAIAI configuration client for Claude Code and Codex"
 license = "MIT"
 homepage = "https://saiai.top"
 repository = "https://github.com/yuns2023/saiai-client"
@@ -11,26 +11,9 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-futures-util = "0.3"
-rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-rpassword = "7"
-rustls = "0.23"
-saiai-core = { path = "../saiai-core" }
-tempfile = "3"
-tokio = { version = "1", features = [
-    "io-util",
-    "macros",
-    "net",
-    "process",
-    "rt-multi-thread",
-    "sync",
-    "time",
-] }
-tokio-rustls = "0.26"
+serde_json = "1"
+toml_edit = "0.22"
 url = "2"
-zeroize = "1"
 
 [dev-dependencies]
-rustls-pemfile = "2"
-serde_json = "1"
+tempfile = "3"

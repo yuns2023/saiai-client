@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   client-linux:
-    name: Core and CLI
+    name: Config client
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
@@ -33,29 +33,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
-          workspaces: |
-            tools/saiai-core -> target
-            tools/saiai-cli -> target
+          workspaces: tools/saiai-cli -> target
 
       - name: Format
-        run: |
-          cargo fmt --manifest-path tools/saiai-core/Cargo.toml --check
-          cargo fmt --manifest-path tools/saiai-cli/Cargo.toml --check
+        run: cargo fmt --manifest-path tools/saiai-cli/Cargo.toml --check
 
       - name: Lint
-        run: |
-          cargo clippy --locked --manifest-path tools/saiai-core/Cargo.toml --all-targets -- -D warnings
-          cargo clippy --locked --manifest-path tools/saiai-cli/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --locked --manifest-path tools/saiai-cli/Cargo.toml --all-targets -- -D warnings
 
       - name: Test
-        run: |
-          cargo test --locked --manifest-path tools/saiai-core/Cargo.toml
-          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml
+        run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml
 
       - name: Verify public release contract
         run: |
           bash scripts/saiai-cli/test-setup-wrappers.sh
-          python3 scripts/saiai-cli/verify-v2-release.py
+          python3 scripts/saiai-cli/verify-release.py
 
   static-linux:
     name: Static Linux client (${{ matrix.asset }})
@@ -104,99 +96,27 @@ jobs:
           "dist/${{ matrix.asset }}" --help >/dev/null
 
   client-windows:
-    name: Native Windows client
+    name: Native Windows config client
     runs-on: windows-latest
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: '3.12'
-
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: '24'
-
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: '1.97.0'
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
-          workspaces: |
-            tools/saiai-core -> target
-            tools/saiai-cli -> target
+          workspaces: tools/saiai-cli -> target
 
-      - name: Test native Windows paths and CLI
+      - name: Test and build native Windows client
         run: |
-          cargo test --locked --manifest-path tools/saiai-core/Cargo.toml client_program::tests::windows
           cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml
+          cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml
 
-      - name: Build and smoke-test native Windows V2 runtime
+      - name: Smoke-test Windows configuration
         shell: pwsh
         run: |
-          cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml
-          & "$PWD/scripts/saiai-cli/test-v2-windows-runtime.ps1" `
+          & "$PWD/scripts/saiai-cli/test-windows-runtime.ps1" `
             -BinaryPath "$PWD/tools/saiai-cli/target/debug/saiai.exe"
-
-  desktop-linux:
-    name: Tauri desktop
-    runs-on: ubuntu-22.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-
-      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
-        with:
-          version: 10.33.2
-
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: '24'
-          cache: pnpm
-          cache-dependency-path: tools/saiai-desktop/pnpm-lock.yaml
-
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
-        with:
-          toolchain: '1.97.0'
-          components: clippy, rustfmt
-
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
-        with:
-          workspaces: |
-            tools/saiai-core -> target
-            tools/saiai-desktop/src-tauri -> target
-
-      - name: Install Tauri Linux prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            build-essential \
-            curl \
-            wget \
-            file \
-            libxdo-dev \
-            libssl-dev \
-            libappindicator3-dev \
-            librsvg2-dev \
-            patchelf \
-            xdg-utils
-
-      - name: Install desktop dependencies
-        working-directory: tools/saiai-desktop
-        run: pnpm install --frozen-lockfile
-
-      - name: Verify desktop frontend
-        working-directory: tools/saiai-desktop
-        run: |
-          pnpm typecheck
-          pnpm test:run
-          pnpm build
-
-      - name: Verify desktop Rust
-        run: |
-          cargo fmt --manifest-path tools/saiai-desktop/src-tauri/Cargo.toml --check
-          cargo clippy --locked --manifest-path tools/saiai-desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
-          cargo test --locked --manifest-path tools/saiai-desktop/src-tauri/Cargo.toml
