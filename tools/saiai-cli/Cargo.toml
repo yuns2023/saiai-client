@@ -1,6 +1,6 @@
 [package]
 name = "saiai"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.97"
 description = "One-command SAIAI configuration client for Claude Code and Codex"

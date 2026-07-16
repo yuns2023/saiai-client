@@ -43,7 +43,7 @@ def load_generator():
 
 def verify_cli() -> None:
     cargo = text("tools/saiai-cli/Cargo.toml")
-    require('version = "1.0.0"' in cargo, "CLI version is not 1.0.0")
+    require('version = "1.0.1"' in cargo, "CLI version is not 1.0.1")
     require("saiai-core" not in cargo, "config client still links the V2 runtime core")
     for dependency in ("reqwest", "tokio", "rustls", "rcgen", "rpassword"):
         require(dependency not in cargo, f"config client still links V2 dependency {dependency}")
@@ -98,7 +98,7 @@ def verify_manifest_and_wrappers() -> None:
         wrappers.mkdir()
         for name in WRAPPERS:
             (wrappers / name).write_bytes((name + "\n").encode())
-        manifest = generator.build_manifest(root, "1.0.0", ASSETS, wrappers)
+        manifest = generator.build_manifest(root, "1.0.1", ASSETS, wrappers)
         require(manifest.get("manifest_schema") == 1, "generated manifest schema differs")
         require(manifest.get("client_mode") == "global-config", "generated client mode differs")
         require(
