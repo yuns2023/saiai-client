@@ -18,12 +18,13 @@ mkdir -p "${fixtures}" "${fake_bin}" "${home}" "${install_dir}"
 asset="${fixtures}/saiai-linux-x86_64"
 cat >"${asset}" <<'SH'
 #!/usr/bin/env bash
-printf '%s\n' "$@" >"${SAIAI_TEST_BINARY_INVOKED:?}"
+printf 'CALL\n' >>"${SAIAI_TEST_BINARY_INVOKED:?}"
+printf '%s\n' "$@" >>"${SAIAI_TEST_BINARY_INVOKED:?}"
 SH
 chmod +x "${asset}"
 sha256="$(sha256sum "${asset}" | awk '{print $1}')"
 size="$(wc -c <"${asset}" | tr -d '[:space:]')"
-printf '{"client_mode":"global-config","configuration_schema_version":1,"manifest_schema":1,"version":"1.0.1","assets":{"saiai-linux-x86_64":{"sha256":"%s","size":%s}}}\n' \
+printf '{"client_mode":"local-proxy","configuration_schema_version":1,"manifest_schema":1,"version":"1.1.0","assets":{"saiai-linux-x86_64":{"sha256":"%s","size":%s}}}\n' \
   "${sha256}" "${size}" >"${fixtures}/manifest.json"
 
 cat >"${fake_bin}/uname" <<'SH'
@@ -75,8 +76,12 @@ run_setup "https://gateway.example.test" "${first_key}"
 test -x "${install_dir}/saiai"
 cmp -s "${asset}" "${install_dir}/saiai"
 mapfile -t first_invocation <"${invoked}"
-test "${first_invocation[0]}" = "https://gateway.example.test"
-test "${first_invocation[1]}" = "${first_key}"
+test "${first_invocation[0]}" = "CALL"
+test "${first_invocation[1]}" = "init"
+test "${first_invocation[2]}" = "https://gateway.example.test"
+test "${first_invocation[3]}" = "${first_key}"
+test "${first_invocation[4]}" = "CALL"
+test "${first_invocation[5]}" = "start"
 test "$(grep -Fc '/manifest.json' "${curl_log}")" -eq 1
 test "$(grep -Fc '/saiai-linux-x86_64' "${curl_log}")" -eq 1
 if grep -Fq "${first_key}" "${output}"; then
@@ -87,18 +92,23 @@ fi
 second_key="TEST_ONLY_REPLACEMENT_KEY"
 run_setup "https://new-gateway.example.test" "${second_key}"
 mapfile -t second_invocation <"${invoked}"
-test "${second_invocation[0]}" = "https://new-gateway.example.test"
-test "${second_invocation[1]}" = "${second_key}"
+test "${second_invocation[0]}" = "CALL"
+test "${second_invocation[1]}" = "init"
+test "${second_invocation[2]}" = "https://new-gateway.example.test"
+test "${second_invocation[3]}" = "${second_key}"
+test "${second_invocation[4]}" = "CALL"
+test "${second_invocation[5]}" = "start"
 test "$(grep -Fc '/manifest.json' "${curl_log}")" -eq 2
 test "$(grep -Fc '/saiai-linux-x86_64' "${curl_log}")" -eq 1
 grep -Fq 'binary download skipped' "${output}"
 
 run_setup init-codex "https://gateway.example.test/v1" "TEST_ONLY_CODEX_KEY" --websockets
 mapfile -t codex_invocation <"${invoked}"
-test "${codex_invocation[0]}" = "init-codex"
-test "${codex_invocation[1]}" = "https://gateway.example.test/v1"
-test "${codex_invocation[2]}" = "TEST_ONLY_CODEX_KEY"
-test "${codex_invocation[3]}" = "--websockets"
+test "${codex_invocation[0]}" = "CALL"
+test "${codex_invocation[1]}" = "init-codex"
+test "${codex_invocation[2]}" = "https://gateway.example.test/v1"
+test "${codex_invocation[3]}" = "TEST_ONLY_CODEX_KEY"
+test "${codex_invocation[4]}" = "--websockets"
 test "$(grep -Fc '/manifest.json' "${curl_log}")" -eq 3
 test "$(grep -Fc '/saiai-linux-x86_64' "${curl_log}")" -eq 1
 
@@ -114,7 +124,7 @@ grep -Fq 'Usage:' "${output}"
 for wrapper in setup.sh setup.ps1 setup.cmd; do
   test -s "${script_dir}/${wrapper}"
   grep -Fq 'https://api.saiai.top/saiai-cli' "${script_dir}/${wrapper}"
-  grep -Fq 'global-config' "${script_dir}/${wrapper}"
+  grep -Fq 'local-proxy' "${script_dir}/${wrapper}"
   if grep -Fq 'bootstrap_schema_version' "${script_dir}/${wrapper}"; then
     echo "${wrapper} still depends on the withdrawn V2 bootstrap contract" >&2
     exit 1
@@ -128,4 +138,4 @@ grep -Fq 'binary download skipped' "${script_dir}/setup.ps1"
 grep -Fq 'INSTALLED_MATCHES=1' "${script_dir}/setup.cmd"
 grep -Fq 'binary download skipped' "${script_dir}/setup.cmd"
 
-echo "SAIAI global-config wrapper checks passed"
+echo "SAIAI local-proxy wrapper checks passed"

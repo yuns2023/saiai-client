@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke-test a packaged SAIAI global-config binary and Unix wrapper."""
+"""Smoke-test a packaged SAIAI managed-local-proxy binary and Unix wrapper."""
 
 from __future__ import annotations
 
@@ -66,8 +66,8 @@ def verify_manifest(bundle: Path, selected_asset: str) -> dict[str, object]:
     manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
     if manifest.get("manifest_schema") != 1:
         raise AssertionError("release manifest schema differs")
-    if manifest.get("client_mode") != "global-config":
-        raise AssertionError("release is not a global-config client")
+    if manifest.get("client_mode") != "local-proxy":
+        raise AssertionError("release is not a local-proxy client")
     if manifest.get("configuration_schema_version") != 1:
         raise AssertionError("configuration schema differs")
     if "bootstrap_schema_version" in manifest:
@@ -137,6 +137,7 @@ def main() -> int:
                 "HOME": str(home),
                 "SAIAI_DOWNLOAD_BASE": bundle.as_uri(),
                 "SAIAI_INSTALL_DIR": str(install),
+                "SAIAI_SKIP_START": "1",
             }
         )
         first_key = "TEST_ONLY_BUNDLE_KEY"
@@ -154,8 +155,8 @@ def main() -> int:
         settings_env = settings["env"]
         if settings_env.get("CLAUDE_CODE_OAUTH_TOKEN") != first_key:
             raise AssertionError("Claude OAuth token was not configured")
-        if settings_env.get("ANTHROPIC_BASE_URL") != "https://gateway.example.test":
-            raise AssertionError("Claude gateway was not configured")
+        if "ANTHROPIC_BASE_URL" in settings_env:
+            raise AssertionError("direct Claude gateway override remains")
         if settings_env.get("CLAUDE_STREAM_IDLE_TIMEOUT_MS") != "600000":
             raise AssertionError("Claude stream timeout differs")
         for removed in (
@@ -163,18 +164,31 @@ def main() -> int:
             "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
             "CLAUDE_CODE_CLIENT_CERT",
             "VERTEX_REGION_CLAUDE_4_6_SONNET",
-            "HTTP_PROXY",
-            "NODE_EXTRA_CA_CERTS",
         ):
             if removed in settings_env:
                 raise AssertionError(f"conflicting environment value remains: {removed}")
         if settings_env.get("KEEP_ME") != "yes" or settings["permissions"]["allow"] != ["Read"]:
             raise AssertionError("unrelated Claude settings were not preserved")
+        expected_proxy = "http://127.0.0.1:19908"
+        for proxy_key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            if settings_env.get(proxy_key) != expected_proxy:
+                raise AssertionError(f"local proxy setting differs: {proxy_key}")
+        ca_path = claude_dir / "saiai-ca.crt"
+        ca_key_path = claude_dir / "saiai-ca.key"
+        if settings_env.get("NODE_EXTRA_CA_CERTS") != str(ca_path):
+            raise AssertionError("Claude CA path was not configured")
+        if not ca_path.is_file() or not ca_key_path.is_file():
+            raise AssertionError("per-user CA pair was not generated")
+        first_ca = ca_path.read_bytes()
+        first_ca_key = ca_key_path.read_bytes()
         state = json.loads((home / ".claude.json").read_text(encoding="utf-8"))
         if "oauthAccount" in state or state.get("userID") != "kept":
             raise AssertionError("Claude state cleanup did not preserve machine identity")
-        if (claude_dir / ".credentials.json").exists() or (claude_dir / "saiai-ca.crt").exists():
-            raise AssertionError("stale OAuth credentials or SAIAI CA remain")
+        if (claude_dir / ".credentials.json").exists():
+            raise AssertionError("stale OAuth credentials remain")
+        saiai_config = json.loads((home / ".saiai" / "config.json").read_text(encoding="utf-8"))
+        if saiai_config.get("version") != 2 or saiai_config.get("api_key") != first_key:
+            raise AssertionError("local proxy config was not written")
 
         second_key = "TEST_ONLY_REPLACEMENT_KEY"
         second = run_checked(
@@ -186,14 +200,17 @@ def main() -> int:
         settings = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
         if settings["env"].get("CLAUDE_CODE_OAUTH_TOKEN") != second_key:
             raise AssertionError("repeat setup did not replace the API key")
-        if settings["env"].get("ANTHROPIC_BASE_URL") != "https://new-gateway.example.test":
+        saiai_config = json.loads((home / ".saiai" / "config.json").read_text(encoding="utf-8"))
+        if saiai_config.get("base_url") != "https://new-gateway.example.test":
             raise AssertionError("repeat setup did not replace the gateway")
+        if ca_path.read_bytes() != first_ca or ca_key_path.read_bytes() != first_ca_key:
+            raise AssertionError("repeat setup unnecessarily rotated the installation CA")
 
-        doctor = run_checked([str(installed), "doctor"], environment)
-        if "value hidden" not in doctor.stdout or second_key in doctor.stdout:
-            raise AssertionError("doctor did not keep the API key hidden")
+        help_output = run_checked([str(installed), "--help"], environment)
+        if "saiai start" not in help_output.stdout or second_key in help_output.stdout:
+            raise AssertionError("local-proxy commands are missing or the API key leaked")
 
-    print("SAIAI global-config release bundle smoke passed")
+    print("SAIAI local-proxy release bundle smoke passed")
     return 0
 
 

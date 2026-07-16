@@ -20,11 +20,11 @@
 
 ## 项目安全边界
 
-- V2 为独立状态模型，不读取或迁移其他客户端配置。
+- 当前稳定客户端会更新用户级 Claude/Codex 配置；必须保留不属于 SAIAI 的字段。
 - Claude 本地代理必须使用安装时生成的 CA 和私钥；不得提交或分发共享私钥。
-- API Key 不应出现在 URL、命令行参数、日志、诊断输出、Issue 或截图中。
-- Desktop WebView 不直接访问 Gateway；网络验证和凭据存储由 Rust 侧处理。
-- Bootstrap 是认证但不产生模型用量的能力发现请求，协议见 [docs/GATEWAY_BOOTSTRAP.md](docs/GATEWAY_BOOTSTRAP.md)。
+- WebUI 一键命令会按明确产品取舍包含用户 API Key；Key 不得进入 URL、程序
+  输出、日志、诊断、Issue、截图、release 证据或仓库。
+- 初始化和发布验证不得调用模型接口；Gateway 健康检查必须保持非计费。
 
 请勿使用他人的真实账号或凭据进行测试。除非得到凭据所有者对该次操作的明确授权，否则不要发送真实模型请求。
 

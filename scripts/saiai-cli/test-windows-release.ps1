@@ -25,14 +25,14 @@ $setupCommand = (Resolve-Path -LiteralPath $SetupCmd).Path
 $binary = Join-Path $bundle $AssetName
 $manifest = Get-Content -LiteralPath (Join-Path $bundle "manifest.json") -Raw | ConvertFrom-Json
 Assert-Saiai ([int]$manifest.manifest_schema -eq 1) "Windows manifest schema differs"
-Assert-Saiai ([string]$manifest.client_mode -ceq "global-config") "Windows manifest mode differs"
+Assert-Saiai ([string]$manifest.client_mode -ceq "local-proxy") "Windows manifest mode differs"
 Assert-Saiai ([int]$manifest.configuration_schema_version -eq 1) "Windows configuration schema differs"
 Assert-Saiai ($null -eq $manifest.PSObject.Properties["bootstrap_schema_version"]) "Windows manifest still claims V2 bootstrap"
 $entry = $manifest.assets.PSObject.Properties[$AssetName]
 Assert-Saiai ($null -ne $entry) "Windows asset is absent from manifest"
 Assert-Saiai ((Get-Sha256 $binary) -ceq [string]$entry.Value.sha256) "Windows asset hash differs"
 Assert-Saiai ((Get-Item -LiteralPath $binary).Length -eq [long]$entry.Value.size) "Windows asset size differs"
-Assert-Saiai ((Get-Content -LiteralPath $setupCommand -Raw).Contains("global-config")) "CMD wrapper contract differs"
+Assert-Saiai ((Get-Content -LiteralPath $setupCommand -Raw).Contains("local-proxy")) "CMD wrapper contract differs"
 
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ("saiai-config-windows-release-" + [guid]::NewGuid().ToString("N"))
 $testHome = Join-Path $temporary "home"
@@ -42,7 +42,7 @@ $downloadBase = ([Uri](Resolve-Path -LiteralPath $bundle).Path).AbsoluteUri.Trim
 $testKey = "TEST_ONLY_WINDOWS_RELEASE_KEY"
 
 $saved = @{}
-foreach ($name in @("HOME", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "CLAUDE_CONFIG_DIR", "SAIAI_INSTALL_DIR", "SAIAI_DOWNLOAD_BASE")) {
+foreach ($name in @("HOME", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "CLAUDE_CONFIG_DIR", "SAIAI_HOME", "SAIAI_INSTALL_DIR", "SAIAI_DOWNLOAD_BASE", "SAIAI_SKIP_START")) {
     $saved[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
 }
 $savedUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -53,8 +53,10 @@ try {
     $env:LOCALAPPDATA = Join-Path $temporary "local-app-data"
     $env:APPDATA = Join-Path $temporary "roaming-app-data"
     $env:CLAUDE_CONFIG_DIR = Join-Path $testHome ".claude"
+    $env:SAIAI_HOME = Join-Path $testHome ".saiai"
     $env:SAIAI_INSTALL_DIR = $install
     $env:SAIAI_DOWNLOAD_BASE = $downloadBase
+    $env:SAIAI_SKIP_START = "1"
 
     . $setupPowerShell
     $result = Invoke-Saiai "https://gateway.example.test" $testKey
@@ -67,13 +69,14 @@ try {
     $settingsPath = Join-Path $env:CLAUDE_CONFIG_DIR "settings.json"
     $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
     Assert-Saiai ([string]$settings.env.CLAUDE_CODE_OAUTH_TOKEN -ceq $testKey) "PowerShell wrapper did not apply the key"
-    Assert-Saiai ([string]$settings.env.ANTHROPIC_BASE_URL -ceq "https://gateway.example.test") "PowerShell wrapper did not apply the gateway"
+    Assert-Saiai ($null -eq $settings.env.PSObject.Properties["ANTHROPIC_BASE_URL"]) "PowerShell wrapper left a direct gateway override"
+    Assert-Saiai ([string]$settings.env.HTTP_PROXY -ceq "http://127.0.0.1:19908") "PowerShell wrapper did not apply the local proxy"
 
     $second = Invoke-Saiai "https://new-gateway.example.test" "TEST_ONLY_WINDOWS_REPLACEMENT_KEY"
     Assert-Saiai ($second -is [int]) "Repeat PowerShell wrapper returned a non-scalar exit code"
     Assert-Saiai ($second -eq 0) "Repeat PowerShell wrapper failed"
-    $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
-    Assert-Saiai ([string]$settings.env.ANTHROPIC_BASE_URL -ceq "https://new-gateway.example.test") "Repeat setup did not replace the gateway"
+    $proxyConfig = Get-Content -LiteralPath (Join-Path $env:SAIAI_HOME "config.json") -Raw | ConvertFrom-Json
+    Assert-Saiai ([string]$proxyConfig.base_url -ceq "https://new-gateway.example.test") "Repeat setup did not replace the gateway"
 }
 finally {
     foreach ($name in $saved.Keys) {
@@ -83,5 +86,5 @@ finally {
     Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-Write-Host "SAIAI global-config Windows release wrapper smoke passed"
+Write-Host "SAIAI local-proxy Windows release wrapper smoke passed"
 $global:LASTEXITCODE = 0

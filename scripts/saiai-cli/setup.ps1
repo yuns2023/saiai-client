@@ -1,4 +1,5 @@
-# Install or reuse the SAIAI config client, then apply the requested config.
+# Install or reuse SAIAI, apply the requested config, and start the Claude
+# per-user local proxy service for the Claude setup path.
 
 $ErrorActionPreference = "Stop"
 
@@ -117,8 +118,8 @@ function Invoke-Saiai {
             if ([int]$manifest.manifest_schema -ne 1) {
                 throw "Unsupported SAIAI manifest schema."
             }
-            if ([string]$manifest.client_mode -cne "global-config") {
-                throw "Release is not a SAIAI global-config client."
+            if ([string]$manifest.client_mode -cne "local-proxy") {
+                throw "Release is not a SAIAI local-proxy client."
             }
             if ([int]$manifest.configuration_schema_version -ne 1) {
                 throw "Unsupported SAIAI configuration schema."
@@ -185,9 +186,22 @@ function Invoke-Saiai {
         # Keep the native client's human-readable stdout visible without
         # mixing it into this function's scalar exit-code result. PowerShell
         # otherwise captures both values when callers assign Invoke-Saiai.
-        & $installPath @provided | Out-Host
-        $nativeExitCode = $LASTEXITCODE
-        return [int]$nativeExitCode
+        if ($provided[0] -eq "init-codex") {
+            & $installPath @provided | Out-Host
+            return [int]$LASTEXITCODE
+        }
+
+        $claudeArguments = @("init") + $provided
+        & $installPath @claudeArguments | Out-Host
+        $nativeExitCode = [int]$LASTEXITCODE
+        if ($nativeExitCode -ne 0) {
+            return $nativeExitCode
+        }
+        if ([string]$env:SAIAI_SKIP_START -eq "1") {
+            return 0
+        }
+        & $installPath start | Out-Host
+        return [int]$LASTEXITCODE
     }
     finally {
         Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue

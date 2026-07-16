@@ -1,6 +1,6 @@
-# Windows 使用指南（SAIAI 1.0.1）
+# Windows 使用指南（SAIAI 1.1.0）
 
-SAIAI `1.0.1` 是全局配置工具，不需要管理员权限、后台服务、本地代理或 CA。
+SAIAI `1.1.0` 为 Claude Code 和 VSCode 提供用户级本地代理，不要求管理员权限。
 
 ## 一键配置 Claude Code
 
@@ -14,28 +14,38 @@ irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai 'https://api.s
 ARM64 资产，验证 manifest、size 和 SHA-256。默认安装位置是
 `%LOCALAPPDATA%\SAIAI\bin\saiai.exe`，并加入用户 PATH。
 
-相同版本再次执行时只获取 manifest，跳过二进制下载，然后重新写入配置。因此
-Gateway 地址或 Key 变更时可以直接重复执行同一形式的命令。
+该命令安装、初始化并启动本地代理。相同版本再次执行时只获取 manifest，跳过
+二进制下载，然后替换 Base URL/Key 并刷新代理。
 
-配置完成后直接运行：
+配置完成后直接运行 `claude` 或使用 VSCode Claude Code。常用管理命令：
 
 ```powershell
-claude
+saiai start
+saiai stop
+saiai status
+saiai logs
+saiai restart
+saiai doctor
+saiai update
 ```
 
-VSCode Claude Code 使用同一份用户级配置。不要再运行 `saiai claude`；1.0.1
-没有隔离 home 或启动器。
-
-## 路径
+## 路径和 CA
 
 默认 Claude 文件：
 
 - `%USERPROFILE%\.claude\settings.json`
 - `%USERPROFILE%\.claude.json`
 - `%USERPROFILE%\.claude\.credentials.json`
+- `%USERPROFILE%\.claude\saiai-ca.crt`
+- `%USERPROFILE%\.claude\saiai-ca.key`
 
-设置 `CLAUDE_CONFIG_DIR` 时，settings、state、credentials 和旧 CA 清理都位于
-该目录。设置文件使用原子替换；现有文件改变前会留下私有备份。
+代理配置默认位于 `%USERPROFILE%\.saiai\config.json`。设置
+`CLAUDE_CONFIG_DIR` 时，Claude settings、state、credentials 和 CA 都跟随该
+目录。每位用户独立生成 CA；私钥只保存在本机，不包含在 release 中。
+
+初始化会移除冲突的认证/provider/model/proxy/CA 环境变量、`oauthAccount` 和旧
+`.credentials.json`，同时保留不相关配置。`CLAUDE_STREAM_IDLE_TIMEOUT_MS=600000`
+保持固定。
 
 ## Codex CLI
 
@@ -44,14 +54,13 @@ irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai init-codex 'ht
 ```
 
 WebSocket 模式在末尾加 `--websockets`。配置写入 `%USERPROFILE%\.codex`，或
-`CODEX_HOME` 指定的目录。
+`CODEX_HOME` 指定的目录；Codex 初始化不会启动 Claude 本地代理。
 
 ## 更新与回退
 
-当前二进制与 manifest 哈希不同时，wrapper 才下载新文件。首次替换不同版本时
-保留 `saiai-previous.exe`。如需要人工回退，可先关闭正在运行的该二进制，再用
-备份覆盖 `saiai.exe`；回退不会自动恢复用户配置文件，配置文件自身已有带时间戳
-的备份。
+当前二进制与 manifest 哈希相同时不会重复下载。首次替换不同二进制时保留
+`saiai-previous.exe`。如需人工回退，应先执行 `saiai stop`，再恢复备份并重新
+启动；用户配置文件自身也会留下带时间戳的备份。
 
-命令中直接包含 API Key，因此 Key 会出现在剪贴板、PowerShell 历史和进程参数
-中；这是 WebUI 一键配置路径的明确取舍。SAIAI 程序本身不会打印 Key。
+命令直接包含 API Key，因此 Key 会出现在剪贴板、PowerShell 历史和进程参数
+中；这是 WebUI 一键配置路径的明确取舍。SAIAI 程序自身不会打印 Key。
