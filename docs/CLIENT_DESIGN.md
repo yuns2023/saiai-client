@@ -17,14 +17,17 @@
 
 ## Claude 配置
 
-路径解析遵守 `CLAUDE_CONFIG_DIR`。未设置时使用：
+Claude 路径解析遵守 `CLAUDE_CONFIG_DIR`。未设置时使用：
 
 - `~/.claude/settings.json`
 - `~/.claude.json`
 - `~/.claude/.credentials.json`
 - `~/.claude/saiai-ca.crt`
 - `~/.claude/saiai-ca.key`
-- `~/.saiai/config.json`
+
+代理配置和 Key 使用独立的 `SAIAI_HOME`，默认写入
+`~/.saiai/config.json`。改变 `CLAUDE_CONFIG_DIR` 不会移动代理配置；改变
+`SAIAI_HOME` 也不会移动 Claude 配置、状态、credentials 或 CA。
 
 初始化会先解析并备份已有配置，然后：
 
