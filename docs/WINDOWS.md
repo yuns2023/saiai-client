@@ -39,9 +39,10 @@ saiai update
 - `%USERPROFILE%\.claude\saiai-ca.crt`
 - `%USERPROFILE%\.claude\saiai-ca.key`
 
-代理配置默认位于 `%USERPROFILE%\.saiai\config.json`。设置
-`CLAUDE_CONFIG_DIR` 时，Claude settings、state、credentials 和 CA 都跟随该
-目录。每位用户独立生成 CA；私钥只保存在本机，不包含在 release 中。
+设置 `CLAUDE_CONFIG_DIR` 时，Claude settings、state、credentials 和 CA 都跟随
+该目录。代理配置和 Key 则独立位于 `%USERPROFILE%\.saiai\config.json`；可用
+`SAIAI_HOME` 改变其目录，且不受 `CLAUDE_CONFIG_DIR` 影响。每位用户独立生成
+CA；私钥只保存在本机，不包含在 release 中。
 
 初始化会移除冲突的认证/provider/model/proxy/CA 环境变量、`oauthAccount` 和旧
 `.credentials.json`，同时保留不相关配置。`CLAUDE_STREAM_IDLE_TIMEOUT_MS=600000`

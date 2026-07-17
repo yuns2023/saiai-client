@@ -44,9 +44,11 @@ JSON 字段和机器本地身份值保持不变。客户端为每个用户生成
 
 默认路径是 `~/.claude/settings.json`、`~/.claude.json` 和
 `~/.claude/.credentials.json`、`~/.claude/saiai-ca.crt` 和
-`~/.claude/saiai-ca.key`。设置 `CLAUDE_CONFIG_DIR` 时，以上文件全部跟随该目录。
-代理配置和 Key 保存于 `~/.saiai/config.json`。配置完成后直接运行 `claude`，
-VSCode 中的 Claude Code 也读取同一份配置。
+`~/.claude/saiai-ca.key`。设置 `CLAUDE_CONFIG_DIR` 时，这些 Claude 配置、状态、
+credentials 和 CA 文件全部跟随该目录。代理配置和 Key 独立保存于
+`~/.saiai/config.json`；可用 `SAIAI_HOME` 改变其目录，且不受
+`CLAUDE_CONFIG_DIR` 影响。配置完成后直接运行 `claude`，VSCode 中的 Claude
+Code 也读取同一份配置。
 
 常用管理命令：
 

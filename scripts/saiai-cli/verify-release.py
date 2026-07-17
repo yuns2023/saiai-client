@@ -62,6 +62,7 @@ def verify_cli() -> None:
         '"CLAUDE_CODE_OAUTH_TOKEN"',
         '"CLAUDE_STREAM_IDLE_TIMEOUT_MS"',
         'const CLAUDE_STREAM_IDLE_TIMEOUT_MS: &str = "600000"',
+        '"SAIAI_HOME"',
         'settings.remove("oauthAccount")',
         'state.remove("oauthAccount")',
         "remove_if_exists_with_backup(credentials_path",
@@ -167,11 +168,14 @@ def verify_workflows_and_docs() -> None:
     for required in (
         "local-proxy",
         "saiai start",
+        "SAIAI_HOME",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CLAUDE_STREAM_IDLE_TIMEOUT_MS=600000",
         "二进制下载",
     ):
         require(required in combined_docs, f"public docs are missing {required!r}")
+    for path in ("README.md", "docs/CLIENT_DESIGN.md", "docs/WINDOWS.md"):
+        require("SAIAI_HOME" in text(path), f"{path} does not document SAIAI_HOME")
     require("SAIAI V2 Preview" not in combined_docs, "public docs still advertise V2 Preview")
 
 
