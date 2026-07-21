@@ -121,6 +121,12 @@ const CLAUDE_MANAGED_ROUTING_ENV_PREFIXES: &[&str] = &["VERTEX_REGION_CLAUDE_"];
 const SAIAI_SERVICE_NAME: &str = "saiai.service";
 #[cfg(target_os = "macos")]
 const SAIAI_LAUNCHD_LABEL: &str = "top.saiai.local-proxy";
+#[cfg(target_os = "macos")]
+const MACOS_ID_COMMAND: &str = "/usr/bin/id";
+#[cfg(target_os = "macos")]
+const MACOS_LAUNCHCTL_COMMAND: &str = "/bin/launchctl";
+#[cfg(target_os = "macos")]
+const MACOS_TAIL_COMMAND: &str = "/usr/bin/tail";
 #[cfg(target_os = "windows")]
 const SAIAI_WINDOWS_PID_FILENAME: &str = "saiai.pid";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -704,7 +710,7 @@ fn run_service_status() -> Result<()> {
     }
     let domain = launchctl_gui_domain()?;
     let target = launchctl_service_target(&domain);
-    match command_output("launchctl", &["print", &target]) {
+    match command_output(MACOS_LAUNCHCTL_COMMAND, &["print", &target]) {
         Ok(output) => {
             println!("service active: yes");
             for line in output.lines().take(8) {
@@ -768,9 +774,8 @@ fn run_service_logs() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn run_service_logs() -> Result<()> {
-    ensure_command("tail")?;
     let log_path = launchd_log_path()?;
-    let status = ProcessCommand::new("tail")
+    let status = ProcessCommand::new(MACOS_TAIL_COMMAND)
         .arg("-n")
         .arg("80")
         .arg("-f")
@@ -2546,7 +2551,6 @@ fn systemd_path_setting(value: &str) -> Result<String> {
 
 #[cfg(target_os = "macos")]
 fn write_launchd_plist() -> Result<PathBuf> {
-    ensure_command("launchctl")?;
     let launch_agents_dir = launchd_agents_dir()?;
     fs::create_dir_all(&launch_agents_dir)
         .with_context(|| format!("failed to create {}", launch_agents_dir.display()))?;
@@ -2630,7 +2634,8 @@ fn launchd_log_path() -> Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn launchctl_gui_domain() -> Result<String> {
-    let uid = command_output("id", &["-u"]).context("failed to resolve current macOS uid")?;
+    let uid =
+        command_output(MACOS_ID_COMMAND, &["-u"]).context("failed to resolve current macOS uid")?;
     Ok(format!("gui/{}", uid.trim()))
 }
 
@@ -2641,13 +2646,17 @@ fn launchctl_service_target(domain: &str) -> String {
 
 #[cfg(target_os = "macos")]
 fn run_launchctl(args: &[&str]) -> Result<()> {
-    ensure_command("launchctl")?;
-    let status = ProcessCommand::new("launchctl")
+    let output = ProcessCommand::new(MACOS_LAUNCHCTL_COMMAND)
         .args(args)
-        .status()
+        .output()
         .context("failed to run launchctl")?;
-    if !status.success() {
-        bail!("launchctl {:?} exited with {status}", args);
+    if !output.status.success() {
+        bail!(
+            "launchctl {:?} exited with {}: {}",
+            args,
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -2656,7 +2665,7 @@ fn run_launchctl(args: &[&str]) -> Result<()> {
 fn macos_launchd_running() -> Result<bool> {
     let domain = launchctl_gui_domain()?;
     let target = launchctl_service_target(&domain);
-    Ok(command_output("launchctl", &["print", &target]).is_ok())
+    Ok(command_output(MACOS_LAUNCHCTL_COMMAND, &["print", &target]).is_ok())
 }
 
 #[cfg(target_os = "macos")]
@@ -2782,7 +2791,7 @@ fn ensure_systemd_user_available() -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn ensure_command(name: &str) -> Result<()> {
     let status = ProcessCommand::new(name)
         .arg("--version")
