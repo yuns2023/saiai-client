@@ -1,6 +1,6 @@
 # SAIAI Client
 
-SAIAI Client `1.1.0` 恢复了托管本地代理模式。Claude Code 和 VSCode 通过用户
+SAIAI Client `1.1.1` 使用托管本地代理模式。Claude Code 和 VSCode 通过用户
 级 `saiai` 代理访问 Gateway；Codex CLI 仍使用直接配置。客户端不创建隔离
 home 或 generation。
 
@@ -41,6 +41,10 @@ Claude 初始化写入用户级 `settings.json`：
 `.claude.json` 中的 `oauthAccount`，并在备份后删除 `.credentials.json`。其他
 JSON 字段和机器本地身份值保持不变。客户端为每个用户生成独立 CA；私钥只以
 用户私有权限保存在本机，不会进入 release 或日志。
+
+代理仅监听 loopback。`api.anthropic.com:443` 由本地代理终止 TLS 并转发到
+Gateway；其他 HTTP `CONNECT` 请求以任意目标、任意 TCP 端口直接建立隧道，
+因此可由本机 TUN、Fake-IP 和用户自己的出站规则继续处理。
 
 默认路径是 `~/.claude/settings.json`、`~/.claude.json` 和
 `~/.claude/.credentials.json`、`~/.claude/saiai-ca.crt` 和

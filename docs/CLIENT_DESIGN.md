@@ -42,8 +42,11 @@ Claude 路径解析遵守 `CLAUDE_CONFIG_DIR`。未设置时使用：
 6. 原子写入代理配置，Base URL 和 Key 在重复初始化时直接替换。
 
 本地代理终止 `api.anthropic.com` 的本机 TLS，并把 Anthropic 请求转发到配置的
-Gateway；其他代理流量保持直接隧道。Gateway Key 由代理从私有配置读取，程序
-不会把 Key 打印到输出或请求日志。
+Gateway；其他 `CONNECT` 请求作为任意目标和任意 TCP 端口的直接隧道处理，让
+系统 TUN、Fake-IP 和用户自己的出站规则接管实际流量。它不提供 UDP 转发，也不
+处理明文 HTTP 的 absolute-form 请求。由于该接口不认证且可访问任意目标，代理
+核心必须强制只监听 loopback，不能仅依赖初始化器生成的默认地址。Gateway Key
+由代理从私有配置读取，程序不会把 Key 打印到输出或请求日志。
 
 ## 用户服务
 

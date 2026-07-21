@@ -6,7 +6,7 @@ use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::io::{
@@ -126,6 +126,16 @@ impl State {
 
         if cfg.listen.trim().is_empty() {
             bail!("local proxy listen address is required");
+        }
+        let listen_addr = cfg
+            .listen
+            .parse::<SocketAddr>()
+            .with_context(|| format!("invalid local proxy listen address {}", cfg.listen))?;
+        if !listen_addr.ip().is_loopback() {
+            bail!(
+                "local proxy listen address must be loopback-only, got {}",
+                cfg.listen
+            );
         }
         let base = cfg.base_url.trim().trim_end_matches('/').to_string();
         let parsed =
@@ -308,14 +318,15 @@ async fn serve_direct_tunnel(
     peer: &str,
     verbose: bool,
 ) -> Result<()> {
-    if port != 443 {
-        write_plain_error(&mut client, StatusCode::FORBIDDEN).await?;
-        bail!("direct tunnel rejected host={host}:{port}: only port 443 is allowed");
-    }
-
-    let mut upstream = connect_public(host, port).await.with_context(|| {
-        format!("failed to open direct tunnel to {host}:{port} for local client {peer}")
-    })?;
+    let mut upstream = match connect_direct_target(host, port).await {
+        Ok(upstream) => upstream,
+        Err(err) => {
+            let _ = write_plain_error(&mut client, StatusCode::BAD_GATEWAY).await;
+            return Err(err).with_context(|| {
+                format!("failed to open direct tunnel to {host}:{port} for local client {peer}")
+            });
+        }
+    };
     client
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await
@@ -887,8 +898,8 @@ fn is_hop_by_hop_header(name: &str) -> bool {
     )
 }
 
-async fn connect_public(host: &str, port: u16) -> Result<TcpStream> {
-    if host == ANTHROPIC_HOST {
+async fn connect_direct_target(host: &str, port: u16) -> Result<TcpStream> {
+    if host == ANTHROPIC_HOST && port == 443 {
         bail!("Anthropic host must use local MITM route");
     }
     let addrs = lookup_host((host, port))
@@ -901,9 +912,6 @@ async fn connect_public(host: &str, port: u16) -> Result<TcpStream> {
 
     let mut last_err = None;
     for addr in addrs {
-        if is_forbidden_addr(addr) {
-            continue;
-        }
         match TcpStream::connect(addr).await {
             Ok(stream) => return Ok(stream),
             Err(err) => last_err = Some(err),
@@ -911,37 +919,8 @@ async fn connect_public(host: &str, port: u16) -> Result<TcpStream> {
     }
     match last_err {
         Some(err) => Err(err).with_context(|| format!("failed to connect to {host}:{port}")),
-        None => bail!("all resolved addresses for {host}:{port} are private or reserved"),
+        None => bail!("no usable addresses resolved for {host}:{port}"),
     }
-}
-
-fn is_forbidden_addr(addr: SocketAddr) -> bool {
-    match addr.ip() {
-        IpAddr::V4(ip) => is_forbidden_ipv4(ip),
-        IpAddr::V6(ip) => is_forbidden_ipv6(ip),
-    }
-}
-
-fn is_forbidden_ipv4(ip: Ipv4Addr) -> bool {
-    ip.is_private()
-        || ip.is_loopback()
-        || ip.is_link_local()
-        || ip.is_broadcast()
-        || ip.is_documentation()
-        || ip.is_unspecified()
-        || ip.octets()[0] == 0
-        || ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1])
-        || ip.octets()[0] == 169 && ip.octets()[1] == 254
-        || ip.octets()[0] == 198 && (18..=19).contains(&ip.octets()[1])
-        || ip.octets()[0] >= 224
-}
-
-fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
-    ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_unique_local()
-        || ip.is_unicast_link_local()
-        || ip.segments()[0] & 0xffc0 == 0xfe80
 }
 
 fn build_leaf_server_config(
@@ -1187,10 +1166,6 @@ mod tests {
             "failed to open direct tunnel to example.invalid:443 for local client 127.0.0.1:12345: failed to resolve example.invalid:443"
         );
         assert!(!is_benign_client_error(&dns));
-
-        let rejected =
-            anyhow::anyhow!("direct tunnel rejected host=127.0.0.1:80: only port 443 is allowed");
-        assert!(!is_benign_client_error(&rejected));
     }
 
     #[test]
@@ -1203,6 +1178,10 @@ mod tests {
             split_host_port("[::1]:443").unwrap(),
             ("::1".to_string(), 443)
         );
+        assert_eq!(
+            split_host_port("git.example.test:22").unwrap(),
+            ("git.example.test".to_string(), 22)
+        );
     }
 
     #[test]
@@ -1210,12 +1189,45 @@ mod tests {
         assert_eq!(canonical_host("[API.Anthropic.Com.]"), "api.anthropic.com");
     }
 
+    #[tokio::test]
+    async fn direct_tunnel_connects_to_any_target_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (connected, accepted) =
+            tokio::join!(connect_direct_target("127.0.0.1", port), listener.accept());
+
+        assert!(connected.is_ok());
+        assert!(accepted.is_ok());
+    }
+
+    #[tokio::test]
+    async fn direct_tunnel_cannot_bypass_anthropic_mitm_route() {
+        let error = connect_direct_target(ANTHROPIC_HOST, 443)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("Anthropic host must use local MITM route")
+        );
+    }
+
     #[test]
-    fn rejects_private_direct_targets() {
-        assert!(is_forbidden_addr("127.0.0.1:443".parse().unwrap()));
-        assert!(is_forbidden_addr("192.168.1.10:443".parse().unwrap()));
-        assert!(is_forbidden_addr("[::1]:443".parse().unwrap()));
-        assert!(!is_forbidden_addr("93.184.216.34:443".parse().unwrap()));
+    fn rejects_non_loopback_proxy_listener() {
+        let (ca_cert_pem, ca_key_pem) = test_ca();
+        let error = State::new(Config {
+            listen: "0.0.0.0:19908".to_string(),
+            base_url: "https://api.saiai.top".to_string(),
+            api_key: "sk-test".to_string(),
+            ca_cert_pem,
+            ca_key_pem,
+            verbose: false,
+        })
+        .err()
+        .unwrap();
+
+        assert!(error.to_string().contains("must be loopback-only"));
     }
 
     #[test]
