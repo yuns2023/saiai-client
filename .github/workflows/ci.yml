@@ -95,6 +95,11 @@ jobs:
           "dist/${{ matrix.asset }}" --version
           "dist/${{ matrix.asset }}" --help >/dev/null
 
+      - name: Smoke-test Linux headless service fallback
+        run: >-
+          python3 scripts/saiai-cli/test-linux-service.py
+          --binary dist/${{ matrix.asset }}
+
   client-windows:
     name: Native Windows config client
     runs-on: windows-latest

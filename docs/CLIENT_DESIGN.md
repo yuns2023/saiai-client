@@ -50,7 +50,11 @@ Gateway；其他 `CONNECT` 请求作为任意目标和任意 TCP 端口的直接
 
 ## 用户服务
 
-- Linux 使用 `systemd --user`。
+- Linux 优先使用 `systemd --user`。如果当前用户的 systemd user bus 不可用
+  （常见于 root、容器和无登录会话），`start` 自动改用脱离终端的托管后台进程；
+  `stop/status/logs/restart/doctor` 识别同一状态。状态文件记录 PID 与
+  `/proc` 启动时间并复核隐藏 worker 参数，避免 PID 复用或 `exec` 后误杀其他
+  进程。状态和日志权限为 `0600`。该 fallback 不提供跨宿主重启或崩溃自动拉起。
 - macOS 使用用户 LaunchAgent；服务管理直接调用系统自带的 `/bin/launchctl`，
   日志跟随使用 `/usr/bin/tail`，不以不兼容的 GNU `--version` 参数探测命令。
 - Windows 使用用户进程与 PID/日志状态文件，不要求管理员权限。
@@ -58,7 +62,8 @@ Gateway；其他 `CONNECT` 请求作为任意目标和任意 TCP 端口的直接
 一键 wrapper 在 Claude 初始化成功后执行 `saiai start`。自动化测试或明确需要只
 配置不启动时可设置 `SAIAI_SKIP_START=1`。Codex 初始化不会启动 Claude 代理。
 发布前在 Intel 和 Apple Silicon macOS runner 上分别验证
-`start/status/logs/restart/stop` 的真实 LaunchAgent 生命周期。
+`start/status/logs/restart/stop` 的真实 LaunchAgent 生命周期；两个 Linux 静态
+资产也必须在强制 `systemctl --user` 失败的环境中完成同一套 fallback 生命周期。
 
 ## Codex 配置
 
