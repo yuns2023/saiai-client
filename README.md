@@ -1,6 +1,6 @@
 # SAIAI Client
 
-SAIAI Client `1.1.2` 使用托管本地代理模式。Claude Code 和 VSCode 通过用户
+SAIAI Client `1.1.3` 使用托管本地代理模式。Claude Code 和 VSCode 通过用户
 级 `saiai` 代理访问 Gateway；Codex CLI 仍使用直接配置。客户端不创建隔离
 home 或 generation。
 
@@ -66,6 +66,9 @@ saiai update
 ```
 
 直接执行 `saiai` 可以前台运行代理，`saiai --verbose` 会显示请求级诊断日志。
+Linux 优先使用 `systemd --user`；root、容器或无登录会话环境没有可用的 user
+bus 时，`saiai start` 会自动改用脱离终端的托管后台进程。后一模式会跨 shell
+持续运行，但宿主重启或进程异常退出后需要再次执行 `saiai start`。
 
 可执行以下命令检查代理、配置和 Gateway 健康状态，Key 值不会显示：
 

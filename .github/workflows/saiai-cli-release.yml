@@ -137,6 +137,12 @@ jobs:
         if: runner.os == 'Linux'
         run: python3 scripts/saiai-cli/verify-linux-portability.py "dist/${{ matrix.asset }}"
 
+      - name: Smoke-test Linux headless service fallback
+        if: runner.os == 'Linux'
+        run: >-
+          python3 scripts/saiai-cli/test-linux-service.py
+          --binary dist/${{ matrix.asset }}
+
       - name: Smoke-test native Unix bundle
         if: runner.os != 'Windows'
         shell: bash

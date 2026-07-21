@@ -127,9 +127,17 @@ const MACOS_ID_COMMAND: &str = "/usr/bin/id";
 const MACOS_LAUNCHCTL_COMMAND: &str = "/bin/launchctl";
 #[cfg(target_os = "macos")]
 const MACOS_TAIL_COMMAND: &str = "/usr/bin/tail";
+#[cfg(target_os = "linux")]
+const SAIAI_LINUX_PID_FILENAME: &str = "saiai.pid";
+#[cfg(target_os = "linux")]
+const SAIAI_LINUX_LOCK_FILENAME: &str = "saiai.lock";
+#[cfg(target_os = "linux")]
+const SAIAI_LINUX_BACKGROUND_COMMAND: &str = "__run-background-proxy";
+#[cfg(target_os = "linux")]
+const SAIAI_LINUX_BACKGROUND_STATE_VERSION: u32 = 1;
 #[cfg(target_os = "windows")]
 const SAIAI_WINDOWS_PID_FILENAME: &str = "saiai.pid";
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const SAIAI_SERVICE_LOG_FILENAME: &str = "saiai.log";
 
 fn is_managed_claude_env(key: &str) -> bool {
@@ -159,13 +167,17 @@ fn main() -> Result<()> {
         Command::Version => print_version(),
         Command::Init(init) => init_claude(init),
         Command::InitCodex(init) => init_codex(init),
+        #[cfg(target_os = "linux")]
+        Command::RunLinuxBackgroundProxy => run_linux_background_proxy_worker(),
     }
 }
 
 #[derive(Debug)]
 enum Command {
     Help,
-    RunProxy { verbose: bool },
+    RunProxy {
+        verbose: bool,
+    },
     Start,
     Stop,
     Status,
@@ -176,6 +188,8 @@ enum Command {
     Version,
     Init(InitArgs),
     InitCodex(InitArgs),
+    #[cfg(target_os = "linux")]
+    RunLinuxBackgroundProxy,
 }
 
 #[derive(Debug)]
@@ -223,6 +237,14 @@ fn parse_command(args: &[String]) -> Result<Command> {
                 "init-codex",
                 &args[1..],
             )?));
+        }
+        #[cfg(target_os = "linux")]
+        SAIAI_LINUX_BACKGROUND_COMMAND => {
+            return parse_no_arg_command(
+                SAIAI_LINUX_BACKGROUND_COMMAND,
+                &args[1..],
+                Command::RunLinuxBackgroundProxy,
+            );
         }
         _ => {}
     }
@@ -504,6 +526,26 @@ struct UpdateManifestAsset {
     size: Option<u64>,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+struct LinuxBackgroundState {
+    schema_version: u32,
+    pid: u32,
+    start_time_ticks: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct LinuxProcessIdentity {
+    state: char,
+    start_time_ticks: u64,
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxServiceLock {
+    _file: fs::File,
+}
+
 fn print_version() -> Result<()> {
     println!("saiai {}", env!("CARGO_PKG_VERSION"));
     Ok(())
@@ -544,25 +586,39 @@ fn read_runtime_ca(cfg: &SaiaiConfig) -> Result<(String, String)> {
 
 #[cfg(target_os = "linux")]
 fn run_service_start() -> Result<()> {
+    let _service_lock = acquire_linux_service_lock()?;
     warn_process_env_conflicts();
     warn_claude_settings_overrides();
     let cfg = read_saiai_config()?;
-    ensure_systemd_user_available()?;
-    warn_systemd_user_env_conflicts();
-    let was_active = service_is_active().unwrap_or(false);
-    if !was_active {
-        ensure_listen_available(&cfg.listen)?;
+    match ensure_systemd_user_available() {
+        Ok(()) => {
+            stop_linux_background_proxy()?;
+            warn_systemd_user_env_conflicts();
+            let was_active = service_is_active().unwrap_or(false);
+            if !was_active {
+                ensure_listen_available(&cfg.listen)?;
+            }
+            let service_path = write_user_service()?;
+            run_systemctl(&["daemon-reload"])?;
+            run_systemctl(&["enable", SAIAI_SERVICE_NAME])?;
+            if was_active {
+                run_systemctl(&["restart", SAIAI_SERVICE_NAME])?;
+            } else {
+                run_systemctl(&["start", SAIAI_SERVICE_NAME])?;
+            }
+            println!("SAIAI user service started or refreshed.");
+            println!("Service: {}", service_path.display());
+        }
+        Err(systemd_error) => {
+            eprintln!(
+                "WARN systemd --user unavailable; using a managed background process: {systemd_error}"
+            );
+            let pid = start_linux_background_proxy(&cfg)?;
+            println!("SAIAI background proxy started or refreshed.");
+            println!("Service manager: background process");
+            println!("PID: {pid}");
+        }
     }
-    let service_path = write_user_service()?;
-    run_systemctl(&["daemon-reload"])?;
-    run_systemctl(&["enable", SAIAI_SERVICE_NAME])?;
-    if was_active {
-        run_systemctl(&["restart", SAIAI_SERVICE_NAME])?;
-    } else {
-        run_systemctl(&["start", SAIAI_SERVICE_NAME])?;
-    }
-    println!("SAIAI user service started or refreshed.");
-    println!("Service: {}", service_path.display());
     println!("Listening: http://{}", cfg.listen);
     println!("Status: saiai status");
     println!("Logs: saiai logs");
@@ -620,11 +676,30 @@ fn run_service_start() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn run_service_stop() -> Result<()> {
-    ensure_systemd_user_available()?;
-    let _ = ProcessCommand::new("systemctl")
-        .args(["--user", "disable", "--now", SAIAI_SERVICE_NAME])
-        .status();
-    println!("SAIAI user service stopped and disabled.");
+    let _service_lock = acquire_linux_service_lock()?;
+    let background_stopped = stop_linux_background_proxy()?;
+    match ensure_systemd_user_available() {
+        Ok(()) => {
+            if stop_systemd_user_service_if_present()? {
+                println!("SAIAI user service stopped and disabled.");
+            } else if background_stopped {
+                println!("SAIAI background proxy stopped.");
+            } else {
+                println!("SAIAI service is not running.");
+            }
+        }
+        Err(systemd_error) => {
+            if background_stopped {
+                println!("SAIAI background proxy stopped.");
+            } else if linux_configured_listen_has_saiai_owner()? {
+                bail!(
+                    "a SAIAI process is listening, but it is not the managed background process and systemd --user is unavailable: {systemd_error}"
+                );
+            } else {
+                println!("SAIAI background proxy is not running.");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -664,9 +739,39 @@ fn run_service_status() -> Result<()> {
         Err(err) => println!("config: not ready ({err})"),
     }
 
-    if let Err(err) = ensure_systemd_user_available() {
-        println!("service: unavailable ({err})");
+    let background = linux_background_state();
+    if let Ok(Some(state)) = background.as_ref()
+        && linux_background_state_is_running(state)
+    {
+        println!("service manager: background process");
+        println!("service active: yes");
+        println!("pid: {}", state.pid);
+        println!("logs: {}", linux_service_log_path()?.display());
+        if ensure_systemd_user_available().is_ok() && service_is_active().unwrap_or(false) {
+            println!("service warning: systemd and background instances are both active");
+        }
         return Ok(());
+    }
+
+    let systemd_status = ensure_systemd_user_available();
+    if let Err(err) = &systemd_status {
+        println!("service manager: background process");
+        println!("service active: no");
+        match background.as_ref() {
+            Ok(Some(state)) => println!("stale pid: {}", state.pid),
+            Ok(None) => {}
+            Err(state_error) => println!("background state: invalid ({state_error})"),
+        }
+        println!("systemd user: unavailable ({err})");
+        println!("logs: {}", linux_service_log_path()?.display());
+        return Ok(());
+    }
+
+    println!("service manager: systemd --user");
+    if let Ok(Some(state)) = background.as_ref() {
+        println!("stale background pid: {}", state.pid);
+    } else if let Err(state_error) = background.as_ref() {
+        println!("background state: invalid ({state_error})");
     }
     print_systemd_user_env_conflicts_for_status();
 
@@ -758,8 +863,16 @@ fn run_service_status() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn run_service_logs() -> Result<()> {
+    let background_active = linux_background_state()?
+        .as_ref()
+        .is_some_and(linux_background_state_is_running);
+    if background_active || ensure_systemd_user_available().is_err() {
+        return run_linux_background_logs();
+    }
     ensure_command("journalctl")?;
-    let status = ProcessCommand::new("journalctl")
+    let mut command = ProcessCommand::new("journalctl");
+    apply_systemd_user_environment(&mut command);
+    let status = command
         .args(["--user", "-u", SAIAI_SERVICE_NAME, "-f"])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -822,10 +935,7 @@ fn run_service_logs() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn run_service_restart() -> Result<()> {
-    ensure_service_loaded()?;
-    run_systemctl(&["restart", SAIAI_SERVICE_NAME])?;
-    println!("SAIAI user service restarted.");
-    Ok(())
+    run_service_start()
 }
 
 #[cfg(target_os = "macos")]
@@ -1403,6 +1513,11 @@ fn warn_systemd_user_env_conflicts() {
 
 #[cfg(target_os = "linux")]
 fn check_systemd_user_env_conflicts(report: &mut DoctorReport) {
+    // Headless/root installations may intentionally use the managed
+    // background fallback. The service check reports that mode directly.
+    if ensure_systemd_user_available().is_err() {
+        return;
+    }
     match systemd_user_env_conflicts() {
         Ok(conflicts) if conflicts.is_empty() => report.ok(
             "systemd user env",
@@ -1428,7 +1543,7 @@ fn check_systemd_user_env_conflicts(_report: &mut DoctorReport) {}
 #[cfg(target_os = "linux")]
 fn systemd_user_env_conflicts() -> Result<Vec<&'static str>> {
     ensure_systemd_user_available()?;
-    let output = ProcessCommand::new("systemctl")
+    let output = systemctl_user_command()
         .args(["--user", "show-environment"])
         .output()
         .context("failed to run systemctl --user show-environment")?;
@@ -1707,10 +1822,24 @@ fn ensure_listen_available(listen: &str) -> Result<()> {
             Ok(())
         }
         Err(err) if err.kind() == ErrorKind::AddrInUse => {
+            let owners = listen_port_owners(addr);
+            // Linux can report EADDRINUSE for a recently closed connection
+            // even though no process owns the listening socket. The Tokio
+            // listener uses the normal Unix reuse semantics, so let the real
+            // bind make the final decision in that case.
+            #[cfg(target_os = "linux")]
+            if owners.is_empty() {
+                return Ok(());
+            }
+            let owner_summary = if owners.is_empty() {
+                format!("an unknown process on port {}", addr.port())
+            } else {
+                format_listen_owners(&owners)
+            };
             bail!(
                 "local proxy listen address {addr} is already in use by {}. \
 Stop the existing process, or if it is a SAIAI service run `saiai stop` first.",
-                listen_owner_summary(addr)
+                owner_summary
             )
         }
         Err(err) => bail!("local proxy listen address {addr} is not available: {err}"),
@@ -1743,14 +1872,6 @@ impl ListenPortOwner {
     fn is_saiai(&self) -> bool {
         self.name.eq_ignore_ascii_case("saiai") || self.name.to_ascii_lowercase().contains("saiai")
     }
-}
-
-fn listen_owner_summary(addr: SocketAddr) -> String {
-    let owners = listen_port_owners(addr);
-    if owners.is_empty() {
-        return format!("an unknown process on port {}", addr.port());
-    }
-    format_listen_owners(&owners)
 }
 
 fn format_listen_owners(owners: &[ListenPortOwner]) -> String {
@@ -2051,10 +2172,37 @@ fn check_current_binary(report: &mut DoctorReport) {
 
 #[cfg(target_os = "linux")]
 fn check_service_config(report: &mut DoctorReport) {
+    match linux_background_state() {
+        Ok(Some(state)) if linux_background_state_is_running(&state) => {
+            report.ok(
+                "service",
+                format!("managed background process active (pid {})", state.pid),
+            );
+            if ensure_systemd_user_available().is_ok() && service_is_active().unwrap_or(false) {
+                report.warn(
+                    "service manager",
+                    "systemd and managed background instances are both active; run `saiai restart`",
+                );
+            }
+            return;
+        }
+        Ok(Some(state)) => report.warn(
+            "service state",
+            format!(
+                "stale managed background state for pid {}; run `saiai start`",
+                state.pid
+            ),
+        ),
+        Ok(None) => {}
+        Err(err) => report.warn("service state", err.to_string()),
+    }
+
     if let Err(err) = ensure_systemd_user_available() {
         report.warn(
             "service",
-            format!("systemd user service unavailable: {err}"),
+            format!(
+                "not running; systemd --user unavailable ({err}); `saiai start` will use the managed background fallback"
+            ),
         );
         return;
     }
@@ -2678,6 +2826,381 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+#[cfg(target_os = "linux")]
+fn run_linux_background_proxy_worker() -> Result<()> {
+    // This command is reached only through a fresh child process created by
+    // `start_linux_background_proxy`, so it is not a process-group leader and
+    // can safely detach from the invoking terminal session.
+    if unsafe { libc::setsid() } == -1 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to detach SAIAI background proxy session");
+    }
+    run_local_proxy(false)
+}
+
+#[cfg(target_os = "linux")]
+fn start_linux_background_proxy(cfg: &SaiaiConfig) -> Result<u32> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    stop_linux_background_proxy()?;
+    ensure_listen_available(&cfg.listen)?;
+
+    let saiai_home = saiai_config_dir()?;
+    fs::create_dir_all(&saiai_home)
+        .with_context(|| format!("failed to create {}", saiai_home.display()))?;
+    let log_path = linux_service_log_path()?;
+    match fs::symlink_metadata(&log_path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            bail!("refusing non-regular SAIAI log path {}", log_path.display())
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {}", log_path.display()));
+        }
+    }
+    let mut log_options = OpenOptions::new();
+    log_options
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
+    let stdout = log_options
+        .open(&log_path)
+        .with_context(|| format!("failed to open {}", log_path.display()))?;
+    stdout
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to protect {}", log_path.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .with_context(|| format!("failed to clone {}", log_path.display()))?;
+
+    let exe = env::current_exe().context("failed to resolve current saiai executable")?;
+    let mut child = ProcessCommand::new(exe)
+        .arg(SAIAI_LINUX_BACKGROUND_COMMAND)
+        .env("SAIAI_HOME", &saiai_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .context("failed to start SAIAI background proxy")?;
+    let pid = child.id();
+    let startup = (|| -> Result<u32> {
+        let identity_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let identity = loop {
+            if let Some(status) = child
+                .try_wait()
+                .context("failed to inspect SAIAI background proxy")?
+            {
+                bail!(
+                    "SAIAI background proxy exited during startup with {status}; inspect {}",
+                    log_path.display()
+                );
+            }
+            if let Some(identity) = linux_process_identity(pid)?
+                && linux_process_has_background_marker(pid)?
+            {
+                break identity;
+            }
+            if std::time::Instant::now() >= identity_deadline {
+                bail!(
+                    "timed out recording SAIAI background process identity; inspect {}",
+                    log_path.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let state = LinuxBackgroundState {
+            schema_version: SAIAI_LINUX_BACKGROUND_STATE_VERSION,
+            pid,
+            start_time_ticks: identity.start_time_ticks,
+        };
+        write_linux_background_state(&state)?;
+
+        let addr = cfg
+            .listen
+            .parse::<SocketAddr>()
+            .with_context(|| format!("invalid local proxy listen address {:?}", cfg.listen))?;
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .context("failed to inspect SAIAI background proxy")?
+            {
+                bail!(
+                    "SAIAI background proxy exited during startup with {status}; inspect {}",
+                    log_path.display()
+                );
+            }
+            let owns_listener = listen_port_owners(addr)
+                .iter()
+                .any(|owner| owner.pid == pid);
+            if owns_listener
+                && TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok()
+            {
+                return Ok(pid);
+            }
+            if std::time::Instant::now() >= ready_deadline {
+                bail!(
+                    "timed out waiting for SAIAI background proxy at {addr}; inspect {}",
+                    log_path.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    })();
+
+    if startup.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Ok(path) = linux_background_state_path() {
+            let _ = fs::remove_file(path);
+        }
+    }
+    startup
+}
+
+#[cfg(target_os = "linux")]
+fn stop_linux_background_proxy() -> Result<bool> {
+    let Some(state) = linux_background_state()? else {
+        return Ok(false);
+    };
+    if !linux_background_state_matches(&state)? {
+        fs::remove_file(linux_background_state_path()?)
+            .with_context(|| format!("failed to remove stale SAIAI state for pid {}", state.pid))?;
+        return Ok(false);
+    }
+
+    signal_linux_background_process(&state, libc::SIGTERM)?;
+    let term_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < term_deadline {
+        if !linux_background_state_matches(&state)? {
+            let _ = fs::remove_file(linux_background_state_path()?);
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Revalidate the original process identity immediately before escalation;
+    // never signal a PID that has been reused or exec'd into another command.
+    if linux_background_state_matches(&state)? {
+        signal_linux_background_process(&state, libc::SIGKILL)?;
+    }
+    let kill_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < kill_deadline {
+        if !linux_background_state_matches(&state)? {
+            let _ = fs::remove_file(linux_background_state_path()?);
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    bail!(
+        "failed to stop managed SAIAI background process {}",
+        state.pid
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn signal_linux_background_process(state: &LinuxBackgroundState, signal: i32) -> Result<()> {
+    if !linux_background_state_matches(state)? {
+        return Ok(());
+    }
+    let pid = i32::try_from(state.pid).context("SAIAI background pid is out of range")?;
+    if unsafe { libc::kill(pid, signal) } == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).with_context(|| format!("failed to signal SAIAI process {pid}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_background_state() -> Result<Option<LinuxBackgroundState>> {
+    let path = linux_background_state_path()?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    if !metadata.file_type().is_file() {
+        bail!("refusing non-regular SAIAI state path {}", path.display());
+    }
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let state: LinuxBackgroundState = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    if state.schema_version != SAIAI_LINUX_BACKGROUND_STATE_VERSION
+        || state.pid <= 1
+        || state.start_time_ticks == 0
+    {
+        bail!("invalid SAIAI background state in {}", path.display());
+    }
+    Ok(Some(state))
+}
+
+#[cfg(target_os = "linux")]
+fn write_linux_background_state(state: &LinuxBackgroundState) -> Result<()> {
+    let mut data = serde_json::to_vec_pretty(state).context("failed to serialize SAIAI state")?;
+    data.push(b'\n');
+    write_bytes_atomic(&linux_background_state_path()?, &data, 0o600)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_background_state_matches(state: &LinuxBackgroundState) -> Result<bool> {
+    let Some(identity) = linux_process_identity(state.pid)? else {
+        return Ok(false);
+    };
+    if matches!(identity.state, 'Z' | 'X' | 'x')
+        || identity.start_time_ticks != state.start_time_ticks
+    {
+        return Ok(false);
+    }
+    linux_process_has_background_marker(state.pid)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_background_state_is_running(state: &LinuxBackgroundState) -> bool {
+    linux_background_state_matches(state).unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_identity(pid: u32) -> Result<Option<LinuxProcessIdentity>> {
+    let path = PathBuf::from(format!("/proc/{pid}/stat"));
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    parse_linux_proc_stat(&raw)
+        .map(Some)
+        .with_context(|| format!("failed to parse {}", path.display()))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_proc_stat(raw: &str) -> Result<LinuxProcessIdentity> {
+    let close = raw
+        .rfind(')')
+        .context("process stat is missing command terminator")?;
+    let fields = raw[close + 1..].split_whitespace().collect::<Vec<_>>();
+    let state = fields
+        .first()
+        .and_then(|value| value.chars().next())
+        .context("process stat is missing state")?;
+    let start_time_ticks = fields
+        .get(19)
+        .context("process stat is missing start time")?
+        .parse::<u64>()
+        .context("process stat has invalid start time")?;
+    Ok(LinuxProcessIdentity {
+        state,
+        start_time_ticks,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_has_background_marker(pid: u32) -> Result<bool> {
+    let path = PathBuf::from(format!("/proc/{pid}/cmdline"));
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    Ok(bytes
+        .split(|byte| *byte == 0)
+        .any(|arg| arg == SAIAI_LINUX_BACKGROUND_COMMAND.as_bytes()))
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_linux_service_lock() -> Result<LinuxServiceLock> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let dir = saiai_config_dir()?;
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let path = dir.join(SAIAI_LINUX_LOCK_FILENAME);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            bail!("refusing non-regular SAIAI lock path {}", path.display())
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    }
+    let mut options = OpenOptions::new();
+    options
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
+    let file = options
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to protect {}", path.display()))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == -1 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to lock {}", path.display()));
+    }
+    Ok(LinuxServiceLock { _file: file })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_background_state_path() -> Result<PathBuf> {
+    Ok(saiai_config_dir()?.join(SAIAI_LINUX_PID_FILENAME))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_service_log_path() -> Result<PathBuf> {
+    Ok(saiai_config_dir()?.join(SAIAI_SERVICE_LOG_FILENAME))
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_background_logs() -> Result<()> {
+    let path = linux_service_log_path()?;
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("SAIAI background log is unavailable at {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("refusing non-regular SAIAI log path {}", path.display());
+    }
+    let status = ProcessCommand::new("tail")
+        .args(["-n", "80", "-f", "--"])
+        .arg(&path)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("tail is required but failed to run")?;
+    if !status.success() {
+        bail!("tail exited with {status}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_configured_listen_has_saiai_owner() -> Result<bool> {
+    let cfg = match read_saiai_config() {
+        Ok(cfg) => cfg,
+        Err(_) => return Ok(false),
+    };
+    let addr = cfg
+        .listen
+        .parse::<SocketAddr>()
+        .with_context(|| format!("invalid local proxy listen address {:?}", cfg.listen))?;
+    Ok(listen_port_owners(addr)
+        .iter()
+        .any(ListenPortOwner::is_saiai))
+}
+
 #[cfg(target_os = "windows")]
 fn start_windows_background_proxy() -> Result<u32> {
     use std::fs::OpenOptions;
@@ -2778,7 +3301,7 @@ fn windows_log_path() -> Result<PathBuf> {
 #[cfg(target_os = "linux")]
 fn ensure_systemd_user_available() -> Result<()> {
     ensure_command("systemctl")?;
-    let output = ProcessCommand::new("systemctl")
+    let output = systemctl_user_command()
         .args(["--user", "show-environment"])
         .output()
         .context("failed to run systemctl --user show-environment")?;
@@ -2789,6 +3312,33 @@ fn ensure_systemd_user_available() -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn apply_systemd_user_environment(command: &mut ProcessCommand) {
+    let uid = unsafe { libc::geteuid() };
+    let runtime_dir = PathBuf::from(format!("/run/user/{uid}"));
+    let runtime_env_missing = env::var_os("XDG_RUNTIME_DIR").is_none_or(|value| value.is_empty());
+    if runtime_env_missing && runtime_dir.is_dir() {
+        command.env("XDG_RUNTIME_DIR", &runtime_dir);
+    }
+
+    let bus_path = runtime_dir.join("bus");
+    let bus_env_missing =
+        env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none_or(|value| value.is_empty());
+    if bus_env_missing && bus_path.exists() {
+        command.env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", bus_path.display()),
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn systemctl_user_command() -> ProcessCommand {
+    let mut command = ProcessCommand::new("systemctl");
+    apply_systemd_user_environment(&mut command);
+    command
 }
 
 #[cfg(target_os = "linux")]
@@ -2809,7 +3359,7 @@ fn ensure_command(name: &str) -> Result<()> {
 #[cfg(target_os = "linux")]
 fn run_systemctl(args: &[&str]) -> Result<()> {
     ensure_systemd_user_available()?;
-    let output = ProcessCommand::new("systemctl")
+    let output = systemctl_user_command()
         .arg("--user")
         .args(args)
         .output()
@@ -2825,17 +3375,18 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_service_loaded() -> Result<()> {
+fn stop_systemd_user_service_if_present() -> Result<bool> {
     let load_state = systemctl_value("LoadState")?;
     if load_state == "not-found" || load_state.is_empty() {
-        bail!("SAIAI user service is not installed; run `saiai start` first");
+        return Ok(false);
     }
-    Ok(())
+    run_systemctl(&["disable", "--now", SAIAI_SERVICE_NAME])?;
+    Ok(true)
 }
 
 #[cfg(target_os = "linux")]
 fn service_is_active() -> Result<bool> {
-    let status = ProcessCommand::new("systemctl")
+    let status = systemctl_user_command()
         .args(["--user", "is-active", "--quiet", SAIAI_SERVICE_NAME])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2848,7 +3399,7 @@ fn service_is_active() -> Result<bool> {
 #[cfg(target_os = "linux")]
 fn systemctl_value(property: &str) -> Result<String> {
     ensure_systemd_user_available()?;
-    let output = ProcessCommand::new("systemctl")
+    let output = systemctl_user_command()
         .args([
             "--user",
             "show",
@@ -2873,7 +3424,9 @@ fn print_recent_logs(lines: usize) -> Result<()> {
     if ensure_command("journalctl").is_err() {
         return Ok(());
     }
-    let output = ProcessCommand::new("journalctl")
+    let mut command = ProcessCommand::new("journalctl");
+    apply_systemd_user_environment(&mut command);
+    let output = command
         .args([
             "--user",
             "-u",
@@ -3662,6 +4215,38 @@ mod tests {
 
         let established = line.replacen(" 0A ", " 01 ", 1);
         assert_eq!(parse_proc_net_tcp_listen_inode(&established, 18081), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_proc_stat_with_closing_parenthesis_in_command() {
+        let mut fields = vec!["S"; 19];
+        fields.push("4242");
+        let raw = format!("123 (saiai worker ) name) {}", fields.join(" "));
+        assert_eq!(
+            parse_linux_proc_stat(&raw).unwrap(),
+            LinuxProcessIdentity {
+                state: 'S',
+                start_time_ticks: 4242,
+            }
+        );
+        assert!(parse_linux_proc_stat("123 (broken) S").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_private_linux_background_worker_command() {
+        match parse_command(&[SAIAI_LINUX_BACKGROUND_COMMAND.to_string()]).unwrap() {
+            Command::RunLinuxBackgroundProxy => {}
+            _ => panic!("expected Linux background proxy worker command"),
+        }
+        assert!(
+            parse_command(&[
+                SAIAI_LINUX_BACKGROUND_COMMAND.to_string(),
+                "extra".to_string(),
+            ])
+            .is_err()
+        );
     }
 
     #[test]

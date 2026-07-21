@@ -43,9 +43,9 @@ def load_generator():
 
 def verify_cli() -> None:
     cargo = text("tools/saiai-cli/Cargo.toml")
-    require('version = "1.1.2"' in cargo, "CLI version is not 1.1.2")
+    require('version = "1.1.3"' in cargo, "CLI version is not 1.1.3")
     require("saiai-core" not in cargo, "local-proxy client still links the V2 runtime core")
-    for dependency in ("reqwest", "tokio", "rustls", "rcgen", "zeroize"):
+    for dependency in ("reqwest", "tokio", "rustls", "rcgen", "zeroize", "libc"):
         require(dependency in cargo, f"local-proxy dependency is missing: {dependency}")
 
     main = text("tools/saiai-cli/src/main.rs")
@@ -77,6 +77,10 @@ def verify_cli() -> None:
         "create_new(true)",
         "MOVEFILE_REPLACE_EXISTING",
         "file.sync_all()",
+        "SAIAI_LINUX_BACKGROUND_COMMAND",
+        "start_linux_background_proxy",
+        "start_time_ticks",
+        "apply_systemd_user_environment",
     ):
         require(required in main, f"CLI contract is missing {required!r}")
     for withdrawn in (
@@ -118,7 +122,7 @@ def verify_manifest_and_wrappers() -> None:
         wrappers.mkdir()
         for name in WRAPPERS:
             (wrappers / name).write_bytes((name + "\n").encode())
-        manifest = generator.build_manifest(root, "1.1.2", ASSETS, wrappers)
+        manifest = generator.build_manifest(root, "1.1.3", ASSETS, wrappers)
         require(manifest.get("manifest_schema") == 1, "generated manifest schema differs")
         require(manifest.get("client_mode") == "local-proxy", "generated client mode differs")
         require(
@@ -151,12 +155,28 @@ def verify_workflows_and_docs() -> None:
     for required in (
         "verify-release.py",
         "test-release-bundle.py",
+        "test-linux-service.py",
         "prerelease: false",
         'name: SAIAI CLI ${{ github.ref_name }}',
         "x86_64-unknown-linux-musl",
         "aarch64-unknown-linux-musl",
     ):
         require(required in release, f"release workflow is missing {required!r}")
+    require(
+        "test-linux-service.py" in ci,
+        "CI workflow does not exercise the Linux headless service fallback",
+    )
+    linux_service = text("scripts/saiai-cli/test-linux-service.py")
+    for required in (
+        "test-forced headless mode",
+        '"start"',
+        '"status"',
+        '"logs"',
+        '"restart"',
+        '"stop"',
+        "start_time_ticks",
+    ):
+        require(required in linux_service, f"Linux service smoke is missing {required!r}")
     for withdrawn in ("test-v2-", "V2 Preview", "saiai-core/Cargo.toml"):
         require(withdrawn not in release, f"release workflow still contains {withdrawn!r}")
         require(withdrawn not in ci, f"CI workflow still contains {withdrawn!r}")
