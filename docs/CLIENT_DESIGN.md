@@ -51,11 +51,14 @@ Gateway；其他 `CONNECT` 请求作为任意目标和任意 TCP 端口的直接
 ## 用户服务
 
 - Linux 使用 `systemd --user`。
-- macOS 使用用户 LaunchAgent。
+- macOS 使用用户 LaunchAgent；服务管理直接调用系统自带的 `/bin/launchctl`，
+  日志跟随使用 `/usr/bin/tail`，不以不兼容的 GNU `--version` 参数探测命令。
 - Windows 使用用户进程与 PID/日志状态文件，不要求管理员权限。
 
 一键 wrapper 在 Claude 初始化成功后执行 `saiai start`。自动化测试或明确需要只
 配置不启动时可设置 `SAIAI_SKIP_START=1`。Codex 初始化不会启动 Claude 代理。
+发布前在 Intel 和 Apple Silicon macOS runner 上分别验证
+`start/status/logs/restart/stop` 的真实 LaunchAgent 生命周期。
 
 ## Codex 配置
 
