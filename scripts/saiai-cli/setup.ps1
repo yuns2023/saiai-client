@@ -110,6 +110,28 @@ function Move-SaiaiCandidate {
     throw $lastError
 }
 
+function Start-SaiaiBackground {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    # Do not invoke `saiai start` through a PowerShell output pipeline. The
+    # detached Windows worker can inherit that pipeline's write handle, which
+    # keeps PowerShell waiting for EOF even after the start command exits.
+    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $Path
+    $startInfo.Arguments = "start"
+    $startInfo.UseShellExecute = $false
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $startInfo
+    try {
+        $null = $process.Start()
+        $process.WaitForExit()
+        return [int]$process.ExitCode
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 function Invoke-Saiai {
     param(
         [Parameter(ValueFromRemainingArguments = $true)]
@@ -237,8 +259,7 @@ function Invoke-Saiai {
         if ([string]$env:SAIAI_SKIP_START -eq "1") {
             return 0
         }
-        & $installPath start | Out-Host
-        return [int]$LASTEXITCODE
+        return Start-SaiaiBackground -Path $installPath
     }
     finally {
         Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue

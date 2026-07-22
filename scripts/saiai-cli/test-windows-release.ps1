@@ -23,6 +23,7 @@ function Invoke-SaiaiProcess {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [bool]$CaptureOutput = $true,
         [int]$TimeoutMilliseconds = 15000
     )
 
@@ -30,8 +31,8 @@ function Invoke-SaiaiProcess {
     $startInfo.FileName = $Path
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
+    $startInfo.RedirectStandardOutput = $CaptureOutput
+    $startInfo.RedirectStandardError = $CaptureOutput
     foreach ($argument in $Arguments) {
         $null = $startInfo.ArgumentList.Add($argument)
     }
@@ -39,15 +40,23 @@ function Invoke-SaiaiProcess {
     $process.StartInfo = $startInfo
     try {
         $null = $process.Start()
-        $stdout = $process.StandardOutput.ReadToEndAsync()
-        $stderr = $process.StandardError.ReadToEndAsync()
+        if ($CaptureOutput) {
+            $stdout = $process.StandardOutput.ReadToEndAsync()
+            $stderr = $process.StandardError.ReadToEndAsync()
+        }
         if (-not $process.WaitForExit($TimeoutMilliseconds)) {
             $process.Kill($true)
             throw "$Path $($Arguments -join ' ') did not return within $TimeoutMilliseconds ms"
         }
+        $output = if ($CaptureOutput) {
+            $stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult()
+        }
+        else {
+            ""
+        }
         return [pscustomobject]@{
             ExitCode = $process.ExitCode
-            Output = ($stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult())
+            Output = $output
         }
     }
     finally {
@@ -119,7 +128,7 @@ try {
     # installed binary while its background worker has the executable locked.
     [IO.File]::AppendAllText($installed, "OLDER_TEST_BUILD")
     Assert-Saiai ((Get-Sha256 $installed) -cne (Get-Sha256 $binary)) "Upgrade fixture still matches the release binary"
-    $oldStart = Invoke-SaiaiProcess -Path $installed -Arguments @("start")
+    $oldStart = Invoke-SaiaiProcess -Path $installed -Arguments @("start") -CaptureOutput $false
     Assert-Saiai ($oldStart.ExitCode -eq 0) "Upgrade fixture could not start: $($oldStart.Output)"
 
     Remove-Item Env:SAIAI_SKIP_START
@@ -131,9 +140,8 @@ if (`$result -ne 0) { exit `$result }
 exit 0
 "@
     $powerShellPath = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-    $upgrade = Invoke-SaiaiProcess -Path $powerShellPath -Arguments @("-NoProfile", "-NonInteractive", "-Command", $childScript) -TimeoutMilliseconds 20000
+    $upgrade = Invoke-SaiaiProcess -Path $powerShellPath -Arguments @("-NoProfile", "-NonInteractive", "-Command", $childScript) -CaptureOutput $false -TimeoutMilliseconds 20000
     Assert-Saiai ($upgrade.ExitCode -eq 0) "Running-client upgrade failed: $($upgrade.Output)"
-    Assert-Saiai ($upgrade.Output.Contains("Stopping the running SAIAI background proxy before updating")) "Upgrade did not stop the running client: $($upgrade.Output)"
     Assert-Saiai ((Get-Sha256 $installed) -ceq (Get-Sha256 $binary)) "Running-client upgrade did not install the release binary"
     $upgradedStatus = Invoke-SaiaiProcess -Path $installed -Arguments @("status")
     Assert-Saiai ($upgradedStatus.ExitCode -eq 0) "Upgraded client status failed: $($upgradedStatus.Output)"

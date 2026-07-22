@@ -157,6 +157,10 @@ def verify_manifest_and_wrappers() -> None:
         "Move-SaiaiCandidate" in powershell,
         "PowerShell wrapper does not retry Windows binary replacement",
     )
+    require(
+        "Start-SaiaiBackground" in powershell and "start | Out-Host" not in powershell,
+        "PowerShell wrapper still starts the background proxy through an output pipeline",
+    )
     windows_release = text("scripts/saiai-cli/test-windows-release.ps1")
     require(
         "Running-client upgrade did not install the release binary" in windows_release,

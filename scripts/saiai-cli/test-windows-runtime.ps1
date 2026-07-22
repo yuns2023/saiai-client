@@ -16,6 +16,7 @@ function Invoke-SaiaiProcess {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [bool]$CaptureOutput = $true,
         [int]$TimeoutMilliseconds = 10000
     )
 
@@ -23,8 +24,8 @@ function Invoke-SaiaiProcess {
     $startInfo.FileName = $Path
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
+    $startInfo.RedirectStandardOutput = $CaptureOutput
+    $startInfo.RedirectStandardError = $CaptureOutput
     foreach ($argument in $Arguments) {
         $null = $startInfo.ArgumentList.Add($argument)
     }
@@ -32,15 +33,23 @@ function Invoke-SaiaiProcess {
     $process.StartInfo = $startInfo
     try {
         $null = $process.Start()
-        $stdout = $process.StandardOutput.ReadToEndAsync()
-        $stderr = $process.StandardError.ReadToEndAsync()
+        if ($CaptureOutput) {
+            $stdout = $process.StandardOutput.ReadToEndAsync()
+            $stderr = $process.StandardError.ReadToEndAsync()
+        }
         if (-not $process.WaitForExit($TimeoutMilliseconds)) {
             $process.Kill($true)
             throw "SAIAI $($Arguments -join ' ') did not return within $TimeoutMilliseconds ms"
         }
+        $output = if ($CaptureOutput) {
+            $stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult()
+        }
+        else {
+            ""
+        }
         return [pscustomobject]@{
             ExitCode = $process.ExitCode
-            Output = ($stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult())
+            Output = $output
         }
     }
     finally {
@@ -112,9 +121,8 @@ try {
     Assert-Saiai ($help.Contains("saiai start")) "Local-proxy commands are missing"
     Assert-Saiai (-not $help.Contains($testKey)) "Help exposed the key"
 
-    $start = Invoke-SaiaiProcess -Path $binary -Arguments @("start")
+    $start = Invoke-SaiaiProcess -Path $binary -Arguments @("start") -CaptureOutput $false
     Assert-Saiai ($start.ExitCode -eq 0) "SAIAI start failed: $($start.Output)"
-    Assert-Saiai ($start.Output.Contains("background proxy started or refreshed")) "SAIAI start output differs: $($start.Output)"
     $status = Invoke-SaiaiProcess -Path $binary -Arguments @("status")
     Assert-Saiai ($status.ExitCode -eq 0) "SAIAI status failed: $($status.Output)"
     Assert-Saiai ($status.Output.Contains("service active: yes")) "SAIAI background proxy is not active: $($status.Output)"
