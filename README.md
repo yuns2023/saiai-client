@@ -1,6 +1,6 @@
 # SAIAI Client
 
-SAIAI Client `1.1.3` 使用托管本地代理模式。Claude Code 和 VSCode 通过用户
+SAIAI Client `1.1.4` 使用托管本地代理模式。Claude Code 和 VSCode 通过用户
 级 `saiai` 代理访问 Gateway；Codex CLI 仍使用直接配置。客户端不创建隔离
 home 或 generation。
 
@@ -25,7 +25,9 @@ Key，Key 会出现在剪贴板、终端命令和 shell 历史中；客户端自
 打印到输出。
 
 wrapper 每次只下载很小的 `manifest.json`。如果本机二进制 SHA-256 已等于
-manifest 中的当前版本，就跳过二进制下载，但仍会重新应用配置。
+manifest 中的当前版本，就跳过二进制下载，但仍会重新应用配置。Windows
+上替换新版本时，wrapper 会在下载和验证完成后停止旧代理，释放可执行文件锁，
+再安装并启动新版本。
 
 ## Claude Code 本地代理
 

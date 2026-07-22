@@ -137,6 +137,8 @@ const SAIAI_LINUX_BACKGROUND_COMMAND: &str = "__run-background-proxy";
 const SAIAI_LINUX_BACKGROUND_STATE_VERSION: u32 = 1;
 #[cfg(target_os = "windows")]
 const SAIAI_WINDOWS_PID_FILENAME: &str = "saiai.pid";
+#[cfg(target_os = "windows")]
+const SAIAI_WINDOWS_BACKGROUND_COMMAND: &str = "__run-background-proxy";
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const SAIAI_SERVICE_LOG_FILENAME: &str = "saiai.log";
 
@@ -169,6 +171,8 @@ fn main() -> Result<()> {
         Command::InitCodex(init) => init_codex(init),
         #[cfg(target_os = "linux")]
         Command::RunLinuxBackgroundProxy => run_linux_background_proxy_worker(),
+        #[cfg(target_os = "windows")]
+        Command::RunWindowsBackgroundProxy => run_windows_background_proxy_worker(),
     }
 }
 
@@ -190,6 +194,8 @@ enum Command {
     InitCodex(InitArgs),
     #[cfg(target_os = "linux")]
     RunLinuxBackgroundProxy,
+    #[cfg(target_os = "windows")]
+    RunWindowsBackgroundProxy,
 }
 
 #[derive(Debug)]
@@ -244,6 +250,14 @@ fn parse_command(args: &[String]) -> Result<Command> {
                 SAIAI_LINUX_BACKGROUND_COMMAND,
                 &args[1..],
                 Command::RunLinuxBackgroundProxy,
+            );
+        }
+        #[cfg(target_os = "windows")]
+        SAIAI_WINDOWS_BACKGROUND_COMMAND => {
+            return parse_no_arg_command(
+                SAIAI_WINDOWS_BACKGROUND_COMMAND,
+                &args[1..],
+                Command::RunWindowsBackgroundProxy,
             );
         }
         _ => {}
@@ -3202,6 +3216,11 @@ fn linux_configured_listen_has_saiai_owner() -> Result<bool> {
 }
 
 #[cfg(target_os = "windows")]
+fn run_windows_background_proxy_worker() -> Result<()> {
+    run_local_proxy(false)
+}
+
+#[cfg(target_os = "windows")]
 fn start_windows_background_proxy() -> Result<u32> {
     use std::fs::OpenOptions;
     use std::os::windows::process::CommandExt;
@@ -3225,6 +3244,7 @@ fn start_windows_background_proxy() -> Result<u32> {
         .with_context(|| format!("failed to clone {}", log_path.display()))?;
 
     let child = ProcessCommand::new(exe)
+        .arg(SAIAI_WINDOWS_BACKGROUND_COMMAND)
         .env("SAIAI_HOME", &saiai_home)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
@@ -4243,6 +4263,22 @@ mod tests {
         assert!(
             parse_command(&[
                 SAIAI_LINUX_BACKGROUND_COMMAND.to_string(),
+                "extra".to_string(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn parses_private_windows_background_worker_command() {
+        match parse_command(&[SAIAI_WINDOWS_BACKGROUND_COMMAND.to_string()]).unwrap() {
+            Command::RunWindowsBackgroundProxy => {}
+            _ => panic!("expected Windows background proxy worker command"),
+        }
+        assert!(
+            parse_command(&[
+                SAIAI_WINDOWS_BACKGROUND_COMMAND.to_string(),
                 "extra".to_string(),
             ])
             .is_err()

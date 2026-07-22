@@ -77,6 +77,61 @@ function Add-SaiaiPath {
     }
 }
 
+function Stop-SaiaiForReplacement {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    Write-Host "Stopping the running SAIAI background proxy before updating..." -ForegroundColor DarkGray
+    & $Path stop | Out-Host
+    $stopExitCode = [int]$LASTEXITCODE
+    if ($stopExitCode -ne 0) {
+        throw "Existing SAIAI client could not be stopped before update (exit $stopExitCode)."
+    }
+}
+
+function Move-SaiaiCandidate {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    $lastError = $null
+    foreach ($attempt in 1..20) {
+        try {
+            Move-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+            return
+        }
+        catch {
+            $lastError = $_
+            if ($attempt -lt 20) {
+                Start-Sleep -Milliseconds 100
+            }
+        }
+    }
+    throw $lastError
+}
+
+function Start-SaiaiBackground {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    # Do not invoke `saiai start` through a PowerShell output pipeline. The
+    # detached Windows worker can inherit that pipeline's write handle, which
+    # keeps PowerShell waiting for EOF even after the start command exits.
+    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $Path
+    $startInfo.Arguments = "start"
+    $startInfo.UseShellExecute = $false
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $startInfo
+    try {
+        $null = $process.Start()
+        $process.WaitForExit()
+        return [int]$process.ExitCode
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 function Invoke-Saiai {
     param(
         [Parameter(ValueFromRemainingArguments = $true)]
@@ -161,7 +216,11 @@ function Invoke-Saiai {
                     throw "SHA-256 mismatch for $asset."
                 }
 
-                if ((Test-Path -LiteralPath $installPath -PathType Leaf) -and
+                $installedExists = Test-Path -LiteralPath $installPath -PathType Leaf
+                if ($installedExists) {
+                    Stop-SaiaiForReplacement -Path $installPath
+                }
+                if ($installedExists -and
                     -not (Test-Path -LiteralPath $backupPath)) {
                     [System.IO.File]::Copy($installPath, $backupPath, $false)
                     Write-Host "Preserved the previous client at $backupPath." -ForegroundColor DarkGray
@@ -169,7 +228,7 @@ function Invoke-Saiai {
                 $stagedPath = Join-Path $installDirectory (".saiai.install." + [guid]::NewGuid().ToString("N") + ".exe")
                 try {
                     [System.IO.File]::Copy($candidatePath, $stagedPath, $false)
-                    Move-Item -LiteralPath $stagedPath -Destination $installPath -Force
+                    Move-SaiaiCandidate -Source $stagedPath -Destination $installPath
                 }
                 finally {
                     Remove-Item -LiteralPath $stagedPath -Force -ErrorAction SilentlyContinue
@@ -200,8 +259,7 @@ function Invoke-Saiai {
         if ([string]$env:SAIAI_SKIP_START -eq "1") {
             return 0
         }
-        & $installPath start | Out-Host
-        return [int]$LASTEXITCODE
+        return Start-SaiaiBackground -Path $installPath
     }
     finally {
         Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue

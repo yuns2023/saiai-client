@@ -43,7 +43,7 @@ def load_generator():
 
 def verify_cli() -> None:
     cargo = text("tools/saiai-cli/Cargo.toml")
-    require('version = "1.1.3"' in cargo, "CLI version is not 1.1.3")
+    require('version = "1.1.4"' in cargo, "CLI version is not 1.1.4")
     require("saiai-core" not in cargo, "local-proxy client still links the V2 runtime core")
     for dependency in ("reqwest", "tokio", "rustls", "rcgen", "zeroize", "libc"):
         require(dependency in cargo, f"local-proxy dependency is missing: {dependency}")
@@ -81,6 +81,8 @@ def verify_cli() -> None:
         "start_linux_background_proxy",
         "start_time_ticks",
         "apply_systemd_user_environment",
+        "SAIAI_WINDOWS_BACKGROUND_COMMAND",
+        "run_windows_background_proxy_worker",
     ):
         require(required in main, f"CLI contract is missing {required!r}")
     for withdrawn in (
@@ -103,6 +105,7 @@ def verify_cli() -> None:
         "TEST_ONLY_WINDOWS_REPLACEMENT_KEY",
         "Repeated setup did not replace the API key",
         "Repeated setup replaced a valid CA key",
+        "service active: yes",
     ):
         require(required in windows_runtime, f"Windows repeat smoke is missing {required!r}")
 
@@ -122,7 +125,7 @@ def verify_manifest_and_wrappers() -> None:
         wrappers.mkdir()
         for name in WRAPPERS:
             (wrappers / name).write_bytes((name + "\n").encode())
-        manifest = generator.build_manifest(root, "1.1.3", ASSETS, wrappers)
+        manifest = generator.build_manifest(root, "1.1.4", ASSETS, wrappers)
         require(manifest.get("manifest_schema") == 1, "generated manifest schema differs")
         require(manifest.get("client_mode") == "local-proxy", "generated client mode differs")
         require(
@@ -145,6 +148,24 @@ def verify_manifest_and_wrappers() -> None:
     require('"${install_path}" init "$@"' in shell, "Unix wrapper does not initialize Claude")
     require('"${install_path}" start' in shell, "Unix wrapper does not start the local proxy")
     require("installed_matches=1" in shell, "Unix wrapper cannot skip the binary download")
+    powershell = (SCRIPT_DIR / "setup.ps1").read_text(encoding="utf-8")
+    require(
+        "Stop-SaiaiForReplacement" in powershell,
+        "PowerShell wrapper cannot stop an in-use client before replacement",
+    )
+    require(
+        "Move-SaiaiCandidate" in powershell,
+        "PowerShell wrapper does not retry Windows binary replacement",
+    )
+    require(
+        "Start-SaiaiBackground" in powershell and "start | Out-Host" not in powershell,
+        "PowerShell wrapper still starts the background proxy through an output pipeline",
+    )
+    windows_release = text("scripts/saiai-cli/test-windows-release.ps1")
+    require(
+        "Running-client upgrade did not install the release binary" in windows_release,
+        "Windows release smoke does not cover a running-client upgrade",
+    )
 
 
 def verify_workflows_and_docs() -> None:
