@@ -1,6 +1,6 @@
-# Windows 使用指南（SAIAI 1.1.3）
+# Windows 使用指南（SAIAI 1.1.4）
 
-SAIAI `1.1.3` 为 Claude Code 和 VSCode 提供用户级本地代理，不要求管理员权限。
+SAIAI `1.1.4` 为 Claude Code 和 VSCode 提供用户级本地代理，不要求管理员权限。
 
 ## 一键配置 Claude Code
 
@@ -15,7 +15,8 @@ ARM64 资产，验证 manifest、size 和 SHA-256。默认安装位置是
 `%LOCALAPPDATA%\SAIAI\bin\saiai.exe`，并加入用户 PATH。
 
 该命令安装、初始化并启动本地代理。相同版本再次执行时只获取 manifest，跳过
-二进制下载，然后替换 Base URL/Key 并刷新代理。
+二进制下载，然后替换 Base URL/Key 并刷新代理。发现新版本时，安装器会先
+下载并验证新二进制，再停止正在运行的旧代理、替换文件并启动新版本。
 
 配置完成后直接运行 `claude` 或使用 VSCode Claude Code。常用管理命令：
 

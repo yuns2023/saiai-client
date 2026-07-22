@@ -77,6 +77,39 @@ function Add-SaiaiPath {
     }
 }
 
+function Stop-SaiaiForReplacement {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    Write-Host "Stopping the running SAIAI background proxy before updating..." -ForegroundColor DarkGray
+    & $Path stop | Out-Host
+    $stopExitCode = [int]$LASTEXITCODE
+    if ($stopExitCode -ne 0) {
+        throw "Existing SAIAI client could not be stopped before update (exit $stopExitCode)."
+    }
+}
+
+function Move-SaiaiCandidate {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    $lastError = $null
+    foreach ($attempt in 1..20) {
+        try {
+            Move-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+            return
+        }
+        catch {
+            $lastError = $_
+            if ($attempt -lt 20) {
+                Start-Sleep -Milliseconds 100
+            }
+        }
+    }
+    throw $lastError
+}
+
 function Invoke-Saiai {
     param(
         [Parameter(ValueFromRemainingArguments = $true)]
@@ -161,7 +194,11 @@ function Invoke-Saiai {
                     throw "SHA-256 mismatch for $asset."
                 }
 
-                if ((Test-Path -LiteralPath $installPath -PathType Leaf) -and
+                $installedExists = Test-Path -LiteralPath $installPath -PathType Leaf
+                if ($installedExists) {
+                    Stop-SaiaiForReplacement -Path $installPath
+                }
+                if ($installedExists -and
                     -not (Test-Path -LiteralPath $backupPath)) {
                     [System.IO.File]::Copy($installPath, $backupPath, $false)
                     Write-Host "Preserved the previous client at $backupPath." -ForegroundColor DarkGray
@@ -169,7 +206,7 @@ function Invoke-Saiai {
                 $stagedPath = Join-Path $installDirectory (".saiai.install." + [guid]::NewGuid().ToString("N") + ".exe")
                 try {
                     [System.IO.File]::Copy($candidatePath, $stagedPath, $false)
-                    Move-Item -LiteralPath $stagedPath -Destination $installPath -Force
+                    Move-SaiaiCandidate -Source $stagedPath -Destination $installPath
                 }
                 finally {
                     Remove-Item -LiteralPath $stagedPath -Force -ErrorAction SilentlyContinue

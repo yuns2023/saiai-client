@@ -19,6 +19,42 @@ function Get-Sha256 {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Invoke-SaiaiProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [int]$TimeoutMilliseconds = 15000
+    )
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Path
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) {
+        $null = $startInfo.ArgumentList.Add($argument)
+    }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        $null = $process.Start()
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            $process.Kill($true)
+            throw "$Path $($Arguments -join ' ') did not return within $TimeoutMilliseconds ms"
+        }
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Output = ($stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult())
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 $bundle = (Resolve-Path -LiteralPath $BundleDir).Path
 $setupPowerShell = (Resolve-Path -LiteralPath $SetupPs1).Path
 $setupCommand = (Resolve-Path -LiteralPath $SetupCmd).Path
@@ -77,8 +113,37 @@ try {
     Assert-Saiai ($second -eq 0) "Repeat PowerShell wrapper failed"
     $proxyConfig = Get-Content -LiteralPath (Join-Path $env:SAIAI_HOME "config.json") -Raw | ConvertFrom-Json
     Assert-Saiai ([string]$proxyConfig.base_url -ceq "https://new-gateway.example.test") "Repeat setup did not replace the gateway"
+
+    # Appended PE overlay data keeps the executable runnable while making its
+    # hash differ from the release manifest. This models upgrading an older
+    # installed binary while its background worker has the executable locked.
+    [IO.File]::AppendAllText($installed, "OLDER_TEST_BUILD")
+    Assert-Saiai ((Get-Sha256 $installed) -cne (Get-Sha256 $binary)) "Upgrade fixture still matches the release binary"
+    $oldStart = Invoke-SaiaiProcess -Path $installed -Arguments @("start")
+    Assert-Saiai ($oldStart.ExitCode -eq 0) "Upgrade fixture could not start: $($oldStart.Output)"
+
+    Remove-Item Env:SAIAI_SKIP_START
+    $escapedSetup = $setupPowerShell.Replace("'", "''")
+    $childScript = @"
+. '$escapedSetup'
+`$result = Invoke-Saiai 'https://upgrade.example.test' 'TEST_ONLY_WINDOWS_UPGRADE_KEY'
+if (`$result -ne 0) { exit `$result }
+exit 0
+"@
+    $powerShellPath = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    $upgrade = Invoke-SaiaiProcess -Path $powerShellPath -Arguments @("-NoProfile", "-NonInteractive", "-Command", $childScript) -TimeoutMilliseconds 20000
+    Assert-Saiai ($upgrade.ExitCode -eq 0) "Running-client upgrade failed: $($upgrade.Output)"
+    Assert-Saiai ($upgrade.Output.Contains("Stopping the running SAIAI background proxy before updating")) "Upgrade did not stop the running client: $($upgrade.Output)"
+    Assert-Saiai ((Get-Sha256 $installed) -ceq (Get-Sha256 $binary)) "Running-client upgrade did not install the release binary"
+    $upgradedStatus = Invoke-SaiaiProcess -Path $installed -Arguments @("status")
+    Assert-Saiai ($upgradedStatus.ExitCode -eq 0) "Upgraded client status failed: $($upgradedStatus.Output)"
+    Assert-Saiai ($upgradedStatus.Output.Contains("service active: yes")) "Upgraded background proxy is not active: $($upgradedStatus.Output)"
 }
 finally {
+    $installedForCleanup = Join-Path $install "saiai.exe"
+    if ((Test-Path -LiteralPath $installedForCleanup -PathType Leaf) -and (Test-Path -LiteralPath $env:SAIAI_HOME -PathType Container)) {
+        & $installedForCleanup stop *> $null
+    }
     foreach ($name in $saved.Keys) {
         [Environment]::SetEnvironmentVariable($name, $saved[$name], "Process")
     }

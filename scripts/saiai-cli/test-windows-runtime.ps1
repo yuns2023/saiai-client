@@ -12,6 +12,42 @@ function Assert-Saiai {
     if (-not $Condition) { throw $Message }
 }
 
+function Invoke-SaiaiProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [int]$TimeoutMilliseconds = 10000
+    )
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Path
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) {
+        $null = $startInfo.ArgumentList.Add($argument)
+    }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        $null = $process.Start()
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            $process.Kill($true)
+            throw "SAIAI $($Arguments -join ' ') did not return within $TimeoutMilliseconds ms"
+        }
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Output = ($stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult())
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 $binary = (Resolve-Path -LiteralPath $BinaryPath).Path
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ("saiai-config-windows-runtime-" + [guid]::NewGuid().ToString("N"))
 $claudeDir = Join-Path $temporary ".claude"
@@ -75,8 +111,20 @@ try {
     Assert-Saiai ($LASTEXITCODE -eq 0) "SAIAI help failed: $help"
     Assert-Saiai ($help.Contains("saiai start")) "Local-proxy commands are missing"
     Assert-Saiai (-not $help.Contains($testKey)) "Help exposed the key"
+
+    $start = Invoke-SaiaiProcess -Path $binary -Arguments @("start")
+    Assert-Saiai ($start.ExitCode -eq 0) "SAIAI start failed: $($start.Output)"
+    Assert-Saiai ($start.Output.Contains("background proxy started or refreshed")) "SAIAI start output differs: $($start.Output)"
+    $status = Invoke-SaiaiProcess -Path $binary -Arguments @("status")
+    Assert-Saiai ($status.ExitCode -eq 0) "SAIAI status failed: $($status.Output)"
+    Assert-Saiai ($status.Output.Contains("service active: yes")) "SAIAI background proxy is not active: $($status.Output)"
+    $stop = Invoke-SaiaiProcess -Path $binary -Arguments @("stop")
+    Assert-Saiai ($stop.ExitCode -eq 0) "SAIAI stop failed: $($stop.Output)"
 }
 finally {
+    if ((Test-Path -LiteralPath $binary -PathType Leaf) -and (Test-Path -LiteralPath $env:SAIAI_HOME -PathType Container)) {
+        & $binary stop *> $null
+    }
     $env:CLAUDE_CONFIG_DIR = $savedConfigDir
     $env:SAIAI_HOME = $savedSaiaiHome
     Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
