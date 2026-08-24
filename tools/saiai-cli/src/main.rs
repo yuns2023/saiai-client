@@ -3839,7 +3839,9 @@ fn merge_codex_config(path: &Path, base_url: &str, websockets: bool) -> Result<(
 /// Write CLI-managed root-level defaults. Each call rewrites these keys to the
 /// values shipped with this binary, even if the user previously customized
 /// them — same idempotent-overwrite contract as `init` (Claude). Unknown root
-/// keys are left untouched.
+/// keys are left untouched. Execution-safety controls are intentionally not
+/// managed here: `init-codex` must not enable full filesystem access, disable
+/// approvals, or set `dangerously_bypass_approvals_and_sandbox`.
 fn merge_codex_root_defaults(doc: &mut DocumentMut) {
     doc["model"] = value("gpt-5.6-sol");
     doc["review_model"] = value("gpt-5.4");
@@ -4609,6 +4611,41 @@ mod tests {
         assert!(
             doc.get("features").is_none(),
             "features table should not exist when websockets=false on fresh file",
+        );
+    }
+
+    #[test]
+    fn does_not_manage_execution_safety_controls() {
+        let (_dir, path) = temp_config();
+        merge_codex_config(&path, "https://example.com", false).unwrap();
+
+        let doc = parse(&path);
+        for key in [
+            "sandbox_mode",
+            "approval_policy",
+            "dangerously_bypass_approvals_and_sandbox",
+        ] {
+            assert!(
+                doc.get(key).is_none(),
+                "init-codex must not add execution-safety setting {key}",
+            );
+        }
+
+        write_str(
+            &path,
+            r#"sandbox_mode = "danger-full-access"
+approval_policy = "never"
+dangerously_bypass_approvals_and_sandbox = true
+"#,
+        );
+        merge_codex_config(&path, "https://example.com", false).unwrap();
+
+        let doc = parse(&path);
+        assert_eq!(doc["sandbox_mode"].as_str(), Some("danger-full-access"));
+        assert_eq!(doc["approval_policy"].as_str(), Some("never"));
+        assert_eq!(
+            doc["dangerously_bypass_approvals_and_sandbox"].as_bool(),
+            Some(true),
         );
     }
 
