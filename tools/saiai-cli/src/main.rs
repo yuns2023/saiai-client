@@ -3839,9 +3839,11 @@ fn merge_codex_config(path: &Path, base_url: &str, websockets: bool) -> Result<(
 /// Write CLI-managed root-level defaults. Each call rewrites these keys to the
 /// values shipped with this binary, even if the user previously customized
 /// them — same idempotent-overwrite contract as `init` (Claude). Unknown root
-/// keys are left untouched.
+/// keys are left untouched. Execution-safety controls are intentionally not
+/// managed here: `init-codex` must not enable full filesystem access, disable
+/// approvals, or set `dangerously_bypass_approvals_and_sandbox`.
 fn merge_codex_root_defaults(doc: &mut DocumentMut) {
-    doc["model"] = value("gpt-5.4");
+    doc["model"] = value("gpt-5.6-sol");
     doc["review_model"] = value("gpt-5.4");
     doc["model_reasoning_effort"] = value("xhigh");
     doc["disable_response_storage"] = value(true);
@@ -3907,10 +3909,10 @@ fn merge_codex_openai_provider(
     // wire_api must remain "responses": the saiai backend dropped the
     // /v1/chat/completions compatibility layer (see backend changelog).
     openai.insert("wire_api", value("responses"));
-    // Force false even if the user's prior config (or `codex login`) left it
-    // true — Codex would otherwise try OAuth login against the SAIAI gateway,
-    // which is not supported.
-    openai.insert("requires_openai_auth", value(false));
+    // Codex 0.149.0+ requires this flag for custom providers to use the
+    // credential stored in auth.json instead of rejecting the request with
+    // API_KEY_REQUIRED / 401.
+    openai.insert("requires_openai_auth", value(true));
     // Drop any `env_key` written by older SAIAI helper builds. Setting it to
     // `OPENAI_API_KEY` made Codex prefer the shell env over the api_key
     // SAIAI writes into ~/.codex/auth.json — a footgun whenever the user
@@ -4027,7 +4029,7 @@ mod tests {
     }
 
     fn assert_managed_root(doc: &DocumentMut) {
-        assert_eq!(doc["model"].as_str(), Some("gpt-5.4"));
+        assert_eq!(doc["model"].as_str(), Some("gpt-5.6-sol"));
         assert_eq!(doc["review_model"].as_str(), Some("gpt-5.4"));
         assert_eq!(doc["model_reasoning_effort"].as_str(), Some("xhigh"));
         assert_eq!(doc["disable_response_storage"].as_bool(), Some(true));
@@ -4046,7 +4048,7 @@ mod tests {
         assert_eq!(openai["name"].as_str(), Some("OpenAI"));
         assert_eq!(openai["base_url"].as_str(), Some(base_url));
         assert_eq!(openai["wire_api"].as_str(), Some("responses"));
-        assert_eq!(openai["requires_openai_auth"].as_bool(), Some(false));
+        assert_eq!(openai["requires_openai_auth"].as_bool(), Some(true));
         assert!(
             openai.get("env_key").is_none(),
             "env_key must not be set; Codex would otherwise prefer shell env over auth.json",
@@ -4613,6 +4615,41 @@ mod tests {
     }
 
     #[test]
+    fn does_not_manage_execution_safety_controls() {
+        let (_dir, path) = temp_config();
+        merge_codex_config(&path, "https://example.com", false).unwrap();
+
+        let doc = parse(&path);
+        for key in [
+            "sandbox_mode",
+            "approval_policy",
+            "dangerously_bypass_approvals_and_sandbox",
+        ] {
+            assert!(
+                doc.get(key).is_none(),
+                "init-codex must not add execution-safety setting {key}",
+            );
+        }
+
+        write_str(
+            &path,
+            r#"sandbox_mode = "danger-full-access"
+approval_policy = "never"
+dangerously_bypass_approvals_and_sandbox = true
+"#,
+        );
+        merge_codex_config(&path, "https://example.com", false).unwrap();
+
+        let doc = parse(&path);
+        assert_eq!(doc["sandbox_mode"].as_str(), Some("danger-full-access"));
+        assert_eq!(doc["approval_policy"].as_str(), Some("never"));
+        assert_eq!(
+            doc["dangerously_bypass_approvals_and_sandbox"].as_bool(),
+            Some(true),
+        );
+    }
+
+    #[test]
     fn fresh_dir_ws_on_writes_supports_websockets_and_features_flag() {
         let (_dir, path) = temp_config();
         merge_codex_config(&path, "https://example.com", true).unwrap();
@@ -4752,7 +4789,7 @@ custom_header = "kept"
         merge_codex_config(&path, "https://example.com", false).unwrap();
 
         let doc = parse(&path);
-        assert_eq!(doc["model"].as_str(), Some("gpt-5.4"));
+        assert_eq!(doc["model"].as_str(), Some("gpt-5.6-sol"));
         assert_eq!(doc["review_model"].as_str(), Some("gpt-5.4"));
     }
 

@@ -1,6 +1,6 @@
 # SAIAI Client
 
-SAIAI Client `1.1.4` 使用托管本地代理模式。Claude Code 和 VSCode 通过用户
+SAIAI Client `1.1.5` 使用托管本地代理模式。Claude Code 和 VSCode 通过用户
 级 `saiai` 代理访问 Gateway；Codex CLI 仍使用直接配置。客户端不创建隔离
 home 或 generation。
 
@@ -86,7 +86,11 @@ saiai init-codex https://api.saiai.top/v1 YOUR_API_KEY --websockets
 ```
 
 该命令合并 `~/.codex/config.toml` 和 `~/.codex/auth.json`，保留不属于 SAIAI
-管理范围的字段。
+管理范围的字段。Codex 0.149.0+ 使用自定义 Provider 时会写入
+`requires_openai_auth = true`，并将全局默认值设置为 `gpt-5.6-sol`、评审模型
+`gpt-5.4` 和 `model_reasoning_effort = "xhigh"`。执行权限相关的
+`sandbox_mode`、`approval_policy` 和 `dangerously_bypass_approvals_and_sandbox`
+不属于 SAIAI CLI 管理范围：已有值会原样保留，初始化不会自动启用全盘访问、关闭审批或绕过安全检查。
 
 ## 发布资产
 

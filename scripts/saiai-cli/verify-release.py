@@ -43,7 +43,7 @@ def load_generator():
 
 def verify_cli() -> None:
     cargo = text("tools/saiai-cli/Cargo.toml")
-    require('version = "1.1.4"' in cargo, "CLI version is not 1.1.4")
+    require('version = "1.1.5"' in cargo, "CLI version is not 1.1.5")
     require("saiai-core" not in cargo, "local-proxy client still links the V2 runtime core")
     for dependency in ("reqwest", "tokio", "rustls", "rcgen", "zeroize", "libc"):
         require(dependency in cargo, f"local-proxy dependency is missing: {dependency}")
@@ -125,7 +125,7 @@ def verify_manifest_and_wrappers() -> None:
         wrappers.mkdir()
         for name in WRAPPERS:
             (wrappers / name).write_bytes((name + "\n").encode())
-        manifest = generator.build_manifest(root, "1.1.4", ASSETS, wrappers)
+        manifest = generator.build_manifest(root, "1.1.5", ASSETS, wrappers)
         require(manifest.get("manifest_schema") == 1, "generated manifest schema differs")
         require(manifest.get("client_mode") == "local-proxy", "generated client mode differs")
         require(
