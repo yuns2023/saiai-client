@@ -86,7 +86,9 @@ saiai init-codex https://api.saiai.top/v1 YOUR_API_KEY --websockets
 ```
 
 该命令合并 `~/.codex/config.toml` 和 `~/.codex/auth.json`，保留不属于 SAIAI
-管理范围的字段。
+管理范围的字段。Codex 0.149.0+ 使用自定义 Provider 时会写入
+`requires_openai_auth = true`，并将全局默认值设置为 `gpt-5.6-sol`、评审模型
+`gpt-5.4` 和 `model_reasoning_effort = "xhigh"`。
 
 ## 发布资产
 
