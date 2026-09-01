@@ -213,7 +213,7 @@ def main() -> int:
         settings_path = claude_dir / "settings.json"
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
         proxy_url = f"http://{LISTEN_HOST}:{port}"
-        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        for key in ("http_proxy", "https_proxy", "all_proxy"):
             settings["env"][key] = proxy_url
         settings_path.write_text(json.dumps(settings), encoding="utf-8")
 

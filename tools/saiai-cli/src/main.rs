@@ -118,6 +118,18 @@ const CLAUDE_MANAGED_ROUTING_ENV: &[&str] = &[
     "no_proxy",
 ];
 const CLAUDE_MANAGED_ROUTING_ENV_PREFIXES: &[&str] = &["VERTEX_REGION_CLAUDE_"];
+const CLAUDE_PROXY_ENV_VARS: [&str; 8] = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
+const CLAUDE_PROXY_ENV_UNSET_KEYS: &str =
+    "HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy";
 const SAIAI_SERVICE_NAME: &str = "saiai.service";
 #[cfg(target_os = "macos")]
 const SAIAI_LAUNCHD_LABEL: &str = "top.saiai.local-proxy";
@@ -1099,6 +1111,13 @@ fn run_doctor() -> Result<()> {
 
     if let Some(cfg) = &cfg {
         check_saiai_config(&mut report, cfg);
+        check_process_proxy_env_conflicts(&mut report, &cfg.listen);
+        check_persistent_proxy_env_conflicts(&mut report);
+        check_systemd_user_proxy_env_conflicts(&mut report);
+    } else {
+        check_process_proxy_env_conflicts(&mut report, DEFAULT_LOCAL_PROXY_LISTEN);
+        check_persistent_proxy_env_conflicts(&mut report);
+        check_systemd_user_proxy_env_conflicts(&mut report);
     }
 
     match resolve_claude_config_paths() {
@@ -1207,6 +1226,11 @@ fn warn_process_env_conflicts() {
             "WARN environment: {key} is set in this shell. For SAIAI local proxy mode, unset it before launching Claude Code: unset {CONFLICTING_ENV_UNSET_KEYS}"
         );
     }
+    for key in process_proxy_env_conflicts(&format!("http://{DEFAULT_LOCAL_PROXY_LISTEN}")) {
+        eprintln!(
+            "WARN environment: {key} is set in this shell. For SAIAI local proxy mode, remove conflicting proxy variables before launching Claude Code: unset {CLAUDE_PROXY_ENV_UNSET_KEYS}"
+        );
+    }
 }
 
 fn warn_claude_settings_overrides() {
@@ -1307,6 +1331,11 @@ fn print_process_env_conflicts_for_status() {
             "env warning: {key} is set in this shell; run `unset {CONFLICTING_ENV_UNSET_KEYS}` before launching Claude Code"
         );
     }
+    for key in process_proxy_env_conflicts(&format!("http://{DEFAULT_LOCAL_PROXY_LISTEN}")) {
+        println!(
+            "proxy env warning: {key} is set in this shell; remove conflicting proxy variables before launching Claude Code: unset {CLAUDE_PROXY_ENV_UNSET_KEYS}"
+        );
+    }
 }
 
 fn check_process_env_conflicts(report: &mut DoctorReport) {
@@ -1319,6 +1348,22 @@ fn check_process_env_conflicts(report: &mut DoctorReport) {
         "shell env",
         format!(
             "{} set; run `unset {CONFLICTING_ENV_UNSET_KEYS}` before launching Claude Code",
+            conflicts.join(", ")
+        ),
+    );
+}
+
+fn check_process_proxy_env_conflicts(report: &mut DoctorReport, listen: &str) {
+    let expected_proxy = format!("http://{listen}");
+    let conflicts = process_proxy_env_conflicts(&expected_proxy);
+    if conflicts.is_empty() {
+        report.ok("proxy shell env", "no conflicting proxy variables");
+        return;
+    }
+    report.warn(
+        "proxy shell env",
+        format!(
+            "{} set to a value that may override the lowercase local proxy; unset {CLAUDE_PROXY_ENV_UNSET_KEYS} before launching Claude Code",
             conflicts.join(", ")
         ),
     );
@@ -1344,12 +1389,55 @@ fn check_persistent_env_conflicts(report: &mut DoctorReport) {
     }
 }
 
+fn check_persistent_proxy_env_conflicts(report: &mut DoctorReport) {
+    match persistent_proxy_env_conflicts() {
+        Ok(conflicts) if conflicts.is_empty() => report.ok(
+            "proxy profile env",
+            "no proxy variables in shell startup files",
+        ),
+        Ok(conflicts) => report.warn(
+            "proxy profile env",
+            format!(
+                "{}; remove or comment these proxy entries before launching Claude Code",
+                format_persistent_env_conflicts(&conflicts)
+            ),
+        ),
+        Err(err) => report.warn(
+            "proxy profile env",
+            format!("could not scan shell startup files: {err}"),
+        ),
+    }
+}
+
 fn process_env_conflicts() -> Vec<&'static str> {
     CONFLICTING_ENV_VARS
         .iter()
         .copied()
         .filter(|key| env_var_is_set(key))
         .collect()
+}
+
+fn process_proxy_env_conflicts(expected_proxy: &str) -> Vec<&'static str> {
+    CLAUDE_PROXY_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|key| {
+            let Some(value) = env::var(key).ok().filter(|value| !value.trim().is_empty()) else {
+                return false;
+            };
+            proxy_value_conflicts(key, &value, expected_proxy)
+        })
+        .collect()
+}
+
+fn proxy_value_conflicts(key: &str, value: &str, expected_proxy: &str) -> bool {
+    if key.eq_ignore_ascii_case("NO_PROXY") {
+        !value
+            .split(',')
+            .any(|item| matches!(item.trim(), "127.0.0.1" | "localhost" | "::1"))
+    } else {
+        value.trim() != expected_proxy
+    }
 }
 
 fn env_var_is_set(key: &str) -> bool {
@@ -1380,7 +1468,22 @@ fn persistent_env_conflicts() -> Result<Vec<PersistentEnvConflict>> {
         if !path.exists() || !path.is_file() {
             continue;
         }
-        scan_persistent_env_file(&path, &mut conflicts)?;
+        scan_persistent_env_file(&path, &mut conflicts, &CONFLICTING_ENV_VARS)?;
+    }
+    Ok(conflicts)
+}
+
+fn persistent_proxy_env_conflicts() -> Result<Vec<PersistentEnvConflict>> {
+    let mut paths = persistent_env_scan_paths()?;
+    paths.sort();
+    paths.dedup();
+
+    let mut conflicts = Vec::new();
+    for path in paths {
+        if !path.exists() || !path.is_file() {
+            continue;
+        }
+        scan_persistent_env_file(&path, &mut conflicts, &CLAUDE_PROXY_ENV_VARS)?;
     }
     Ok(conflicts)
 }
@@ -1414,11 +1517,15 @@ fn persistent_env_scan_paths() -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn scan_persistent_env_file(path: &Path, conflicts: &mut Vec<PersistentEnvConflict>) -> Result<()> {
+fn scan_persistent_env_file(
+    path: &Path,
+    conflicts: &mut Vec<PersistentEnvConflict>,
+    keys: &[&'static str],
+) -> Result<()> {
     let raw =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     for (idx, line) in raw.lines().enumerate() {
-        for key in CONFLICTING_ENV_VARS {
+        for key in keys {
             if persistent_env_line_sets_key(line, key) {
                 conflicts.push(PersistentEnvConflict {
                     path: path.to_path_buf(),
@@ -1506,6 +1613,16 @@ fn print_systemd_user_env_conflicts_for_status() {
             println!("systemd env warning: could not inspect systemd --user environment ({err})")
         }
     }
+    match systemd_user_proxy_env_conflicts() {
+        Ok(conflicts) if conflicts.is_empty() => {}
+        Ok(conflicts) => println!(
+            "proxy env warning: {} set in systemd --user manager; remove them before launching Claude Code: systemctl --user unset-environment {CLAUDE_PROXY_ENV_UNSET_KEYS}",
+            conflicts.join(", ")
+        ),
+        Err(err) => {
+            println!("proxy env warning: could not inspect systemd --user environment ({err})")
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1551,8 +1668,34 @@ fn check_systemd_user_env_conflicts(report: &mut DoctorReport) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn check_systemd_user_proxy_env_conflicts(report: &mut DoctorReport) {
+    if ensure_systemd_user_available().is_err() {
+        return;
+    }
+    match systemd_user_proxy_env_conflicts() {
+        Ok(conflicts) if conflicts.is_empty() => {
+            report.ok("proxy systemd env", "no proxy variables in systemd --user manager")
+        }
+        Ok(conflicts) => report.warn(
+            "proxy systemd env",
+            format!(
+                "{} set in systemd --user manager; remove them before launching Claude Code: systemctl --user unset-environment {CLAUDE_PROXY_ENV_UNSET_KEYS}",
+                conflicts.join(", ")
+            ),
+        ),
+        Err(err) => report.warn(
+            "proxy systemd env",
+            format!("could not inspect systemd --user environment: {err}"),
+        ),
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 fn check_systemd_user_env_conflicts(_report: &mut DoctorReport) {}
+
+#[cfg(not(target_os = "linux"))]
+fn check_systemd_user_proxy_env_conflicts(_report: &mut DoctorReport) {}
 
 #[cfg(target_os = "linux")]
 fn systemd_user_env_conflicts() -> Result<Vec<&'static str>> {
@@ -1569,6 +1712,27 @@ fn systemd_user_env_conflicts() -> Result<Vec<&'static str>> {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     Ok(CONFLICTING_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|key| systemd_env_contains_key(&stdout, key))
+        .collect())
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_user_proxy_env_conflicts() -> Result<Vec<&'static str>> {
+    ensure_systemd_user_available()?;
+    let output = systemctl_user_command()
+        .args(["--user", "show-environment"])
+        .output()
+        .context("failed to run systemctl --user show-environment")?;
+    if !output.status.success() {
+        bail!(
+            "systemctl --user show-environment failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(CLAUDE_PROXY_ENV_VARS
         .iter()
         .copied()
         .filter(|key| systemd_env_contains_key(&stdout, key))
@@ -1698,10 +1862,11 @@ fn check_claude_config(
     let expected_proxy = cfg
         .map(|cfg| format!("http://{}", cfg.listen))
         .unwrap_or_else(|| format!("http://{DEFAULT_LOCAL_PROXY_LISTEN}"));
-    check_env_equals(report, env, "HTTP_PROXY", &expected_proxy);
-    check_env_equals(report, env, "HTTPS_PROXY", &expected_proxy);
-    check_env_equals(report, env, "ALL_PROXY", &expected_proxy);
-    check_env_contains(report, env, "NO_PROXY", "127.0.0.1");
+    check_env_equals(report, env, "http_proxy", &expected_proxy);
+    check_env_equals(report, env, "https_proxy", &expected_proxy);
+    check_env_equals(report, env, "all_proxy", &expected_proxy);
+    check_env_contains(report, env, "no_proxy", "127.0.0.1");
+    check_proxy_setting_case_conflicts(report, env);
 
     match env_string(env, "NODE_EXTRA_CA_CERTS") {
         Some(value) => {
@@ -1820,6 +1985,27 @@ fn check_env_contains(
 
 fn env_string<'a>(env: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     env.get(key).and_then(Value::as_str)
+}
+
+fn check_proxy_setting_case_conflicts(report: &mut DoctorReport, env: &Map<String, Value>) {
+    let uppercase = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"];
+    let mut conflicts = Vec::new();
+    for key in uppercase {
+        if env.contains_key(key) {
+            conflicts.push(key);
+        }
+    }
+    if conflicts.is_empty() {
+        report.ok("Claude proxy case", "canonical lowercase proxy keys only");
+    } else {
+        report.warn(
+            "Claude proxy case",
+            format!(
+                "{} also present; remove uppercase proxy keys so lowercase settings take precedence",
+                conflicts.join(", ")
+            ),
+        );
+    }
 }
 
 fn ensure_listen_available(listen: &str) -> Result<()> {
@@ -3502,11 +3688,11 @@ fn clean_claude_state(state: &mut Map<String, Value>) {
 fn apply_claude_local_proxy_env(env_obj: &mut Map<String, Value>, listen: &str, ca_path: &Path) {
     let proxy_url = format!("http://{listen}");
     env_obj.remove("ANTHROPIC_BASE_URL");
-    env_obj.insert("HTTP_PROXY".to_string(), Value::String(proxy_url.clone()));
-    env_obj.insert("HTTPS_PROXY".to_string(), Value::String(proxy_url.clone()));
-    env_obj.insert("ALL_PROXY".to_string(), Value::String(proxy_url));
+    env_obj.insert("http_proxy".to_string(), Value::String(proxy_url.clone()));
+    env_obj.insert("https_proxy".to_string(), Value::String(proxy_url.clone()));
+    env_obj.insert("all_proxy".to_string(), Value::String(proxy_url));
     env_obj.insert(
-        "NO_PROXY".to_string(),
+        "no_proxy".to_string(),
         Value::String(DEFAULT_NO_PROXY.to_string()),
     );
     env_obj.insert(
@@ -4305,6 +4491,28 @@ mod tests {
     }
 
     #[test]
+    fn detects_proxy_values_that_can_override_local_proxy() {
+        let expected = "http://127.0.0.1:19908";
+        assert!(proxy_value_conflicts(
+            "HTTP_PROXY",
+            "http://172.26.0.1:7890",
+            expected
+        ));
+        assert!(proxy_value_conflicts(
+            "http_proxy",
+            "http://172.26.0.1:7890",
+            expected
+        ));
+        assert!(!proxy_value_conflicts("HTTP_PROXY", expected, expected));
+        assert!(!proxy_value_conflicts(
+            "http_proxy",
+            "localhost,127.0.0.1",
+            expected
+        ));
+        assert!(proxy_value_conflicts("NO_PROXY", "172.26.0.1", expected));
+    }
+
+    #[test]
     fn detects_persistent_environment_assignments() {
         assert!(persistent_env_line_sets_key(
             "export ANTHROPIC_BASE_URL=https://example.test",
@@ -4475,12 +4683,16 @@ mod tests {
         assert!(env_obj.get("ANTHROPIC_AUTH_TOKEN").is_none());
         assert!(env_obj.get("CLAUDE_CODE_ATTRIBUTION_HEADER").is_none());
         assert_eq!(json_str(&env_obj, "CLAUDE_CODE_OAUTH_TOKEN"), "sk-test");
-        assert_eq!(json_str(&env_obj, "HTTP_PROXY"), "http://127.0.0.1:19908");
-        assert_eq!(json_str(&env_obj, "HTTPS_PROXY"), "http://127.0.0.1:19908");
-        assert_eq!(json_str(&env_obj, "ALL_PROXY"), "http://127.0.0.1:19908");
-        assert_eq!(json_str(&env_obj, "NO_PROXY"), DEFAULT_NO_PROXY);
+        assert_eq!(json_str(&env_obj, "http_proxy"), "http://127.0.0.1:19908");
+        assert_eq!(json_str(&env_obj, "https_proxy"), "http://127.0.0.1:19908");
+        assert_eq!(json_str(&env_obj, "all_proxy"), "http://127.0.0.1:19908");
+        assert_eq!(json_str(&env_obj, "no_proxy"), DEFAULT_NO_PROXY);
+        assert!(env_obj.get("HTTP_PROXY").is_none());
+        assert!(env_obj.get("HTTPS_PROXY").is_none());
+        assert!(env_obj.get("ALL_PROXY").is_none());
+        assert!(env_obj.get("NO_PROXY").is_none());
         assert!(
-            !json_str(&env_obj, "NO_PROXY").contains("downloads.claude.ai"),
+            !json_str(&env_obj, "no_proxy").contains("downloads.claude.ai"),
             "product domains should not be maintained in NO_PROXY",
         );
         assert_eq!(
@@ -4497,7 +4709,7 @@ mod tests {
                 "CLAUDE_CODE_ATTRIBUTION_HEADER": "old-attribution",
                 "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-v4-pro[1m]",
                 "CLAUDE_CODE_EFFORT_LEVEL": "",
-                "HTTP_PROXY": "http://127.0.0.1:19908"
+                "http_proxy": "http://127.0.0.1:19908"
             },
             "model": "opus[1m]",
             "permissions": {}
@@ -4528,7 +4740,7 @@ mod tests {
     fn allows_native_claude_root_model_preference() {
         let settings = serde_json::json!({
             "env": {
-                "HTTP_PROXY": "http://127.0.0.1:19908"
+                "http_proxy": "http://127.0.0.1:19908"
             },
             "model": "sonnet"
         });

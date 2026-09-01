@@ -72,7 +72,7 @@ def verify_cli() -> None:
         '"VERTEX_REGION_CLAUDE_"',
         '"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"',
         '"CLAUDE_CODE_CLIENT_CERT"',
-        '"HTTP_PROXY"',
+        '"http_proxy"',
         '"NODE_EXTRA_CA_CERTS"',
         "create_new(true)",
         "MOVEFILE_REPLACE_EXISTING",

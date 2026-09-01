@@ -33,13 +33,19 @@ Claude 路径解析遵守 `CLAUDE_CONFIG_DIR`。未设置时使用：
 
 1. 保留无关的 settings/state 字段。
 2. 移除认证、云 provider、模型、旧 proxy 和 CA 冲突环境变量。
-3. 写入 `CLAUDE_CODE_OAUTH_TOKEN`、loopback proxy、`NO_PROXY`、
+3. 写入 `CLAUDE_CODE_OAUTH_TOKEN`、loopback proxy（使用小写的
+   `http_proxy` / `https_proxy` / `all_proxy` / `no_proxy`）、
    `NODE_EXTRA_CA_CERTS` 和 `CLAUDE_STREAM_IDLE_TIMEOUT_MS=600000`。
 4. 移除 settings/state 中的 `oauthAccount`，备份后删除
    `.credentials.json`。
 5. 复用有效的用户 CA；CA 缺失或损坏时备份旧文件并生成新 CA 对，私钥权限为
    `0600`。
 6. 原子写入代理配置，Base URL 和 Key 在重复初始化时直接替换。
+
+`saiai doctor` 同时检查当前 shell、shell 启动文件、Linux `systemd --user`
+环境以及 `settings.json` 中的代理变量。代理配置以小写键为 canonical；发现
+大写或其他值（包括 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 和对应小写键）
+可能覆盖本地代理时会明确提示用户清理后再启动 Claude Code。
 
 本地代理终止 `api.anthropic.com` 的本机 TLS，并把 Anthropic 请求转发到配置的
 Gateway；其他 `CONNECT` 请求作为任意目标和任意 TCP 端口的直接隧道处理，让
