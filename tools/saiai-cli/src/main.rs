@@ -4505,7 +4505,7 @@ mod tests {
         ));
         assert!(!proxy_value_conflicts("HTTP_PROXY", expected, expected));
         assert!(!proxy_value_conflicts(
-            "http_proxy",
+            "NO_PROXY",
             "localhost,127.0.0.1",
             expected
         ));
