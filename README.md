@@ -1,6 +1,6 @@
 # SAIAI Client
 
-SAIAI Client `1.1.5` 使用托管本地代理模式。Claude Code 和 VSCode 通过用户
+SAIAI Client `1.1.6` 使用托管本地代理模式。Claude Code 和 VSCode 通过用户
 级 `saiai` 代理访问 Gateway；Codex CLI 仍使用直接配置。客户端不创建隔离
 home 或 generation。
 
@@ -34,12 +34,13 @@ manifest 中的当前版本，就跳过二进制下载，但仍会重新应用�
 Claude 初始化写入用户级 `settings.json`：
 
 - `CLAUDE_CODE_OAUTH_TOKEN`
-- `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`
+- `http_proxy` / `https_proxy` / `all_proxy`
 - `NODE_EXTRA_CA_CERTS`
 - `CLAUDE_STREAM_IDLE_TIMEOUT_MS=600000`
 - 当前 SAIAI 功能开关
 
-写入时会移除会覆盖认证、provider、model、proxy 和 CA 的冲突环境变量，移除
+写入时会移除会覆盖认证、provider、model、proxy 和 CA 的冲突环境变量，代理配置使用
+小写环境变量名以优先于 Linux/WSL shell 中遗留的大写代理变量；移除
 `.claude.json` 中的 `oauthAccount`，并在备份后删除 `.credentials.json`。其他
 JSON 字段和机器本地身份值保持不变。客户端为每个用户生成独立 CA；私钥只以
 用户私有权限保存在本机，不会进入 release 或日志。

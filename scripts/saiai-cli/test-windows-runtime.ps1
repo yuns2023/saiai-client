@@ -92,7 +92,7 @@ try {
     Assert-Saiai ([string]$settings.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS -ceq "600000") "Timeout differs"
     Assert-Saiai ([string]$settings.env.KEEP_ME -ceq "yes") "Unrelated env was lost"
     Assert-Saiai ($null -eq $settings.env.PSObject.Properties["ANTHROPIC_AUTH_TOKEN"]) "Conflicting auth token remains"
-    Assert-Saiai ([string]$settings.env.HTTP_PROXY -ceq "http://127.0.0.1:19908") "Local proxy differs"
+    Assert-Saiai ([string]$settings.env.http_proxy -ceq "http://127.0.0.1:19908") "Local proxy differs"
     Assert-Saiai ([string]$settings.env.NODE_EXTRA_CA_CERTS -ceq $caPath) "CA path differs"
     Assert-Saiai (@($settings.permissions.allow) -contains "Read") "Unrelated settings were lost"
 

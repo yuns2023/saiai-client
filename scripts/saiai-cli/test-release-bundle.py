@@ -117,7 +117,7 @@ def main() -> int:
                         "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": "9",
                         "CLAUDE_CODE_CLIENT_CERT": "/tmp/old-client.crt",
                         "VERTEX_REGION_CLAUDE_4_6_SONNET": "old-region",
-                        "HTTP_PROXY": "http://127.0.0.1:19908",
+                        "http_proxy": "http://127.0.0.1:19908",
                         "NODE_EXTRA_CA_CERTS": str(claude_dir / "saiai-ca.crt"),
                     },
                 }
@@ -170,7 +170,7 @@ def main() -> int:
         if settings_env.get("KEEP_ME") != "yes" or settings["permissions"]["allow"] != ["Read"]:
             raise AssertionError("unrelated Claude settings were not preserved")
         expected_proxy = "http://127.0.0.1:19908"
-        for proxy_key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        for proxy_key in ("http_proxy", "https_proxy", "all_proxy"):
             if settings_env.get(proxy_key) != expected_proxy:
                 raise AssertionError(f"local proxy setting differs: {proxy_key}")
         ca_path = claude_dir / "saiai-ca.crt"

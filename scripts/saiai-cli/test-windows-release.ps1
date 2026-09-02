@@ -115,7 +115,7 @@ try {
     $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
     Assert-Saiai ([string]$settings.env.CLAUDE_CODE_OAUTH_TOKEN -ceq $testKey) "PowerShell wrapper did not apply the key"
     Assert-Saiai ($null -eq $settings.env.PSObject.Properties["ANTHROPIC_BASE_URL"]) "PowerShell wrapper left a direct gateway override"
-    Assert-Saiai ([string]$settings.env.HTTP_PROXY -ceq "http://127.0.0.1:19908") "PowerShell wrapper did not apply the local proxy"
+    Assert-Saiai ([string]$settings.env.http_proxy -ceq "http://127.0.0.1:19908") "PowerShell wrapper did not apply the local proxy"
 
     $second = Invoke-Saiai "https://new-gateway.example.test" "TEST_ONLY_WINDOWS_REPLACEMENT_KEY"
     Assert-Saiai ($second -is [int]) "Repeat PowerShell wrapper returned a non-scalar exit code"
