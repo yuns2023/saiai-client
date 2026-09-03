@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+remote_name="${1:-origin}"
+
+"$repo_root/scripts/git-hooks/assert-repo-role.sh" "$remote_name"
+
+if [ "${PREPUSH_DRY_RUN:-0}" = "1" ]; then
+  echo "[pre-push] dry run: canonical client remote verified"
+  exit 0
+fi
+
+echo "[pre-push] client: cargo fmt"
+cargo fmt --manifest-path "$repo_root/tools/saiai-cli/Cargo.toml" --check
+
+echo "[pre-push] client: cargo test"
+CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" \
+  cargo test --locked --manifest-path "$repo_root/tools/saiai-cli/Cargo.toml"
+
+echo "[pre-push] client: release contract"
+(cd "$repo_root" && bash scripts/saiai-cli/test-setup-wrappers.sh)
+(cd "$repo_root" && python3 scripts/saiai-cli/verify-release.py)
