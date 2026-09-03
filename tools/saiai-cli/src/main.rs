@@ -49,7 +49,9 @@ const SAIAI_CA_KEY_FILENAME: &str = "saiai-ca.key";
 const SAIAI_CONFIG_VERSION: u32 = 2;
 const CLAUDE_STREAM_IDLE_TIMEOUT_MS: &str = "600000";
 const DEFAULT_LOCAL_PROXY_LISTEN: &str = "127.0.0.1:19908";
-const DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local";
+// Claude's updater must use the user's normal network path. Model/API
+// traffic remains routed through the SAIAI local proxy.
+const DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local,downloads.claude.ai";
 const SAIAI_CONFIG_FILENAME: &str = "config.json";
 
 // Remove stale routing, authentication, model, proxy, and CA values before
@@ -4691,10 +4693,7 @@ mod tests {
         assert!(env_obj.get("HTTPS_PROXY").is_none());
         assert!(env_obj.get("ALL_PROXY").is_none());
         assert!(env_obj.get("NO_PROXY").is_none());
-        assert!(
-            !json_str(&env_obj, "no_proxy").contains("downloads.claude.ai"),
-            "product domains should not be maintained in NO_PROXY",
-        );
+        assert!(json_str(&env_obj, "no_proxy").contains("downloads.claude.ai"));
         assert_eq!(
             json_str(&env_obj, "NODE_EXTRA_CA_CERTS"),
             "/tmp/saiai-ca.crt"
