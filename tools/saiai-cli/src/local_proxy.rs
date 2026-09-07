@@ -19,6 +19,7 @@ use url::Url;
 use zeroize::Zeroizing;
 
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
+const OPENAI_HOST: &str = "api.openai.com";
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HEADER_LINE: usize = 32 * 1024;
 const MAX_HEADER_BYTES: usize = 256 * 1024;
@@ -92,7 +93,7 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     eprintln!("saiai local proxy listening on http://{}", state.listen);
     eprintln!(
-        "forwarding Claude Code Anthropic traffic to {}",
+        "forwarding managed Claude/OpenAI traffic to {}",
         state.base_url
     );
     eprintln!("press Ctrl-C to stop");
@@ -262,18 +263,18 @@ async fn handle_client(
     };
 
     let mut stream = reader.into_inner();
-    if connect.host == ANTHROPIC_HOST && connect.port == 443 {
+    if (connect.host == ANTHROPIC_HOST || connect.host == OPENAI_HOST) && connect.port == 443 {
         stream
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await
-            .context("failed to acknowledge Anthropic CONNECT")?;
+            .context("failed to acknowledge managed CONNECT")?;
         if state.verbose {
             eprintln!(
                 "mitm accepted host={}:{} remote={}",
                 connect.host, connect.port, peer
             );
         }
-        serve_anthropic_tls(state, stream).await
+        serve_managed_tls(state, stream, &connect.host).await
     } else {
         serve_direct_tunnel(stream, &connect.host, connect.port, &peer, state.verbose).await
     }
@@ -340,8 +341,8 @@ async fn serve_direct_tunnel(
     Ok(())
 }
 
-async fn serve_anthropic_tls(state: Arc<State>, stream: TcpStream) -> Result<()> {
-    let tls_config = state.tls_config_for_host(ANTHROPIC_HOST)?;
+async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> Result<()> {
+    let tls_config = state.tls_config_for_host(host)?;
     let acceptor = TlsAcceptor::from(tls_config);
     let tls_stream = acceptor
         .accept(stream)
@@ -371,27 +372,53 @@ async fn serve_anthropic_tls(state: Arc<State>, stream: TcpStream) -> Result<()>
         handled_requests += 1;
         let close_after = request_wants_close(&request);
 
-        if let Some(resp) = local_sidecar_response(&request) {
-            if state.verbose {
-                eprintln!(
-                    "local sidecar response method={} target={} status={} reason={} close_after={}",
-                    request.method, request.target, resp.status, resp.reason, close_after
-                );
-            }
-            write_static_response(
-                reader.get_mut(),
-                resp.status,
-                resp.content_type,
-                resp.body,
-                close_after,
-            )
-            .await?;
-        } else {
-            let path = request_path(&request.target)?;
-            if !is_forwarded_anthropic_path(&path) {
+        if host == ANTHROPIC_HOST {
+            if let Some(resp) = local_sidecar_response(&request) {
                 if state.verbose {
                     eprintln!(
-                        "local sidecar fallback method={} target={} status=204 reason=unknown_anthropic_sidecar close_after={}",
+                        "local sidecar response method={} target={} status={} reason={} close_after={}",
+                        request.method, request.target, resp.status, resp.reason, close_after
+                    );
+                }
+                write_static_response(
+                    reader.get_mut(),
+                    resp.status,
+                    resp.content_type,
+                    resp.body,
+                    close_after,
+                )
+                .await?;
+            } else {
+                let path = request_path(&request.target)?;
+                if !is_forwarded_anthropic_path(&path) {
+                    if state.verbose {
+                        eprintln!(
+                            "local sidecar fallback method={} target={} status=204 reason=unknown_anthropic_sidecar close_after={}",
+                            request.method, request.target, close_after
+                        );
+                    }
+                    write_static_response(
+                        reader.get_mut(),
+                        StatusCode::NO_CONTENT,
+                        "text/plain",
+                        b"",
+                        close_after,
+                    )
+                    .await?;
+                } else {
+                    forward_to_saiai(&state, reader.get_mut(), request, close_after, false).await?;
+                }
+            }
+        } else if host == OPENAI_HOST {
+            let path = request_path(&request.target)?;
+            if is_forwarded_openai_path(&path) {
+                // Codex's OAuth request shape is preserved; only the Gateway
+                // credential is substituted at this upstream boundary.
+                forward_to_saiai(&state, reader.get_mut(), request, close_after, true).await?;
+            } else {
+                if state.verbose {
+                    eprintln!(
+                        "openai sidecar fallback method={} target={} status=204 reason=unknown_openai_path close_after={}",
                         request.method, request.target, close_after
                     );
                 }
@@ -403,8 +430,6 @@ async fn serve_anthropic_tls(state: Arc<State>, stream: TcpStream) -> Result<()>
                     close_after,
                 )
                 .await?;
-            } else {
-                forward_to_saiai(&state, reader.get_mut(), request, close_after).await?;
             }
         }
 
@@ -517,6 +542,7 @@ async fn forward_to_saiai<W>(
     writer: &mut W,
     request: IncomingRequest,
     close_after: bool,
+    replace_authorization: bool,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -531,11 +557,13 @@ where
         if name.eq_ignore_ascii_case("authorization") {
             has_authorization = true;
         }
-        if should_forward_request_header(name) {
+        if should_forward_request_header(name)
+            && !(replace_authorization && name.eq_ignore_ascii_case("authorization"))
+        {
             builder = builder.header(name.as_str(), value.as_str());
         }
     }
-    if !has_authorization {
+    if replace_authorization || !has_authorization {
         builder = builder.bearer_auth(&*state.api_key);
     }
 
@@ -869,6 +897,13 @@ fn is_forwarded_anthropic_path(path: &str) -> bool {
         || path.starts_with("/v1/models/")
 }
 
+fn is_forwarded_openai_path(path: &str) -> bool {
+    path == "/v1/responses"
+        || path.starts_with("/v1/responses/")
+        || path == "/v1/models"
+        || path.starts_with("/v1/models/")
+}
+
 fn should_forward_request_header(name: &str) -> bool {
     !is_hop_by_hop_header(name)
         && !name.eq_ignore_ascii_case("host")
@@ -899,8 +934,8 @@ fn is_hop_by_hop_header(name: &str) -> bool {
 }
 
 async fn connect_direct_target(host: &str, port: u16) -> Result<TcpStream> {
-    if host == ANTHROPIC_HOST && port == 443 {
-        bail!("Anthropic host must use local MITM route");
+    if (host == ANTHROPIC_HOST || host == OPENAI_HOST) && port == 443 {
+        bail!("managed host must use local MITM route");
     }
     let addrs = lookup_host((host, port))
         .await
@@ -1113,6 +1148,15 @@ mod tests {
     }
 
     #[test]
+    fn detects_forwarded_openai_paths() {
+        assert!(is_forwarded_openai_path("/v1/responses"));
+        assert!(is_forwarded_openai_path("/v1/responses/compact"));
+        assert!(is_forwarded_openai_path("/v1/models"));
+        assert!(is_forwarded_openai_path("/v1/models/gpt-5.3-codex"));
+        assert!(!is_forwarded_openai_path("/backend-api/codex/models"));
+    }
+
+    #[test]
     fn builds_tls_config_with_explicit_crypto_provider() {
         let (ca_cert_pem, ca_key_pem) = test_ca();
         let state = State::new(Config {
@@ -1209,7 +1253,17 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("Anthropic host must use local MITM route")
+                .contains("managed host must use local MITM route")
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_tunnel_cannot_bypass_openai_mitm_route() {
+        let error = connect_direct_target(OPENAI_HOST, 443).await.err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("managed host must use local MITM route")
         );
     }
 

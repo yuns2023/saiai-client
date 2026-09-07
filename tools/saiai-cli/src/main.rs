@@ -41,6 +41,7 @@ Usage:
   saiai --version                                                 # print version
   saiai init <base_url> <api_key>                                 # initialize Claude Code
   saiai init-codex <base_url> <api_key> [--websockets]            # initialize Codex CLI
+  saiai codex [-- <codex arguments>]                              # launch Codex through SAIAI local proxy
   saiai init       --base-url <base_url> --api-key <api_key>      # initialize Claude Code
   saiai init-codex --base-url <base_url> --api-key <api_key> [--websockets]";
 
@@ -53,6 +54,25 @@ const DEFAULT_LOCAL_PROXY_LISTEN: &str = "127.0.0.1:19908";
 // traffic remains routed through the SAIAI local proxy.
 const DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local,downloads.claude.ai";
 const SAIAI_CONFIG_FILENAME: &str = "config.json";
+
+// `saiai codex` owns these variables only in the Codex child process. The
+// invoking shell and the user's system environment are never modified.
+const CODEX_MANAGED_ENV: &[&str] = &[
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "CODEX_ACCESS_TOKEN",
+    "CODEX_CA_CERTIFICATE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
+const CODEX_LOCAL_PROXY_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local";
 
 // Remove stale routing, authentication, model, proxy, and CA values before
 // installing the exact local-proxy environment. Unrelated user settings are
@@ -183,6 +203,7 @@ fn main() -> Result<()> {
         Command::Version => print_version(),
         Command::Init(init) => init_claude(init),
         Command::InitCodex(init) => init_codex(init),
+        Command::Codex(args) => run_codex(&args),
         #[cfg(target_os = "linux")]
         Command::RunLinuxBackgroundProxy => run_linux_background_proxy_worker(),
         #[cfg(target_os = "windows")]
@@ -206,6 +227,7 @@ enum Command {
     Version,
     Init(InitArgs),
     InitCodex(InitArgs),
+    Codex(Vec<String>),
     #[cfg(target_os = "linux")]
     RunLinuxBackgroundProxy,
     #[cfg(target_os = "windows")]
@@ -257,6 +279,13 @@ fn parse_command(args: &[String]) -> Result<Command> {
                 "init-codex",
                 &args[1..],
             )?));
+        }
+        "codex" => {
+            let mut codex_args = args[1..].to_vec();
+            if codex_args.first().is_some_and(|arg| arg == "--") {
+                codex_args.remove(0);
+            }
+            return Ok(Command::Codex(codex_args));
         }
         #[cfg(target_os = "linux")]
         SAIAI_LINUX_BACKGROUND_COMMAND => {
@@ -526,6 +555,208 @@ fn init_codex(args: InitArgs) -> Result<()> {
     warn_claude_settings_overrides();
 
     Ok(())
+}
+
+/// Launch the real Codex executable with a child-only SAIAI proxy environment.
+///
+/// This mode deliberately keeps Codex's built-in OpenAI provider and ChatGPT
+/// OAuth credential. The local proxy changes the network route and performs
+/// the Gateway authentication at its own upstream boundary; it does not write
+/// a third-party `base_url` into Codex configuration.
+fn run_codex(args: &[String]) -> Result<()> {
+    let codex_dir = codex_config_dir().context("failed to resolve Codex config directory")?;
+    let auth_path = codex_dir.join("auth.json");
+    validate_codex_oauth_auth(&auth_path)?;
+    let cfg = read_saiai_config()
+        .context("SAIAI local proxy is not configured; run the SAIAI Claude setup first")?;
+    let _runtime_ca = read_runtime_ca(&cfg)
+        .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
+    ensure_local_proxy_running(&cfg.listen)?;
+    let files = prepare_codex_oauth_files(&codex_dir)?;
+
+    let proxy = format!("http://{}", cfg.listen);
+    let mut command = ProcessCommand::new("codex");
+    command.args(args).env("CODEX_HOME", &codex_dir);
+    command.env("CODEX_CA_CERTIFICATE", &cfg.ca_cert_path);
+    command
+        .env("HTTP_PROXY", &proxy)
+        .env("HTTPS_PROXY", &proxy)
+        .env("ALL_PROXY", &proxy)
+        .env("NO_PROXY", CODEX_LOCAL_PROXY_NO_PROXY)
+        .env("http_proxy", &proxy)
+        .env("https_proxy", &proxy)
+        .env("all_proxy", &proxy)
+        .env("no_proxy", CODEX_LOCAL_PROXY_NO_PROXY);
+    for name in CODEX_MANAGED_ENV {
+        if !matches!(
+            *name,
+            "HTTP_PROXY"
+                | "HTTPS_PROXY"
+                | "ALL_PROXY"
+                | "NO_PROXY"
+                | "http_proxy"
+                | "https_proxy"
+                | "all_proxy"
+                | "no_proxy"
+                | "CODEX_CA_CERTIFICATE"
+        ) {
+            command.env_remove(*name);
+        }
+    }
+
+    println!("Starting Codex through the SAIAI local proxy.");
+    println!("  CODEX_HOME={}", codex_dir.display());
+    println!("  proxy={proxy}");
+    println!(
+        "  migrated {} Codex config file(s) with backups",
+        files.len()
+    );
+    let status = command.status().context("failed to start codex")?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("codex exited with {status}")
+    }
+}
+
+fn validate_codex_oauth_auth(path: &Path) -> Result<()> {
+    let auth = load_json_object(path)
+        .with_context(|| format!("failed to load OAuth auth file {}", path.display()))?;
+    let auth_mode = auth.get("auth_mode").and_then(Value::as_str).unwrap_or("");
+    if auth_mode != "chatgpt" {
+        bail!(
+            "{} is not in ChatGPT OAuth mode; first-phase `saiai codex` does not accept API-key-only auth",
+            path.display()
+        );
+    }
+    let access_token = auth
+        .get("tokens")
+        .and_then(Value::as_object)
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if access_token.trim().is_empty() {
+        bail!(
+            "{} has no ChatGPT OAuth access token; run `codex login` before `saiai codex`",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn prepare_codex_oauth_files(codex_dir: &Path) -> Result<Vec<PathBuf>> {
+    let config_path = codex_dir.join("config.toml");
+    let auth_path = codex_dir.join("auth.json");
+    let mut documents = Vec::new();
+
+    let raw = if config_path.exists() {
+        fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?
+    } else {
+        String::new()
+    };
+    let document = if raw.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        raw.parse::<DocumentMut>().with_context(|| {
+            format!(
+                "failed to parse {} as TOML; no file was modified",
+                config_path.display()
+            )
+        })?
+    };
+    documents.push((config_path.clone(), document));
+
+    if codex_dir.is_dir() {
+        for entry in fs::read_dir(codex_dir)
+            .with_context(|| format!("failed to list {}", codex_dir.display()))?
+        {
+            let path = entry?.path();
+            if path == config_path
+                || !path.is_file()
+                || !path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".config.toml"))
+            {
+                continue;
+            }
+            let raw = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let document = raw.parse::<DocumentMut>().with_context(|| {
+                format!(
+                    "failed to parse {} as TOML; no file was modified",
+                    path.display()
+                )
+            })?;
+            documents.push((path, document));
+        }
+    }
+
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S%.9f").to_string();
+    backup_if_exists(&config_path, &timestamp)?;
+    backup_if_exists(&auth_path, &timestamp)?;
+    for (path, _) in &documents {
+        if path != &config_path {
+            backup_if_exists(path, &timestamp)?;
+        }
+    }
+
+    let mut written = Vec::with_capacity(documents.len());
+    for (path, mut document) in documents {
+        clean_codex_oauth_document(&mut document);
+        write_bytes_atomic(path.as_path(), document.to_string().as_bytes(), 0o600)?;
+        written.push(path);
+    }
+
+    let mut auth = load_json_object(&auth_path)?;
+    // Keep the OAuth token object intact. A null API-key field matches Codex's
+    // normal OAuth shape while preventing API-key precedence in mixed installs.
+    auth.insert("OPENAI_API_KEY".to_string(), Value::Null);
+    write_json_object(&auth_path, Value::Object(auth))?;
+    Ok(written)
+}
+
+fn clean_codex_oauth_document(document: &mut DocumentMut) {
+    document["model_provider"] = value("openai");
+    for key in ["base_url", "openai_base_url", "chatgpt_base_url"] {
+        document.as_table_mut().remove(key);
+    }
+    // A custom provider can override the built-in endpoint even when the root
+    // provider looks harmless. The explicit `saiai codex` migration removes
+    // the whole table after backup, as requested by the managed mode.
+    document.as_table_mut().remove("model_providers");
+
+    // Codex 0.153.x may attempt a Responses WebSocket by default. The first
+    // local-proxy phase is HTTP-only; keep both feature switches explicit so a
+    // future Codex default cannot silently bypass the tested HTTP path.
+    if !document.get("features").is_some_and(Item::is_table) {
+        document.as_table_mut().remove("features");
+        document["features"] = Item::Table(Table::new());
+    }
+    let features = document["features"]
+        .as_table_mut()
+        .expect("features table created above");
+    features.insert("responses_websockets", value(false));
+    features.insert("responses_websockets_v2", value(false));
+}
+
+fn ensure_local_proxy_running(listen: &str) -> Result<()> {
+    let addr = listen
+        .parse::<SocketAddr>()
+        .with_context(|| format!("invalid local proxy listen address {listen}"))?;
+    if TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
+        return Ok(());
+    }
+    run_service_start().context("failed to start the SAIAI local proxy")?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    bail!("SAIAI local proxy did not become reachable at {listen}")
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -4251,6 +4482,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cleans_third_party_codex_routes_for_oauth_launcher() {
+        let mut doc = r#"
+model_provider = "third_party"
+openai_base_url = "https://third-party.example/v1"
+chatgpt_base_url = "https://another.example"
+base_url = "https://legacy.example"
+
+[features]
+other_flag = true
+responses_websockets = true
+responses_websockets_v2 = true
+
+[model_providers.third_party]
+name = "third_party"
+base_url = "https://third-party.example/v1"
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+
+        clean_codex_oauth_document(&mut doc);
+
+        assert_eq!(doc["model_provider"].as_str(), Some("openai"));
+        for key in ["base_url", "openai_base_url", "chatgpt_base_url"] {
+            assert!(doc.get(key).is_none(), "{key} should be removed");
+        }
+        assert!(doc.get("model_providers").is_none());
+        assert_eq!(doc["features"]["other_flag"].as_bool(), Some(true));
+        assert_eq!(
+            doc["features"]["responses_websockets"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            doc["features"]["responses_websockets_v2"].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn accepts_only_chatgpt_oauth_auth_for_codex_launcher() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        write_str(
+            &path,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"oauth-test"}}"#,
+        );
+        validate_codex_oauth_auth(&path).unwrap();
+
+        write_str(&path, r#"{"OPENAI_API_KEY":"sk-test"}"#);
+        assert!(validate_codex_oauth_auth(&path).is_err());
+    }
+
     fn json_str<'a>(map: &'a Map<String, Value>, key: &str) -> &'a str {
         map.get(key).and_then(Value::as_str).unwrap_or("")
     }
@@ -4327,6 +4610,23 @@ mod tests {
         match parse_command(&["--version".to_string()]).unwrap() {
             Command::Version => {}
             _ => panic!("expected version command"),
+        }
+    }
+
+    #[test]
+    fn parses_codex_launcher_arguments_without_consuming_them() {
+        let args = [
+            "codex".to_string(),
+            "--".to_string(),
+            "app-server".to_string(),
+            "--stdio".to_string(),
+        ];
+        match parse_command(&args).unwrap() {
+            Command::Codex(codex_args) => assert_eq!(
+                codex_args,
+                vec!["app-server".to_string(), "--stdio".to_string()]
+            ),
+            _ => panic!("expected codex launcher command"),
         }
     }
 

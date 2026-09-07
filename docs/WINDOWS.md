@@ -56,7 +56,8 @@ irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai init-codex 'ht
 ```
 
 WebSocket 模式在末尾加 `--websockets`。配置写入 `%USERPROFILE%\.codex`，或
-`CODEX_HOME` 指定的目录；Codex 初始化不会启动 Claude 本地代理。
+`CODEX_HOME` 指定的目录；旧初始化不会启动 Claude 本地代理。OAuth/local-proxy
+模式使用 `saiai codex`，并只给 Codex 子进程设置代理环境。
 
 ## 更新与回退
 

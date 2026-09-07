@@ -59,6 +59,9 @@ def verify_cli() -> None:
         "saiai doctor",
         "saiai init <base_url> <api_key>",
         "saiai init-codex <base_url> <api_key>",
+        "saiai codex [-- <codex arguments>]",
+        '"CODEX_CA_CERTIFICATE"',
+        '"OPENAI_API_KEY"',
         '"CLAUDE_CODE_OAUTH_TOKEN"',
         '"CLAUDE_STREAM_IDLE_TIMEOUT_MS"',
         'const CLAUDE_STREAM_IDLE_TIMEOUT_MS: &str = "600000"',
@@ -100,6 +103,8 @@ def verify_cli() -> None:
     proxy = text("tools/saiai-cli/src/local_proxy.rs")
     require("ca_key_pem" in proxy, "local proxy does not require runtime CA material")
     require("piproxy-ca.key" not in proxy, "local proxy still embeds the historical shared CA key")
+    require('const OPENAI_HOST: &str = "api.openai.com"' in proxy, "Codex OpenAI MITM route is missing")
+    require("replace_authorization" in proxy, "Codex Gateway authorization boundary is missing")
     windows_runtime = text("scripts/saiai-cli/test-windows-runtime.ps1")
     for required in (
         "TEST_ONLY_WINDOWS_REPLACEMENT_KEY",

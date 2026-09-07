@@ -2,8 +2,8 @@
 
 ## 目标
 
-`saiai` 为 Claude Code 和 VSCode 提供用户级托管本地代理，同时保留 Codex CLI
-直接配置。WebUI 的一行命令完成安装、配置并启动代理；用户也可以用
+`saiai` 为 Claude Code、VSCode 和新的 `saiai codex` 启动路径提供用户级托管本地
+代理，同时保留旧的 Codex CLI 直接配置。WebUI 的一行命令完成安装、配置并启动代理；用户也可以用
 `saiai start/stop/status/logs/restart` 管理服务，或直接运行 `saiai` 使用前台模式。
 
 稳定边界：
@@ -47,12 +47,12 @@ Claude 路径解析遵守 `CLAUDE_CONFIG_DIR`。未设置时使用：
 大写或其他值（包括 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 和对应小写键）
 可能覆盖本地代理时会明确提示用户清理后再启动 Claude Code。
 
-本地代理终止 `api.anthropic.com` 的本机 TLS，并把 Anthropic 请求转发到配置的
-Gateway；其他 `CONNECT` 请求作为任意目标和任意 TCP 端口的直接隧道处理，让
-系统 TUN、Fake-IP 和用户自己的出站规则接管实际流量。它不提供 UDP 转发，也不
-处理明文 HTTP 的 absolute-form 请求。由于该接口不认证且可访问任意目标，代理
-核心必须强制只监听 loopback，不能仅依赖初始化器生成的默认地址。Gateway Key
-由代理从私有配置读取，程序不会把 Key 打印到输出或请求日志。
+本地代理终止 `api.anthropic.com` 和 Codex 使用的 `api.openai.com` 本机 TLS，
+分别把允许的请求转发到配置的 Gateway；其他 `CONNECT` 请求作为任意目标和任意
+TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出站规则接管实际流量。
+它不提供 UDP 转发，也不处理明文 HTTP 的 absolute-form 请求。由于该接口不认证且
+可访问任意目标，代理核心必须强制只监听 loopback，不能仅依赖初始化器生成的默认
+地址。Gateway Key 由代理从私有配置读取，程序不会把 Key 打印到输出或请求日志。
 
 ## 用户服务
 
@@ -71,11 +71,24 @@ Gateway；其他 `CONNECT` 请求作为任意目标和任意 TCP 端口的直接
 `start/status/logs/restart/stop` 的真实 LaunchAgent 生命周期；两个 Linux 静态
 资产也必须在强制 `systemctl --user` 失败的环境中完成同一套 fallback 生命周期。
 
-## Codex 配置
+## Codex 启动与配置
 
-路径遵守 `CODEX_HOME`，默认是 `~/.codex`。客户端合并 `config.toml` 与
-`auth.json`，保留不属于 SAIAI 的字段。OpenAI provider 使用 Responses API；
-`--websockets` 可开启对应传输配置。
+旧的 `init-codex <base_url> <api_key> [--websockets]` 继续保留兼容。新的
+`saiai codex [-- <codex arguments>]` 是收敛方向：它遵守生效的 `CODEX_HOME`
+（默认 `~/.codex`），不写入第三方 `base_url`，而是在启动的 Codex 子进程中设置
+本地 HTTP 代理和 `CODEX_CA_CERTIFICATE`。
+
+启动前会先完成只读预检，然后备份并清理主 `config.toml` 及 profile 配置中的
+`base_url`、`model_providers` 和 Responses WebSocket 开关，将根 provider 设置为
+内置 `openai`。`auth.json` 的 `auth_mode = "chatgpt"` 和 OAuth `tokens` 原样保留；
+第一阶段把 `OPENAI_API_KEY` 置为空值，API-key-only 登录会被拒绝。所有备份都写在
+原目录下，命名为 `.bak-<timestamp>`。
+
+本地代理对 `api.openai.com:443` 终止 TLS 后，仅将 `/v1/responses` 和 `/v1/models`
+请求转发到 Gateway。Codex 原始方法、路径、query、JSON body、User-Agent、
+`originator`、session/thread/request id 等头保持不变；只有代理发往 Gateway 时的
+`Authorization` 使用 SAIAI Key。第一阶段显式关闭 HTTP Responses WebSocket，避免
+绕过已验证的 HTTP 请求路径。代理仍只监听 loopback，用户 shell 和系统环境不变。
 
 ## 更新短路径
 

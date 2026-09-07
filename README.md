@@ -1,7 +1,8 @@
 # SAIAI Client
 
-SAIAI Client `1.1.6` 使用托管本地代理模式。Claude Code 和 VSCode 通过用户
-级 `saiai` 代理访问 Gateway；Codex CLI 仍使用直接配置。客户端不创建隔离
+SAIAI Client `1.1.7` 使用托管本地代理模式。Claude Code 和 VSCode 通过用户
+级 `saiai` 代理访问 Gateway；Codex CLI 通过 `saiai codex` 使用同一用户级代理，
+旧的 `init-codex` 直接配置方式继续兼容。客户端不创建隔离
 home 或 generation。
 
 ## 一键配置
@@ -45,9 +46,10 @@ Claude 初始化写入用户级 `settings.json`：
 JSON 字段和机器本地身份值保持不变。客户端为每个用户生成独立 CA；私钥只以
 用户私有权限保存在本机，不会进入 release 或日志。
 
-代理仅监听 loopback。`api.anthropic.com:443` 由本地代理终止 TLS 并转发到
-Gateway；其他 HTTP `CONNECT` 请求以任意目标、任意 TCP 端口直接建立隧道，
-因此可由本机 TUN、Fake-IP 和用户自己的出站规则继续处理。
+代理仅监听 loopback。`api.anthropic.com:443` 和 Codex 使用的
+`api.openai.com:443` 由本地代理终止 TLS 并转发到 Gateway；其他 HTTP `CONNECT`
+请求以任意目标、任意 TCP 端口直接建立隧道，因此可由本机 TUN、Fake-IP 和用户
+自己的出站规则继续处理。
 
 默认路径是 `~/.claude/settings.json`、`~/.claude.json` 和
 `~/.claude/.credentials.json`、`~/.claude/saiai-ca.crt` 和
@@ -80,6 +82,26 @@ saiai doctor
 ```
 
 ## Codex CLI
+
+OAuth/local-proxy 模式（第一阶段）使用：
+
+```bash
+saiai codex
+saiai codex -- app-server --stdio
+```
+
+该命令只在 Codex 子进程中设置 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和
+`CODEX_CA_CERTIFICATE`，不会修改用户 shell 或系统环境变量。启动前会备份并清理
+生效 `CODEX_HOME` 中的第三方 `base_url`、`model_providers` 和 WebSocket 开关，
+将根 provider 恢复为官方内置 `openai`，并保留 `auth.json` 中的 ChatGPT OAuth
+token。备份文件使用同目录的 `.bak-<timestamp>` 后缀。
+
+第一阶段只接受 `auth_mode = "chatgpt"` 且存在 OAuth access token 的登录状态；
+`OPENAI_API_KEY` 不参与认证。代理转发 Codex 的 Responses HTTP 请求时保留原始
+路径、请求体和客户端标识头，只在发往 SAIAI Gateway 的边界替换 Gateway 认证。
+Responses WebSocket 在第一阶段显式关闭，待 HTTP 请求形状验证完成后再单独支持。
+
+旧的 API-key 初始化命令暂时保持兼容：
 
 ```bash
 saiai init-codex https://api.saiai.top/v1 YOUR_API_KEY
