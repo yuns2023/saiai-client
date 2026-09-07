@@ -5,7 +5,12 @@ use reqwest::{Client, Method, StatusCode};
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -19,6 +24,7 @@ use tokio_rustls::server::TlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::Role;
@@ -63,6 +69,7 @@ struct State {
     verbose: bool,
     client: Client,
     certs: Mutex<HashMap<String, Arc<ServerConfig>>>,
+    openai_trace: Option<Arc<OpenAITrace>>,
 }
 
 struct ParsedConnect {
@@ -77,6 +84,56 @@ struct IncomingRequest {
     http_version: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+}
+
+struct OpenAITrace {
+    file: Mutex<fs::File>,
+}
+
+impl OpenAITrace {
+    fn from_env() -> Result<Option<Arc<Self>>> {
+        if env::var("SAIAI_OPENAI_TRACE").ok().as_deref() != Some("1") {
+            return Ok(None);
+        }
+        let path = env::var("SAIAI_OPENAI_TRACE_PATH")
+            .unwrap_or_else(|_| "/tmp/saiai-openai-trace.jsonl".to_string());
+        let path = std::path::PathBuf::from(path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create OpenAI trace directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open OpenAI trace {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("failed to protect OpenAI trace {}", path.display()))?;
+        }
+        eprintln!("OpenAI trace enabled path={}", path.display());
+        Ok(Some(Arc::new(Self {
+            file: Mutex::new(file),
+        })))
+    }
+
+    fn write(&self, record: Value) {
+        let Ok(mut file) = self.file.lock() else {
+            return;
+        };
+        let Ok(mut bytes) = serde_json::to_vec(&record) else {
+            return;
+        };
+        bytes.push(b'\n');
+        let _ = file.write_all(&bytes);
+        let _ = file.flush();
+    }
 }
 
 struct UpstreamResponseOutcome {
@@ -168,6 +225,7 @@ impl State {
             .pool_idle_timeout(Duration::from_secs(90))
             .build()
             .context("failed to build upstream HTTP client")?;
+        let openai_trace = OpenAITrace::from_env()?;
 
         Ok(Self {
             listen: cfg.listen,
@@ -178,6 +236,7 @@ impl State {
             verbose: cfg.verbose,
             client,
             certs: Mutex::new(HashMap::new()),
+            openai_trace,
         })
     }
 
@@ -217,6 +276,74 @@ impl State {
         url.set_scheme(scheme)
             .map_err(|_| anyhow::anyhow!("failed to set Gateway WebSocket scheme"))?;
         Ok(url)
+    }
+
+    fn trace_openai_request(&self, event: &str, direction: &str, request: &IncomingRequest) {
+        let Some(trace) = &self.openai_trace else {
+            return;
+        };
+        let mut headers = Map::new();
+        for (name, value) in &request.headers {
+            let name = name.to_ascii_lowercase();
+            let value = if matches!(
+                name.as_str(),
+                "authorization" | "proxy-authorization" | "cookie"
+            ) {
+                "<redacted>".to_string()
+            } else {
+                value.clone()
+            };
+            headers.insert(name, Value::String(value));
+        }
+        trace.write(json!({
+            "event": event,
+            "direction": direction,
+            "method": request.method,
+            "path": request.target,
+            "headers": headers,
+            "body": String::from_utf8_lossy(&request.body),
+        }));
+    }
+
+    fn trace_openai_frame(&self, direction: &str, message: &Message) {
+        let Some(trace) = &self.openai_trace else {
+            return;
+        };
+        let (kind, body) = match message {
+            Message::Text(text) => ("text", Value::String(text.to_string())),
+            Message::Binary(bytes) => (
+                "binary",
+                json!({
+                    "bytes": bytes.len(),
+                    "sha256": format!("{:x}", Sha256::digest(bytes)),
+                }),
+            ),
+            Message::Ping(bytes) => (
+                "ping",
+                json!({
+                    "bytes": bytes.len(),
+                    "sha256": format!("{:x}", Sha256::digest(bytes)),
+                }),
+            ),
+            Message::Pong(bytes) => (
+                "pong",
+                json!({
+                    "bytes": bytes.len(),
+                    "sha256": format!("{:x}", Sha256::digest(bytes)),
+                }),
+            ),
+            Message::Close(frame) => (
+                "close",
+                json!(frame.as_ref().map(|value| value.reason.to_string())),
+            ),
+            Message::Frame(_) => ("frame", Value::Null),
+        };
+        trace.write(json!({
+            "event": "frame",
+            "direction": direction,
+            "kind": kind,
+            "body": body,
+        }));
     }
 
     fn lock_cert_cache(&self) -> MutexGuard<'_, HashMap<String, Arc<ServerConfig>>> {
@@ -430,6 +557,15 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                 }
             }
         } else if host == OPENAI_HOST {
+            state.trace_openai_request(
+                if is_websocket_upgrade(&request) {
+                    "handshake"
+                } else {
+                    "request"
+                },
+                "to_gateway",
+                &request,
+            );
             if is_websocket_upgrade(&request) {
                 let client_stream = reader.into_inner();
                 return serve_openai_websocket(state, client_stream, request).await;
@@ -556,6 +692,7 @@ async fn serve_openai_websocket(
                 match client_message {
                     Some(Ok(message)) => {
                         let is_close = message.is_close();
+                        state.trace_openai_frame("to_gateway", &message);
                         upstream_sink.send(message).await.context("failed to forward Codex WebSocket frame to Gateway")?;
                         if is_close { return Ok(()); }
                     }
@@ -567,6 +704,7 @@ async fn serve_openai_websocket(
                 match upstream_message {
                     Some(Ok(message)) => {
                         let is_close = message.is_close();
+                        state.trace_openai_frame("from_gateway", &message);
                         client_sink.send(message).await.context("failed to forward Gateway WebSocket frame to Codex")?;
                         if is_close { return Ok(()); }
                     }
