@@ -79,16 +79,16 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
 本地 HTTP 代理和 `CODEX_CA_CERTIFICATE`。
 
 启动前会先完成只读预检，然后备份并清理主 `config.toml` 及 profile 配置中的
-`base_url`、`model_providers` 和 Responses WebSocket 开关，将根 provider 设置为
+第三方 `base_url`、`model_providers` 覆盖，将根 provider 设置为
 内置 `openai`。`auth.json` 的 `auth_mode = "chatgpt"` 和 OAuth `tokens` 原样保留；
 第一阶段把 `OPENAI_API_KEY` 置为空值，API-key-only 登录会被拒绝。所有备份都写在
 原目录下，命名为 `.bak-<timestamp>`。
 
-本地代理对 `api.openai.com:443` 终止 TLS 后，仅将 `/v1/responses` 和 `/v1/models`
-请求转发到 Gateway。Codex 原始方法、路径、query、JSON body、User-Agent、
-`originator`、session/thread/request id 等头保持不变；只有代理发往 Gateway 时的
-`Authorization` 使用 SAIAI Key。第一阶段显式关闭 HTTP Responses WebSocket，避免
-绕过已验证的 HTTP 请求路径。代理仍只监听 loopback，用户 shell 和系统环境不变。
+本地代理对 `api.openai.com:443` 终止 TLS 后，将 `/v1/responses` 和 `/v1/models`
+的 HTTP 与 WebSocket 请求转发到 Gateway。Codex 原始方法、路径、query、JSON body、
+WebSocket 帧、User-Agent、`originator`、session/thread/request id 等头保持不变；
+只有代理发往 Gateway 时的 `Authorization` 使用 SAIAI Key。代理仍只监听 loopback，
+用户 shell 和系统环境不变。
 
 ## 更新短路径
 

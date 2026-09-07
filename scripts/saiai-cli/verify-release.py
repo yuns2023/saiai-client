@@ -45,7 +45,7 @@ def verify_cli() -> None:
     cargo = text("tools/saiai-cli/Cargo.toml")
     require('version = "1.1.7"' in cargo, "CLI version is not 1.1.7")
     require("saiai-core" not in cargo, "local-proxy client still links the V2 runtime core")
-    for dependency in ("reqwest", "tokio", "rustls", "rcgen", "zeroize", "libc"):
+    for dependency in ("reqwest", "tokio", "tokio-tungstenite", "rustls", "rcgen", "zeroize", "libc"):
         require(dependency in cargo, f"local-proxy dependency is missing: {dependency}")
 
     main = text("tools/saiai-cli/src/main.rs")
@@ -105,6 +105,7 @@ def verify_cli() -> None:
     require("piproxy-ca.key" not in proxy, "local proxy still embeds the historical shared CA key")
     require('const OPENAI_HOST: &str = "api.openai.com"' in proxy, "Codex OpenAI MITM route is missing")
     require("replace_authorization" in proxy, "Codex Gateway authorization boundary is missing")
+    require("serve_openai_websocket" in proxy, "Codex WebSocket bridge is missing")
     windows_runtime = text("scripts/saiai-cli/test-windows-runtime.ps1")
     for required in (
         "TEST_ONLY_WINDOWS_REPLACEMENT_KEY",

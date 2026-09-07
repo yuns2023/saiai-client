@@ -727,18 +727,19 @@ fn clean_codex_oauth_document(document: &mut DocumentMut) {
     // the whole table after backup, as requested by the managed mode.
     document.as_table_mut().remove("model_providers");
 
-    // Codex 0.153.x may attempt a Responses WebSocket by default. The first
-    // local-proxy phase is HTTP-only; keep both feature switches explicit so a
-    // future Codex default cannot silently bypass the tested HTTP path.
+    // Let the built-in OpenAI provider keep its official Responses transport
+    // defaults. The local proxy supports both HTTP fallback and WebSocket.
     if !document.get("features").is_some_and(Item::is_table) {
-        document.as_table_mut().remove("features");
-        document["features"] = Item::Table(Table::new());
+        return;
     }
     let features = document["features"]
         .as_table_mut()
         .expect("features table created above");
-    features.insert("responses_websockets", value(false));
-    features.insert("responses_websockets_v2", value(false));
+    features.remove("responses_websockets");
+    features.remove("responses_websockets_v2");
+    if features.is_empty() {
+        document.as_table_mut().remove("features");
+    }
 }
 
 fn ensure_local_proxy_running(listen: &str) -> Result<()> {
@@ -4510,14 +4511,8 @@ base_url = "https://third-party.example/v1"
         }
         assert!(doc.get("model_providers").is_none());
         assert_eq!(doc["features"]["other_flag"].as_bool(), Some(true));
-        assert_eq!(
-            doc["features"]["responses_websockets"].as_bool(),
-            Some(false)
-        );
-        assert_eq!(
-            doc["features"]["responses_websockets_v2"].as_bool(),
-            Some(false)
-        );
+        assert!(doc["features"].get("responses_websockets").is_none());
+        assert!(doc["features"].get("responses_websockets_v2").is_none());
     }
 
     #[test]

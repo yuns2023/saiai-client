@@ -97,9 +97,9 @@ saiai codex -- app-server --stdio
 token。备份文件使用同目录的 `.bak-<timestamp>` 后缀。
 
 第一阶段只接受 `auth_mode = "chatgpt"` 且存在 OAuth access token 的登录状态；
-`OPENAI_API_KEY` 不参与认证。代理转发 Codex 的 Responses HTTP 请求时保留原始
-路径、请求体和客户端标识头，只在发往 SAIAI Gateway 的边界替换 Gateway 认证。
-Responses WebSocket 在第一阶段显式关闭，待 HTTP 请求形状验证完成后再单独支持。
+`OPENAI_API_KEY` 不参与认证。代理转发 Codex 的 Responses HTTP/WebSocket 请求时
+保留原始路径、请求体、帧和客户端标识头，只在发往 SAIAI Gateway 的边界替换
+Gateway 认证。
 
 旧的 API-key 初始化命令暂时保持兼容：
 

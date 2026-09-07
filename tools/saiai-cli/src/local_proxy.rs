@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use reqwest::{Client, Method, StatusCode};
 use rustls::ServerConfig;
@@ -15,6 +15,13 @@ use tokio::io::{
 use tokio::net::{TcpListener, TcpStream, lookup_host};
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::{HeaderName, HeaderValue};
+use tokio_tungstenite::tungstenite::protocol::Role;
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -197,6 +204,19 @@ impl State {
     fn upstream_url(&self, target: &str) -> Result<String> {
         let path_query = path_query_from_target(target)?;
         Ok(format!("{}{}", self.base_url, path_query))
+    }
+
+    fn websocket_upstream_url(&self, target: &str) -> Result<Url> {
+        let mut url = Url::parse(&self.upstream_url(target)?)
+            .context("failed to parse Gateway WebSocket URL")?;
+        let scheme = match url.scheme() {
+            "http" => "ws",
+            "https" => "wss",
+            scheme => bail!("unsupported Gateway WebSocket scheme {scheme}"),
+        };
+        url.set_scheme(scheme)
+            .map_err(|_| anyhow::anyhow!("failed to set Gateway WebSocket scheme"))?;
+        Ok(url)
     }
 
     fn lock_cert_cache(&self) -> MutexGuard<'_, HashMap<String, Arc<ServerConfig>>> {
@@ -410,6 +430,10 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                 }
             }
         } else if host == OPENAI_HOST {
+            if is_websocket_upgrade(&request) {
+                let client_stream = reader.into_inner();
+                return serve_openai_websocket(state, client_stream, request).await;
+            }
             let path = request_path(&request.target)?;
             if is_forwarded_openai_path(&path) {
                 // Codex's OAuth request shape is preserved; only the Gateway
@@ -435,6 +459,121 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
 
         if close_after {
             return Ok(());
+        }
+    }
+}
+
+async fn serve_openai_websocket(
+    state: Arc<State>,
+    mut client_stream: TlsStream<TcpStream>,
+    request: IncomingRequest,
+) -> Result<()> {
+    let sec_key = header_value(&request.headers, "sec-websocket-key")
+        .context("OpenAI WebSocket request did not include Sec-WebSocket-Key")?;
+    let upstream_url = state.websocket_upstream_url(&request.target)?;
+    let mut upstream_request = upstream_url
+        .as_str()
+        .into_client_request()
+        .context("failed to build Gateway WebSocket request")?;
+
+    // Preserve Codex's WebSocket handshake and client metadata while changing
+    // only the destination and the Gateway credential. The generated request
+    // key is replaced with Codex's key so the client-facing accept value is
+    // derived from the exact incoming handshake.
+    let upstream_headers = upstream_request.headers_mut();
+    for (name, value) in &request.headers {
+        if is_websocket_handshake_header(name)
+            || (should_forward_request_header(name) && !name.eq_ignore_ascii_case("authorization"))
+        {
+            let header_name = HeaderName::from_bytes(name.as_bytes())
+                .with_context(|| format!("invalid WebSocket header name {name:?}"))?;
+            let header_value = HeaderValue::from_str(value)
+                .with_context(|| format!("invalid WebSocket header value for {name:?}"))?;
+            upstream_headers.insert(header_name, header_value);
+        }
+    }
+    upstream_headers.insert(
+        HeaderName::from_static("authorization"),
+        HeaderValue::from_str(&format!("Bearer {}", *state.api_key))
+            .context("failed to build Gateway WebSocket authorization")?,
+    );
+    upstream_headers.insert(
+        HeaderName::from_static("host"),
+        HeaderValue::from_str(upstream_url.authority())
+            .context("invalid Gateway WebSocket host")?,
+    );
+
+    let (upstream_ws, upstream_response) = match connect_async(upstream_request).await {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = write_plain_error(&mut client_stream, StatusCode::BAD_GATEWAY).await;
+            return Err(error).context("failed to establish Gateway WebSocket");
+        }
+    };
+    if upstream_response.status().as_u16() != 101 {
+        let _ = write_plain_error(&mut client_stream, StatusCode::BAD_GATEWAY).await;
+        bail!(
+            "Gateway WebSocket handshake returned {}",
+            upstream_response.status()
+        );
+    }
+
+    let accept_key = tungstenite::handshake::derive_accept_key(sec_key.as_bytes());
+    let negotiated_headers = ["sec-websocket-protocol", "sec-websocket-extensions"]
+        .into_iter()
+        .filter_map(|name| {
+            upstream_response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| {
+                    let display = if name == "sec-websocket-protocol" {
+                        "Sec-WebSocket-Protocol"
+                    } else {
+                        "Sec-WebSocket-Extensions"
+                    };
+                    format!("{display}: {value}\r\n")
+                })
+        })
+        .collect::<String>();
+    client_stream
+        .write_all(
+            format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key}\r\n{negotiated_headers}\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .context("failed to acknowledge Codex WebSocket")?;
+
+    let client_ws = WebSocketStream::from_raw_socket(client_stream, Role::Server, None).await;
+    let (mut client_sink, mut client_source) = client_ws.split();
+    let (mut upstream_sink, mut upstream_source) = upstream_ws.split();
+
+    loop {
+        tokio::select! {
+            client_message = client_source.next() => {
+                match client_message {
+                    Some(Ok(message)) => {
+                        let is_close = message.is_close();
+                        upstream_sink.send(message).await.context("failed to forward Codex WebSocket frame to Gateway")?;
+                        if is_close { return Ok(()); }
+                    }
+                    Some(Err(error)) => return Err(error).context("Codex WebSocket read failed"),
+                    None => return Ok(()),
+                }
+            }
+            upstream_message = upstream_source.next() => {
+                match upstream_message {
+                    Some(Ok(message)) => {
+                        let is_close = message.is_close();
+                        client_sink.send(message).await.context("failed to forward Gateway WebSocket frame to Codex")?;
+                        if is_close { return Ok(()); }
+                    }
+                    Some(Err(error)) => return Err(error).context("Gateway WebSocket read failed"),
+                    None => return Ok(()),
+                }
+            }
         }
     }
 }
@@ -904,6 +1043,24 @@ fn is_forwarded_openai_path(path: &str) -> bool {
         || path.starts_with("/v1/models/")
 }
 
+fn is_websocket_upgrade(request: &IncomingRequest) -> bool {
+    header_contains(&request.headers, "upgrade", "websocket")
+        && header_contains(&request.headers, "connection", "upgrade")
+        && header_value(&request.headers, "sec-websocket-key").is_some()
+}
+
+fn is_websocket_handshake_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "upgrade"
+            | "sec-websocket-key"
+            | "sec-websocket-version"
+            | "sec-websocket-extensions"
+            | "sec-websocket-protocol"
+    )
+}
+
 fn should_forward_request_header(name: &str) -> bool {
     !is_hop_by_hop_header(name)
         && !name.eq_ignore_ascii_case("host")
@@ -1154,6 +1311,22 @@ mod tests {
         assert!(is_forwarded_openai_path("/v1/models"));
         assert!(is_forwarded_openai_path("/v1/models/gpt-5.3-codex"));
         assert!(!is_forwarded_openai_path("/backend-api/codex/models"));
+    }
+
+    #[test]
+    fn detects_openai_websocket_handshake() {
+        let request = IncomingRequest {
+            method: "GET".to_string(),
+            target: "/v1/responses".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: vec![
+                ("Connection".to_string(), "Upgrade".to_string()),
+                ("Upgrade".to_string(), "websocket".to_string()),
+                ("Sec-WebSocket-Key".to_string(), "key".to_string()),
+            ],
+            body: Vec::new(),
+        };
+        assert!(is_websocket_upgrade(&request));
     }
 
     #[test]
