@@ -78,6 +78,12 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
 （默认 `~/.codex`），不写入第三方 `base_url`，而是在启动的 Codex 子进程中设置
 本地 HTTP 代理和 `CODEX_CA_CERTIFICATE`。
 
+在已安装 Codex、但尚未生成 OAuth `auth.json` 的环境中，`saiai codex` 会在目标
+`CODEX_HOME` 中创建一个仅供本地代理使用的 ChatGPT OAuth 形状占位文件，然后完成
+正常配置迁移。占位 token 不代表 provider 凭证，只有本地代理正在运行且由 Gateway
+替换认证时才有意义；绕过本地代理会失败。该行为让首次启动不要求用户额外执行
+官方登录流程。
+
 启动前会先完成只读预检，然后备份并清理主 `config.toml` 及 profile 配置中的
 第三方 `base_url`、`model_providers` 覆盖，将根 provider 设置为
 内置 `openai`。`auth.json` 的 `auth_mode = "chatgpt"` 和 OAuth `tokens` 原样保留；
@@ -89,6 +95,11 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
 WebSocket 帧、User-Agent、`originator`、session/thread/request id 等头保持不变；
 只有代理发往 Gateway 时的 `Authorization` 使用 SAIAI Key。代理仍只监听 loopback，
 用户 shell 和系统环境不变。
+
+当前 launcher 只覆盖由它直接启动的 Codex CLI 子进程。Codex Desktop 和 VSCode
+扩展不是该子进程，不能因为共享 `CODEX_HOME` 就推断它们已继承代理/CA 环境。
+两者必须分别验证进程启动、OAuth 存储、HTTP(S) proxy、CA 信任和 WebSocket 行为；
+在独立 capture 通过前，不对外声明 Desktop/VSCode Codex 已兼容。
 
 ## 更新短路径
 

@@ -566,6 +566,7 @@ fn init_codex(args: InitArgs) -> Result<()> {
 fn run_codex(args: &[String]) -> Result<()> {
     let codex_dir = codex_config_dir().context("failed to resolve Codex config directory")?;
     let auth_path = codex_dir.join("auth.json");
+    ensure_codex_local_proxy_auth(&auth_path)?;
     validate_codex_oauth_auth(&auth_path)?;
     let cfg = read_saiai_config()
         .context("SAIAI local proxy is not configured; run the SAIAI Claude setup first")?;
@@ -617,6 +618,33 @@ fn run_codex(args: &[String]) -> Result<()> {
     } else {
         bail!("codex exited with {status}")
     }
+}
+
+fn ensure_codex_local_proxy_auth(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+
+    let placeholder = serde_json::json!({
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "access_token": "saiai-local-proxy-placeholder-access",
+            "refresh_token": "saiai-local-proxy-placeholder-refresh",
+            "account_id": "saiai-local-proxy-placeholder-account"
+        },
+        "OPENAI_API_KEY": null
+    });
+    write_json_object(path, placeholder).with_context(|| {
+        format!(
+            "failed to create local-proxy OAuth auth file {}; the placeholder is only safe when the local proxy is active",
+            path.display()
+        )
+    })?;
+    println!(
+        "Created local-proxy OAuth auth placeholder at {} (no provider login required).",
+        path.display()
+    );
+    Ok(())
 }
 
 fn validate_codex_oauth_auth(path: &Path) -> Result<()> {
