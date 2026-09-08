@@ -88,6 +88,9 @@ OAuth/local-proxy 模式（第一阶段）使用：
 ```bash
 saiai codex
 saiai codex -- app-server --stdio
+saiai desktop
+# alias:
+saiai chatgpt
 ```
 
 该命令只在 Codex 子进程中设置 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和
@@ -103,6 +106,14 @@ token。备份文件使用同目录的 `.bak-<timestamp>` 后缀。
 `OPENAI_API_KEY` 不参与认证。代理转发 Codex 的 Responses HTTP/WebSocket 请求时
 保留原始路径、请求体、帧和客户端标识头，只在发往 SAIAI Gateway 的边界替换
 Gateway 认证。
+
+`saiai desktop` 使用现有 ChatGPT OAuth `auth.json` 的副本启动隔离的 Desktop
+`CODEX_HOME`，不会修改原始 Codex 目录。Linux 下还会在 SAIAI 管理目录创建独立
+NSS 数据库并导入本地 CA，避免修改系统信任库；首次使用需要系统已有
+`certutil`（`libnss3-tools`）。Desktop 的 OAuth/CA/代理环境由 launcher 注入，
+不会写入系统环境变量。隔离的 Desktop 全局状态会预置“已完成首次项目引导”，
+因此不会每次启动都要求选择职业/个性化设置；这只影响 SAIAI 管理的 Desktop
+profile，不会改写原始 Codex 配置。
 
 旧的 API-key 初始化命令暂时保持兼容：
 

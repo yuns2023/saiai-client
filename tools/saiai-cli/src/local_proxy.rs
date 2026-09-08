@@ -569,7 +569,36 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
             );
             let is_chatgpt = host == CHATGPT_HOST;
             if is_chatgpt {
-                request.target = normalize_chatgpt_gateway_target(&request.target)?;
+                match normalize_chatgpt_gateway_target(&request.target) {
+                    Ok(target) => request.target = target,
+                    Err(_) => {
+                        if let Some(resp) = chatgpt_sidecar_response(&request) {
+                            if state.verbose {
+                                eprintln!(
+                                    "chatgpt sidecar response method={} target={} status={} reason={} close_after={}",
+                                    request.method,
+                                    request.target,
+                                    resp.status,
+                                    resp.reason,
+                                    close_after
+                                );
+                            }
+                            write_static_response(
+                                reader.get_mut(),
+                                resp.status,
+                                resp.content_type,
+                                resp.body,
+                                close_after,
+                            )
+                            .await?;
+                            if close_after {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        return normalize_chatgpt_gateway_target(&request.target).map(|_| ());
+                    }
+                }
             }
             if is_websocket_upgrade(&request) {
                 let client_stream = reader.into_inner();
@@ -1209,6 +1238,42 @@ fn normalize_chatgpt_gateway_target(target: &str) -> Result<String> {
     })
 }
 
+fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse> {
+    let path = request_path(&request.target).ok()?;
+    match path.as_str() {
+        "/ces/v1/rgstr" => Some(StaticResponse {
+            status: StatusCode::NO_CONTENT,
+            content_type: "text/plain",
+            body: b"",
+            reason: "desktop_telemetry_noop",
+        }),
+        "/backend-api/plugins/featured" => Some(StaticResponse {
+            status: StatusCode::OK,
+            content_type: "application/json",
+            body: br#"{"plugins":[]}"#,
+            reason: "desktop_plugins_empty",
+        }),
+        _ if path.starts_with("/backend-api/wham/")
+            || path.starts_with("/backend-api/")
+            || path.starts_with("/wham/")
+            || path.starts_with("/accounts/")
+            || path == "/me"
+            || path.starts_with("/settings/")
+            || path.starts_with("/beacons/")
+            || path == "/settings/user"
+            || path == "/automations" =>
+        {
+            Some(StaticResponse {
+                status: StatusCode::OK,
+                content_type: "application/json",
+                body: br#"{}"#,
+                reason: "desktop_account_sidecar_empty",
+            })
+        }
+        _ => None,
+    }
+}
+
 fn is_managed_host(host: &str) -> bool {
     host == ANTHROPIC_HOST || host == OPENAI_HOST || host == CHATGPT_HOST
 }
@@ -1495,6 +1560,27 @@ mod tests {
         );
         assert!(normalize_chatgpt_gateway_target("/backend-api/conversations").is_err());
         assert!(is_managed_host(CHATGPT_HOST));
+    }
+
+    #[test]
+    fn serves_desktop_non_model_sidecars_locally() {
+        let request = IncomingRequest {
+            method: "GET".to_string(),
+            target: "/backend-api/wham/accounts/check".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let response = chatgpt_sidecar_response(&request).expect("desktop sidecar response");
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, br#"{}"#);
+
+        let telemetry = IncomingRequest {
+            target: "/ces/v1/rgstr".to_string(),
+            ..request
+        };
+        let response = chatgpt_sidecar_response(&telemetry).expect("telemetry sidecar response");
+        assert_eq!(response.status, StatusCode::NO_CONTENT);
     }
 
     #[test]

@@ -42,6 +42,8 @@ Usage:
   saiai init <base_url> <api_key>                                 # initialize Claude Code
   saiai init-codex <base_url> <api_key> [--websockets]            # initialize Codex CLI
   saiai codex [-- <codex arguments>]                              # launch Codex through SAIAI local proxy
+  saiai desktop [-- <ChatGPT arguments>]                         # launch ChatGPT Desktop through SAIAI
+  saiai chatgpt [-- <ChatGPT arguments>]                         # alias for desktop
   saiai init       --base-url <base_url> --api-key <api_key>      # initialize Claude Code
   saiai init-codex --base-url <base_url> --api-key <api_key> [--websockets]";
 
@@ -204,6 +206,7 @@ fn main() -> Result<()> {
         Command::Init(init) => init_claude(init),
         Command::InitCodex(init) => init_codex(init),
         Command::Codex(args) => run_codex(&args),
+        Command::Desktop(args) => run_desktop(&args),
         #[cfg(target_os = "linux")]
         Command::RunLinuxBackgroundProxy => run_linux_background_proxy_worker(),
         #[cfg(target_os = "windows")]
@@ -228,6 +231,7 @@ enum Command {
     Init(InitArgs),
     InitCodex(InitArgs),
     Codex(Vec<String>),
+    Desktop(Vec<String>),
     #[cfg(target_os = "linux")]
     RunLinuxBackgroundProxy,
     #[cfg(target_os = "windows")]
@@ -286,6 +290,13 @@ fn parse_command(args: &[String]) -> Result<Command> {
                 codex_args.remove(0);
             }
             return Ok(Command::Codex(codex_args));
+        }
+        "desktop" | "chatgpt" => {
+            let mut desktop_args = args[1..].to_vec();
+            if desktop_args.first().is_some_and(|arg| arg == "--") {
+                desktop_args.remove(0);
+            }
+            return Ok(Command::Desktop(desktop_args));
         }
         #[cfg(target_os = "linux")]
         SAIAI_LINUX_BACKGROUND_COMMAND => {
@@ -692,6 +703,207 @@ fn ensure_codex_local_proxy_auth(path: &Path) -> Result<()> {
         path.display()
     );
     Ok(())
+}
+
+fn run_desktop(args: &[String]) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        return run_linux_desktop(args);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = args;
+        bail!("SAIAI Desktop integration is currently implemented for Linux only");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_desktop(args: &[String]) -> Result<()> {
+    let cfg = read_saiai_config().context("SAIAI local proxy is not configured")?;
+    let _runtime_ca = read_runtime_ca(&cfg)
+        .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
+    ensure_local_proxy_running(&cfg.listen)?;
+
+    let source_codex = codex_config_dir()?;
+    let desktop_root = saiai_config_dir()?.join("desktop");
+    let desktop_home = desktop_root.join("home");
+    let desktop_codex = desktop_root.join("codex");
+    let desktop_user_data = desktop_root.join("user-data");
+    fs::create_dir_all(&desktop_codex)
+        .with_context(|| format!("failed to create {}", desktop_codex.display()))?;
+    fs::create_dir_all(&desktop_user_data)
+        .with_context(|| format!("failed to create {}", desktop_user_data.display()))?;
+    ensure_desktop_oauth_auth(
+        &source_codex.join("auth.json"),
+        &desktop_codex.join("auth.json"),
+    )?;
+    validate_codex_oauth_auth(&desktop_codex.join("auth.json"))?;
+    prepare_desktop_onboarding_state(&desktop_codex)?;
+    ensure_desktop_nss_ca(&desktop_home, &cfg.ca_cert_path)?;
+
+    let executable = env::var_os("SAIAI_CHATGPT_BIN")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            ["/usr/bin/chatgpt", "/usr/lib/chatgpt/ChatGPT"]
+                .iter()
+                .map(PathBuf::from)
+                .find(|path| path.is_file())
+        })
+        .context("ChatGPT Desktop was not found; install the ChatGPT Desktop package first")?;
+
+    let mut launch_args = vec![format!("--user-data-dir={}", desktop_user_data.display())];
+    launch_args.extend(args.iter().cloned());
+    let proxy = format!("http://{}", cfg.listen);
+    let mut command = ProcessCommand::new(&executable);
+    command.args(launch_args);
+    for name in CODEX_MANAGED_ENV {
+        command.env_remove(*name);
+    }
+    command
+        .env("HOME", &desktop_home)
+        .env("USERPROFILE", &desktop_home)
+        .env("CODEX_HOME", &desktop_codex)
+        .env("CODEX_ELECTRON_USER_DATA_PATH", &desktop_user_data)
+        .env("CODEX_CA_CERTIFICATE", &cfg.ca_cert_path)
+        .env("NSS_DEFAULT_DB_TYPE", "sql")
+        .env("HTTP_PROXY", &proxy)
+        .env("HTTPS_PROXY", &proxy)
+        .env("ALL_PROXY", &proxy)
+        .env("NO_PROXY", CODEX_LOCAL_PROXY_NO_PROXY)
+        .env("http_proxy", &proxy)
+        .env("https_proxy", &proxy)
+        .env("all_proxy", &proxy)
+        .env("no_proxy", CODEX_LOCAL_PROXY_NO_PROXY);
+
+    println!("Starting ChatGPT Desktop through the SAIAI local proxy.");
+    println!("  CODEX_HOME={}", desktop_codex.display());
+    println!("  user-data-dir={}", desktop_user_data.display());
+    println!("  proxy={proxy}");
+    let status = command
+        .status()
+        .with_context(|| format!("failed to start {}", executable.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("ChatGPT Desktop exited with {status}")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_desktop_oauth_auth(source: &Path, target: &Path) -> Result<()> {
+    if target.exists() {
+        let existing = load_json_object(target).ok();
+        let placeholder = existing
+            .as_ref()
+            .and_then(|auth| auth.get("tokens"))
+            .and_then(Value::as_object)
+            .and_then(|tokens| tokens.get("access_token"))
+            .and_then(Value::as_str)
+            .is_some_and(|token| token.starts_with("saiai-local-proxy-placeholder-"));
+        if !placeholder {
+            return Ok(());
+        }
+    }
+    if !source.exists() {
+        bail!(
+            "Desktop login requires an existing ChatGPT OAuth auth.json at {}; run the official Codex login once, then retry",
+            source.display()
+        );
+    }
+    validate_codex_oauth_auth(source)?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::copy(source, target).with_context(|| {
+        format!(
+            "failed to copy OAuth auth.json from {} to {}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(target, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to protect {}", target.display()))?;
+    println!("Copied existing ChatGPT OAuth state into the isolated Desktop CODEX_HOME.");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_desktop_nss_ca(home: &Path, ca_cert: &str) -> Result<()> {
+    let db_dir = home.join(".pki/nssdb");
+    fs::create_dir_all(&db_dir)
+        .with_context(|| format!("failed to create {}", db_dir.display()))?;
+    let db = format!("sql:{}", db_dir.display());
+    let cert_db = db_dir.join("cert9.db");
+    if !cert_db.exists() {
+        let status = ProcessCommand::new("certutil")
+            .args(["-N", "-d", &db, "--empty-password"])
+            .status()
+            .context("failed to initialize the Desktop NSS database")?;
+        if !status.success() {
+            bail!("certutil failed to initialize the Desktop NSS database");
+        }
+    }
+    let _ = ProcessCommand::new("certutil")
+        .args(["-D", "-d", &db, "-n", "saiai-local-proxy"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let status = ProcessCommand::new("certutil")
+        .args([
+            "-A",
+            "-d",
+            &db,
+            "-n",
+            "saiai-local-proxy",
+            "-t",
+            "C,,",
+            "-a",
+            "-i",
+            ca_cert,
+        ])
+        .status()
+        .context("failed to import the SAIAI CA into the Desktop NSS database")?;
+    if !status.success() {
+        bail!("certutil failed to import the SAIAI CA into the Desktop NSS database");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_desktop_onboarding_state(codex_home: &Path) -> Result<()> {
+    let path = codex_home.join(".codex-global-state.json");
+    let mut root = if path.exists() {
+        Value::Object(load_json_object(&path)?)
+    } else {
+        Value::Object(Map::new())
+    };
+    let object = root
+        .as_object_mut()
+        .context("Desktop global state must contain a JSON object")?;
+    let atom_state = object
+        .entry("electron-persisted-atom-state".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let atom_state = atom_state
+        .as_object_mut()
+        .context("Desktop persisted atom state must contain a JSON object")?;
+    atom_state.insert(
+        "electron:onboarding-projectless-completed".to_string(),
+        Value::Bool(true),
+    );
+    atom_state.insert(
+        "electron:onboarding-hide-first-new-thread-promos".to_string(),
+        Value::Bool(true),
+    );
+    write_json_object(&path, root).with_context(|| {
+        format!(
+            "failed to prepare Desktop onboarding state {}",
+            path.display()
+        )
+    })
 }
 
 fn validate_codex_oauth_auth(path: &Path) -> Result<()> {
@@ -4697,6 +4909,19 @@ base_url = "https://third-party.example/v1"
                 vec!["app-server".to_string(), "--stdio".to_string()]
             ),
             _ => panic!("expected codex launcher command"),
+        }
+    }
+
+    #[test]
+    fn parses_desktop_launcher_aliases_without_consuming_arguments() {
+        for command in ["desktop", "chatgpt"] {
+            let args = vec![command.to_string(), "--".to_string(), "--help".to_string()];
+            match parse_command(&args).unwrap() {
+                Command::Desktop(desktop_args) => {
+                    assert_eq!(desktop_args, vec!["--help".to_string()]);
+                }
+                _ => panic!("expected Desktop launcher command"),
+            }
         }
     }
 

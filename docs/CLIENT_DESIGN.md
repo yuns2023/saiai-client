@@ -106,8 +106,16 @@ Desktop/app-server 是否信任代理 CA 仍需独立验证，不能仅凭 CLI �
 
 当前 launcher 只覆盖由它直接启动的 Codex CLI 子进程。Codex Desktop 和 VSCode
 扩展不是该子进程，不能因为共享 `CODEX_HOME` 就推断它们已继承代理/CA 环境。
-两者必须分别验证进程启动、OAuth 存储、HTTP(S) proxy、CA 信任和 WebSocket 行为；
-在独立 capture 通过前，不对外声明 Desktop/VSCode Codex 已兼容。
+Linux Desktop 现在有独立的 `saiai desktop`（`saiai chatgpt` 别名）启动路径：
+它复制现有 OAuth `auth.json` 到 SAIAI 管理的隔离 `CODEX_HOME`，为 Electron/NSS
+创建独立 CA 数据库，并向 Desktop 与 app-server 注入本地代理变量。它不修改
+`/home/*/.codex*` 原目录或系统信任库。没有现有 OAuth `auth.json` 时，Desktop
+launcher 会明确报错；CLI 的本地代理占位 OAuth 不等价于 Desktop 的已登录状态。
+launcher 同时在隔离的 `.codex-global-state.json` 中标记首次项目引导已完成，
+跳过启动时的职业/个性化问卷；原始用户状态不受影响。
+
+VSCode 扩展仍必须分别验证进程启动、OAuth 存储、HTTP(S) proxy、CA 信任和
+WebSocket 行为；在独立 capture 通过前，不对外声明 VSCode Codex 已兼容。
 
 ## 更新短路径
 
