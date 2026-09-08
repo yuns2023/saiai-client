@@ -96,6 +96,12 @@ WebSocket 帧、User-Agent、`originator`、session/thread/request id 等头保�
 只有代理发往 Gateway 时的 `Authorization` 使用 SAIAI Key。代理仍只监听 loopback，
 用户 shell 和系统环境不变。
 
+Desktop 可能使用 `chatgpt.com/backend-api/codex/*` 而不是
+`api.openai.com/v1/*`。代理现在识别这类 managed host，并将 Responses/models
+路径映射到 Gateway 的 `/v1/*` ingress；业务 body 和客户端身份 header 仍保持。
+Desktop/app-server 是否信任代理 CA 仍需独立验证，不能仅凭 CLI 的
+`CODEX_CA_CERTIFICATE` child 环境变量推断。
+
 当前 launcher 只覆盖由它直接启动的 Codex CLI 子进程。Codex Desktop 和 VSCode
 扩展不是该子进程，不能因为共享 `CODEX_HOME` 就推断它们已继承代理/CA 环境。
 两者必须分别验证进程启动、OAuth 存储、HTTP(S) proxy、CA 信任和 WebSocket 行为；

@@ -33,6 +33,7 @@ use zeroize::Zeroizing;
 
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
 const OPENAI_HOST: &str = "api.openai.com";
+const CHATGPT_HOST: &str = "chatgpt.com";
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HEADER_LINE: usize = 32 * 1024;
 const MAX_HEADER_BYTES: usize = 256 * 1024;
@@ -410,7 +411,7 @@ async fn handle_client(
     };
 
     let mut stream = reader.into_inner();
-    if (connect.host == ANTHROPIC_HOST || connect.host == OPENAI_HOST) && connect.port == 443 {
+    if is_managed_host(&connect.host) && connect.port == 443 {
         stream
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await
@@ -499,7 +500,7 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
     let mut handled_requests = 0usize;
 
     loop {
-        let request = match read_http_request(&mut reader).await {
+        let mut request = match read_http_request(&mut reader).await {
             Ok(request) => request,
             Err(err) => {
                 if handled_requests > 0 && is_idle_http_connection_end(&err) {
@@ -556,7 +557,7 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                     forward_to_saiai(&state, reader.get_mut(), request, close_after, false).await?;
                 }
             }
-        } else if host == OPENAI_HOST {
+        } else if host == OPENAI_HOST || host == CHATGPT_HOST {
             state.trace_openai_request(
                 if is_websocket_upgrade(&request) {
                     "handshake"
@@ -566,6 +567,10 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                 "to_gateway",
                 &request,
             );
+            let is_chatgpt = host == CHATGPT_HOST;
+            if is_chatgpt {
+                request.target = normalize_chatgpt_gateway_target(&request.target)?;
+            }
             if is_websocket_upgrade(&request) {
                 let client_stream = reader.into_inner();
                 return serve_openai_websocket(state, client_stream, request).await;
@@ -1184,6 +1189,30 @@ fn is_forwarded_openai_path(path: &str) -> bool {
         || path.starts_with("/v1/models/")
 }
 
+fn normalize_chatgpt_gateway_target(target: &str) -> Result<String> {
+    let path = request_path(target)?;
+    let normalized = if path == "/backend-api/codex/responses" {
+        "/v1/responses"
+    } else if path.starts_with("/backend-api/codex/responses/") {
+        return Ok(target.replacen("/backend-api/codex/responses", "/v1/responses", 1));
+    } else if path == "/backend-api/codex/models" {
+        "/v1/models"
+    } else if path.starts_with("/backend-api/codex/models/") {
+        return Ok(target.replacen("/backend-api/codex/models", "/v1/models", 1));
+    } else {
+        bail!("unsupported ChatGPT Codex path: {path}");
+    };
+    let query = target.split_once('?').map(|(_, value)| value);
+    Ok(match query {
+        Some(value) if !value.is_empty() => format!("{normalized}?{value}"),
+        _ => normalized.to_string(),
+    })
+}
+
+fn is_managed_host(host: &str) -> bool {
+    host == ANTHROPIC_HOST || host == OPENAI_HOST || host == CHATGPT_HOST
+}
+
 fn is_websocket_upgrade(request: &IncomingRequest) -> bool {
     header_contains(&request.headers, "upgrade", "websocket")
         && header_contains(&request.headers, "connection", "upgrade")
@@ -1232,7 +1261,7 @@ fn is_hop_by_hop_header(name: &str) -> bool {
 }
 
 async fn connect_direct_target(host: &str, port: u16) -> Result<TcpStream> {
-    if (host == ANTHROPIC_HOST || host == OPENAI_HOST) && port == 443 {
+    if is_managed_host(host) && port == 443 {
         bail!("managed host must use local MITM route");
     }
     let addrs = lookup_host((host, port))
@@ -1452,6 +1481,20 @@ mod tests {
         assert!(is_forwarded_openai_path("/v1/models"));
         assert!(is_forwarded_openai_path("/v1/models/gpt-5.3-codex"));
         assert!(!is_forwarded_openai_path("/backend-api/codex/models"));
+    }
+
+    #[test]
+    fn normalizes_chatgpt_codex_targets_for_gateway() {
+        assert_eq!(
+            normalize_chatgpt_gateway_target("/backend-api/codex/responses?stream=true").unwrap(),
+            "/v1/responses?stream=true"
+        );
+        assert_eq!(
+            normalize_chatgpt_gateway_target("/backend-api/codex/models/gpt-5").unwrap(),
+            "/v1/models/gpt-5"
+        );
+        assert!(normalize_chatgpt_gateway_target("/backend-api/conversations").is_err());
+        assert!(is_managed_host(CHATGPT_HOST));
     }
 
     #[test]
