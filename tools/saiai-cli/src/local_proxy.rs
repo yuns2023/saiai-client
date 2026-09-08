@@ -572,6 +572,28 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                 match normalize_chatgpt_gateway_target(&request.target) {
                     Ok(target) => request.target = target,
                     Err(_) => {
+                        if let Some((status, body, reason)) =
+                            chatgpt_account_sidecar_response(&request)
+                        {
+                            if state.verbose {
+                                eprintln!(
+                                    "chatgpt account sidecar response method={} target={} status={} reason={} close_after={}",
+                                    request.method, request.target, status, reason, close_after
+                                );
+                            }
+                            write_static_response(
+                                reader.get_mut(),
+                                status,
+                                "application/json",
+                                &body,
+                                close_after,
+                            )
+                            .await?;
+                            if close_after {
+                                return Ok(());
+                            }
+                            continue;
+                        }
                         if let Some(resp) = chatgpt_sidecar_response(&request) {
                             if state.verbose {
                                 eprintln!(
@@ -1253,6 +1275,12 @@ fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse>
             body: br#"{"plugins":[]}"#,
             reason: "desktop_plugins_empty",
         }),
+        _ if path.starts_with("/backend-api/ps/plugins/") => Some(StaticResponse {
+            status: StatusCode::OK,
+            content_type: "application/json",
+            body: br#"{"plugins":[]}"#,
+            reason: "desktop_plugins_empty",
+        }),
         _ if path.starts_with("/backend-api/wham/")
             || path.starts_with("/backend-api/")
             || path.starts_with("/wham/")
@@ -1272,6 +1300,34 @@ fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse>
         }
         _ => None,
     }
+}
+
+fn chatgpt_account_sidecar_response(
+    request: &IncomingRequest,
+) -> Option<(StatusCode, Vec<u8>, &'static str)> {
+    let path = request_path(&request.target).ok()?;
+    let account_id =
+        header_value(&request.headers, "chatgpt-account-id").unwrap_or("fixture-chatgpt-account");
+    let response = match path.as_str() {
+        "/backend-api/accounts/optimized/check" => json!({
+            "account_ordering": [account_id],
+            "accounts": [{"id": account_id, "plan_type": "plus"}]
+        }),
+        "/backend-api/me" => json!({
+            "id": account_id,
+            "account_id": account_id,
+            "email": "staging@example.invalid"
+        }),
+        _ if path.starts_with("/backend-api/accounts/") && path.ends_with("/settings") => {
+            json!({"account_id": account_id, "settings": {}})
+        }
+        _ => return None,
+    };
+    Some((
+        StatusCode::OK,
+        serde_json::to_vec(&response).ok()?,
+        "desktop_account_identity",
+    ))
 }
 
 fn is_managed_host(host: &str) -> bool {
