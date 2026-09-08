@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use reqwest::{Client, Method, StatusCode};
@@ -1272,13 +1273,13 @@ fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse>
         "/backend-api/plugins/featured" => Some(StaticResponse {
             status: StatusCode::OK,
             content_type: "application/json",
-            body: br#"{"plugins":[]}"#,
+            body: br#"{"plugins":[],"pagination":{"total":0,"limit":200,"offset":0}}"#,
             reason: "desktop_plugins_empty",
         }),
         _ if path.starts_with("/backend-api/ps/plugins/") => Some(StaticResponse {
             status: StatusCode::OK,
             content_type: "application/json",
-            body: br#"{"plugins":[]}"#,
+            body: br#"{"plugins":[],"pagination":{"total":0,"limit":200,"offset":0}}"#,
             reason: "desktop_plugins_empty",
         }),
         _ if path.starts_with("/backend-api/wham/")
@@ -1306,10 +1307,13 @@ fn chatgpt_account_sidecar_response(
     request: &IncomingRequest,
 ) -> Option<(StatusCode, Vec<u8>, &'static str)> {
     let path = request_path(&request.target).ok()?;
-    let account_id =
-        header_value(&request.headers, "chatgpt-account-id").unwrap_or("fixture-chatgpt-account");
+    let account_id = header_value(&request.headers, "chatgpt-account-id")
+        .map(str::to_owned)
+        .or_else(|| oauth_claim_account_id(&request.headers))
+        .or_else(desktop_account_id_fallback)
+        .unwrap_or_else(|| "fixture-chatgpt-account".to_string());
     let response = match path.as_str() {
-        "/backend-api/accounts/optimized/check" => json!({
+        "/backend-api/accounts/optimized/check" | "/backend-api/wham/accounts/check" => json!({
             "account_ordering": [account_id],
             "accounts": [{"id": account_id, "plan_type": "plus"}]
         }),
@@ -1328,6 +1332,34 @@ fn chatgpt_account_sidecar_response(
         serde_json::to_vec(&response).ok()?,
         "desktop_account_identity",
     ))
+}
+
+fn oauth_claim_account_id(headers: &[(String, String)]) -> Option<String> {
+    let authorization = header_value(headers, "authorization")?;
+    let token = authorization.strip_prefix("Bearer ")?.trim();
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    claims
+        .get("https://api.openai.com/auth")
+        .and_then(Value::as_object)
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(Value::as_str)
+        .or_else(|| claims.get("chatgpt_account_id").and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
+fn desktop_account_id_fallback() -> Option<String> {
+    let root = env::var_os("SAIAI_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".saiai"))
+        })?;
+    let value = fs::read_to_string(root.join("desktop/account-id")).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn is_managed_host(host: &str) -> bool {

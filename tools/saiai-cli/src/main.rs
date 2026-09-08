@@ -739,6 +739,7 @@ fn run_linux_desktop(args: &[String]) -> Result<()> {
         &desktop_codex.join("auth.json"),
     )?;
     validate_codex_oauth_auth(&desktop_codex.join("auth.json"))?;
+    write_desktop_account_id(&desktop_codex.join("auth.json"), &desktop_root)?;
     prepare_desktop_onboarding_state(&desktop_codex)?;
     ensure_desktop_nss_ca(&desktop_home, &cfg.ca_cert_path)?;
 
@@ -901,6 +902,25 @@ fn prepare_desktop_onboarding_state(codex_home: &Path) -> Result<()> {
     write_json_object(&path, root).with_context(|| {
         format!(
             "failed to prepare Desktop onboarding state {}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn write_desktop_account_id(auth_path: &Path, desktop_root: &Path) -> Result<()> {
+    let auth = load_json_object(auth_path)?;
+    let account_id = auth
+        .get("tokens")
+        .and_then(Value::as_object)
+        .and_then(|tokens| tokens.get("account_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("Desktop OAuth auth.json has no account_id")?;
+    let path = desktop_root.join("account-id");
+    write_bytes_atomic(&path, account_id.as_bytes(), 0o600).with_context(|| {
+        format!(
+            "failed to write Desktop account identity {}",
             path.display()
         )
     })
