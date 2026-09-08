@@ -618,6 +618,12 @@ async fn serve_openai_websocket(
     // derived from the exact incoming handshake.
     let upstream_headers = upstream_request.headers_mut();
     for (name, value) in &request.headers {
+        if name.eq_ignore_ascii_case("sec-websocket-extensions") {
+            // The Rust upstream relay does not enable a compression codec.
+            // Do not negotiate permessage-deflate on that leg; otherwise the
+            // upstream can send RSV1 frames that the relay cannot decode.
+            continue;
+        }
         if is_websocket_handshake_header(name)
             || (should_forward_request_header(name) && !name.eq_ignore_ascii_case("authorization"))
         {
@@ -655,21 +661,18 @@ async fn serve_openai_websocket(
     }
 
     let accept_key = tungstenite::handshake::derive_accept_key(sec_key.as_bytes());
-    let negotiated_headers = ["sec-websocket-protocol", "sec-websocket-extensions"]
+    // The client-facing side uses a raw WebSocket stream without an extension
+    // codec. Do not accept permessage-deflate back to Codex; otherwise Codex
+    // may send frames with RSV1 set and the raw client-side relay rejects them
+    // as compressed.
+    let negotiated_headers = ["sec-websocket-protocol"]
         .into_iter()
         .filter_map(|name| {
             upstream_response
                 .headers()
                 .get(name)
                 .and_then(|value| value.to_str().ok())
-                .map(|value| {
-                    let display = if name == "sec-websocket-protocol" {
-                        "Sec-WebSocket-Protocol"
-                    } else {
-                        "Sec-WebSocket-Extensions"
-                    };
-                    format!("{display}: {value}\r\n")
-                })
+                .map(|value| format!("Sec-WebSocket-Protocol: {value}\r\n"))
         })
         .collect::<String>();
     client_stream
