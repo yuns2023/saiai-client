@@ -76,7 +76,9 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
 旧的 `init-codex <base_url> <api_key> [--websockets]` 继续保留兼容。新的
 `saiai codex [-- <codex arguments>]` 是收敛方向：它遵守生效的 `CODEX_HOME`
 （默认 `~/.codex`），不写入第三方 `base_url`，而是在启动的 Codex 子进程中设置
-本地 HTTP 代理和 `CODEX_CA_CERTIFICATE`。
+本地 HTTP 代理和 `CODEX_CA_CERTIFICATE`。当前 Codex 0.153.x 把读取系统代理放在
+`features.respect_system_proxy` 后面，因此 launcher 同时注入等价的子进程命令行
+覆盖；该开关不持久化到 `config.toml`，用户显式传入同名覆盖时保持用户参数。
 
 在已安装 Codex、但尚未生成 OAuth `auth.json` 的环境中，`saiai codex` 会在目标
 `CODEX_HOME` 中创建一个仅供本地代理使用的 ChatGPT OAuth 形状占位文件，然后完成

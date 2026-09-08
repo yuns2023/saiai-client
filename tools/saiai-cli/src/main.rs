@@ -577,7 +577,12 @@ fn run_codex(args: &[String]) -> Result<()> {
 
     let proxy = format!("http://{}", cfg.listen);
     let mut command = ProcessCommand::new("codex");
-    command.args(args).env("CODEX_HOME", &codex_dir);
+    // Codex 0.153.x keeps system-proxy support behind the
+    // `respect_system_proxy` feature. The local-proxy launcher owns the
+    // proxy variables only in this child process, so enable the feature here
+    // instead of writing another routing/base_url setting to config.toml.
+    command.args(codex_launcher_args(args));
+    command.env("CODEX_HOME", &codex_dir);
     command.env("CODEX_CA_CERTIFICATE", &cfg.ca_cert_path);
     command
         .env("HTTP_PROXY", &proxy)
@@ -618,6 +623,48 @@ fn run_codex(args: &[String]) -> Result<()> {
     } else {
         bail!("codex exited with {status}")
     }
+}
+
+fn codex_launcher_args(args: &[String]) -> Vec<String> {
+    if codex_args_override_system_proxy(args) {
+        return args.to_vec();
+    }
+
+    let mut launch_args = Vec::with_capacity(args.len() + 2);
+    launch_args.push("-c".to_string());
+    launch_args.push("features.respect_system_proxy=true".to_string());
+    launch_args.extend(args.iter().cloned());
+    launch_args
+}
+
+fn codex_args_override_system_proxy(args: &[String]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let value = if arg == "-c" || arg == "--config" || arg == "--enable" || arg == "--disable" {
+            i += 1;
+            args.get(i).map(String::as_str)
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            Some(value)
+        } else if let Some(value) = arg.strip_prefix("--enable=") {
+            Some(value)
+        } else if let Some(value) = arg.strip_prefix("--disable=") {
+            Some(value)
+        } else {
+            None
+        };
+
+        if value.is_some_and(|value| {
+            value
+                .trim_start()
+                .starts_with("features.respect_system_proxy")
+                || value.trim() == "respect_system_proxy"
+        }) {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 fn ensure_codex_local_proxy_auth(path: &Path) -> Result<()> {
@@ -4650,6 +4697,34 @@ base_url = "https://third-party.example/v1"
                 vec!["app-server".to_string(), "--stdio".to_string()]
             ),
             _ => panic!("expected codex launcher command"),
+        }
+    }
+
+    #[test]
+    fn codex_launcher_enables_child_only_system_proxy_support() {
+        let args = vec!["exec".to_string(), "probe".to_string()];
+        assert_eq!(
+            codex_launcher_args(&args),
+            vec![
+                "-c".to_string(),
+                "features.respect_system_proxy=true".to_string(),
+                "exec".to_string(),
+                "probe".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_launcher_preserves_explicit_system_proxy_override() {
+        for args in [
+            vec![
+                "-c".to_string(),
+                "features.respect_system_proxy=false".to_string(),
+            ],
+            vec!["--enable=respect_system_proxy".to_string()],
+            vec!["--disable".to_string(), "respect_system_proxy".to_string()],
+        ] {
+            assert_eq!(codex_launcher_args(&args), args);
         }
     }
 

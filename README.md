@@ -91,12 +91,15 @@ saiai codex -- app-server --stdio
 ```
 
 该命令只在 Codex 子进程中设置 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和
-`CODEX_CA_CERTIFICATE`，不会修改用户 shell 或系统环境变量。启动前会备份并清理
+`CODEX_CA_CERTIFICATE`，并通过子进程参数启用 Codex 的
+`features.respect_system_proxy`；不会修改用户 shell、系统环境变量或把这个开关写入
+`config.toml`。启动前会备份并清理
 生效 `CODEX_HOME` 中的第三方 `base_url`、`model_providers` 和 WebSocket 开关，
 将根 provider 恢复为官方内置 `openai`，并保留 `auth.json` 中的 ChatGPT OAuth
 token。备份文件使用同目录的 `.bak-<timestamp>` 后缀。
 
-第一阶段只接受 `auth_mode = "chatgpt"` 且存在 OAuth access token 的登录状态；
+第一阶段只接受 `auth_mode = "chatgpt"` 且存在 access-token 形状的状态；若用户从未
+登录，launcher 会创建只对本地代理有意义的占位状态，Gateway 仍是实际认证边界。
 `OPENAI_API_KEY` 不参与认证。代理转发 Codex 的 Responses HTTP/WebSocket 请求时
 保留原始路径、请求体、帧和客户端标识头，只在发往 SAIAI Gateway 的边界替换
 Gateway 认证。
