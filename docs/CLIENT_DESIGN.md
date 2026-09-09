@@ -85,6 +85,10 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
 正常配置迁移。占位 token 不代表 provider 凭证，只有本地代理正在运行且由 Gateway
 替换认证时才有意义；绕过本地代理会失败。该行为让首次启动不要求用户额外执行
 官方登录流程。
+占位状态包含一个无签名、固定 SAIAI 虚拟声明的 ID token，使 VSCode app-server 的
+`account/read` 能返回本地登录态；它不能通过 OpenAI 签名校验，也不能在绕过本地代理
+时作为 provider 凭证。`last_refresh` 使用当前时间，避免客户端把这个占位状态当成
+需要主动刷新真实 OAuth token 的旧登录。
 
 启动前会先完成只读预检，然后备份并清理主 `config.toml` 及 profile 配置中的
 第三方 `base_url`、`model_providers` 覆盖，将根 provider 设置为
@@ -114,8 +118,20 @@ launcher 会明确报错；CLI 的本地代理占位 OAuth 不等价于 Desktop 
 launcher 同时在隔离的 `.codex-global-state.json` 中标记首次项目引导已完成，
 跳过启动时的职业/个性化问卷；原始用户状态不受影响。
 
-VSCode 扩展仍必须分别验证进程启动、OAuth 存储、HTTP(S) proxy、CA 信任和
-WebSocket 行为；在独立 capture 通过前，不对外声明 VSCode Codex 已兼容。
+VSCode 使用一次性的 `saiai vscode` 配置入口，之后用户仍正常启动 VSCode 和官方
+Codex 扩展。该命令复用 CLI 的 OAuth 占位、第三方 provider/base URL 清理和备份
+逻辑，在 `CODEX_HOME/.env` 中写入 loopback HTTP(S) proxy、`NO_PROXY` 和
+`SSL_CERT_FILE`，并在 Codex 配置中持久启用 `features.respect_system_proxy`；它不
+修改 shell 或系统环境变量，也不写第三方 `base_url`。官方扩展的 Codex app-server
+会读取 `.env` 中的标准代理和 `SSL_CERT_FILE`。实测 Codex 0.153.4 从 `.env` 读取
+代理和 `SSL_CERT_FILE` 后，HTTP 与 WebSocket 均到达隔离本地代理；仅把
+`CODEX_CA_CERTIFICATE` 写入 `.env` 则不足以建立信任，因此 IDE 路径固定使用标准
+TLS 变量，CLI 子进程路径继续使用 `CODEX_CA_CERTIFICATE`。显式 VSCode
+`http.proxy` 可能覆盖扩展子进程的代理变量，命令输出会提示移除冲突设置。
+
+当前验证覆盖 Linux 官方扩展/app-server 的进程、OAuth 文件、HTTP(S) proxy、CA
+信任和 WebSocket 握手路径；真正发布前仍需在 Windows/macOS runner 上验证对应
+路径与用户服务生命周期。
 
 ## 更新短路径
 

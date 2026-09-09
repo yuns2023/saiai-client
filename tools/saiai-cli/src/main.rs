@@ -42,6 +42,7 @@ Usage:
   saiai init <base_url> <api_key>                                 # initialize Claude Code
   saiai init-codex <base_url> <api_key> [--websockets]            # initialize Codex CLI
   saiai codex [-- <codex arguments>]                              # launch Codex through SAIAI local proxy
+  saiai vscode                                                    # configure the Codex VSCode extension for SAIAI
   saiai desktop [-- <ChatGPT arguments>]                         # launch ChatGPT Desktop through SAIAI
   saiai chatgpt [-- <ChatGPT arguments>]                         # alias for desktop
   saiai init       --base-url <base_url> --api-key <api_key>      # initialize Claude Code
@@ -65,6 +66,7 @@ const CODEX_MANAGED_ENV: &[&str] = &[
     "OPENAI_API_BASE",
     "CODEX_ACCESS_TOKEN",
     "CODEX_CA_CERTIFICATE",
+    "SSL_CERT_FILE",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "ALL_PROXY",
@@ -75,6 +77,15 @@ const CODEX_MANAGED_ENV: &[&str] = &[
     "no_proxy",
 ];
 const CODEX_LOCAL_PROXY_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local";
+const CODEX_IDE_ENV_BEGIN: &str = "# BEGIN SAIAI CODEX IDE (managed)";
+const CODEX_IDE_ENV_END: &str = "# END SAIAI CODEX IDE (managed)";
+const CODEX_PLACEHOLDER_ACCESS_TOKEN: &str = "saiai-local-proxy-placeholder-access";
+const CODEX_PLACEHOLDER_REFRESH_TOKEN: &str = "saiai-local-proxy-placeholder-refresh";
+const CODEX_PLACEHOLDER_ACCOUNT_ID: &str = "saiai-local-proxy-placeholder-account";
+// Structurally valid but unsigned and therefore unusable against OpenAI. The
+// local proxy replaces request authentication at the Gateway boundary; these
+// claims only let Codex's local app-server expose an authenticated UI state.
+const CODEX_PLACEHOLDER_ID_TOKEN: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InNhaWFpLWxvY2FsLXByb3h5QGludmFsaWQiLCJleHAiOjQxMDI0NDQ4MDAsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3BsYW5fdHlwZSI6InBsdXMiLCJjaGF0Z3B0X3VzZXJfaWQiOiJzYWlhaS1sb2NhbC1wcm94eS11c2VyIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoic2FpYWktbG9jYWwtcHJveHktYWNjb3VudCJ9fQ.c2FpYWktbG9jYWwtcHJveHk";
 
 // Remove stale routing, authentication, model, proxy, and CA values before
 // installing the exact local-proxy environment. Unrelated user settings are
@@ -206,6 +217,7 @@ fn main() -> Result<()> {
         Command::Init(init) => init_claude(init),
         Command::InitCodex(init) => init_codex(init),
         Command::Codex(args) => run_codex(&args),
+        Command::VSCode => configure_vscode(),
         Command::Desktop(args) => run_desktop(&args),
         #[cfg(target_os = "linux")]
         Command::RunLinuxBackgroundProxy => run_linux_background_proxy_worker(),
@@ -231,6 +243,7 @@ enum Command {
     Init(InitArgs),
     InitCodex(InitArgs),
     Codex(Vec<String>),
+    VSCode,
     Desktop(Vec<String>),
     #[cfg(target_os = "linux")]
     RunLinuxBackgroundProxy,
@@ -291,6 +304,7 @@ fn parse_command(args: &[String]) -> Result<Command> {
             }
             return Ok(Command::Codex(codex_args));
         }
+        "vscode" => return parse_no_arg_command("vscode", &args[1..], Command::VSCode),
         "desktop" | "chatgpt" => {
             let mut desktop_args = args[1..].to_vec();
             if desktop_args.first().is_some_and(|arg| arg == "--") {
@@ -584,7 +598,7 @@ fn run_codex(args: &[String]) -> Result<()> {
     let _runtime_ca = read_runtime_ca(&cfg)
         .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
     ensure_local_proxy_running(&cfg.listen)?;
-    let files = prepare_codex_oauth_files(&codex_dir)?;
+    let files = prepare_codex_oauth_files(&codex_dir, false)?;
 
     let proxy = format!("http://{}", cfg.listen);
     let mut command = ProcessCommand::new("codex");
@@ -636,6 +650,132 @@ fn run_codex(args: &[String]) -> Result<()> {
     }
 }
 
+/// Configure Codex's application-local environment for the official VSCode
+/// extension. Unlike `saiai codex`, the extension is not our direct child, so
+/// the proxy variables must live in Codex's own `.env` file. This never
+/// changes the invoking shell or the operating-system environment.
+fn configure_vscode() -> Result<()> {
+    let codex_dir = codex_config_dir().context("failed to resolve Codex config directory")?;
+    fs::create_dir_all(&codex_dir)
+        .with_context(|| format!("failed to create {}", codex_dir.display()))?;
+    let auth_path = codex_dir.join("auth.json");
+    ensure_codex_local_proxy_auth(&auth_path)?;
+    validate_codex_oauth_auth(&auth_path)?;
+
+    let cfg = read_saiai_config()
+        .context("SAIAI local proxy is not configured; run the SAIAI setup first")?;
+    let _runtime_ca = read_runtime_ca(&cfg)
+        .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
+
+    let files = prepare_codex_oauth_files(&codex_dir, true)?;
+    let env_path = codex_dir.join(".env");
+    write_codex_ide_env(&env_path, &cfg.listen, &cfg.ca_cert_path)?;
+    ensure_local_proxy_running(&cfg.listen)?;
+
+    println!("SAIAI configured the Codex VSCode extension for local proxy mode.");
+    println!("  CODEX_HOME={}", codex_dir.display());
+    println!("  environment={}", env_path.display());
+    println!("  proxy=http://{}", cfg.listen);
+    println!(
+        "  migrated {} Codex config file(s) with backups",
+        files.len()
+    );
+    println!("Restart VSCode (or reload its window) before starting a new Codex session.");
+    println!(
+        "If VSCode has an explicit `http.proxy`, remove it when it overrides the SAIAI proxy."
+    );
+    Ok(())
+}
+
+fn write_codex_ide_env(path: &Path, listen: &str, ca_cert_path: &str) -> Result<()> {
+    let raw = if path.exists() {
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?
+    } else {
+        String::new()
+    };
+    let merged = merge_codex_ide_env(&raw, listen, ca_cert_path);
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S%.9f").to_string();
+    backup_if_exists(path, &timestamp)?;
+    write_bytes_atomic(path, merged.as_bytes(), 0o600)
+}
+
+fn merge_codex_ide_env(raw: &str, listen: &str, ca_cert_path: &str) -> String {
+    let mut kept = Vec::new();
+    let mut in_managed_block = false;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed == CODEX_IDE_ENV_BEGIN {
+            in_managed_block = true;
+            continue;
+        }
+        if trimmed == CODEX_IDE_ENV_END {
+            in_managed_block = false;
+            continue;
+        }
+        if in_managed_block || dotenv_assignment_key(line).is_some_and(is_managed_codex_env) {
+            continue;
+        }
+        kept.push(line);
+    }
+    while kept.last().is_some_and(|line| line.trim().is_empty()) {
+        kept.pop();
+    }
+
+    let proxy = format!("http://{listen}");
+    if !kept.is_empty() {
+        kept.push("");
+    }
+    kept.push(CODEX_IDE_ENV_BEGIN);
+    let mut output = kept.join("\n");
+    for (key, value) in [
+        // Codex loads standard TLS variables from CODEX_HOME/.env before it
+        // constructs the IDE/app-server HTTP clients. Its Codex-specific CA
+        // variable is only reliable when present in the process environment,
+        // which is why the direct CLI launcher still uses that variable.
+        ("SSL_CERT_FILE", ca_cert_path),
+        ("HTTP_PROXY", proxy.as_str()),
+        ("HTTPS_PROXY", proxy.as_str()),
+        ("ALL_PROXY", proxy.as_str()),
+        ("NO_PROXY", CODEX_LOCAL_PROXY_NO_PROXY),
+        ("http_proxy", proxy.as_str()),
+        ("https_proxy", proxy.as_str()),
+        ("all_proxy", proxy.as_str()),
+        ("no_proxy", CODEX_LOCAL_PROXY_NO_PROXY),
+    ] {
+        output.push('\n');
+        output.push_str(key);
+        output.push('=');
+        output.push_str(&serde_json::to_string(value).expect("string serialization cannot fail"));
+    }
+    output.push('\n');
+    output.push_str(CODEX_IDE_ENV_END);
+    output.push('\n');
+    output
+}
+
+fn dotenv_assignment_key(line: &str) -> Option<&str> {
+    let mut assignment = line.trim_start();
+    if let Some(rest) = assignment.strip_prefix("export ") {
+        assignment = rest.trim_start();
+    }
+    let (key, _) = assignment.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|character| character == '_' || character.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some(key)
+}
+
+fn is_managed_codex_env(key: &str) -> bool {
+    CODEX_MANAGED_ENV
+        .iter()
+        .any(|candidate| key.eq_ignore_ascii_case(candidate))
+}
+
 fn codex_launcher_args(args: &[String]) -> Vec<String> {
     if codex_args_override_system_proxy(args) {
         return args.to_vec();
@@ -659,10 +799,8 @@ fn codex_args_override_system_proxy(args: &[String]) -> bool {
             Some(value)
         } else if let Some(value) = arg.strip_prefix("--enable=") {
             Some(value)
-        } else if let Some(value) = arg.strip_prefix("--disable=") {
-            Some(value)
         } else {
-            None
+            arg.strip_prefix("--disable=")
         };
 
         if value.is_some_and(|value| {
@@ -679,27 +817,51 @@ fn codex_args_override_system_proxy(args: &[String]) -> bool {
 }
 
 fn ensure_codex_local_proxy_auth(path: &Path) -> Result<()> {
-    if path.exists() {
-        return Ok(());
+    let existed = path.exists();
+    let mut auth = if existed {
+        load_json_object(path)?
+    } else {
+        Map::new()
+    };
+    if existed {
+        let existing_access = auth
+            .get("tokens")
+            .and_then(Value::as_object)
+            .and_then(|tokens| tokens.get("access_token"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !existing_access.starts_with("saiai-local-proxy-placeholder-") {
+            return Ok(());
+        }
     }
 
-    let placeholder = serde_json::json!({
-        "auth_mode": "chatgpt",
-        "tokens": {
-            "access_token": "saiai-local-proxy-placeholder-access",
-            "refresh_token": "saiai-local-proxy-placeholder-refresh",
-            "account_id": "saiai-local-proxy-placeholder-account"
-        },
-        "OPENAI_API_KEY": null
-    });
-    write_json_object(path, placeholder).with_context(|| {
+    auth.insert(
+        "auth_mode".to_string(),
+        Value::String("chatgpt".to_string()),
+    );
+    auth.insert(
+        "tokens".to_string(),
+        serde_json::json!({
+            "id_token": CODEX_PLACEHOLDER_ID_TOKEN,
+            "access_token": CODEX_PLACEHOLDER_ACCESS_TOKEN,
+            "refresh_token": CODEX_PLACEHOLDER_REFRESH_TOKEN,
+            "account_id": CODEX_PLACEHOLDER_ACCOUNT_ID
+        }),
+    );
+    auth.insert("OPENAI_API_KEY".to_string(), Value::Null);
+    auth.insert(
+        "last_refresh".to_string(),
+        Value::String(Utc::now().to_rfc3339()),
+    );
+    write_json_object(path, Value::Object(auth)).with_context(|| {
         format!(
             "failed to create local-proxy OAuth auth file {}; the placeholder is only safe when the local proxy is active",
             path.display()
         )
     })?;
+    let verb = if existed { "Updated" } else { "Created" };
     println!(
-        "Created local-proxy OAuth auth placeholder at {} (no provider login required).",
+        "{verb} local-proxy OAuth auth placeholder at {} (no provider login required).",
         path.display()
     );
     Ok(())
@@ -708,7 +870,7 @@ fn ensure_codex_local_proxy_auth(path: &Path) -> Result<()> {
 fn run_desktop(args: &[String]) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        return run_linux_desktop(args);
+        run_linux_desktop(args)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -951,7 +1113,7 @@ fn validate_codex_oauth_auth(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn prepare_codex_oauth_files(codex_dir: &Path) -> Result<Vec<PathBuf>> {
+fn prepare_codex_oauth_files(codex_dir: &Path, persist_system_proxy: bool) -> Result<Vec<PathBuf>> {
     let config_path = codex_dir.join("config.toml");
     let auth_path = codex_dir.join("auth.json");
     let mut documents = Vec::new();
@@ -1012,6 +1174,9 @@ fn prepare_codex_oauth_files(codex_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut written = Vec::with_capacity(documents.len());
     for (path, mut document) in documents {
         clean_codex_oauth_document(&mut document);
+        if persist_system_proxy {
+            enable_codex_system_proxy(&mut document, &path)?;
+        }
         write_bytes_atomic(path.as_path(), document.to_string().as_bytes(), 0o600)?;
         written.push(path);
     }
@@ -1022,6 +1187,22 @@ fn prepare_codex_oauth_files(codex_dir: &Path) -> Result<Vec<PathBuf>> {
     auth.insert("OPENAI_API_KEY".to_string(), Value::Null);
     write_json_object(&auth_path, Value::Object(auth))?;
     Ok(written)
+}
+
+fn enable_codex_system_proxy(document: &mut DocumentMut, path: &Path) -> Result<()> {
+    match document.get("features") {
+        None => document["features"] = Item::Table(Table::new()),
+        Some(item) if item.is_table() => {}
+        Some(_) => bail!(
+            "{} has a `features` entry that is not a table; refusing to overwrite (backup is preserved)",
+            path.display()
+        ),
+    }
+    document["features"]
+        .as_table_mut()
+        .expect("features ensured to be a table")
+        .insert("respect_system_proxy", value(true));
+    Ok(())
 }
 
 fn clean_codex_oauth_document(document: &mut DocumentMut) {
@@ -4823,6 +5004,66 @@ base_url = "https://third-party.example/v1"
     }
 
     #[test]
+    fn enables_persistent_system_proxy_for_codex_ide() {
+        let mut doc = r#"
+model_provider = "third_party"
+
+[features]
+other_flag = true
+responses_websockets_v2 = true
+
+[model_providers.third_party]
+base_url = "https://third-party.example/v1"
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+        let path = Path::new("config.toml");
+
+        clean_codex_oauth_document(&mut doc);
+        enable_codex_system_proxy(&mut doc, path).unwrap();
+
+        assert_eq!(doc["model_provider"].as_str(), Some("openai"));
+        assert!(doc.get("model_providers").is_none());
+        assert_eq!(doc["features"]["other_flag"].as_bool(), Some(true));
+        assert_eq!(
+            doc["features"]["respect_system_proxy"].as_bool(),
+            Some(true)
+        );
+        assert!(doc["features"].get("responses_websockets_v2").is_none());
+    }
+
+    #[test]
+    fn codex_ide_env_replaces_conflicts_and_preserves_unrelated_values() {
+        let raw = r#"# user comment
+USER_SETTING=keep-me
+export HTTP_PROXY=https://old-proxy.example
+CUSTOM_BASE_URL=https://unrelated.example/v1
+OPENAI_API_KEY=remove-me
+
+# BEGIN SAIAI CODEX IDE (managed)
+HTTPS_PROXY="http://127.0.0.1:1111"
+# END SAIAI CODEX IDE (managed)
+"#;
+
+        let merged = merge_codex_ide_env(raw, "127.0.0.1:19908", "/tmp/SAIAI CA/saiai-ca.crt");
+
+        assert!(merged.contains("# user comment\nUSER_SETTING=keep-me"));
+        assert!(!merged.contains("old-proxy"));
+        assert!(!merged.contains("remove-me"));
+        assert!(merged.contains("CUSTOM_BASE_URL=https://unrelated.example/v1"));
+        assert_eq!(merged.matches(CODEX_IDE_ENV_BEGIN).count(), 1);
+        assert_eq!(merged.matches(CODEX_IDE_ENV_END).count(), 1);
+        assert!(merged.contains("HTTP_PROXY=\"http://127.0.0.1:19908\""));
+        assert!(merged.contains("http_proxy=\"http://127.0.0.1:19908\""));
+        assert!(merged.contains("SSL_CERT_FILE=\"/tmp/SAIAI CA/saiai-ca.crt\""));
+        assert!(!merged.contains("OPENAI_API_KEY="));
+        assert_eq!(
+            merge_codex_ide_env(&merged, "127.0.0.1:19908", "/tmp/SAIAI CA/saiai-ca.crt",),
+            merged
+        );
+    }
+
+    #[test]
     fn accepts_only_chatgpt_oauth_auth_for_codex_launcher() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("auth.json");
@@ -4834,6 +5075,59 @@ base_url = "https://third-party.example/v1"
 
         write_str(&path, r#"{"OPENAI_API_KEY":"sk-test"}"#);
         assert!(validate_codex_oauth_auth(&path).is_err());
+    }
+
+    #[test]
+    fn creates_and_upgrades_app_server_shaped_codex_placeholder_auth() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        ensure_codex_local_proxy_auth(&path).unwrap();
+
+        let created = load_json_object(&path).unwrap();
+        let created_tokens = created["tokens"].as_object().unwrap();
+        assert_eq!(created["auth_mode"].as_str(), Some("chatgpt"));
+        assert_eq!(created["OPENAI_API_KEY"], Value::Null);
+        assert_eq!(
+            created_tokens["access_token"].as_str(),
+            Some(CODEX_PLACEHOLDER_ACCESS_TOKEN)
+        );
+        assert_eq!(
+            created_tokens["id_token"]
+                .as_str()
+                .unwrap()
+                .split('.')
+                .count(),
+            3
+        );
+        assert!(
+            created["last_refresh"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty())
+        );
+
+        write_str(
+            &path,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"saiai-local-proxy-placeholder-old","refresh_token":"old","account_id":"old"},"unrelated":"keep"}"#,
+        );
+        ensure_codex_local_proxy_auth(&path).unwrap();
+        let upgraded = load_json_object(&path).unwrap();
+        assert_eq!(upgraded["unrelated"].as_str(), Some("keep"));
+        assert_eq!(
+            upgraded["tokens"]["id_token"].as_str(),
+            Some(CODEX_PLACEHOLDER_ID_TOKEN)
+        );
+    }
+
+    #[test]
+    fn preserves_existing_real_codex_oauth_auth() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        let real = r#"{"auth_mode":"chatgpt","tokens":{"id_token":"real.id.token","access_token":"real-access","refresh_token":"real-refresh","account_id":"real-account"},"last_refresh":"2026-09-09T00:00:00Z"}"#;
+        write_str(&path, real);
+
+        ensure_codex_local_proxy_auth(&path).unwrap();
+
+        assert_eq!(read_str(&path), real);
     }
 
     fn json_str<'a>(map: &'a Map<String, Value>, key: &str) -> &'a str {
@@ -4930,6 +5224,15 @@ base_url = "https://third-party.example/v1"
             ),
             _ => panic!("expected codex launcher command"),
         }
+    }
+
+    #[test]
+    fn parses_vscode_configuration_command_without_arguments() {
+        assert!(matches!(
+            parse_command(&["vscode".to_string()]).unwrap(),
+            Command::VSCode
+        ));
+        assert!(parse_command(&["vscode".to_string(), "extra".to_string()]).is_err());
     }
 
     #[test]

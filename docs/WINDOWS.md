@@ -57,7 +57,10 @@ irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai init-codex 'ht
 
 WebSocket 模式在末尾加 `--websockets`。配置写入 `%USERPROFILE%\.codex`，或
 `CODEX_HOME` 指定的目录；旧初始化不会启动 Claude 本地代理。OAuth/local-proxy
-模式使用 `saiai codex`，并只给 Codex 子进程设置代理环境。
+模式使用 `saiai codex`，并只给 Codex 子进程设置代理环境。Codex VSCode 扩展先执行
+一次 `saiai vscode`；该命令只写 Codex 专属 `.env` 和配置文件，不修改 Windows
+系统环境变量。完成后重启 VSCode。Windows 的 VSCode/CA 路径仍须在发布 runner 上
+完成验证后才能作为正式支持声明。
 
 ## 更新与回退
 

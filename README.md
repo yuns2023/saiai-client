@@ -1,7 +1,8 @@
 # SAIAI Client
 
 SAIAI Client `1.1.7` 使用托管本地代理模式。Claude Code 和 VSCode 通过用户
-级 `saiai` 代理访问 Gateway；Codex CLI 通过 `saiai codex` 使用同一用户级代理，
+级 `saiai` 代理访问 Gateway；Codex CLI 通过 `saiai codex`、Codex VSCode 扩展
+通过一次性的 `saiai vscode` 配置使用同一用户级代理，
 旧的 `init-codex` 直接配置方式继续兼容。客户端不创建隔离
 home 或 generation。
 
@@ -88,6 +89,7 @@ OAuth/local-proxy 模式（第一阶段）使用：
 ```bash
 saiai codex
 saiai codex -- app-server --stdio
+saiai vscode
 saiai desktop
 # alias:
 saiai chatgpt
@@ -103,9 +105,24 @@ token。备份文件使用同目录的 `.bak-<timestamp>` 后缀。
 
 第一阶段只接受 `auth_mode = "chatgpt"` 且存在 access-token 形状的状态；若用户从未
 登录，launcher 会创建只对本地代理有意义的占位状态，Gateway 仍是实际认证边界。
+占位状态包含供本地 app-server 展示登录态所需的无签名 ID token 形状，但不能通过
+OpenAI 校验；绕过本地代理时不会成为可用凭证。
 `OPENAI_API_KEY` 不参与认证。代理转发 Codex 的 Responses HTTP/WebSocket 请求时
 保留原始路径、请求体、帧和客户端标识头，只在发往 SAIAI Gateway 的边界替换
 Gateway 认证。
+
+Codex VSCode 扩展不是 `saiai codex` 的子进程，因此首次使用前执行：
+
+```bash
+saiai vscode
+```
+
+该命令备份并清理同一 `CODEX_HOME` 中冲突的 provider/base URL，创建本地代理 OAuth
+占位状态，并在 Codex 专属 `.env` 中写入 loopback 代理、`SSL_CERT_FILE` 和
+`NO_PROXY`；同时仅在 Codex 配置中持久启用 `features.respect_system_proxy`。它不会
+修改 shell 或操作系统环境变量，也不会写入第三方 `base_url`。配置完成后重启
+VSCode（或 reload window），继续正常使用官方 Codex 扩展。若用户显式配置了 VSCode
+的 `http.proxy`，该值可能优先于 Codex `.env`，需要移除冲突值。
 
 `saiai desktop` 使用现有 ChatGPT OAuth `auth.json` 的副本启动隔离的 Desktop
 `CODEX_HOME`，不会修改原始 Codex 目录。Linux 下还会在 SAIAI 管理目录创建独立
