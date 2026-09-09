@@ -1276,6 +1276,12 @@ fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse>
             body: br#"{"plugins":[],"pagination":{"total":0,"limit":200,"offset":0}}"#,
             reason: "desktop_plugins_empty",
         }),
+        "/backend-api/ps/plugins/suggested/codex" => Some(StaticResponse {
+            status: StatusCode::OK,
+            content_type: "application/json",
+            body: br#"{"plugins":[],"enabled":false}"#,
+            reason: "desktop_recommended_plugins_disabled",
+        }),
         _ if path.starts_with("/backend-api/ps/plugins/") => Some(StaticResponse {
             status: StatusCode::OK,
             content_type: "application/json",
@@ -1348,6 +1354,19 @@ fn chatgpt_account_sidecar_response(
             "total": 0,
             "limit": 100,
             "offset": 0
+        }),
+        "/backend-api/wham/profiles/me" | "/wham/profiles/me" => json!({
+            "profile": {
+                "display_name": null,
+                "username": null,
+                "profile_picture_url": null
+            },
+            "stats": {
+                "daily_usage_buckets": null
+            },
+            "metadata": {
+                "stats_error": null
+            }
         }),
         "/backend-api/me" => json!({
             "id": account_id,
@@ -1701,6 +1720,18 @@ mod tests {
         };
         let response = chatgpt_sidecar_response(&telemetry).expect("telemetry sidecar response");
         assert_eq!(response.status, StatusCode::NO_CONTENT);
+
+        let recommended_plugins = IncomingRequest {
+            method: "GET".to_string(),
+            target: "/backend-api/ps/plugins/suggested/codex?scope=GLOBAL".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let response = chatgpt_sidecar_response(&recommended_plugins).unwrap();
+        let body: Value = serde_json::from_slice(response.body).unwrap();
+        assert_eq!(body["plugins"], json!([]));
+        assert_eq!(body["enabled"], false);
     }
 
     #[test]
@@ -1727,6 +1758,19 @@ mod tests {
         let (_, body, _) = chatgpt_account_sidecar_response(&statsig).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["statsigPayload"], "{\"user\":{}}");
+
+        let profile = IncomingRequest {
+            method: "GET".to_string(),
+            target: "/backend-api/wham/profiles/me".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: vec![("ChatGPT-Account-ID".to_string(), "account-test".to_string())],
+            body: Vec::new(),
+        };
+        let (_, body, _) = chatgpt_account_sidecar_response(&profile).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["profile"].is_object());
+        assert!(body["stats"].is_object());
+        assert!(body["metadata"].is_object());
 
         let mcp = IncomingRequest {
             method: "POST".to_string(),
