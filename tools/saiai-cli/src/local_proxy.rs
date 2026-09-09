@@ -1312,10 +1312,42 @@ fn chatgpt_account_sidecar_response(
         .or_else(|| oauth_claim_account_id(&request.headers))
         .or_else(desktop_account_id_fallback)
         .unwrap_or_else(|| "fixture-chatgpt-account".to_string());
+    if path == "/backend-api/ps/mcp" {
+        let request_json: Value = serde_json::from_slice(&request.body).ok()?;
+        let id = request_json.get("id").cloned().unwrap_or(Value::Null);
+        let method = request_json.get("method").and_then(Value::as_str);
+        if id.is_null() || method.is_some_and(|value| value.starts_with("notifications/")) {
+            return Some((StatusCode::ACCEPTED, Vec::new(), "desktop_mcp_notification"));
+        }
+        let result = match method {
+            Some("initialize") => json!({
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "saiai-local", "version": "1"}
+            }),
+            Some("tools/list") => json!({"tools": []}),
+            _ => json!({}),
+        };
+        let response = json!({"jsonrpc": "2.0", "id": id, "result": result});
+        return Some((
+            StatusCode::OK,
+            serde_json::to_vec(&response).ok()?,
+            "desktop_mcp_response",
+        ));
+    }
     let response = match path.as_str() {
         "/backend-api/accounts/optimized/check" | "/backend-api/wham/accounts/check" => json!({
             "account_ordering": [account_id],
             "accounts": [{"id": account_id, "plan_type": "plus"}]
+        }),
+        "/backend-api/wham/statsig/bootstrap" => json!({
+            "statsigPayload": "{\"user\":{}}"
+        }),
+        "/backend-api/conversations" => json!({
+            "items": [],
+            "total": 0,
+            "limit": 100,
+            "offset": 0
         }),
         "/backend-api/me" => json!({
             "id": account_id,
@@ -1669,6 +1701,64 @@ mod tests {
         };
         let response = chatgpt_sidecar_response(&telemetry).expect("telemetry sidecar response");
         assert_eq!(response.status, StatusCode::NO_CONTENT);
+    }
+
+    #[test]
+    fn serves_desktop_control_plane_shapes_locally() {
+        let conversations = IncomingRequest {
+            method: "GET".to_string(),
+            target: "/backend-api/conversations?limit=100&offset=0".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: vec![("ChatGPT-Account-ID".to_string(), "account-test".to_string())],
+            body: Vec::new(),
+        };
+        let (_, body, _) = chatgpt_account_sidecar_response(&conversations).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["items"], json!([]));
+        assert_eq!(body["total"], 0);
+
+        let statsig = IncomingRequest {
+            method: "GET".to_string(),
+            target: "/backend-api/wham/statsig/bootstrap".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: vec![("ChatGPT-Account-ID".to_string(), "account-test".to_string())],
+            body: Vec::new(),
+        };
+        let (_, body, _) = chatgpt_account_sidecar_response(&statsig).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["statsigPayload"], "{\"user\":{}}");
+
+        let mcp = IncomingRequest {
+            method: "POST".to_string(),
+            target: "/backend-api/ps/mcp".to_string(),
+            body: br#"{"jsonrpc":"2.0","id":7,"method":"initialize"}"#.to_vec(),
+            ..conversations
+        };
+        let (_, body, _) = chatgpt_account_sidecar_response(&mcp).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 7);
+        assert_eq!(body["result"]["serverInfo"]["name"], "saiai-local");
+
+        let tools_list = IncomingRequest {
+            method: "POST".to_string(),
+            target: "/backend-api/ps/mcp".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: vec![("ChatGPT-Account-ID".to_string(), "account-test".to_string())],
+            body: br#"{"jsonrpc":"2.0","id":8,"method":"tools/list"}"#.to_vec(),
+        };
+        let (_, body, _) = chatgpt_account_sidecar_response(&tools_list).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["id"], 8);
+        assert_eq!(body["result"]["tools"], json!([]));
+
+        let notification = IncomingRequest {
+            body: br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_vec(),
+            ..mcp
+        };
+        let (status, body, _) = chatgpt_account_sidecar_response(&notification).unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.is_empty());
     }
 
     #[test]
