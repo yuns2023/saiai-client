@@ -67,8 +67,10 @@ $caPath = Join-Path $claudeDir "saiai-ca.crt"
 $caKeyPath = Join-Path $claudeDir "saiai-ca.key"
 $testKey = "TEST_ONLY_WINDOWS_RUNTIME_KEY"
 $replacementKey = "TEST_ONLY_WINDOWS_REPLACEMENT_KEY"
+$codexKey = "TEST_ONLY_WINDOWS_CODEX_PROXY_KEY"
 $savedConfigDir = $env:CLAUDE_CONFIG_DIR
 $savedSaiaiHome = $env:SAIAI_HOME
+$savedCodexHome = $env:CODEX_HOME
 
 try {
     $null = New-Item -ItemType Directory -Path $claudeDir -Force
@@ -116,9 +118,22 @@ try {
     Assert-Saiai ([string]$saiaiConfig.base_url -ceq "https://replacement.example.test") "Repeated setup did not replace the Gateway"
     Assert-Saiai ([string]$saiaiConfig.api_key -ceq $replacementKey) "Repeated setup config Key differs"
 
+    $env:CODEX_HOME = Join-Path $temporary ".codex"
+    $codexOutput = & $binary init-codex "https://codex.example.test/v1" $codexKey 2>&1 | Out-String
+    Assert-Saiai ($LASTEXITCODE -eq 0) "SAIAI Codex initialization failed: $codexOutput"
+    Assert-Saiai (-not $codexOutput.Contains($codexKey)) "Codex initialization output exposed the API key"
+    $codexProxyConfig = Get-Content -LiteralPath (Join-Path $env:SAIAI_HOME "config.json") -Raw | ConvertFrom-Json
+    Assert-Saiai ([string]$codexProxyConfig.base_url -ceq "https://codex.example.test/v1") "Codex initialization did not update the local-proxy Gateway"
+    Assert-Saiai ([string]$codexProxyConfig.api_key -ceq $codexKey) "Codex initialization did not update the local-proxy Key"
+    Assert-Saiai ((Get-FileHash -Algorithm SHA256 -LiteralPath $caPath).Hash -ceq $caHash) "Codex initialization replaced the existing CA"
+    Assert-Saiai ((Get-FileHash -Algorithm SHA256 -LiteralPath $caKeyPath).Hash -ceq $caKeyHash) "Codex initialization replaced the existing CA key"
+    Assert-Saiai (Test-Path -LiteralPath (Join-Path $env:CODEX_HOME "config.toml") -PathType Leaf) "Codex config was not created"
+    Assert-Saiai (Test-Path -LiteralPath (Join-Path $env:CODEX_HOME "auth.json") -PathType Leaf) "Codex auth was not created"
+
     $help = & $binary --help 2>&1 | Out-String
     Assert-Saiai ($LASTEXITCODE -eq 0) "SAIAI help failed: $help"
     Assert-Saiai ($help.Contains("saiai start")) "Local-proxy commands are missing"
+    Assert-Saiai ($help.Contains("saiai codex")) "Codex local-proxy launcher is missing"
     Assert-Saiai (-not $help.Contains($testKey)) "Help exposed the key"
 
     $start = Invoke-SaiaiProcess -Path $binary -Arguments @("start") -CaptureOutput $false
@@ -135,6 +150,7 @@ finally {
     }
     $env:CLAUDE_CONFIG_DIR = $savedConfigDir
     $env:SAIAI_HOME = $savedSaiaiHome
+    $env:CODEX_HOME = $savedCodexHome
     Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
 }
 

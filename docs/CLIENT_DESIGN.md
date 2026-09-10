@@ -80,6 +80,12 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
 `features.respect_system_proxy` 后面，因此 launcher 同时注入等价的子进程命令行
 覆盖；该开关不持久化到 `config.toml`，用户显式传入同名覆盖时保持用户参数。
 
+`init-codex` 在保留旧 `config.toml`/`auth.json` 直连配置的同时，也会在独立的
+`SAIAI_HOME` 中创建本地代理配置和安装 CA，使同一次 WebUI 初始化之后可以直接运行
+`saiai codex`。该兼容初始化不修改 Claude 配置，也不启动代理；launcher 按需启动。
+若已有有效的 SAIAI 代理配置，它复用原 CA、监听地址和普通 Chat 开关，只替换
+Gateway 与 Key，避免破坏已经配置好的 Claude/ChatGPT 代理信任。
+
 在已安装 Codex、但尚未生成 OAuth `auth.json` 的环境中，`saiai codex` 会在目标
 `CODEX_HOME` 中创建一个仅供本地代理使用的 ChatGPT OAuth 形状占位文件，然后完成
 正常配置迁移。占位 token 不代表 provider 凭证，只有本地代理正在运行且由 Gateway

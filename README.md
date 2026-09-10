@@ -156,7 +156,10 @@ saiai init-codex https://api.saiai.top/v1 YOUR_API_KEY --websockets
 ```
 
 该命令合并 `~/.codex/config.toml` 和 `~/.codex/auth.json`，保留不属于 SAIAI
-管理范围的字段。Codex 0.149.0+ 使用自定义 Provider 时会写入
+管理范围的字段；同时在独立的 `SAIAI_HOME` 中创建或更新本地代理配置和安装 CA，
+因此同一次初始化后可以直接运行 `saiai codex`。它不会修改 Claude 配置或自动启动
+代理；`saiai codex` 会在需要时启动代理。已有有效代理 CA、监听地址和普通 Chat
+开关会保留，只替换本次指定的 Gateway 和 Key。Codex 0.149.0+ 使用自定义 Provider 时会写入
 `requires_openai_auth = true`，并将全局默认值设置为 `gpt-5.6-sol`、评审模型
 `gpt-5.4` 和 `model_reasoning_effort = "xhigh"`。执行权限相关的
 `sandbox_mode`、`approval_policy` 和 `dangerously_bypass_approvals_and_sandbox`

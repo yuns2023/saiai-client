@@ -60,6 +60,8 @@ def verify_cli() -> None:
         "saiai init <base_url> <api_key>",
         "saiai init-codex <base_url> <api_key>",
         "saiai codex [-- <codex arguments>]",
+        "initialize_codex_local_proxy",
+        "SAIAI local-proxy configuration is ready; run `saiai codex` for OAuth mode.",
         '"CODEX_CA_CERTIFICATE"',
         '"OPENAI_API_KEY"',
         '"CLAUDE_CODE_OAUTH_TOKEN"',
@@ -111,6 +113,8 @@ def verify_cli() -> None:
         "TEST_ONLY_WINDOWS_REPLACEMENT_KEY",
         "Repeated setup did not replace the API key",
         "Repeated setup replaced a valid CA key",
+        "Codex initialization did not update the local-proxy Gateway",
+        "Codex local-proxy launcher is missing",
         "service active: yes",
     ):
         require(required in windows_runtime, f"Windows repeat smoke is missing {required!r}")

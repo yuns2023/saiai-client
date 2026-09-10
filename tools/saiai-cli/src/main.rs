@@ -571,11 +571,15 @@ fn init_codex(args: InitArgs) -> Result<()> {
 
     merge_codex_config(&config_path, &args.base_url, args.websockets)?;
     merge_codex_auth(&auth_path, &args.api_key)?;
+    let proxy_init = initialize_codex_local_proxy(&args, &timestamp)?;
 
     println!("SAIAI configured Codex CLI for saiai gateway.");
     println!("Updated:");
     println!("  {}", config_path.display());
     println!("  {}", auth_path.display());
+    println!("  {}", proxy_init.config_path.display());
+    println!("  {}", proxy_init.ca_cert_path.display());
+    println!("  {}", proxy_init.ca_key_path.display());
     if args.websockets {
         println!(
             "Default provider set to `OpenAI` pointing at SAIAI (wire_api = responses, websockets enabled)."
@@ -584,9 +588,67 @@ fn init_codex(args: InitArgs) -> Result<()> {
         println!("Default provider set to `OpenAI` pointing at SAIAI (wire_api = responses).");
     }
     println!("Existing TOML keys and JSON auth fields outside our scope were preserved.");
+    println!("SAIAI local-proxy configuration is ready; run `saiai codex` for OAuth mode.");
     warn_claude_settings_overrides();
 
     Ok(())
+}
+
+struct CodexLocalProxyInit {
+    config_path: PathBuf,
+    ca_cert_path: PathBuf,
+    ca_key_path: PathBuf,
+}
+
+fn initialize_codex_local_proxy(args: &InitArgs, timestamp: &str) -> Result<CodexLocalProxyInit> {
+    let config_dir = saiai_config_dir()?;
+    initialize_codex_local_proxy_at(&config_dir, args, timestamp)
+}
+
+fn initialize_codex_local_proxy_at(
+    config_dir: &Path,
+    args: &InitArgs,
+    timestamp: &str,
+) -> Result<CodexLocalProxyInit> {
+    fs::create_dir_all(config_dir)
+        .with_context(|| format!("failed to create {}", config_dir.display()))?;
+    let config_path = config_dir.join(SAIAI_CONFIG_FILENAME);
+
+    if let Ok(raw) = fs::read_to_string(&config_path)
+        && let Ok(mut existing) = serde_json::from_str::<SaiaiConfig>(&raw)
+        && read_runtime_ca(&existing).is_ok()
+    {
+        existing.base_url = args.base_url.clone();
+        existing.api_key = args.api_key.clone();
+        write_saiai_config_at(&config_path, &existing)?;
+        return Ok(CodexLocalProxyInit {
+            config_path,
+            ca_cert_path: PathBuf::from(existing.ca_cert_path),
+            ca_key_path: PathBuf::from(existing.ca_key_path),
+        });
+    }
+
+    backup_if_exists(&config_path, timestamp)?;
+    let ca_cert_path = config_dir.join(SAIAI_CA_FILENAME);
+    let ca_key_path = config_dir.join(SAIAI_CA_KEY_FILENAME);
+    ensure_installation_ca(&ca_cert_path, &ca_key_path, timestamp)?;
+    write_saiai_config_at(
+        &config_path,
+        &SaiaiConfig {
+            version: SAIAI_CONFIG_VERSION,
+            base_url: args.base_url.clone(),
+            api_key: args.api_key.clone(),
+            listen: DEFAULT_LOCAL_PROXY_LISTEN.to_string(),
+            ca_cert_path: ca_cert_path.display().to_string(),
+            ca_key_path: ca_key_path.display().to_string(),
+            chatgpt_chat_passthrough: true,
+        },
+    )?;
+    Ok(CodexLocalProxyInit {
+        config_path,
+        ca_cert_path,
+        ca_key_path,
+    })
 }
 
 /// Launch the real Codex executable with a child-only SAIAI proxy environment.
@@ -4551,12 +4613,16 @@ fn saiai_config_path() -> Result<PathBuf> {
 
 fn write_saiai_config(config: &SaiaiConfig) -> Result<()> {
     let path = saiai_config_path()?;
+    write_saiai_config_at(&path, config)
+}
+
+fn write_saiai_config_at(path: &Path, config: &SaiaiConfig) -> Result<()> {
     let parent = path
         .parent()
         .context("failed to resolve SAIAI config parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
     let value = serde_json::to_value(config).context("failed to serialize SAIAI config")?;
-    write_json_object(&path, value)
+    write_json_object(path, value)
 }
 
 fn read_saiai_config() -> Result<SaiaiConfig> {
@@ -5358,6 +5424,74 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         }))
         .unwrap();
         assert!(config.chatgpt_chat_passthrough);
+    }
+
+    #[test]
+    fn init_codex_prepares_standalone_local_proxy_config() {
+        let temporary = tempfile::tempdir().unwrap();
+        let args = InitArgs {
+            base_url: "https://gateway.example.test".to_string(),
+            api_key: "TEST_ONLY_CODEX_PROXY_KEY".to_string(),
+            websockets: false,
+        };
+
+        let initialized =
+            initialize_codex_local_proxy_at(temporary.path(), &args, "test-create").unwrap();
+        let config: SaiaiConfig =
+            serde_json::from_slice(&fs::read(&initialized.config_path).unwrap()).unwrap();
+
+        assert_eq!(config.version, SAIAI_CONFIG_VERSION);
+        assert_eq!(config.base_url, args.base_url);
+        assert_eq!(config.api_key, args.api_key);
+        assert_eq!(config.listen, DEFAULT_LOCAL_PROXY_LISTEN);
+        assert_eq!(
+            config.ca_cert_path,
+            initialized.ca_cert_path.display().to_string()
+        );
+        assert_eq!(
+            config.ca_key_path,
+            initialized.ca_key_path.display().to_string()
+        );
+        assert!(config.chatgpt_chat_passthrough);
+        read_runtime_ca(&config).unwrap();
+    }
+
+    #[test]
+    fn init_codex_reuses_existing_proxy_ca_and_local_preferences() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first_args = InitArgs {
+            base_url: "https://first.example.test".to_string(),
+            api_key: "TEST_ONLY_FIRST_CODEX_PROXY_KEY".to_string(),
+            websockets: false,
+        };
+        let first =
+            initialize_codex_local_proxy_at(temporary.path(), &first_args, "test-first").unwrap();
+        let cert_before = fs::read(&first.ca_cert_path).unwrap();
+        let key_before = fs::read(&first.ca_key_path).unwrap();
+        let mut config: SaiaiConfig =
+            serde_json::from_slice(&fs::read(&first.config_path).unwrap()).unwrap();
+        config.listen = "127.0.0.1:29908".to_string();
+        config.chatgpt_chat_passthrough = false;
+        write_saiai_config_at(&first.config_path, &config).unwrap();
+
+        let second_args = InitArgs {
+            base_url: "https://second.example.test".to_string(),
+            api_key: "TEST_ONLY_SECOND_CODEX_PROXY_KEY".to_string(),
+            websockets: true,
+        };
+        let second =
+            initialize_codex_local_proxy_at(temporary.path(), &second_args, "test-second").unwrap();
+        let updated: SaiaiConfig =
+            serde_json::from_slice(&fs::read(&second.config_path).unwrap()).unwrap();
+
+        assert_eq!(second.ca_cert_path, first.ca_cert_path);
+        assert_eq!(second.ca_key_path, first.ca_key_path);
+        assert_eq!(fs::read(&second.ca_cert_path).unwrap(), cert_before);
+        assert_eq!(fs::read(&second.ca_key_path).unwrap(), key_before);
+        assert_eq!(updated.base_url, second_args.base_url);
+        assert_eq!(updated.api_key, second_args.api_key);
+        assert_eq!(updated.listen, "127.0.0.1:29908");
+        assert!(!updated.chatgpt_chat_passthrough);
     }
 
     #[test]
