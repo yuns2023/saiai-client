@@ -127,12 +127,14 @@ launcher 同时在隔离的 `.codex-global-state.json` 中标记首次项目引�
 该选项目前仅影响 ChatGPT Desktop 普通 Chat，不向 Codex Responses body 强行添加
 未知字段，也不用于绕过服务端客户端策略。
 
-普通 Chat 协议的 Gateway 转发仍处于实验阶段。仅在隔离测试时设置
-`SAIAI_CHATGPT_CHAT_PASSTHROUGH=1`，本地代理才会把经过 allowlist 的
+普通 Chat 协议的 Gateway 转发仍处于实验阶段，但客户端 allowlist 默认开启：
+本地代理会把经过 allowlist 的
 `/backend-api/f/conversation`、`conversation/init`、`f/conversation/prepare` 和
 `sentinel/chat-requirements/prepare` 路径转成带有 `/chatgpt/` 命名空间的 Gateway
-测试路径；默认关闭。该开关不会把请求转换为 Responses，也不代表 Gateway 已经
-实现上游 ChatGPT OAuth/SSE 转发。
+路径。`SAIAI_CHATGPT_CHAT_PASSTHROUGH=0` 仅作为当前代理进程的紧急关闭开关。
+该路径不会把请求转换为 Responses；Gateway 仍以独立 feature flag 和计费保护决定
+是否允许最终 Chat 模型请求。旧 Gateway 上普通 Chat 仍不可用，但现有 Desktop
+Codex、CLI 和 VSCode 路径不受影响。
 
 VSCode 使用一次性的 `saiai vscode` 配置入口，之后用户仍正常启动 VSCode 和官方
 Codex 扩展。该命令复用 CLI 的 OAuth 占位、第三方 provider/base URL 清理和备份

@@ -48,6 +48,7 @@ pub struct Config {
     pub ca_cert_pem: String,
     pub ca_key_pem: String,
     pub verbose: bool,
+    pub chatgpt_chat_passthrough: bool,
 }
 
 impl std::fmt::Debug for Config {
@@ -59,6 +60,7 @@ impl std::fmt::Debug for Config {
             .field("api_key", &"[redacted]")
             .field("runtime_ca", &true)
             .field("verbose", &self.verbose)
+            .field("chatgpt_chat_passthrough", &self.chatgpt_chat_passthrough)
             .finish()
     }
 }
@@ -230,8 +232,12 @@ impl State {
             .build()
             .context("failed to build upstream HTTP client")?;
         let openai_trace = OpenAITrace::from_env()?;
-        let chatgpt_chat_passthrough =
-            env::var(CHATGPT_CHAT_PASSTHROUGH_ENV).ok().as_deref() == Some("1");
+        let chatgpt_chat_passthrough = match env::var(CHATGPT_CHAT_PASSTHROUGH_ENV).ok().as_deref()
+        {
+            Some("0") => false,
+            Some("1") => true,
+            _ => cfg.chatgpt_chat_passthrough,
+        };
 
         Ok(Self {
             listen: cfg.listen,
@@ -1891,6 +1897,7 @@ mod tests {
             ca_cert_pem,
             ca_key_pem,
             verbose: false,
+            chatgpt_chat_passthrough: true,
         })
         .unwrap();
 
@@ -2002,6 +2009,7 @@ mod tests {
             ca_cert_pem,
             ca_key_pem,
             verbose: false,
+            chatgpt_chat_passthrough: true,
         })
         .err()
         .unwrap();

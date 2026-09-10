@@ -535,6 +535,7 @@ fn init_claude(args: InitArgs) -> Result<()> {
         listen: DEFAULT_LOCAL_PROXY_LISTEN.to_string(),
         ca_cert_path: ca_path.display().to_string(),
         ca_key_path: ca_key_path.display().to_string(),
+        chatgpt_chat_passthrough: true,
     })?;
 
     println!("SAIAI configured Claude Code for local proxy mode.");
@@ -1328,6 +1329,12 @@ struct SaiaiConfig {
     ca_cert_path: String,
     #[serde(default)]
     ca_key_path: String,
+    #[serde(default = "default_true")]
+    chatgpt_chat_passthrough: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -1387,6 +1394,7 @@ fn run_local_proxy(verbose: bool) -> Result<()> {
         ca_cert_pem,
         ca_key_pem,
         verbose,
+        chatgpt_chat_passthrough: cfg.chatgpt_chat_passthrough,
     }))
 }
 
@@ -5336,6 +5344,20 @@ HTTPS_PROXY="http://127.0.0.1:1111"
 
         assert!(validate_chatgpt_timezone("../etc/passwd").is_err());
         assert!(validate_chatgpt_timezone("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn existing_saiai_config_defaults_chatgpt_passthrough_on() {
+        let config: SaiaiConfig = serde_json::from_value(serde_json::json!({
+            "version": SAIAI_CONFIG_VERSION,
+            "base_url": "https://gateway.example.test",
+            "api_key": "TEST_ONLY_KEY",
+            "listen": "127.0.0.1:19908",
+            "ca_cert_path": "/tmp/test-ca.crt",
+            "ca_key_path": "/tmp/test-ca.key"
+        }))
+        .unwrap();
+        assert!(config.chatgpt_chat_passthrough);
     }
 
     #[test]

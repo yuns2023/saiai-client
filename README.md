@@ -143,6 +143,11 @@ SAIAI_CHATGPT_TIMEZONE=America/Los_Angeles saiai chatgpt
 `SAIAI_CHATGPT_TIMEZONE=system`。它不会改变 Codex CLI/VSCode 的 Responses 请求，
 也不会修改系统环境或 Gateway 请求体。
 
+`saiai chatgpt` 默认转发普通 ChatGPT Chat 的明确 allowlist 到 Gateway 的独立
+`/chatgpt/backend-api/*` ingress，不做 Responses 协议转换。紧急排障时可仅对代理
+进程设置 `SAIAI_CHATGPT_CHAT_PASSTHROUGH=0` 关闭该路径；Gateway 端仍需显式启用
+普通 Chat，并在计费不可用时默认拒绝最终模型请求。
+
 旧的 API-key 初始化命令暂时保持兼容：
 
 ```bash
