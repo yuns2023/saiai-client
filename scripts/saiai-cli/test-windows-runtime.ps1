@@ -129,9 +129,11 @@ try {
     Assert-Saiai ((Get-FileHash -Algorithm SHA256 -LiteralPath $caKeyPath).Hash -ceq $caKeyHash) "Codex initialization replaced the existing CA key"
     Assert-Saiai (Test-Path -LiteralPath (Join-Path $env:CODEX_HOME "config.toml") -PathType Leaf) "Codex config was not created"
     Assert-Saiai (Test-Path -LiteralPath (Join-Path $env:CODEX_HOME "auth.json") -PathType Leaf) "Codex auth was not created"
-    $vscodeOutput = & $binary vscode 2>&1 | Out-String
-    Assert-Saiai ($LASTEXITCODE -eq 0) "SAIAI Codex OAuth upgrade failed: $vscodeOutput"
-    Assert-Saiai (-not $vscodeOutput.Contains($codexKey)) "Codex OAuth upgrade output exposed the API key"
+    # `vscode` may start the detached proxy. Do not attach it to a PowerShell
+    # output pipeline: the child can inherit the pipeline handle and keep
+    # Out-String waiting for EOF after the command itself exits.
+    $vscode = Invoke-SaiaiProcess -Path $binary -Arguments @("vscode") -CaptureOutput $false
+    Assert-Saiai ($vscode.ExitCode -eq 0) "SAIAI Codex OAuth upgrade failed"
     $codexAuth = Get-Content -LiteralPath (Join-Path $env:CODEX_HOME "auth.json") -Raw | ConvertFrom-Json
     Assert-Saiai ([string]$codexAuth.auth_mode -ceq "chatgpt") "Managed legacy Codex auth was not upgraded"
     Assert-Saiai ($null -eq $codexAuth.OPENAI_API_KEY) "Managed legacy Codex API key remains after upgrade"
