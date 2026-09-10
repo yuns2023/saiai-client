@@ -115,6 +115,7 @@ def verify_cli() -> None:
         "Repeated setup replaced a valid CA key",
         "Codex initialization did not update the local-proxy Gateway",
         "Codex local-proxy launcher is missing",
+        "Managed legacy Codex auth was not upgraded",
         "service active: yes",
     ):
         require(required in windows_runtime, f"Windows repeat smoke is missing {required!r}")

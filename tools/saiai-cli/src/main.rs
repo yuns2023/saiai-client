@@ -660,10 +660,10 @@ fn initialize_codex_local_proxy_at(
 fn run_codex(args: &[String]) -> Result<()> {
     let codex_dir = codex_config_dir().context("failed to resolve Codex config directory")?;
     let auth_path = codex_dir.join("auth.json");
-    ensure_codex_local_proxy_auth(&auth_path)?;
-    validate_codex_oauth_auth(&auth_path)?;
     let cfg = read_saiai_config()
         .context("SAIAI local proxy is not configured; run the SAIAI Claude setup first")?;
+    ensure_codex_local_proxy_auth(&auth_path, Some(&cfg.api_key))?;
+    validate_codex_oauth_auth(&auth_path)?;
     let _runtime_ca = read_runtime_ca(&cfg)
         .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
     ensure_local_proxy_running(&cfg.listen)?;
@@ -728,11 +728,10 @@ fn configure_vscode() -> Result<()> {
     fs::create_dir_all(&codex_dir)
         .with_context(|| format!("failed to create {}", codex_dir.display()))?;
     let auth_path = codex_dir.join("auth.json");
-    ensure_codex_local_proxy_auth(&auth_path)?;
-    validate_codex_oauth_auth(&auth_path)?;
-
     let cfg = read_saiai_config()
         .context("SAIAI local proxy is not configured; run the SAIAI setup first")?;
+    ensure_codex_local_proxy_auth(&auth_path, Some(&cfg.api_key))?;
+    validate_codex_oauth_auth(&auth_path)?;
     let _runtime_ca = read_runtime_ca(&cfg)
         .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
 
@@ -885,7 +884,7 @@ fn codex_args_override_system_proxy(args: &[String]) -> bool {
     false
 }
 
-fn ensure_codex_local_proxy_auth(path: &Path) -> Result<()> {
+fn ensure_codex_local_proxy_auth(path: &Path, expected_legacy_api_key: Option<&str>) -> Result<()> {
     let existed = path.exists();
     let mut auth = if existed {
         load_json_object(path)?
@@ -899,7 +898,16 @@ fn ensure_codex_local_proxy_auth(path: &Path) -> Result<()> {
             .and_then(|tokens| tokens.get("access_token"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        if !existing_access.starts_with("saiai-local-proxy-placeholder-") {
+        let managed_legacy_api_key = existing_access.is_empty()
+            && expected_legacy_api_key.is_some_and(|expected| {
+                !expected.is_empty()
+                    && auth
+                        .get("OPENAI_API_KEY")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value == expected)
+            });
+        if !existing_access.starts_with("saiai-local-proxy-placeholder-") && !managed_legacy_api_key
+        {
             return Ok(());
         }
     }
@@ -5226,7 +5234,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     fn creates_and_upgrades_app_server_shaped_codex_placeholder_auth() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("auth.json");
-        ensure_codex_local_proxy_auth(&path).unwrap();
+        ensure_codex_local_proxy_auth(&path, None).unwrap();
 
         let created = load_json_object(&path).unwrap();
         let created_tokens = created["tokens"].as_object().unwrap();
@@ -5254,7 +5262,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             &path,
             r#"{"auth_mode":"chatgpt","tokens":{"access_token":"saiai-local-proxy-placeholder-old","refresh_token":"old","account_id":"old"},"unrelated":"keep"}"#,
         );
-        ensure_codex_local_proxy_auth(&path).unwrap();
+        ensure_codex_local_proxy_auth(&path, None).unwrap();
         let upgraded = load_json_object(&path).unwrap();
         assert_eq!(upgraded["unrelated"].as_str(), Some("keep"));
         assert_eq!(
@@ -5264,13 +5272,37 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     }
 
     #[test]
+    fn upgrades_only_matching_legacy_saiai_api_key_auth() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        write_str(&path, r#"{"OPENAI_API_KEY":"TEST_ONLY_MANAGED_KEY"}"#);
+
+        ensure_codex_local_proxy_auth(&path, Some("TEST_ONLY_MANAGED_KEY")).unwrap();
+        let upgraded = load_json_object(&path).unwrap();
+        assert_eq!(upgraded["auth_mode"].as_str(), Some("chatgpt"));
+        assert_eq!(
+            upgraded["tokens"]["access_token"].as_str(),
+            Some(CODEX_PLACEHOLDER_ACCESS_TOKEN)
+        );
+        assert_eq!(upgraded["OPENAI_API_KEY"], Value::Null);
+
+        write_str(&path, r#"{"OPENAI_API_KEY":"TEST_ONLY_UNRELATED_KEY"}"#);
+        ensure_codex_local_proxy_auth(&path, Some("TEST_ONLY_MANAGED_KEY")).unwrap();
+        assert_eq!(
+            load_json_object(&path).unwrap()["OPENAI_API_KEY"].as_str(),
+            Some("TEST_ONLY_UNRELATED_KEY")
+        );
+        assert!(validate_codex_oauth_auth(&path).is_err());
+    }
+
+    #[test]
     fn preserves_existing_real_codex_oauth_auth() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("auth.json");
         let real = r#"{"auth_mode":"chatgpt","tokens":{"id_token":"real.id.token","access_token":"real-access","refresh_token":"real-refresh","account_id":"real-account"},"last_refresh":"2026-09-09T00:00:00Z"}"#;
         write_str(&path, real);
 
-        ensure_codex_local_proxy_auth(&path).unwrap();
+        ensure_codex_local_proxy_auth(&path, Some("TEST_ONLY_MANAGED_KEY")).unwrap();
 
         assert_eq!(read_str(&path), real);
     }

@@ -84,7 +84,10 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
 `SAIAI_HOME` 中创建本地代理配置和安装 CA，使同一次 WebUI 初始化之后可以直接运行
 `saiai codex`。该兼容初始化不修改 Claude 配置，也不启动代理；launcher 按需启动。
 若已有有效的 SAIAI 代理配置，它复用原 CA、监听地址和普通 Chat 开关，只替换
-Gateway 与 Key，避免破坏已经配置好的 Claude/ChatGPT 代理信任。
+Gateway 与 Key，避免破坏已经配置好的 Claude/ChatGPT 代理信任。随后 launcher
+只在旧 `auth.json.OPENAI_API_KEY` 与当前 SAIAI 配置 Key 完全一致时把该旧初始化
+状态升级为本地代理 OAuth 占位；不同的 API Key 或真实 ChatGPT OAuth 原样保留，
+不做模糊识别。
 
 在已安装 Codex、但尚未生成 OAuth `auth.json` 的环境中，`saiai codex` 会在目标
 `CODEX_HOME` 中创建一个仅供本地代理使用的 ChatGPT OAuth 形状占位文件，然后完成
