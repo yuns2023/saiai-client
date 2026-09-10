@@ -973,18 +973,24 @@ fn is_managed_codex_env(key: &str) -> bool {
 }
 
 fn codex_launcher_args(args: &[String]) -> Vec<String> {
-    if codex_args_override_system_proxy(args) {
-        return args.to_vec();
+    let mut launch_args = Vec::with_capacity(args.len() + 4);
+    if !codex_args_override_feature(args, "respect_system_proxy") {
+        launch_args.push("-c".to_string());
+        launch_args.push("features.respect_system_proxy=true".to_string());
     }
-
-    let mut launch_args = Vec::with_capacity(args.len() + 2);
-    launch_args.push("-c".to_string());
-    launch_args.push("features.respect_system_proxy=true".to_string());
+    // A synthetic SAIAI identity cannot authenticate Codex's hosted Apps MCP
+    // endpoint. Disable that optional control plane for this launcher so it
+    // does not emit a misleading startup failure. A caller can explicitly
+    // re-enable it and that later argument wins.
+    if !codex_args_override_feature(args, "apps") {
+        launch_args.push("-c".to_string());
+        launch_args.push("features.apps=false".to_string());
+    }
     launch_args.extend(args.iter().cloned());
     launch_args
 }
 
-fn codex_args_override_system_proxy(args: &[String]) -> bool {
+fn codex_args_override_feature(args: &[String], feature: &str) -> bool {
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -1000,10 +1006,8 @@ fn codex_args_override_system_proxy(args: &[String]) -> bool {
         };
 
         if value.is_some_and(|value| {
-            value
-                .trim_start()
-                .starts_with("features.respect_system_proxy")
-                || value.trim() == "respect_system_proxy"
+            let key = value.split_once('=').map_or(value, |(key, _)| key).trim();
+            key == feature || key == format!("features.{feature}")
         }) {
             return true;
         }
@@ -5711,6 +5715,8 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             vec![
                 "-c".to_string(),
                 "features.respect_system_proxy=true".to_string(),
+                "-c".to_string(),
+                "features.apps=false".to_string(),
                 "exec".to_string(),
                 "probe".to_string(),
             ]
@@ -5718,7 +5724,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     }
 
     #[test]
-    fn codex_launcher_preserves_explicit_system_proxy_override() {
+    fn codex_launcher_preserves_explicit_feature_overrides() {
         for args in [
             vec![
                 "-c".to_string(),
@@ -5727,8 +5733,25 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             vec!["--enable=respect_system_proxy".to_string()],
             vec!["--disable".to_string(), "respect_system_proxy".to_string()],
         ] {
-            assert_eq!(codex_launcher_args(&args), args);
+            assert_eq!(
+                codex_launcher_args(&args),
+                [
+                    vec!["-c".to_string(), "features.apps=false".to_string()],
+                    args,
+                ]
+                .concat()
+            );
         }
+
+        let args = vec![
+            "--enable".to_string(),
+            "apps".to_string(),
+            "exec".to_string(),
+        ];
+        let launch_args = codex_launcher_args(&args);
+        assert!(launch_args.contains(&"features.respect_system_proxy=true".to_string()));
+        assert!(!launch_args.contains(&"features.apps=false".to_string()));
+        assert!(launch_args.ends_with(&args));
     }
 
     #[test]

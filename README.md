@@ -103,6 +103,10 @@ saiai chatgpt
 将根 provider 恢复为官方内置 `openai`，并保留 `auth.json` 中的 ChatGPT OAuth
 token。备份文件使用同目录的 `.bak-<timestamp>` 后缀。
 
+SAIAI 合成登录态不能认证官方 hosted Apps MCP，因此 launcher 默认仅在该 Codex
+子进程中设置 `features.apps=false`，避免出现与模型请求无关的 `codex_apps` 451
+启动告警。用户显式传入同名 feature 覆盖时，以用户参数为准。
+
 第一阶段接受 `auth_mode = "chatgpt"` 或 `auth_mode = "chatgptAuthTokens"` 且存在
 access-token 形状的状态；若用户从未登录，launcher 会创建只对本地代理有意义的
 `chatgptAuthTokens` 占位状态，Gateway 仍是实际认证边界。该模式明确告诉 Codex

@@ -79,6 +79,8 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
 本地 HTTP 代理和 `CODEX_CA_CERTIFICATE`。当前 Codex 0.153.x 把读取系统代理放在
 `features.respect_system_proxy` 后面，因此 launcher 同时注入等价的子进程命令行
 覆盖；该开关不持久化到 `config.toml`，用户显式传入同名覆盖时保持用户参数。
+同理，合成 SAIAI 身份不能认证官方 hosted Apps MCP，launcher 默认对子进程设置
+`features.apps=false`，避免非模型控制面产生 `codex_apps` 451；显式用户覆盖仍优先。
 
 `init-codex` 在保留旧 `config.toml`/`auth.json` 直连配置的同时，也会在独立的
 `SAIAI_HOME` 中创建本地代理配置和安装 CA，使同一次 WebUI 初始化之后可以直接运行
