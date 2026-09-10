@@ -35,6 +35,7 @@ use zeroize::Zeroizing;
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
 const OPENAI_HOST: &str = "api.openai.com";
 const CHATGPT_HOST: &str = "chatgpt.com";
+const CHATGPT_CHAT_PASSTHROUGH_ENV: &str = "SAIAI_CHATGPT_CHAT_PASSTHROUGH";
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HEADER_LINE: usize = 32 * 1024;
 const MAX_HEADER_BYTES: usize = 256 * 1024;
@@ -69,6 +70,7 @@ struct State {
     ca_cert_pem: String,
     ca_key_pem: Zeroizing<String>,
     verbose: bool,
+    chatgpt_chat_passthrough: bool,
     client: Client,
     certs: Mutex<HashMap<String, Arc<ServerConfig>>>,
     openai_trace: Option<Arc<OpenAITrace>>,
@@ -228,6 +230,8 @@ impl State {
             .build()
             .context("failed to build upstream HTTP client")?;
         let openai_trace = OpenAITrace::from_env()?;
+        let chatgpt_chat_passthrough =
+            env::var(CHATGPT_CHAT_PASSTHROUGH_ENV).ok().as_deref() == Some("1");
 
         Ok(Self {
             listen: cfg.listen,
@@ -236,6 +240,7 @@ impl State {
             ca_cert_pem: cfg.ca_cert_pem,
             ca_key_pem: Zeroizing::new(cfg.ca_key_pem),
             verbose: cfg.verbose,
+            chatgpt_chat_passthrough,
             client,
             certs: Mutex::new(HashMap::new()),
             openai_trace,
@@ -573,53 +578,61 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                 match normalize_chatgpt_gateway_target(&request.target) {
                     Ok(target) => request.target = target,
                     Err(_) => {
-                        if let Some((status, body, reason)) =
-                            chatgpt_account_sidecar_response(&request)
-                        {
-                            if state.verbose {
-                                eprintln!(
-                                    "chatgpt account sidecar response method={} target={} status={} reason={} close_after={}",
-                                    request.method, request.target, status, reason, close_after
-                                );
+                        let ordinary_chat_forwarded = state.chatgpt_chat_passthrough
+                            && normalize_chatgpt_chat_target(&request.target)
+                                .map(|target| {
+                                    request.target = target;
+                                })
+                                .is_ok();
+                        if !ordinary_chat_forwarded {
+                            if let Some((status, body, reason)) =
+                                chatgpt_account_sidecar_response(&request)
+                            {
+                                if state.verbose {
+                                    eprintln!(
+                                        "chatgpt account sidecar response method={} target={} status={} reason={} close_after={}",
+                                        request.method, request.target, status, reason, close_after
+                                    );
+                                }
+                                write_static_response(
+                                    reader.get_mut(),
+                                    status,
+                                    "application/json",
+                                    &body,
+                                    close_after,
+                                )
+                                .await?;
+                                if close_after {
+                                    return Ok(());
+                                }
+                                continue;
                             }
-                            write_static_response(
-                                reader.get_mut(),
-                                status,
-                                "application/json",
-                                &body,
-                                close_after,
-                            )
-                            .await?;
-                            if close_after {
-                                return Ok(());
-                            }
-                            continue;
-                        }
-                        if let Some(resp) = chatgpt_sidecar_response(&request) {
-                            if state.verbose {
-                                eprintln!(
-                                    "chatgpt sidecar response method={} target={} status={} reason={} close_after={}",
-                                    request.method,
-                                    request.target,
+                            if let Some(resp) = chatgpt_sidecar_response(&request) {
+                                if state.verbose {
+                                    eprintln!(
+                                        "chatgpt sidecar response method={} target={} status={} reason={} close_after={}",
+                                        request.method,
+                                        request.target,
+                                        resp.status,
+                                        resp.reason,
+                                        close_after
+                                    );
+                                }
+                                write_static_response(
+                                    reader.get_mut(),
                                     resp.status,
-                                    resp.reason,
-                                    close_after
-                                );
+                                    resp.content_type,
+                                    resp.body,
+                                    close_after,
+                                )
+                                .await?;
+                                if close_after {
+                                    return Ok(());
+                                }
+                                continue;
                             }
-                            write_static_response(
-                                reader.get_mut(),
-                                resp.status,
-                                resp.content_type,
-                                resp.body,
-                                close_after,
-                            )
-                            .await?;
-                            if close_after {
-                                return Ok(());
-                            }
-                            continue;
+                            return normalize_chatgpt_gateway_target(&request.target).map(|_| ());
                         }
-                        return normalize_chatgpt_gateway_target(&request.target).map(|_| ());
                     }
                 }
             }
@@ -1239,6 +1252,14 @@ fn is_forwarded_openai_path(path: &str) -> bool {
         || path.starts_with("/v1/responses/")
         || path == "/v1/models"
         || path.starts_with("/v1/models/")
+        || is_forwarded_chatgpt_path(path)
+}
+
+fn is_forwarded_chatgpt_path(path: &str) -> bool {
+    path == "/chatgpt/backend-api/f/conversation"
+        || path.starts_with("/chatgpt/backend-api/f/conversation/")
+        || path == "/chatgpt/backend-api/conversation/init"
+        || path == "/chatgpt/backend-api/sentinel/chat-requirements/prepare"
 }
 
 fn normalize_chatgpt_gateway_target(target: &str) -> Result<String> {
@@ -1259,6 +1280,18 @@ fn normalize_chatgpt_gateway_target(target: &str) -> Result<String> {
         Some(value) if !value.is_empty() => format!("{normalized}?{value}"),
         _ => normalized.to_string(),
     })
+}
+
+fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
+    let path = request_path(target)?;
+    let allowed = path == "/backend-api/f/conversation"
+        || path.starts_with("/backend-api/f/conversation/")
+        || path == "/backend-api/conversation/init"
+        || path == "/backend-api/sentinel/chat-requirements/prepare";
+    if !allowed {
+        bail!("unsupported ChatGPT ordinary Chat path: {path}");
+    }
+    Ok(target.replacen("/backend-api/", "/chatgpt/backend-api/", 1))
 }
 
 fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse> {
@@ -1699,6 +1732,23 @@ mod tests {
         );
         assert!(normalize_chatgpt_gateway_target("/backend-api/conversations").is_err());
         assert!(is_managed_host(CHATGPT_HOST));
+    }
+
+    #[test]
+    fn normalizes_ordinary_chatgpt_targets_only_when_allowlisted() {
+        assert_eq!(
+            normalize_chatgpt_chat_target("/backend-api/f/conversation?foo=bar").unwrap(),
+            "/chatgpt/backend-api/f/conversation?foo=bar"
+        );
+        assert_eq!(
+            normalize_chatgpt_chat_target("/backend-api/f/conversation/prepare").unwrap(),
+            "/chatgpt/backend-api/f/conversation/prepare"
+        );
+        assert!(normalize_chatgpt_chat_target("/backend-api/conversations").is_err());
+        assert!(is_forwarded_chatgpt_path(
+            "/chatgpt/backend-api/f/conversation"
+        ));
+        assert!(!is_forwarded_chatgpt_path("/backend-api/f/conversation"));
     }
 
     #[test]
