@@ -907,9 +907,7 @@ where
         if name.eq_ignore_ascii_case("authorization") {
             has_authorization = true;
         }
-        if should_forward_request_header(name)
-            && !(replace_authorization && name.eq_ignore_ascii_case("authorization"))
-        {
+        if should_forward_request_header_to_gateway(name, replace_authorization) {
             builder = builder.header(name.as_str(), value.as_str());
         }
     }
@@ -1477,6 +1475,12 @@ fn should_forward_request_header(name: &str) -> bool {
         && !name.eq_ignore_ascii_case("proxy-connection")
 }
 
+fn should_forward_request_header_to_gateway(name: &str, replace_authorization: bool) -> bool {
+    should_forward_request_header(name)
+        && !(replace_authorization
+            && (name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("cookie")))
+}
+
 fn should_forward_response_header(name: &str) -> bool {
     !is_hop_by_hop_header(name)
         && !name.eq_ignore_ascii_case("content-length")
@@ -1749,6 +1753,12 @@ mod tests {
             "/chatgpt/backend-api/f/conversation"
         ));
         assert!(!is_forwarded_chatgpt_path("/backend-api/f/conversation"));
+        assert!(!should_forward_request_header_to_gateway(
+            "Authorization",
+            true
+        ));
+        assert!(!should_forward_request_header_to_gateway("Cookie", true));
+        assert!(should_forward_request_header_to_gateway("originator", true));
     }
 
     #[test]
