@@ -59,7 +59,9 @@ WebSocket 模式在末尾加 `--websockets`。配置写入 `%USERPROFILE%\.codex
 `CODEX_HOME` 指定的目录。该命令保留旧直连配置，同时在 `%USERPROFILE%\.saiai`
 准备本地代理配置和独立安装 CA；不会修改 Claude 配置或立即启动代理。随后运行
 `saiai codex` 即进入 OAuth/local-proxy 模式，代理会按需启动，并且代理环境只注入
-Codex 子进程。若旧初始化刚写入的 API Key 与 SAIAI 配置 Key 完全一致，launcher
+Codex 子进程。旧直连配置保留命令中的 `/v1`，本地代理配置会移除末尾 `/v1`，
+避免代理转发时产生 `/v1/v1/*`。若旧初始化刚写入的 API Key 与 SAIAI 配置 Key
+完全一致，launcher
 会将该状态升级为仅供本地代理使用的 OAuth 占位；真实 OAuth 和不匹配的 API Key
 不会被覆盖。Codex VSCode 扩展先执行
 一次 `saiai vscode`；该命令只写 Codex 专属 `.env` 和配置文件，不修改 Windows

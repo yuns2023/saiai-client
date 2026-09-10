@@ -123,7 +123,7 @@ try {
     Assert-Saiai ($LASTEXITCODE -eq 0) "SAIAI Codex initialization failed: $codexOutput"
     Assert-Saiai (-not $codexOutput.Contains($codexKey)) "Codex initialization output exposed the API key"
     $codexProxyConfig = Get-Content -LiteralPath (Join-Path $env:SAIAI_HOME "config.json") -Raw | ConvertFrom-Json
-    Assert-Saiai ([string]$codexProxyConfig.base_url -ceq "https://codex.example.test/v1") "Codex initialization did not update the local-proxy Gateway"
+    Assert-Saiai ([string]$codexProxyConfig.base_url -ceq "https://codex.example.test") "Codex initialization did not normalize the local-proxy Gateway root"
     Assert-Saiai ([string]$codexProxyConfig.api_key -ceq $codexKey) "Codex initialization did not update the local-proxy Key"
     Assert-Saiai ((Get-FileHash -Algorithm SHA256 -LiteralPath $caPath).Hash -ceq $caHash) "Codex initialization replaced the existing CA"
     Assert-Saiai ((Get-FileHash -Algorithm SHA256 -LiteralPath $caKeyPath).Hash -ceq $caKeyHash) "Codex initialization replaced the existing CA key"

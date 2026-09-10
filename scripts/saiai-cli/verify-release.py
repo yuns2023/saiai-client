@@ -113,7 +113,7 @@ def verify_cli() -> None:
         "TEST_ONLY_WINDOWS_REPLACEMENT_KEY",
         "Repeated setup did not replace the API key",
         "Repeated setup replaced a valid CA key",
-        "Codex initialization did not update the local-proxy Gateway",
+        "Codex initialization did not normalize the local-proxy Gateway root",
         "Codex local-proxy launcher is missing",
         "Managed legacy Codex auth was not upgraded",
         "service active: yes",

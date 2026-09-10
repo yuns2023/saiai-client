@@ -83,6 +83,8 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
 `init-codex` 在保留旧 `config.toml`/`auth.json` 直连配置的同时，也会在独立的
 `SAIAI_HOME` 中创建本地代理配置和安装 CA，使同一次 WebUI 初始化之后可以直接运行
 `saiai codex`。该兼容初始化不修改 Claude 配置，也不启动代理；launcher 按需启动。
+旧直连 Provider 继续使用传入的 `/v1` Base URL；写入本地代理配置时只移除末尾
+`/v1`，再透传客户端原始 `/v1/*` 路径，禁止形成 `/v1/v1/*`。
 若已有有效的 SAIAI 代理配置，它复用原 CA、监听地址和普通 Chat 开关，只替换
 Gateway 与 Key，避免破坏已经配置好的 Claude/ChatGPT 代理信任。随后 launcher
 只在旧 `auth.json.OPENAI_API_KEY` 与当前 SAIAI 配置 Key 完全一致时把该旧初始化

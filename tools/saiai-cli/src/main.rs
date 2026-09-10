@@ -613,12 +613,13 @@ fn initialize_codex_local_proxy_at(
     fs::create_dir_all(config_dir)
         .with_context(|| format!("failed to create {}", config_dir.display()))?;
     let config_path = config_dir.join(SAIAI_CONFIG_FILENAME);
+    let proxy_base_url = codex_proxy_gateway_root(&args.base_url)?;
 
     if let Ok(raw) = fs::read_to_string(&config_path)
         && let Ok(mut existing) = serde_json::from_str::<SaiaiConfig>(&raw)
         && read_runtime_ca(&existing).is_ok()
     {
-        existing.base_url = args.base_url.clone();
+        existing.base_url = proxy_base_url.clone();
         existing.api_key = args.api_key.clone();
         write_saiai_config_at(&config_path, &existing)?;
         return Ok(CodexLocalProxyInit {
@@ -636,7 +637,7 @@ fn initialize_codex_local_proxy_at(
         &config_path,
         &SaiaiConfig {
             version: SAIAI_CONFIG_VERSION,
-            base_url: args.base_url.clone(),
+            base_url: proxy_base_url,
             api_key: args.api_key.clone(),
             listen: DEFAULT_LOCAL_PROXY_LISTEN.to_string(),
             ca_cert_path: ca_cert_path.display().to_string(),
@@ -649,6 +650,18 @@ fn initialize_codex_local_proxy_at(
         ca_cert_path,
         ca_key_path,
     })
+}
+
+fn codex_proxy_gateway_root(base_url: &str) -> Result<String> {
+    let mut url = Url::parse(base_url).context("failed to parse Codex Gateway base URL")?;
+    let path = url.path().trim_end_matches('/');
+    let root_path = path.strip_suffix("/v1").unwrap_or(path).to_string();
+    url.set_path(if root_path.is_empty() {
+        "/"
+    } else {
+        &root_path
+    });
+    Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
 /// Launch the real Codex executable with a child-only SAIAI proxy environment.
@@ -5462,7 +5475,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     fn init_codex_prepares_standalone_local_proxy_config() {
         let temporary = tempfile::tempdir().unwrap();
         let args = InitArgs {
-            base_url: "https://gateway.example.test".to_string(),
+            base_url: "https://gateway.example.test/v1".to_string(),
             api_key: "TEST_ONLY_CODEX_PROXY_KEY".to_string(),
             websockets: false,
         };
@@ -5473,7 +5486,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             serde_json::from_slice(&fs::read(&initialized.config_path).unwrap()).unwrap();
 
         assert_eq!(config.version, SAIAI_CONFIG_VERSION);
-        assert_eq!(config.base_url, args.base_url);
+        assert_eq!(config.base_url, "https://gateway.example.test");
         assert_eq!(config.api_key, args.api_key);
         assert_eq!(config.listen, DEFAULT_LOCAL_PROXY_LISTEN);
         assert_eq!(
@@ -5486,6 +5499,22 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         );
         assert!(config.chatgpt_chat_passthrough);
         read_runtime_ca(&config).unwrap();
+    }
+
+    #[test]
+    fn codex_proxy_gateway_root_strips_only_terminal_v1() {
+        assert_eq!(
+            codex_proxy_gateway_root("https://gateway.example.test/v1").unwrap(),
+            "https://gateway.example.test"
+        );
+        assert_eq!(
+            codex_proxy_gateway_root("https://gateway.example.test/prefix/v1").unwrap(),
+            "https://gateway.example.test/prefix"
+        );
+        assert_eq!(
+            codex_proxy_gateway_root("https://gateway.example.test/prefix").unwrap(),
+            "https://gateway.example.test/prefix"
+        );
     }
 
     #[test]
