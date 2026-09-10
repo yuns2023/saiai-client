@@ -132,15 +132,16 @@ NSS 数据库并导入本地 CA，避免修改系统信任库；首次使用需�
 因此不会每次启动都要求选择职业/个性化设置；这只影响 SAIAI 管理的 Desktop
 profile，不会改写原始 Codex 配置。
 
-如果需要让普通 ChatGPT Chat 使用固定美国时区，可只为该次启动设置：
+普通 ChatGPT Chat 默认使用固定的美国太平洋时区。也可以按次启动覆盖：
 
 ```bash
 SAIAI_CHATGPT_TIMEZONE=America/Los_Angeles saiai chatgpt
 ```
 
-该变量只作用于 Desktop 子进程，必须是本机存在的 IANA zoneinfo 名称；不设置时
-保持系统时区。它不会改变 Codex CLI/VSCode 的 Responses 请求，也不会修改系统
-环境或 Gateway 请求体。
+该变量只作用于 Desktop 子进程，必须是本机存在的 IANA zoneinfo 名称；未设置时
+默认使用 `America/Los_Angeles`。如果需要恢复系统时区，可设置
+`SAIAI_CHATGPT_TIMEZONE=system`。它不会改变 Codex CLI/VSCode 的 Responses 请求，
+也不会修改系统环境或 Gateway 请求体。
 
 旧的 API-key 初始化命令暂时保持兼容：
 

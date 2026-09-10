@@ -91,6 +91,7 @@ const CODEX_PLACEHOLDER_ID_TOKEN: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.ey
 // the launcher and applied only to the Desktop child process; the parent
 // shell and system timezone are never modified.
 const SAIAI_CHATGPT_TIMEZONE_ENV: &str = "SAIAI_CHATGPT_TIMEZONE";
+const DEFAULT_CHATGPT_TIMEZONE: &str = "America/Los_Angeles";
 
 // Remove stale routing, authentication, model, proxy, and CA values before
 // installing the exact local-proxy environment. Unrelated user settings are
@@ -971,14 +972,24 @@ fn run_linux_desktop(args: &[String]) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn resolve_chatgpt_timezone() -> Result<Option<String>> {
-    let Some(raw) = env::var_os(SAIAI_CHATGPT_TIMEZONE_ENV) else {
-        return Ok(None);
+    let raw = env::var_os(SAIAI_CHATGPT_TIMEZONE_ENV);
+    let Some(raw) = raw else {
+        return resolve_chatgpt_timezone_value(None);
     };
     let value = raw
         .to_str()
         .context("SAIAI_CHATGPT_TIMEZONE must be valid UTF-8")?
         .trim();
+    resolve_chatgpt_timezone_value(Some(value))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_chatgpt_timezone_value(value: Option<&str>) -> Result<Option<String>> {
+    let value = value.unwrap_or(DEFAULT_CHATGPT_TIMEZONE).trim();
     if value.is_empty() {
+        return Ok(None);
+    }
+    if value.eq_ignore_ascii_case("system") {
         return Ok(None);
     }
     validate_chatgpt_timezone(value)
@@ -5311,6 +5322,14 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     #[cfg(target_os = "linux")]
     #[test]
     fn validates_optional_chatgpt_timezone() {
+        assert_eq!(
+            resolve_chatgpt_timezone_value(None).unwrap().as_deref(),
+            Some(DEFAULT_CHATGPT_TIMEZONE)
+        );
+        assert_eq!(
+            resolve_chatgpt_timezone_value(Some("system")).unwrap(),
+            None
+        );
         let resolved =
             validate_chatgpt_timezone("America/Los_Angeles").expect("valid zoneinfo timezone");
         assert_eq!(resolved.as_deref(), Some("America/Los_Angeles"));
