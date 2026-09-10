@@ -118,6 +118,15 @@ launcher 会明确报错；CLI 的本地代理占位 OAuth 不等价于 Desktop 
 launcher 同时在隔离的 `.codex-global-state.json` 中标记首次项目引导已完成，
 跳过启动时的职业/个性化问卷；原始用户状态不受影响。
 
+普通 ChatGPT Chat 的固定时区是显式的、可选的 Desktop 子进程设置，不是全局
+请求改写。设置 `SAIAI_CHATGPT_TIMEZONE`（例如
+`America/Los_Angeles`）后，`saiai chatgpt` 会校验对应的 IANA zoneinfo 文件，
+只向该 Electron 子进程设置 `TZ`，并移除控制变量本身；父 shell、系统环境和
+原始 `CODEX_HOME` 均不变。Desktop 会据此生成 `timezone` 与
+`timezone_offset_min`。未设置时保持系统真实时区。该选项目前仅影响 ChatGPT
+Desktop 普通 Chat，不向 Codex Responses body 强行添加未知字段，也不用于绕过
+服务端客户端策略。
+
 VSCode 使用一次性的 `saiai vscode` 配置入口，之后用户仍正常启动 VSCode 和官方
 Codex 扩展。该命令复用 CLI 的 OAuth 占位、第三方 provider/base URL 清理和备份
 逻辑，在 `CODEX_HOME/.env` 中写入 loopback HTTP(S) proxy、`NO_PROXY` 和

@@ -87,6 +87,11 @@ const CODEX_PLACEHOLDER_ACCOUNT_ID: &str = "saiai-local-proxy-placeholder-accoun
 // claims only let Codex's local app-server expose an authenticated UI state.
 const CODEX_PLACEHOLDER_ID_TOKEN: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InNhaWFpLWxvY2FsLXByb3h5QGludmFsaWQiLCJleHAiOjQxMDI0NDQ4MDAsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3BsYW5fdHlwZSI6InBsdXMiLCJjaGF0Z3B0X3VzZXJfaWQiOiJzYWlhaS1sb2NhbC1wcm94eS11c2VyIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoic2FpYWktbG9jYWwtcHJveHktYWNjb3VudCJ9fQ.c2FpYWktbG9jYWwtcHJveHk";
 
+// Optional fixed timezone for ChatGPT Desktop ordinary Chat. It is read by
+// the launcher and applied only to the Desktop child process; the parent
+// shell and system timezone are never modified.
+const SAIAI_CHATGPT_TIMEZONE_ENV: &str = "SAIAI_CHATGPT_TIMEZONE";
+
 // Remove stale routing, authentication, model, proxy, and CA values before
 // installing the exact local-proxy environment. Unrelated user settings are
 // preserved.
@@ -915,6 +920,7 @@ fn run_linux_desktop(args: &[String]) -> Result<()> {
                 .find(|path| path.is_file())
         })
         .context("ChatGPT Desktop was not found; install the ChatGPT Desktop package first")?;
+    let fixed_timezone = resolve_chatgpt_timezone()?;
 
     let mut launch_args = vec![format!("--user-data-dir={}", desktop_user_data.display())];
     launch_args.extend(args.iter().cloned());
@@ -924,6 +930,9 @@ fn run_linux_desktop(args: &[String]) -> Result<()> {
     for name in CODEX_MANAGED_ENV {
         command.env_remove(*name);
     }
+    // Do not pass the SAIAI control variable into Electron. If configured,
+    // apply the validated IANA timezone only to this Desktop child process.
+    command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV);
     command
         .env("HOME", &desktop_home)
         .env("USERPROFILE", &desktop_home)
@@ -939,11 +948,17 @@ fn run_linux_desktop(args: &[String]) -> Result<()> {
         .env("https_proxy", &proxy)
         .env("all_proxy", &proxy)
         .env("no_proxy", CODEX_LOCAL_PROXY_NO_PROXY);
+    if let Some(timezone) = &fixed_timezone {
+        command.env("TZ", timezone);
+    }
 
     println!("Starting ChatGPT Desktop through the SAIAI local proxy.");
     println!("  CODEX_HOME={}", desktop_codex.display());
     println!("  user-data-dir={}", desktop_user_data.display());
     println!("  proxy={proxy}");
+    if let Some(timezone) = &fixed_timezone {
+        println!("  timezone={timezone} (Desktop child only)");
+    }
     let status = command
         .status()
         .with_context(|| format!("failed to start {}", executable.display()))?;
@@ -952,6 +967,51 @@ fn run_linux_desktop(args: &[String]) -> Result<()> {
     } else {
         bail!("ChatGPT Desktop exited with {status}")
     }
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_chatgpt_timezone() -> Result<Option<String>> {
+    let Some(raw) = env::var_os(SAIAI_CHATGPT_TIMEZONE_ENV) else {
+        return Ok(None);
+    };
+    let value = raw
+        .to_str()
+        .context("SAIAI_CHATGPT_TIMEZONE must be valid UTF-8")?
+        .trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    validate_chatgpt_timezone(value)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_chatgpt_timezone(value: &str) -> Result<Option<String>> {
+    if value.len() > 128
+        || value.starts_with('/')
+        || value.contains('\\')
+        || value
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '+' | '-' | '.'))
+    {
+        bail!("{SAIAI_CHATGPT_TIMEZONE_ENV} must be an IANA timezone such as America/Los_Angeles");
+    }
+    let zoneinfo_path = Path::new("/usr/share/zoneinfo").join(value);
+    let metadata = fs::metadata(&zoneinfo_path).with_context(|| {
+        format!(
+            "{SAIAI_CHATGPT_TIMEZONE_ENV} does not exist in {}",
+            zoneinfo_path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        bail!(
+            "{SAIAI_CHATGPT_TIMEZONE_ENV} is not a zoneinfo file: {}",
+            zoneinfo_path.display()
+        );
+    }
+    Ok(Some(value.to_string()))
 }
 
 #[cfg(target_os = "linux")]
@@ -5246,6 +5306,17 @@ HTTPS_PROXY="http://127.0.0.1:1111"
                 _ => panic!("expected Desktop launcher command"),
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validates_optional_chatgpt_timezone() {
+        let resolved =
+            validate_chatgpt_timezone("America/Los_Angeles").expect("valid zoneinfo timezone");
+        assert_eq!(resolved.as_deref(), Some("America/Los_Angeles"));
+
+        assert!(validate_chatgpt_timezone("../etc/passwd").is_err());
+        assert!(validate_chatgpt_timezone("/etc/passwd").is_err());
     }
 
     #[test]
