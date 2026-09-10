@@ -103,13 +103,21 @@ saiai chatgpt
 将根 provider 恢复为官方内置 `openai`，并保留 `auth.json` 中的 ChatGPT OAuth
 token。备份文件使用同目录的 `.bak-<timestamp>` 后缀。
 
-第一阶段只接受 `auth_mode = "chatgpt"` 且存在 access-token 形状的状态；若用户从未
-登录，launcher 会创建只对本地代理有意义的占位状态，Gateway 仍是实际认证边界。
+第一阶段接受 `auth_mode = "chatgpt"` 或 `auth_mode = "chatgptAuthTokens"` 且存在
+access-token 形状的状态；若用户从未登录，launcher 会创建只对本地代理有意义的
+`chatgptAuthTokens` 占位状态，Gateway 仍是实际认证边界。该模式明确告诉 Codex
+token 由外部宿主提供，Codex 不得拿合成状态访问 OpenAI OAuth refresh endpoint。
 占位状态包含供本地 app-server 展示登录态所需的无签名 ID token 形状，但不能通过
 OpenAI 校验；绕过本地代理时不会成为可用凭证。
 `OPENAI_API_KEY` 不参与认证。代理转发 Codex 的 Responses HTTP/WebSocket 请求时
 保留原始路径、请求体、帧和客户端标识头，只在发往 SAIAI Gateway 的边界替换
 Gateway 认证。
+
+launcher 会直接运行 PATH 中的原生 Codex 可执行文件。Linux 官方安装器刚把
+`~/.local/bin` 写入 shell profile、但当前终端尚未刷新 PATH 时，也会回退查找
+`~/.local/bin/codex`。Windows 同时支持 PATH 中的原生 `codex.exe`，以及 npm 常见的
+`codex.cmd` + `node_modules/@openai/codex/bin/codex.js` 布局；后者通过 `node.exe`
+安全启动，不依赖 `cmd.exe` 展开参数。
 
 Codex VSCode 扩展不是 `saiai codex` 的子进程，因此首次使用前执行：
 

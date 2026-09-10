@@ -9,6 +9,8 @@ use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
 use std::env;
+#[cfg(windows)]
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream};
@@ -80,7 +82,6 @@ const CODEX_LOCAL_PROXY_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172
 const CODEX_IDE_ENV_BEGIN: &str = "# BEGIN SAIAI CODEX IDE (managed)";
 const CODEX_IDE_ENV_END: &str = "# END SAIAI CODEX IDE (managed)";
 const CODEX_PLACEHOLDER_ACCESS_TOKEN: &str = "saiai-local-proxy-placeholder-access";
-const CODEX_PLACEHOLDER_REFRESH_TOKEN: &str = "saiai-local-proxy-placeholder-refresh";
 const CODEX_PLACEHOLDER_ACCOUNT_ID: &str = "saiai-local-proxy-placeholder-account";
 // Structurally valid but unsigned and therefore unusable against OpenAI. The
 // local proxy replaces request authentication at the Gateway boundary; these
@@ -673,17 +674,21 @@ fn codex_proxy_gateway_root(base_url: &str) -> Result<String> {
 fn run_codex(args: &[String]) -> Result<()> {
     let codex_dir = codex_config_dir().context("failed to resolve Codex config directory")?;
     let auth_path = codex_dir.join("auth.json");
+    // Resolve the executable before mutating auth/config or starting the
+    // proxy. Official installers may add ~/.local/bin only for future
+    // terminals, and Windows npm installs expose a .cmd shim that Rust's
+    // Command cannot execute directly.
+    let mut command = codex_process_command().context("failed to resolve Codex executable")?;
     let cfg = read_saiai_config()
         .context("SAIAI local proxy is not configured; run the SAIAI Claude setup first")?;
-    ensure_codex_local_proxy_auth(&auth_path, Some(&cfg.api_key))?;
-    validate_codex_oauth_auth(&auth_path)?;
     let _runtime_ca = read_runtime_ca(&cfg)
         .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
+    ensure_codex_local_proxy_auth(&auth_path, Some(&cfg.api_key))?;
+    validate_codex_oauth_auth(&auth_path)?;
     ensure_local_proxy_running(&cfg.listen)?;
     let files = prepare_codex_oauth_files(&codex_dir, false)?;
 
     let proxy = format!("http://{}", cfg.listen);
-    let mut command = ProcessCommand::new("codex");
     // Codex 0.153.x keeps system-proxy support behind the
     // `respect_system_proxy` feature. The local-proxy launcher owns the
     // proxy variables only in this child process, so enable the feature here
@@ -730,6 +735,116 @@ fn run_codex(args: &[String]) -> Result<()> {
     } else {
         bail!("codex exited with {status}")
     }
+}
+
+#[cfg(not(windows))]
+fn codex_process_command() -> Result<ProcessCommand> {
+    let path_directories = env::var_os("PATH")
+        .map(|path| env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if let Some(program) = find_unix_executable(&path_directories, "codex") {
+        return Ok(ProcessCommand::new(program));
+    }
+
+    if let Some(home) = home_dir() {
+        let official_installer_program = home.join(".local/bin/codex");
+        if is_unix_executable(&official_installer_program) {
+            return Ok(ProcessCommand::new(official_installer_program));
+        }
+    }
+
+    bail!(
+        "Codex executable was not found in PATH or ~/.local/bin; install Codex and open a new terminal"
+    )
+}
+
+#[cfg(not(windows))]
+fn find_unix_executable(directories: &[PathBuf], name: &str) -> Option<PathBuf> {
+    directories
+        .iter()
+        .map(|directory| directory.join(name))
+        .find(|candidate| is_unix_executable(candidate))
+}
+
+#[cfg(not(windows))]
+fn is_unix_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(windows)]
+fn codex_process_command() -> Result<ProcessCommand> {
+    let search_path = env::var_os("PATH").context("PATH is unavailable")?;
+    let launch = resolve_windows_codex_launch(&search_path)?;
+    let mut command = ProcessCommand::new(launch.program);
+    command.args(launch.prefix_args);
+    Ok(command)
+}
+
+#[cfg(windows)]
+struct WindowsCodexLaunch {
+    program: PathBuf,
+    prefix_args: Vec<OsString>,
+}
+
+#[cfg(windows)]
+fn resolve_windows_codex_launch(search_path: &OsStr) -> Result<WindowsCodexLaunch> {
+    let mut npm_shim_seen = false;
+    for directory in env::split_paths(search_path) {
+        for name in ["codex.exe", "codex.com"] {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Ok(WindowsCodexLaunch {
+                    program: candidate,
+                    prefix_args: Vec::new(),
+                });
+            }
+        }
+
+        for name in ["codex.cmd", "codex.bat"] {
+            let shim = directory.join(name);
+            if !shim.is_file() {
+                continue;
+            }
+            npm_shim_seen = true;
+            let entrypoint = directory.join("node_modules/@openai/codex/bin/codex.js");
+            if !entrypoint.is_file() {
+                continue;
+            }
+            let node = [directory.join("node.exe"), directory.join("node.com")]
+                .into_iter()
+                .find(|candidate| candidate.is_file())
+                .or_else(|| find_windows_program(search_path, &["node.exe", "node.com"]));
+            if let Some(node) = node {
+                return Ok(WindowsCodexLaunch {
+                    program: node,
+                    prefix_args: vec![entrypoint.into_os_string()],
+                });
+            }
+        }
+    }
+
+    if npm_shim_seen {
+        bail!(
+            "Codex npm command shim was found, but its Node.js entrypoint could not be resolved; reinstall Codex CLI and open a new terminal"
+        );
+    }
+    bail!("Codex executable was not found in PATH; install Codex CLI and open a new terminal")
+}
+
+#[cfg(windows)]
+fn find_windows_program(search_path: &OsStr, names: &[&str]) -> Option<PathBuf> {
+    for directory in env::split_paths(search_path) {
+        for name in names {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 /// Configure Codex's application-local environment for the official VSCode
@@ -927,14 +1042,18 @@ fn ensure_codex_local_proxy_auth(path: &Path, expected_legacy_api_key: Option<&s
 
     auth.insert(
         "auth_mode".to_string(),
-        Value::String("chatgpt".to_string()),
+        // Codex owns refresh-token rotation in `chatgpt` mode. SAIAI's
+        // synthetic local identity is supplied by an external host and must
+        // never be sent to the provider refresh endpoint, so use Codex's
+        // dedicated external-token mode instead.
+        Value::String("chatgptAuthTokens".to_string()),
     );
     auth.insert(
         "tokens".to_string(),
         serde_json::json!({
             "id_token": CODEX_PLACEHOLDER_ID_TOKEN,
             "access_token": CODEX_PLACEHOLDER_ACCESS_TOKEN,
-            "refresh_token": CODEX_PLACEHOLDER_REFRESH_TOKEN,
+            "refresh_token": "",
             "account_id": CODEX_PLACEHOLDER_ACCOUNT_ID
         }),
     );
@@ -1247,9 +1366,9 @@ fn validate_codex_oauth_auth(path: &Path) -> Result<()> {
     let auth = load_json_object(path)
         .with_context(|| format!("failed to load OAuth auth file {}", path.display()))?;
     let auth_mode = auth.get("auth_mode").and_then(Value::as_str).unwrap_or("");
-    if auth_mode != "chatgpt" {
+    if !matches!(auth_mode, "chatgpt" | "chatgptAuthTokens") {
         bail!(
-            "{} is not in ChatGPT OAuth mode; first-phase `saiai codex` does not accept API-key-only auth",
+            "{} is not in ChatGPT token mode; first-phase `saiai codex` does not accept API-key-only auth",
             path.display()
         );
     }
@@ -5092,6 +5211,27 @@ mod tests {
         fs::read_to_string(path).unwrap()
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn resolves_only_executable_unix_codex_candidates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let candidate = dir.path().join("codex");
+        write_str(&candidate, "#!/bin/sh\nexit 0\n");
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            find_unix_executable(&[dir.path().to_path_buf()], "codex"),
+            None
+        );
+
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            find_unix_executable(&[dir.path().to_path_buf()], "codex"),
+            Some(candidate)
+        );
+    }
+
     fn parse(path: &Path) -> DocumentMut {
         read_str(path).parse::<DocumentMut>().unwrap()
     }
@@ -5230,12 +5370,18 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     }
 
     #[test]
-    fn accepts_only_chatgpt_oauth_auth_for_codex_launcher() {
+    fn accepts_chatgpt_managed_and_external_token_auth_for_codex_launcher() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("auth.json");
         write_str(
             &path,
             r#"{"auth_mode":"chatgpt","tokens":{"access_token":"oauth-test"}}"#,
+        );
+        validate_codex_oauth_auth(&path).unwrap();
+
+        write_str(
+            &path,
+            r#"{"auth_mode":"chatgptAuthTokens","tokens":{"access_token":"external-oauth-test"}}"#,
         );
         validate_codex_oauth_auth(&path).unwrap();
 
@@ -5251,12 +5397,13 @@ HTTPS_PROXY="http://127.0.0.1:1111"
 
         let created = load_json_object(&path).unwrap();
         let created_tokens = created["tokens"].as_object().unwrap();
-        assert_eq!(created["auth_mode"].as_str(), Some("chatgpt"));
+        assert_eq!(created["auth_mode"].as_str(), Some("chatgptAuthTokens"));
         assert_eq!(created["OPENAI_API_KEY"], Value::Null);
         assert_eq!(
             created_tokens["access_token"].as_str(),
             Some(CODEX_PLACEHOLDER_ACCESS_TOKEN)
         );
+        assert_eq!(created_tokens["refresh_token"].as_str(), Some(""));
         assert_eq!(
             created_tokens["id_token"]
                 .as_str()
@@ -5278,6 +5425,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         ensure_codex_local_proxy_auth(&path, None).unwrap();
         let upgraded = load_json_object(&path).unwrap();
         assert_eq!(upgraded["unrelated"].as_str(), Some("keep"));
+        assert_eq!(upgraded["auth_mode"].as_str(), Some("chatgptAuthTokens"));
         assert_eq!(
             upgraded["tokens"]["id_token"].as_str(),
             Some(CODEX_PLACEHOLDER_ID_TOKEN)
@@ -5292,7 +5440,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
 
         ensure_codex_local_proxy_auth(&path, Some("TEST_ONLY_MANAGED_KEY")).unwrap();
         let upgraded = load_json_object(&path).unwrap();
-        assert_eq!(upgraded["auth_mode"].as_str(), Some("chatgpt"));
+        assert_eq!(upgraded["auth_mode"].as_str(), Some("chatgptAuthTokens"));
         assert_eq!(
             upgraded["tokens"]["access_token"].as_str(),
             Some(CODEX_PLACEHOLDER_ACCESS_TOKEN)

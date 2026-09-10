@@ -63,7 +63,10 @@ Codex 子进程。旧直连配置保留命令中的 `/v1`，本地代理配置�
 避免代理转发时产生 `/v1/v1/*`。若旧初始化刚写入的 API Key 与 SAIAI 配置 Key
 完全一致，launcher
 会将该状态升级为仅供本地代理使用的 OAuth 占位；真实 OAuth 和不匹配的 API Key
-不会被覆盖。Codex VSCode 扩展先执行
+不会被覆盖。占位状态使用 Codex 的 `chatgptAuthTokens` 外部 token 模式，避免 Codex
+把合成 refresh token 发往 OpenAI。`saiai codex` 支持 PATH 中的原生 `codex.exe`，
+也支持 npm 安装生成的 `codex.cmd`；npm 布局会由 SAIAI 解析后直接通过 `node.exe`
+运行官方 launcher。Codex VSCode 扩展先执行
 一次 `saiai vscode`；该命令只写 Codex 专属 `.env` 和配置文件，不修改 Windows
 系统环境变量。完成后重启 VSCode。Windows 的 VSCode/CA 路径仍须在发布 runner 上
 完成验证后才能作为正式支持声明。

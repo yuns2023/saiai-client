@@ -71,6 +71,7 @@ $codexKey = "TEST_ONLY_WINDOWS_CODEX_PROXY_KEY"
 $savedConfigDir = $env:CLAUDE_CONFIG_DIR
 $savedSaiaiHome = $env:SAIAI_HOME
 $savedCodexHome = $env:CODEX_HOME
+$savedPath = $env:PATH
 
 try {
     $null = New-Item -ItemType Directory -Path $claudeDir -Force
@@ -135,9 +136,29 @@ try {
     $vscode = Invoke-SaiaiProcess -Path $binary -Arguments @("vscode") -CaptureOutput $false
     Assert-Saiai ($vscode.ExitCode -eq 0) "SAIAI Codex OAuth upgrade failed"
     $codexAuth = Get-Content -LiteralPath (Join-Path $env:CODEX_HOME "auth.json") -Raw | ConvertFrom-Json
-    Assert-Saiai ([string]$codexAuth.auth_mode -ceq "chatgpt") "Managed legacy Codex auth was not upgraded"
+    Assert-Saiai ([string]$codexAuth.auth_mode -ceq "chatgptAuthTokens") "Managed legacy Codex auth was not upgraded to externally supplied token mode"
     Assert-Saiai ($null -eq $codexAuth.OPENAI_API_KEY) "Managed legacy Codex API key remains after upgrade"
     Assert-Saiai (-not [string]::IsNullOrWhiteSpace([string]$codexAuth.tokens.access_token)) "Codex OAuth placeholder access token is missing"
+    Assert-Saiai ([string]$codexAuth.tokens.refresh_token -ceq "") "Synthetic Codex auth must not contain a provider refresh token"
+
+    # Rust's std::process::Command does not execute .cmd files directly. A
+    # normal Windows npm installation exposes codex.cmd plus the JavaScript
+    # launcher, so verify SAIAI resolves it through node.exe without cmd.exe.
+    $codexShimDir = Join-Path $temporary "npm-bin"
+    $codexEntrypointDir = Join-Path $codexShimDir "node_modules\@openai\codex\bin"
+    $null = New-Item -ItemType Directory -Path $codexEntrypointDir -Force
+    [IO.File]::WriteAllText((Join-Path $codexShimDir "codex.cmd"), "@echo off`r`nexit /b 99`r`n")
+    [IO.File]::WriteAllText(
+        (Join-Path $codexEntrypointDir "codex.js"),
+        'console.log("SAIAI_WINDOWS_NPM_CODEX " + process.argv.slice(2).join(" "));'
+    )
+    $env:PATH = $codexShimDir + [IO.Path]::PathSeparator + $savedPath
+    $npmCodex = Invoke-SaiaiProcess -Path $binary -Arguments @("codex", "--", "--version")
+    Assert-Saiai ($npmCodex.ExitCode -eq 0) "SAIAI failed to launch a Windows npm Codex install: $($npmCodex.Output)"
+    Assert-Saiai ($npmCodex.Output.Contains("SAIAI_WINDOWS_NPM_CODEX")) "SAIAI did not execute the npm Codex JavaScript launcher"
+    Assert-Saiai ($npmCodex.Output.Contains("features.respect_system_proxy=true")) "SAIAI omitted the child-only Codex proxy feature"
+    Assert-Saiai ($npmCodex.Output.Contains("--version")) "SAIAI did not preserve Codex arguments"
+    $env:PATH = $savedPath
     $preStartStop = Invoke-SaiaiProcess -Path $binary -Arguments @("stop")
     Assert-Saiai ($preStartStop.ExitCode -eq 0) "SAIAI stop after Codex OAuth upgrade failed: $($preStartStop.Output)"
 
@@ -162,6 +183,7 @@ finally {
     $env:CLAUDE_CONFIG_DIR = $savedConfigDir
     $env:SAIAI_HOME = $savedSaiaiHome
     $env:CODEX_HOME = $savedCodexHome
+    $env:PATH = $savedPath
     Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
 }
 

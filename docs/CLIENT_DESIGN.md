@@ -96,16 +96,24 @@ Gateway 与 Key，避免破坏已经配置好的 Claude/ChatGPT 代理信任。�
 正常配置迁移。占位 token 不代表 provider 凭证，只有本地代理正在运行且由 Gateway
 替换认证时才有意义；绕过本地代理会失败。该行为让首次启动不要求用户额外执行
 官方登录流程。
-占位状态包含一个无签名、固定 SAIAI 虚拟声明的 ID token，使 VSCode app-server 的
+占位状态使用 Codex 原生的 `auth_mode = "chatgptAuthTokens"`：它表示 token 由外部
+宿主提供，不允许 Codex 将合成 refresh token 发往 OpenAI。占位状态包含一个无签名、
+固定 SAIAI 虚拟声明的 ID token，使 VSCode app-server 的
 `account/read` 能返回本地登录态；它不能通过 OpenAI 签名校验，也不能在绕过本地代理
-时作为 provider 凭证。`last_refresh` 使用当前时间，避免客户端把这个占位状态当成
-需要主动刷新真实 OAuth token 的旧登录。
+时作为 provider 凭证。占位 refresh token 为空，`last_refresh` 仅用于保持 Codex
+token 数据结构完整；禁止刷新由 auth mode 本身保证。
 
 启动前会先完成只读预检，然后备份并清理主 `config.toml` 及 profile 配置中的
 第三方 `base_url`、`model_providers` 覆盖，将根 provider 设置为
-内置 `openai`。`auth.json` 的 `auth_mode = "chatgpt"` 和 OAuth `tokens` 原样保留；
-第一阶段把 `OPENAI_API_KEY` 置为空值，API-key-only 登录会被拒绝。所有备份都写在
-原目录下，命名为 `.bak-<timestamp>`。
+内置 `openai`。用户已有的真实 `auth_mode = "chatgpt"` OAuth `tokens` 原样保留；
+SAIAI 创建或升级的占位状态使用 `auth_mode = "chatgptAuthTokens"`。第一阶段把
+`OPENAI_API_KEY` 置为空值，API-key-only 登录会被拒绝。所有备份都写在原目录下，
+命名为 `.bak-<timestamp>`。
+
+启动器优先解析 PATH 中的原生 Codex。Linux 额外识别官方安装器默认的
+`~/.local/bin/codex`，即使当前 shell 尚未重新加载 profile；Windows 同时识别原生
+`codex.exe` 和 npm 的 `codex.cmd` 布局，npm 情况直接以 `node.exe` 运行官方
+JavaScript launcher，避免 Rust `Command` 无法直接执行 `.cmd`。
 
 本地代理对 `api.openai.com:443` 终止 TLS 后，将 `/v1/responses` 和 `/v1/models`
 的 HTTP 与 WebSocket 请求转发到 Gateway。Codex 原始方法、路径、query、JSON body、
