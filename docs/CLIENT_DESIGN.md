@@ -81,6 +81,9 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
 覆盖；该开关不持久化到 `config.toml`，用户显式传入同名覆盖时保持用户参数。
 同理，合成 SAIAI 身份不能认证官方 hosted Apps MCP，launcher 默认对子进程设置
 `features.apps=false`，避免非模型控制面产生 `codex_apps` 451；显式用户覆盖仍优先。
+Codex 0.146.0、0.153.4 和 0.154.0 默认使用 `ab.chatgpt.com` 作为 Statsig OTEL
+metrics exporter。SAIAI 网络下该非模型端点可能不可达，因此 launcher 默认对子进程
+设置 `otel.metrics_exporter="none"`；不改写持久配置，显式用户覆盖仍优先。
 
 `init-codex` 在保留旧 `config.toml`/`auth.json` 直连配置的同时，也会在独立的
 `SAIAI_HOME` 中创建本地代理配置和安装 CA，使同一次 WebUI 初始化之后可以直接运行

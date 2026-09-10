@@ -973,10 +973,19 @@ fn is_managed_codex_env(key: &str) -> bool {
 }
 
 fn codex_launcher_args(args: &[String]) -> Vec<String> {
-    let mut launch_args = Vec::with_capacity(args.len() + 4);
+    let mut launch_args = Vec::with_capacity(args.len() + 6);
     if !codex_args_override_feature(args, "respect_system_proxy") {
         launch_args.push("-c".to_string());
         launch_args.push("features.respect_system_proxy=true".to_string());
+    }
+    // Codex defaults OTEL metrics to its hosted Statsig endpoint at
+    // ab.chatgpt.com. That non-model control plane can be unreachable on the
+    // same networks that require SAIAI and should not delay or add errors to
+    // a local-proxy model session. Keep this child-only and honor an explicit
+    // caller override.
+    if !codex_args_override_config_key(args, "otel.metrics_exporter") {
+        launch_args.push("-c".to_string());
+        launch_args.push("otel.metrics_exporter=\"none\"".to_string());
     }
     // A synthetic SAIAI identity cannot authenticate Codex's hosted Apps MCP
     // endpoint. Disable that optional control plane for this launcher so it
@@ -1008,6 +1017,26 @@ fn codex_args_override_feature(args: &[String], feature: &str) -> bool {
         if value.is_some_and(|value| {
             let key = value.split_once('=').map_or(value, |(key, _)| key).trim();
             key == feature || key == format!("features.{feature}")
+        }) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn codex_args_override_config_key(args: &[String], expected_key: &str) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let value = if arg == "-c" || arg == "--config" {
+            i += 1;
+            args.get(i).map(String::as_str)
+        } else {
+            arg.strip_prefix("--config=")
+        };
+        if value.is_some_and(|value| {
+            value.split_once('=').map_or(value, |(key, _)| key).trim() == expected_key
         }) {
             return true;
         }
@@ -5716,6 +5745,8 @@ HTTPS_PROXY="http://127.0.0.1:1111"
                 "-c".to_string(),
                 "features.respect_system_proxy=true".to_string(),
                 "-c".to_string(),
+                "otel.metrics_exporter=\"none\"".to_string(),
+                "-c".to_string(),
                 "features.apps=false".to_string(),
                 "exec".to_string(),
                 "probe".to_string(),
@@ -5736,7 +5767,12 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             assert_eq!(
                 codex_launcher_args(&args),
                 [
-                    vec!["-c".to_string(), "features.apps=false".to_string()],
+                    vec![
+                        "-c".to_string(),
+                        "otel.metrics_exporter=\"none\"".to_string(),
+                        "-c".to_string(),
+                        "features.apps=false".to_string(),
+                    ],
                     args,
                 ]
                 .concat()
@@ -5750,7 +5786,23 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         ];
         let launch_args = codex_launcher_args(&args);
         assert!(launch_args.contains(&"features.respect_system_proxy=true".to_string()));
+        assert!(launch_args.contains(&"otel.metrics_exporter=\"none\"".to_string()));
         assert!(!launch_args.contains(&"features.apps=false".to_string()));
+        assert!(launch_args.ends_with(&args));
+
+        let args = vec![
+            "--config".to_string(),
+            "otel.metrics_exporter=\"statsig\"".to_string(),
+            "exec".to_string(),
+        ];
+        let launch_args = codex_launcher_args(&args);
+        assert_eq!(
+            launch_args
+                .iter()
+                .filter(|value| value.starts_with("otel.metrics_exporter="))
+                .count(),
+            1
+        );
         assert!(launch_args.ends_with(&args));
     }
 

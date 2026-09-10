@@ -157,6 +157,7 @@ try {
     Assert-Saiai ($npmCodex.ExitCode -eq 0) "SAIAI failed to launch a Windows npm Codex install: $($npmCodex.Output)"
     Assert-Saiai ($npmCodex.Output.Contains("SAIAI_WINDOWS_NPM_CODEX")) "SAIAI did not execute the npm Codex JavaScript launcher"
     Assert-Saiai ($npmCodex.Output.Contains("features.respect_system_proxy=true")) "SAIAI omitted the child-only Codex proxy feature"
+    Assert-Saiai ($npmCodex.Output.Contains("otel.metrics_exporter=")) "SAIAI did not disable the unreachable Statsig OTEL endpoint"
     Assert-Saiai ($npmCodex.Output.Contains("features.apps=false")) "SAIAI did not disable the unsupported hosted Apps MCP control plane"
     Assert-Saiai ($npmCodex.Output.Contains("--version")) "SAIAI did not preserve Codex arguments"
     $env:PATH = $savedPath

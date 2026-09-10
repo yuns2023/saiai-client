@@ -69,6 +69,7 @@ def verify_cli() -> None:
         'const CLAUDE_STREAM_IDLE_TIMEOUT_MS: &str = "600000"',
         'Value::String("chatgptAuthTokens".to_string())',
         '"features.apps=false".to_string()',
+        '"otel.metrics_exporter=\\\"none\\\"".to_string()',
         'directory.join("node_modules/@openai/codex/bin/codex.js")',
         'home.join(".local/bin/codex")',
         '"SAIAI_HOME"',
@@ -122,6 +123,7 @@ def verify_cli() -> None:
         "Managed legacy Codex auth was not upgraded",
         "SAIAI_WINDOWS_NPM_CODEX",
         "features.apps=false",
+        "otel.metrics_exporter=",
         "service active: yes",
     ):
         require(required in windows_runtime, f"Windows repeat smoke is missing {required!r}")
