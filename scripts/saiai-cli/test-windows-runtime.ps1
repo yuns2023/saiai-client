@@ -154,7 +154,7 @@ try {
         'console.log("SAIAI_WINDOWS_NPM_CODEX " + process.argv.slice(2).join(" "));'
     )
     $env:PATH = $codexShimDir + [IO.Path]::PathSeparator + $savedPath
-    $npmCodex = Invoke-SaiaiProcess -Path $binary -Arguments @("codex", "--", "--version")
+    $npmCodex = Invoke-SaiaiProcess -Path $binary -Arguments @("codex", "--", "--version") -TimeoutMilliseconds 30000
     Assert-Saiai ($npmCodex.ExitCode -eq 0) "SAIAI failed to launch a Windows npm Codex install: $($npmCodex.Output)"
     Assert-Saiai ($npmCodex.Output.Contains("SAIAI_WINDOWS_NPM_CODEX")) "SAIAI did not execute the npm Codex JavaScript launcher"
     Assert-Saiai ($codexConfig.Contains("respect_system_proxy = false")) "Windows Codex IDE config can bypass the child proxy through WinHTTP DIRECT"
