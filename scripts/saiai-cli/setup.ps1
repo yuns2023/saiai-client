@@ -95,14 +95,14 @@ function Move-SaiaiCandidate {
     )
 
     $lastError = $null
-    foreach ($attempt in 1..20) {
+    foreach ($attempt in 1..100) {
         try {
             Move-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
             return
         }
         catch {
             $lastError = $_
-            if ($attempt -lt 20) {
+            if ($attempt -lt 100) {
                 Start-Sleep -Milliseconds 100
             }
         }
@@ -217,7 +217,10 @@ function Invoke-Saiai {
                 }
 
                 $installedExists = Test-Path -LiteralPath $installPath -PathType Leaf
+                $serviceWasRunning = $false
                 if ($installedExists) {
+                    $statusText = (& $installPath status 2>&1 | Out-String)
+                    $serviceWasRunning = ($LASTEXITCODE -eq 0) -and ($statusText -match 'service active:\s+yes')
                     Stop-SaiaiForReplacement -Path $installPath
                 }
                 if ($installedExists -and
@@ -226,9 +229,24 @@ function Invoke-Saiai {
                     Write-Host "Preserved the previous client at $backupPath." -ForegroundColor DarkGray
                 }
                 $stagedPath = Join-Path $installDirectory (".saiai.install." + [guid]::NewGuid().ToString("N") + ".exe")
+                $serviceStoppedForUpdate = $serviceWasRunning
                 try {
                     [System.IO.File]::Copy($candidatePath, $stagedPath, $false)
                     Move-SaiaiCandidate -Source $stagedPath -Destination $installPath
+                }
+                catch {
+                    if ($serviceStoppedForUpdate -and (Test-Path -LiteralPath $installPath -PathType Leaf)) {
+                        try {
+                            $restartExitCode = Start-SaiaiBackground -Path $installPath
+                            if ($restartExitCode -ne 0) {
+                                Write-Warning "The previous SAIAI proxy could not be restarted after the failed update (exit $restartExitCode)."
+                            }
+                        }
+                        catch {
+                            Write-Warning "The previous SAIAI proxy could not be restarted after the failed update."
+                        }
+                    }
+                    throw
                 }
                 finally {
                     Remove-Item -LiteralPath $stagedPath -Force -ErrorAction SilentlyContinue
