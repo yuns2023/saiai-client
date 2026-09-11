@@ -507,8 +507,10 @@ fn init_claude(args: InitArgs) -> Result<()> {
     let settings_path = &paths.settings_path;
     let state_path = &paths.state_path;
     let credentials_path = &paths.credentials_path;
-    let ca_path = claude_dir.join(SAIAI_CA_FILENAME);
-    let ca_key_path = claude_dir.join(SAIAI_CA_KEY_FILENAME);
+    let default_ca_path = claude_dir.join(SAIAI_CA_FILENAME);
+    let default_ca_key_path = claude_dir.join(SAIAI_CA_KEY_FILENAME);
+    let (ca_path, ca_key_path) =
+        existing_runtime_ca_paths().unwrap_or((default_ca_path, default_ca_key_path));
 
     fs::create_dir_all(claude_dir)
         .with_context(|| format!("failed to create {}", claude_dir.display()))?;
@@ -538,15 +540,14 @@ fn init_claude(args: InitArgs) -> Result<()> {
     state.insert("hasCompletedOnboarding".to_string(), Value::Bool(true));
     write_json_object(state_path, Value::Object(state))?;
 
-    write_saiai_config(&SaiaiConfig {
-        version: SAIAI_CONFIG_VERSION,
-        base_url: args.base_url,
-        api_key: args.api_key,
-        listen: DEFAULT_LOCAL_PROXY_LISTEN.to_string(),
-        ca_cert_path: ca_path.display().to_string(),
-        ca_key_path: ca_key_path.display().to_string(),
-        chatgpt_chat_passthrough: true,
-    })?;
+    update_saiai_provider_config(
+        ProviderKind::Claude,
+        ProviderCredential {
+            base_url: args.base_url,
+            api_key: args.api_key,
+        },
+        Some((ca_path.clone(), ca_key_path.clone())),
+    )?;
 
     println!("SAIAI configured Claude Code for local proxy mode.");
     println!("Updated:");
@@ -629,8 +630,10 @@ fn initialize_codex_local_proxy_at(
         && let Ok(mut existing) = serde_json::from_str::<SaiaiConfig>(&raw)
         && read_runtime_ca(&existing).is_ok()
     {
-        existing.base_url = proxy_base_url.clone();
-        existing.api_key = args.api_key.clone();
+        existing.providers.codex = Some(ProviderCredential {
+            base_url: proxy_base_url,
+            api_key: args.api_key.clone(),
+        });
         write_saiai_config_at(&config_path, &existing)?;
         return Ok(CodexLocalProxyInit {
             config_path,
@@ -643,18 +646,21 @@ fn initialize_codex_local_proxy_at(
     let ca_cert_path = config_dir.join(SAIAI_CA_FILENAME);
     let ca_key_path = config_dir.join(SAIAI_CA_KEY_FILENAME);
     ensure_installation_ca(&ca_cert_path, &ca_key_path, timestamp)?;
-    write_saiai_config_at(
-        &config_path,
-        &SaiaiConfig {
-            version: SAIAI_CONFIG_VERSION,
-            base_url: proxy_base_url,
-            api_key: args.api_key.clone(),
-            listen: DEFAULT_LOCAL_PROXY_LISTEN.to_string(),
-            ca_cert_path: ca_cert_path.display().to_string(),
-            ca_key_path: ca_key_path.display().to_string(),
-            chatgpt_chat_passthrough: true,
-        },
-    )?;
+    let mut config = SaiaiConfig {
+        version: SAIAI_CONFIG_VERSION,
+        base_url: proxy_base_url.clone(),
+        api_key: args.api_key.clone(),
+        listen: DEFAULT_LOCAL_PROXY_LISTEN.to_string(),
+        ca_cert_path: ca_cert_path.display().to_string(),
+        ca_key_path: ca_key_path.display().to_string(),
+        chatgpt_chat_passthrough: true,
+        providers: ProviderCredentials::default(),
+    };
+    config.providers.codex = Some(ProviderCredential {
+        base_url: proxy_base_url,
+        api_key: args.api_key.clone(),
+    });
+    write_saiai_config_at(&config_path, &config)?;
     Ok(CodexLocalProxyInit {
         config_path,
         ca_cert_path,
@@ -2193,6 +2199,111 @@ struct SaiaiConfig {
     ca_key_path: String,
     #[serde(default = "default_true")]
     chatgpt_chat_passthrough: bool,
+    #[serde(default)]
+    providers: ProviderCredentials,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct ProviderCredentials {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude: Option<ProviderCredential>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex: Option<ProviderCredential>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ProviderCredential {
+    base_url: String,
+    api_key: String,
+}
+
+#[derive(Clone, Copy)]
+enum ProviderKind {
+    Claude,
+    Codex,
+}
+
+impl ProviderKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+        }
+    }
+}
+
+fn update_saiai_provider_config(
+    provider: ProviderKind,
+    credential: ProviderCredential,
+    ca_paths: Option<(PathBuf, PathBuf)>,
+) -> Result<SaiaiConfig> {
+    let path = saiai_config_path()?;
+    update_saiai_provider_config_at(&path, provider, credential, ca_paths)
+}
+
+fn update_saiai_provider_config_at(
+    path: &Path,
+    provider: ProviderKind,
+    credential: ProviderCredential,
+    ca_paths: Option<(PathBuf, PathBuf)>,
+) -> Result<SaiaiConfig> {
+    let existing = fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<SaiaiConfig>(&raw).ok());
+    let mut config = existing.unwrap_or_else(|| SaiaiConfig {
+        version: SAIAI_CONFIG_VERSION,
+        base_url: credential.base_url.clone(),
+        api_key: credential.api_key.clone(),
+        listen: DEFAULT_LOCAL_PROXY_LISTEN.to_string(),
+        ca_cert_path: ca_paths
+            .as_ref()
+            .map(|(cert, _)| cert.display().to_string())
+            .unwrap_or_default(),
+        ca_key_path: ca_paths
+            .as_ref()
+            .map(|(_, key)| key.display().to_string())
+            .unwrap_or_default(),
+        chatgpt_chat_passthrough: true,
+        providers: ProviderCredentials::default(),
+    });
+
+    if config.version != SAIAI_CONFIG_VERSION
+        || config.ca_cert_path.trim().is_empty()
+        || config.ca_key_path.trim().is_empty()
+    {
+        if let Some((cert, key)) = ca_paths.as_ref() {
+            config.version = SAIAI_CONFIG_VERSION;
+            config.ca_cert_path = cert.display().to_string();
+            config.ca_key_path = key.display().to_string();
+        } else {
+            bail!(
+                "SAIAI config is obsolete; initialize {} again with the one-command setup",
+                provider.name()
+            );
+        }
+    }
+    if let Some((cert, key)) = ca_paths.as_ref()
+        && read_runtime_ca(&config).is_err()
+    {
+        config.version = SAIAI_CONFIG_VERSION;
+        config.ca_cert_path = cert.display().to_string();
+        config.ca_key_path = key.display().to_string();
+    }
+    if let Some((cert, key)) = ca_paths {
+        if config.ca_cert_path.trim().is_empty() {
+            config.ca_cert_path = cert.display().to_string();
+        }
+        if config.ca_key_path.trim().is_empty() {
+            config.ca_key_path = key.display().to_string();
+        }
+    }
+
+    match provider {
+        ProviderKind::Claude => config.providers.claude = Some(credential),
+        ProviderKind::Codex => config.providers.codex = Some(credential),
+    }
+    write_saiai_config_at(path, &config)?;
+    Ok(config)
 }
 
 fn default_true() -> bool {
@@ -2249,10 +2360,28 @@ fn run_local_proxy(verbose: bool) -> Result<()> {
         .enable_all()
         .build()
         .context("failed to start async runtime")?;
+    let claude = cfg
+        .providers
+        .claude
+        .as_ref()
+        .map(|credential| local_proxy::RouteConfig {
+            base_url: credential.base_url.clone(),
+            api_key: credential.api_key.clone(),
+        });
+    let codex = cfg
+        .providers
+        .codex
+        .as_ref()
+        .map(|credential| local_proxy::RouteConfig {
+            base_url: credential.base_url.clone(),
+            api_key: credential.api_key.clone(),
+        });
     runtime.block_on(local_proxy::run(local_proxy::Config {
         listen: cfg.listen,
         base_url: cfg.base_url,
         api_key: cfg.api_key,
+        claude,
+        codex,
         ca_cert_pem,
         ca_key_pem,
         verbose,
@@ -5421,11 +5550,6 @@ fn saiai_config_path() -> Result<PathBuf> {
     Ok(saiai_config_dir()?.join(SAIAI_CONFIG_FILENAME))
 }
 
-fn write_saiai_config(config: &SaiaiConfig) -> Result<()> {
-    let path = saiai_config_path()?;
-    write_saiai_config_at(&path, config)
-}
-
 fn write_saiai_config_at(path: &Path, config: &SaiaiConfig) -> Result<()> {
     let parent = path
         .parent()
@@ -5444,6 +5568,24 @@ fn read_saiai_config() -> Result<SaiaiConfig> {
         )
     })?;
     serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn existing_runtime_ca_paths() -> Option<(PathBuf, PathBuf)> {
+    let path = saiai_config_path().ok()?;
+    let raw = fs::read_to_string(path).ok()?;
+    let config = serde_json::from_str::<SaiaiConfig>(&raw).ok()?;
+    if config.version != SAIAI_CONFIG_VERSION
+        || config.ca_cert_path.trim().is_empty()
+        || config.ca_key_path.trim().is_empty()
+    {
+        return None;
+    }
+    let cert = PathBuf::from(config.ca_cert_path);
+    let key = PathBuf::from(config.ca_key_path);
+    let cert_pem = fs::read_to_string(&cert).ok()?;
+    let key_pem = fs::read_to_string(&key).ok()?;
+    local_proxy::validate_tls_config(&cert_pem, &key_pem).ok()?;
+    Some((cert, key))
 }
 
 fn env_dir_override(var: &str) -> Option<PathBuf> {
@@ -6306,6 +6448,10 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert_eq!(config.version, SAIAI_CONFIG_VERSION);
         assert_eq!(config.base_url, "https://gateway.example.test");
         assert_eq!(config.api_key, args.api_key);
+        assert_eq!(
+            config.providers.codex.as_ref().map(|value| &value.api_key),
+            Some(&args.api_key)
+        );
         assert_eq!(config.listen, DEFAULT_LOCAL_PROXY_LISTEN);
         assert_eq!(
             config.ca_cert_path,
@@ -6349,6 +6495,10 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         let key_before = fs::read(&first.ca_key_path).unwrap();
         let mut config: SaiaiConfig =
             serde_json::from_slice(&fs::read(&first.config_path).unwrap()).unwrap();
+        config.providers.claude = Some(ProviderCredential {
+            base_url: "https://claude.example.test".to_string(),
+            api_key: "TEST_ONLY_CLAUDE_PROXY_KEY".to_string(),
+        });
         config.listen = "127.0.0.1:29908".to_string();
         config.chatgpt_chat_passthrough = false;
         write_saiai_config_at(&first.config_path, &config).unwrap();
@@ -6367,10 +6517,65 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert_eq!(second.ca_key_path, first.ca_key_path);
         assert_eq!(fs::read(&second.ca_cert_path).unwrap(), cert_before);
         assert_eq!(fs::read(&second.ca_key_path).unwrap(), key_before);
-        assert_eq!(updated.base_url, second_args.base_url);
-        assert_eq!(updated.api_key, second_args.api_key);
+        assert_eq!(updated.base_url, first_args.base_url);
+        assert_eq!(updated.api_key, first_args.api_key);
+        assert_eq!(
+            updated.providers.codex.as_ref().map(|value| &value.api_key),
+            Some(&second_args.api_key)
+        );
+        assert_eq!(
+            updated
+                .providers
+                .claude
+                .as_ref()
+                .map(|value| &value.api_key),
+            Some(&"TEST_ONLY_CLAUDE_PROXY_KEY".to_string())
+        );
         assert_eq!(updated.listen, "127.0.0.1:29908");
         assert!(!updated.chatgpt_chat_passthrough);
+    }
+
+    #[test]
+    fn updates_only_selected_saiai_provider_config() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config_path = temporary.path().join(SAIAI_CONFIG_FILENAME);
+        let cert_path = temporary.path().join("saiai-ca.crt");
+        let key_path = temporary.path().join("saiai-ca.key");
+        let initial = update_saiai_provider_config_at(
+            &config_path,
+            ProviderKind::Claude,
+            ProviderCredential {
+                base_url: "https://claude.example.test".to_string(),
+                api_key: "TEST_ONLY_CLAUDE_KEY".to_string(),
+            },
+            Some((cert_path.clone(), key_path.clone())),
+        )
+        .unwrap();
+        let updated = update_saiai_provider_config_at(
+            &config_path,
+            ProviderKind::Codex,
+            ProviderCredential {
+                base_url: "https://codex.example.test".to_string(),
+                api_key: "TEST_ONLY_CODEX_KEY".to_string(),
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(updated.base_url, initial.base_url);
+        assert_eq!(updated.api_key, initial.api_key);
+        assert_eq!(
+            updated
+                .providers
+                .claude
+                .as_ref()
+                .map(|value| &value.api_key),
+            Some(&"TEST_ONLY_CLAUDE_KEY".to_string())
+        );
+        assert_eq!(
+            updated.providers.codex.as_ref().map(|value| &value.api_key),
+            Some(&"TEST_ONLY_CODEX_KEY".to_string())
+        );
     }
 
     #[test]

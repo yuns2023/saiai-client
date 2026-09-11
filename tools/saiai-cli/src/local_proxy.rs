@@ -47,10 +47,18 @@ pub struct Config {
     pub listen: String,
     pub base_url: String,
     pub api_key: String,
+    pub claude: Option<RouteConfig>,
+    pub codex: Option<RouteConfig>,
     pub ca_cert_pem: String,
     pub ca_key_pem: String,
     pub verbose: bool,
     pub chatgpt_chat_passthrough: bool,
+}
+
+#[derive(Clone)]
+pub struct RouteConfig {
+    pub base_url: String,
+    pub api_key: String,
 }
 
 impl std::fmt::Debug for Config {
@@ -60,6 +68,8 @@ impl std::fmt::Debug for Config {
             .field("listen", &self.listen)
             .field("base_url", &self.base_url)
             .field("api_key", &"[redacted]")
+            .field("claude", &self.claude.as_ref().map(|_| "[configured]"))
+            .field("codex", &self.codex.as_ref().map(|_| "[configured]"))
             .field("runtime_ca", &true)
             .field("verbose", &self.verbose)
             .field("chatgpt_chat_passthrough", &self.chatgpt_chat_passthrough)
@@ -69,8 +79,9 @@ impl std::fmt::Debug for Config {
 
 struct State {
     listen: String,
-    base_url: String,
-    api_key: Zeroizing<String>,
+    default_route: UpstreamRoute,
+    claude_route: Option<UpstreamRoute>,
+    codex_route: Option<UpstreamRoute>,
     ca_cert_pem: String,
     ca_key_pem: Zeroizing<String>,
     verbose: bool,
@@ -78,6 +89,31 @@ struct State {
     client: Client,
     certs: Mutex<HashMap<String, ManagedCertificate>>,
     openai_trace: Option<Arc<OpenAITrace>>,
+}
+
+struct UpstreamRoute {
+    base_url: String,
+    api_key: Zeroizing<String>,
+}
+
+fn validate_route(name: &str, route: RouteConfig) -> Result<UpstreamRoute> {
+    let base = route.base_url.trim().trim_end_matches('/').to_string();
+    let parsed =
+        Url::parse(&base).with_context(|| format!("invalid {name} SAIAI base URL: {base}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => bail!("{name} SAIAI base URL must use http or https, got {scheme}"),
+    }
+    if parsed.host_str().is_none() {
+        bail!("{name} SAIAI base URL host is required");
+    }
+    if route.api_key.trim().is_empty() {
+        bail!("{name} SAIAI API key is required");
+    }
+    Ok(UpstreamRoute {
+        base_url: base,
+        api_key: Zeroizing::new(route.api_key),
+    })
 }
 
 #[derive(Clone)]
@@ -172,7 +208,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     eprintln!("saiai local proxy listening on http://{}", state.listen);
     eprintln!(
         "forwarding managed Claude/OpenAI traffic to {}",
-        state.base_url
+        state.default_route.base_url
     );
     eprintln!("press Ctrl-C to stop");
 
@@ -216,19 +252,21 @@ impl State {
                 cfg.listen
             );
         }
-        let base = cfg.base_url.trim().trim_end_matches('/').to_string();
-        let parsed =
-            Url::parse(&base).with_context(|| format!("invalid SAIAI base URL: {base}"))?;
-        match parsed.scheme() {
-            "http" | "https" => {}
-            scheme => bail!("SAIAI base URL must use http or https, got {scheme}"),
-        }
-        if parsed.host_str().is_none() {
-            bail!("SAIAI base URL host is required");
-        }
-        if cfg.api_key.trim().is_empty() {
-            bail!("SAIAI API key is required");
-        }
+        let default_route = validate_route(
+            "default",
+            RouteConfig {
+                base_url: cfg.base_url,
+                api_key: cfg.api_key,
+            },
+        )?;
+        let claude_route = cfg
+            .claude
+            .map(|route| validate_route("Claude", route))
+            .transpose()?;
+        let codex_route = cfg
+            .codex
+            .map(|route| validate_route("Codex", route))
+            .transpose()?;
 
         build_leaf_server_config(ANTHROPIC_HOST, &cfg.ca_cert_pem, &cfg.ca_key_pem)
             .context("failed to validate installation-specific SAIAI CA")?;
@@ -249,8 +287,9 @@ impl State {
 
         Ok(Self {
             listen: cfg.listen,
-            base_url: base,
-            api_key: Zeroizing::new(cfg.api_key),
+            default_route,
+            claude_route,
+            codex_route,
             ca_cert_pem: cfg.ca_cert_pem,
             ca_key_pem: Zeroizing::new(cfg.ca_key_pem),
             verbose: cfg.verbose,
@@ -283,13 +322,22 @@ impl State {
         Ok(certs.entry(host).or_insert(certificate).clone())
     }
 
-    fn upstream_url(&self, target: &str) -> Result<String> {
-        let path_query = path_query_from_target(target)?;
-        Ok(format!("{}{}", self.base_url, path_query))
+    fn route_for_host(&self, host: &str) -> &UpstreamRoute {
+        let host = canonical_host(host);
+        match host.as_str() {
+            ANTHROPIC_HOST => self.claude_route.as_ref().unwrap_or(&self.default_route),
+            OPENAI_HOST | CHATGPT_HOST => self.codex_route.as_ref().unwrap_or(&self.default_route),
+            _ => &self.default_route,
+        }
     }
 
-    fn websocket_upstream_url(&self, target: &str) -> Result<Url> {
-        let mut url = Url::parse(&self.upstream_url(target)?)
+    fn upstream_url(&self, target: &str, route: &UpstreamRoute) -> Result<String> {
+        let path_query = path_query_from_target(target)?;
+        Ok(format!("{}{}", route.base_url, path_query))
+    }
+
+    fn websocket_upstream_url(&self, target: &str, route: &UpstreamRoute) -> Result<Url> {
+        let mut url = Url::parse(&self.upstream_url(target, route)?)
             .context("failed to parse Gateway WebSocket URL")?;
         let scheme = match url.scheme() {
             "http" => "ws",
@@ -707,7 +755,8 @@ async fn serve_openai_websocket(
 ) -> Result<()> {
     let sec_key = header_value(&request.headers, "sec-websocket-key")
         .context("OpenAI WebSocket request did not include Sec-WebSocket-Key")?;
-    let upstream_url = state.websocket_upstream_url(&request.target)?;
+    let route = state.route_for_host(CHATGPT_HOST);
+    let upstream_url = state.websocket_upstream_url(&request.target, route)?;
     let mut upstream_request = upstream_url
         .as_str()
         .into_client_request()
@@ -737,7 +786,7 @@ async fn serve_openai_websocket(
     }
     upstream_headers.insert(
         HeaderName::from_static("authorization"),
-        HeaderValue::from_str(&format!("Bearer {}", *state.api_key))
+        HeaderValue::from_str(&format!("Bearer {}", *route.api_key))
             .context("failed to build Gateway WebSocket authorization")?,
     );
     upstream_headers.insert(
@@ -928,7 +977,12 @@ async fn forward_to_saiai<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let upstream_url = state.upstream_url(&request.target)?;
+    let route = if replace_authorization {
+        state.route_for_host(OPENAI_HOST)
+    } else {
+        state.route_for_host(ANTHROPIC_HOST)
+    };
+    let upstream_url = state.upstream_url(&request.target, route)?;
     let method = Method::from_bytes(request.method.as_bytes())
         .with_context(|| format!("unsupported HTTP method {}", request.method))?;
     let mut builder = state.client.request(method, &upstream_url);
@@ -943,7 +997,7 @@ where
         }
     }
     if replace_authorization || !has_authorization {
-        builder = builder.bearer_auth(&*state.api_key);
+        builder = builder.bearer_auth(&*route.api_key);
     }
 
     let request_method = request.method.clone();
@@ -2024,6 +2078,14 @@ mod tests {
             listen: "127.0.0.1:0".to_string(),
             base_url: "https://api.saiai.top".to_string(),
             api_key: "sk-test".to_string(),
+            claude: Some(RouteConfig {
+                base_url: "https://claude.example.test".to_string(),
+                api_key: "claude-key".to_string(),
+            }),
+            codex: Some(RouteConfig {
+                base_url: "https://codex.example.test".to_string(),
+                api_key: "codex-key".to_string(),
+            }),
             ca_cert_pem,
             ca_key_pem,
             verbose: false,
@@ -2042,6 +2104,22 @@ mod tests {
                 .unwrap()
                 .len(),
             32
+        );
+        assert_eq!(
+            state.route_for_host(ANTHROPIC_HOST).base_url,
+            "https://claude.example.test"
+        );
+        assert_eq!(
+            state.route_for_host(ANTHROPIC_HOST).api_key.as_str(),
+            "claude-key"
+        );
+        assert_eq!(
+            state.route_for_host(OPENAI_HOST).base_url,
+            "https://codex.example.test"
+        );
+        assert_eq!(
+            state.route_for_host(CHATGPT_HOST).api_key.as_str(),
+            "codex-key"
         );
     }
 
@@ -2146,6 +2224,8 @@ mod tests {
             listen: "0.0.0.0:19908".to_string(),
             base_url: "https://api.saiai.top".to_string(),
             api_key: "sk-test".to_string(),
+            claude: None,
+            codex: None,
             ca_cert_pem,
             ca_key_pem,
             verbose: false,
