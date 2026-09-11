@@ -174,3 +174,13 @@ jobs:
         run: >-
           python3 scripts/saiai-cli/test-macos-service.py
           --binary tools/saiai-cli/target/debug/saiai
+
+      - name: Capture official macOS Codex through local proxy
+        if: matrix.arch == 'arm64'
+        run: |
+          prefix="$RUNNER_TEMP/codex-0.153.4"
+          npm install --global --prefix "$prefix" @openai/codex@0.153.4
+          python3 scripts/saiai-cli/test-windows-codex-proxy.py \
+            --saiai tools/saiai-cli/target/debug/saiai \
+            --codex-prefix "$prefix/bin" \
+            --codex-version 0.153.4

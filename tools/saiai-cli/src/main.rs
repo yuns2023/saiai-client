@@ -1003,11 +1003,11 @@ fn codex_launcher_args(args: &[String]) -> Vec<String> {
 }
 
 fn codex_respect_system_proxy_enabled() -> bool {
-    // On Windows the feature gives WinHTTP/IE proxy discovery precedence over
-    // HTTP_PROXY/HTTPS_PROXY. A DIRECT system decision therefore bypasses the
-    // child-only SAIAI proxy environment. Reqwest and Tungstenite both honor
-    // those environment variables in their transport-default mode.
-    !cfg!(windows)
+    // On Windows and macOS the feature gives platform system-proxy discovery
+    // precedence over HTTP_PROXY/HTTPS_PROXY. A DIRECT system decision
+    // therefore bypasses the child-only SAIAI proxy environment. Reqwest and
+    // Tungstenite both honor those variables in transport-default mode.
+    cfg!(target_os = "linux")
 }
 
 fn codex_args_override_feature(args: &[String], feature: &str) -> bool {

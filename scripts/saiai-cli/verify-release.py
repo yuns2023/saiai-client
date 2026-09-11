@@ -222,6 +222,11 @@ def verify_workflows_and_docs() -> None:
             and '"0.146.0", "0.153.4"' in workflow,
             "Windows workflows do not capture both supported official Codex versions",
         )
+        require(
+            "Capture official macOS Codex through local proxy" in workflow
+            and 'codex-prefix "$prefix/bin"' in workflow,
+            "macOS workflows do not capture the official Apple Silicon Codex client",
+        )
     linux_service = text("scripts/saiai-cli/test-linux-service.py")
     for required in (
         "test-forced headless mode",

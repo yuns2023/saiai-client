@@ -108,6 +108,16 @@ jobs:
           python3 scripts/saiai-cli/test-macos-service.py
           --binary tools/saiai-cli/target/${{ matrix.target }}/release/saiai
 
+      - name: Capture official macOS Codex through local proxy
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          prefix="$RUNNER_TEMP/codex-0.153.4"
+          npm install --global --prefix "$prefix" @openai/codex@0.153.4
+          python3 scripts/saiai-cli/test-windows-codex-proxy.py \
+            --saiai tools/saiai-cli/target/${{ matrix.target }}/release/saiai \
+            --codex-prefix "$prefix/bin" \
+            --codex-version 0.153.4
+
       - name: Smoke-test native Windows local proxy runtime
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh

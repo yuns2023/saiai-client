@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove an official Windows Codex Responses request reaches the SAIAI proxy.
+"""Prove an official Codex Responses request reaches the SAIAI proxy.
 
 The fixture uses only synthetic credentials and a loopback Gateway. Provider
 hostnames are temporarily pinned to loopback so a routing regression cannot
@@ -12,7 +12,10 @@ import argparse
 import http.server
 import json
 import os
+import platform
 from pathlib import Path
+import signal
+import socket
 import subprocess
 import tempfile
 import threading
@@ -20,7 +23,7 @@ import time
 import urllib.parse
 
 
-TEST_KEY = "TEST_ONLY_WINDOWS_CODEX_CAPTURE_KEY"
+TEST_KEY = "TEST_ONLY_CODEX_CAPTURE_KEY"
 BLOCKED_PROVIDER_HOSTS = ("chatgpt.com", "api.openai.com", "ab.chatgpt.com")
 
 
@@ -80,6 +83,61 @@ def run(command: list[str], env: dict[str, str], cwd: Path, timeout: int = 60) -
     )
 
 
+def process_group_options() -> dict[str, object]:
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+        )
+        process.wait(timeout=15)
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=5)
+
+
+def write_hosts(path: Path, content: bytes) -> None:
+    if os.name == "nt":
+        path.write_bytes(content)
+        return
+    subprocess.run(
+        ["sudo", "tee", str(path)],
+        input=content,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=15,
+        check=True,
+    )
+
+
+def wait_for_proxy(process: subprocess.Popen[bytes], port: int = 19908) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("SAIAI foreground proxy exited during startup")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise RuntimeError("SAIAI foreground proxy did not start")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--saiai", required=True, type=Path)
@@ -89,20 +147,24 @@ def main() -> int:
 
     saiai = args.saiai.resolve()
     codex_prefix = args.codex_prefix.resolve()
-    hosts_path = Path(os.environ["SystemRoot"]) / "System32/drivers/etc/hosts"
+    hosts_path = (
+        Path(os.environ["SystemRoot"]) / "System32/drivers/etc/hosts"
+        if os.name == "nt"
+        else Path("/etc/hosts")
+    )
     original_hosts = hosts_path.read_bytes()
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), CaptureHandler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
 
     try:
-        with hosts_path.open("ab") as hosts:
-            hosts.write(b"\n# BEGIN SAIAI CODEX TEST\n")
-            for host in BLOCKED_PROVIDER_HOSTS:
-                hosts.write(f"127.0.0.1 {host}\n::1 {host}\n".encode())
-            hosts.write(b"# END SAIAI CODEX TEST\n")
+        hosts_block = bytearray(b"\n# BEGIN SAIAI CODEX TEST\n")
+        for host in BLOCKED_PROVIDER_HOSTS:
+            hosts_block.extend(f"127.0.0.1 {host}\n::1 {host}\n".encode())
+        hosts_block.extend(b"# END SAIAI CODEX TEST\n")
+        write_hosts(hosts_path, original_hosts + hosts_block)
 
-        with tempfile.TemporaryDirectory(prefix="saiai-windows-codex-proxy-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="saiai-codex-proxy-") as temporary:
             root = Path(temporary)
             env = os.environ.copy()
             env.update(
@@ -126,8 +188,18 @@ def main() -> int:
                 root,
             )
             if init.returncode != 0:
-                raise RuntimeError("SAIAI init-codex failed in the Windows capture fixture")
+                raise RuntimeError("SAIAI init-codex failed in the capture fixture")
 
+            proxy = subprocess.Popen(
+                [str(saiai), "--verbose"],
+                cwd=root,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **process_group_options(),
+            )
+            wait_for_proxy(proxy)
             capture = subprocess.Popen(
                 [
                     str(saiai),
@@ -145,6 +217,7 @@ def main() -> int:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                **process_group_options(),
             )
             deadline = time.monotonic() + 60
             while (
@@ -156,17 +229,9 @@ def main() -> int:
             capture_exit = capture.poll()
             try:
                 if capture_exit is None:
-                    subprocess.run(
-                        ["taskkill", "/PID", str(capture.pid), "/T", "/F"],
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=15,
-                        check=False,
-                    )
-                    capture.wait(timeout=15)
+                    terminate_process_tree(capture)
             finally:
-                run([str(saiai), "stop"], env, root, timeout=15)
+                terminate_process_tree(proxy)
 
             paths = list(CaptureHandler.requests)
             if not CaptureHandler.responses_event.is_set():
@@ -180,14 +245,14 @@ def main() -> int:
 
             print(
                 f"PASS: official Codex {args.codex_version} reached /v1/responses through the "
-                "Windows SAIAI child proxy environment"
+                f"{platform.system()} SAIAI child proxy environment"
             )
             return 0
     finally:
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=5)
-        hosts_path.write_bytes(original_hosts)
+        write_hosts(hosts_path, original_hosts)
 
 
 if __name__ == "__main__":
