@@ -142,7 +142,7 @@ Linux、macOS 和 Windows Desktop 现在有独立的 `saiai desktop`（`saiai ch
 它复制现有 OAuth `auth.json` 到 SAIAI 管理的隔离 `CODEX_HOME`，为 Electron/NSS
 创建独立 CA 数据库（Linux），并向 Desktop 与 app-server 注入本地代理变量。macOS
 直接启动 `/Applications` 或 `~/Applications` 中 `ChatGPT.app`/`Codex.app` app
-bundle 的真实可执行文件，附加
+bundle，并从 `Info.plist` 的 `CFBundleExecutable` 解析真实可执行文件，附加
 进程级 `--proxy-server`，并同时设置 Codex、OpenSSL 和 Node CA 环境；它不修改
 系统代理、Keychain 或系统环境。三种平台都不修改
 用户原始 `.codex*` 目录或系统信任库。没有现有 OAuth `auth.json` 时，Desktop
@@ -188,6 +188,11 @@ Windows 通过 `Get-AppxPackage` 动态解析 `OpenAI.Codex`/`OpenAI.ChatGPT` �
 位置，支持 MSIX 包内 `app\\ChatGPT.exe`，并保留普通安装目录和
 `SAIAI_DESKTOP_BIN` 覆盖。Windows runner 验证原生编译和隔离子进程合同；真实
 商店应用的激活、TLS、登录控制面和模型流量仍需在隔离测试 Gateway 上实测。
+
+Windows wrapper 替换已安装客户端时，先让客户端用 `/T /F` 停止其 PID 文件指向的
+后台进程树，并等待该 PID 消失，再在安装目录内用原子 `File.Replace` 替换可执行
+文件。目标存在时不使用 `Move-Item -Force`；替换失败时保留旧文件，并仅在更新前
+确实运行过后台代理时尝试恢复它。
 
 ## 更新短路径
 

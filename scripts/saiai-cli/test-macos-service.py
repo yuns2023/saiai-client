@@ -161,7 +161,11 @@ def main() -> int:
         auth_path.chmod(0o600)
 
         desktop_capture = temporary / "desktop-capture.json"
-        fake_chatgpt = temporary / "fake-chatgpt.py"
+        fake_bundle = home / "Applications" / "Codex.app"
+        fake_contents = fake_bundle / "Contents"
+        fake_macos = fake_contents / "MacOS"
+        fake_macos.mkdir(parents=True)
+        fake_chatgpt = fake_macos / "FixtureDesktop"
         fake_chatgpt.write_text(
             """#!/usr/bin/env python3
 import json
@@ -194,9 +198,18 @@ Path(os.environ["SAIAI_DESKTOP_CAPTURE"]).write_text(
             encoding="utf-8",
         )
         fake_chatgpt.chmod(0o700)
+        (fake_contents / "Info.plist").write_text(
+            """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>FixtureDesktop</string>
+<key>CFBundleIdentifier</key><string>top.saiai.fixture-codex</string>
+</dict></plist>
+""",
+            encoding="utf-8",
+        )
         environment.update(
             {
-                "SAIAI_DESKTOP_BIN": str(fake_chatgpt),
                 "SAIAI_CHATGPT_TIMEZONE": "America/Los_Angeles",
                 "SAIAI_DESKTOP_CAPTURE": str(desktop_capture),
             }

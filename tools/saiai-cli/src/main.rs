@@ -1321,23 +1321,45 @@ fn resolve_macos_chatgpt_executable() -> Result<PathBuf> {
         }
     }
 
-    let mut candidates = Vec::with_capacity(4);
+    let mut bundles = Vec::with_capacity(4);
     if let Some(home) = home_dir() {
-        candidates.push(home.join("Applications/ChatGPT.app/Contents/MacOS/ChatGPT"));
-        candidates.push(home.join("Applications/Codex.app/Contents/MacOS/Codex"));
+        bundles.push(home.join("Applications/ChatGPT.app"));
+        bundles.push(home.join("Applications/Codex.app"));
     }
-    candidates.push(PathBuf::from(
-        "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
-    ));
-    candidates.push(PathBuf::from(
-        "/Applications/Codex.app/Contents/MacOS/Codex",
-    ));
-    candidates
-        .into_iter()
-        .find(|path| is_unix_executable(path))
-        .context(
-            "ChatGPT.app or Codex.app was not found in /Applications or ~/Applications; install an official Desktop app or set SAIAI_DESKTOP_BIN",
-        )
+    bundles.push(PathBuf::from("/Applications/ChatGPT.app"));
+    bundles.push(PathBuf::from("/Applications/Codex.app"));
+    for bundle in bundles {
+        if let Some(path) = resolve_macos_bundle_executable(&bundle) {
+            return Ok(path);
+        }
+    }
+    bail!(
+        "ChatGPT.app or Codex.app was not found in /Applications or ~/Applications; install an official Desktop app or set SAIAI_DESKTOP_BIN"
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_bundle_executable(bundle: &Path) -> Option<PathBuf> {
+    let plist = bundle.join("Contents/Info.plist");
+    let plist_text = plist.as_os_str().to_str()?;
+    let executable = command_output(
+        "/usr/bin/plutil",
+        &[
+            "-extract",
+            "CFBundleExecutable",
+            "raw",
+            "-o",
+            "-",
+            plist_text,
+        ],
+    )
+    .ok()?;
+    let executable = executable.trim();
+    if executable.is_empty() || executable.contains('/') || executable.contains('\\') {
+        return None;
+    }
+    let path = bundle.join("Contents/MacOS").join(executable);
+    is_unix_executable(&path).then_some(path)
 }
 
 #[cfg(target_os = "windows")]
@@ -4770,11 +4792,21 @@ fn stop_windows_background_proxy() -> Result<()> {
     };
     if windows_pid_is_running(pid).unwrap_or(false) {
         let status = ProcessCommand::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
             .status()
             .context("failed to run taskkill")?;
         if !status.success() {
             bail!("taskkill exited with {status}");
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if !windows_pid_is_running(pid).unwrap_or(false) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if windows_pid_is_running(pid).unwrap_or(false) {
+            bail!("SAIAI background process {pid} did not exit after forced termination");
         }
     }
     let _ = fs::remove_file(windows_pid_path()?);

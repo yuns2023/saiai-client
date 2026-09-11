@@ -95,9 +95,17 @@ function Move-SaiaiCandidate {
     )
 
     $lastError = $null
+    $replaceBackup = "$Destination.replace-backup"
     foreach ($attempt in 1..100) {
         try {
-            Move-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+                Remove-Item -LiteralPath $replaceBackup -Force -ErrorAction SilentlyContinue
+                [System.IO.File]::Replace($Source, $Destination, $replaceBackup, $true)
+                Remove-Item -LiteralPath $replaceBackup -Force -ErrorAction SilentlyContinue
+            }
+            else {
+                [System.IO.File]::Move($Source, $Destination)
+            }
             return
         }
         catch {
@@ -107,6 +115,7 @@ function Move-SaiaiCandidate {
             }
         }
     }
+    Remove-Item -LiteralPath $replaceBackup -Force -ErrorAction SilentlyContinue
     throw $lastError
 }
 
