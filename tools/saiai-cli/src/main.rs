@@ -1,4 +1,6 @@
 use anyhow::{Context, Result, bail};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use base64::Engine;
 use chrono::Utc;
 use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
 use serde::{Deserialize, Serialize};
@@ -12,6 +14,8 @@ use std::env;
 #[cfg(windows)]
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::io::{BufRead, BufReader as StdBufReader};
 use std::io::{ErrorKind, Write};
 use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -81,12 +85,17 @@ const CODEX_MANAGED_ENV: &[&str] = &[
 const CODEX_LOCAL_PROXY_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local";
 const CODEX_IDE_ENV_BEGIN: &str = "# BEGIN SAIAI CODEX IDE (managed)";
 const CODEX_IDE_ENV_END: &str = "# END SAIAI CODEX IDE (managed)";
-const CODEX_PLACEHOLDER_ACCESS_TOKEN: &str = "saiai-local-proxy-placeholder-access";
+const CODEX_CERTIFICATE_CONTROL_HOST: &str = "certificate.saiai.local";
+const CODEX_CERTIFICATE_SPKI_HEADER: &str = "x-saiai-leaf-spki-sha256";
 const CODEX_PLACEHOLDER_ACCOUNT_ID: &str = "saiai-local-proxy-placeholder-account";
 // Structurally valid but unsigned and therefore unusable against OpenAI. The
 // local proxy replaces request authentication at the Gateway boundary; these
 // claims only let Codex's local app-server expose an authenticated UI state.
 const CODEX_PLACEHOLDER_ID_TOKEN: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InNhaWFpLWxvY2FsLXByb3h5QGludmFsaWQiLCJleHAiOjQxMDI0NDQ4MDAsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3BsYW5fdHlwZSI6InBsdXMiLCJjaGF0Z3B0X3VzZXJfaWQiOiJzYWlhaS1sb2NhbC1wcm94eS11c2VyIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoic2FpYWktbG9jYWwtcHJveHktYWNjb3VudCJ9fQ.c2FpYWktbG9jYWwtcHJveHk";
+// Electron's Desktop shell decodes the access token as a JWT before it asks
+// its app-server for account state. Reuse the unsigned local-only token for
+// both fields; the local proxy replaces authorization before Gateway egress.
+const CODEX_PLACEHOLDER_ACCESS_TOKEN: &str = CODEX_PLACEHOLDER_ID_TOKEN;
 
 // Optional fixed timezone for ChatGPT Desktop ordinary Chat. It is read by
 // the launcher and applied only to the Desktop child process; the parent
@@ -1057,13 +1066,28 @@ fn codex_args_override_config_key(args: &[String], expected_key: &str) -> bool {
 }
 
 fn ensure_codex_local_proxy_auth(path: &Path, expected_legacy_api_key: Option<&str>) -> Result<()> {
+    write_codex_local_proxy_auth(path, expected_legacy_api_key, false)
+}
+
+fn replace_codex_local_proxy_auth(
+    path: &Path,
+    expected_legacy_api_key: Option<&str>,
+) -> Result<()> {
+    write_codex_local_proxy_auth(path, expected_legacy_api_key, true)
+}
+
+fn write_codex_local_proxy_auth(
+    path: &Path,
+    expected_legacy_api_key: Option<&str>,
+    replace_existing: bool,
+) -> Result<()> {
     let existed = path.exists();
     let mut auth = if existed {
         load_json_object(path)?
     } else {
         Map::new()
     };
-    if existed {
+    if existed && !replace_existing {
         let existing_access = auth
             .get("tokens")
             .and_then(Value::as_object)
@@ -1078,8 +1102,7 @@ fn ensure_codex_local_proxy_auth(path: &Path, expected_legacy_api_key: Option<&s
                         .and_then(Value::as_str)
                         .is_some_and(|value| value == expected)
             });
-        if !existing_access.starts_with("saiai-local-proxy-placeholder-") && !managed_legacy_api_key
-        {
+        if !is_codex_placeholder_access_token(existing_access) && !managed_legacy_api_key {
             return Ok(());
         }
     }
@@ -1120,6 +1143,10 @@ fn ensure_codex_local_proxy_auth(path: &Path, expected_legacy_api_key: Option<&s
     Ok(())
 }
 
+fn is_codex_placeholder_access_token(token: &str) -> bool {
+    token.starts_with("saiai-local-proxy-placeholder-") || token == CODEX_PLACEHOLDER_ACCESS_TOKEN
+}
+
 fn run_desktop(args: &[String]) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -1152,7 +1179,6 @@ fn run_linux_desktop(args: &[String]) -> Result<()> {
         .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
     ensure_local_proxy_running(&cfg.listen)?;
 
-    let source_codex = codex_config_dir()?;
     let desktop_root = saiai_config_dir()?.join("desktop");
     let desktop_home = desktop_root.join("home");
     let desktop_codex = desktop_root.join("codex");
@@ -1161,13 +1187,7 @@ fn run_linux_desktop(args: &[String]) -> Result<()> {
         .with_context(|| format!("failed to create {}", desktop_codex.display()))?;
     fs::create_dir_all(&desktop_user_data)
         .with_context(|| format!("failed to create {}", desktop_user_data.display()))?;
-    ensure_desktop_oauth_auth(
-        &source_codex.join("auth.json"),
-        &desktop_codex.join("auth.json"),
-    )?;
-    validate_codex_oauth_auth(&desktop_codex.join("auth.json"))?;
-    write_desktop_account_id(&desktop_codex.join("auth.json"), &desktop_root)?;
-    prepare_desktop_onboarding_state(&desktop_codex)?;
+    prepare_isolated_desktop_state(&cfg, &desktop_root, &desktop_codex)?;
     ensure_desktop_nss_ca(&desktop_home, &cfg.ca_cert_path)?;
 
     let executable = env::var_os("SAIAI_CHATGPT_BIN")
@@ -1236,13 +1256,12 @@ fn run_macos_desktop(args: &[String]) -> Result<()> {
         .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
     ensure_local_proxy_running(&cfg.listen)?;
 
-    if resolve_macos_desktop_override()?.is_none()
-        && let Some(bundle) = resolve_macos_codex_bundle()?
-    {
-        return run_macos_packaged_desktop(args, &cfg, &bundle);
-    }
+    let packaged_bundle = if resolve_macos_desktop_override()?.is_none() {
+        resolve_macos_codex_bundle()?
+    } else {
+        None
+    };
 
-    let source_codex = codex_config_dir()?;
     let desktop_root = saiai_config_dir()?.join("desktop");
     let desktop_home = desktop_root.join("home");
     let desktop_codex = desktop_root.join("codex");
@@ -1251,26 +1270,26 @@ fn run_macos_desktop(args: &[String]) -> Result<()> {
         fs::create_dir_all(directory)
             .with_context(|| format!("failed to create {}", directory.display()))?;
     }
-    ensure_desktop_oauth_auth(
-        &source_codex.join("auth.json"),
-        &desktop_codex.join("auth.json"),
-    )?;
-    validate_codex_oauth_auth(&desktop_codex.join("auth.json"))?;
-    // The Desktop app-server runs outside the terminal launcher. Persist the
-    // macOS transport-default choice into its isolated config so a platform
-    // DIRECT result cannot bypass the child-only proxy environment.
-    prepare_codex_oauth_files(&desktop_codex, true)?;
-    write_desktop_account_id(&desktop_codex.join("auth.json"), &desktop_root)?;
-    prepare_desktop_onboarding_state(&desktop_codex)?;
+    prepare_isolated_desktop_state(&cfg, &desktop_root, &desktop_codex)?;
 
     let executable = resolve_macos_chatgpt_executable()?;
+    if let Some(bundle) = &packaged_bundle {
+        verify_macos_codex_bundle(bundle)?;
+        stop_macos_packaged_desktop(bundle)?;
+    }
     let fixed_timezone = resolve_chatgpt_timezone()?;
     let proxy = format!("http://{}", cfg.listen);
+    let spki = local_proxy_chatgpt_spki(&cfg.listen)?;
     let mut launch_args = vec![
         format!("--user-data-dir={}", desktop_user_data.display()),
         format!("--proxy-server={proxy}"),
+        format!("--ignore-certificate-errors-spki-list={spki}"),
     ];
-    launch_args.extend(args.iter().cloned());
+    launch_args.extend(
+        args.iter()
+            .filter(|arg| !arg.starts_with("--ignore-certificate-errors-spki-list="))
+            .cloned(),
+    );
 
     let mut command = ProcessCommand::new(&executable);
     command.args(launch_args);
@@ -1306,13 +1325,51 @@ fn run_macos_desktop(args: &[String]) -> Result<()> {
     if let Some(timezone) = &fixed_timezone {
         println!("  timezone={timezone} (Desktop child only)");
     }
-    let status = command
-        .status()
-        .with_context(|| format!("failed to start {}", executable.display()))?;
-    if status.success() {
+    if let Some(bundle) = packaged_bundle {
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to start {}", executable.display()))?;
+        std::thread::sleep(Duration::from_millis(750));
+        let workspace = env::current_dir().context("failed to resolve the Desktop workspace")?;
+        let target = codex_new_thread_url(&workspace);
+        let mut activation_error = String::new();
+        let mut activated = false;
+        for attempt in 1..=10 {
+            let output = ProcessCommand::new("/usr/bin/open")
+                .arg("-a")
+                .arg(&bundle)
+                .arg(&target)
+                .output()
+                .context("failed to activate packaged OpenAI Desktop")?;
+            if output.status.success() {
+                activated = true;
+                break;
+            }
+            activation_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if attempt < 10 {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+        if !activated {
+            let _ = child.kill();
+            bail!("packaged OpenAI Desktop activation failed after retries: {activation_error}");
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to inspect packaged OpenAI Desktop")?
+        {
+            bail!("ChatGPT Desktop exited with {status}");
+        }
         Ok(())
     } else {
-        bail!("ChatGPT Desktop exited with {status}")
+        let status = command
+            .status()
+            .with_context(|| format!("failed to start {}", executable.display()))?;
+        if status.success() {
+            Ok(())
+        } else {
+            bail!("ChatGPT Desktop exited with {status}")
+        }
     }
 }
 
@@ -1416,75 +1473,21 @@ fn resolve_macos_codex_bundle() -> Result<Option<PathBuf>> {
 }
 
 #[cfg(target_os = "macos")]
-fn run_macos_packaged_desktop(args: &[String], cfg: &SaiaiConfig, bundle: &Path) -> Result<()> {
-    if !args.is_empty() {
-        bail!("packaged macOS Desktop does not accept passthrough arguments");
-    }
-    let codex_dir = codex_config_dir()?;
-    fs::create_dir_all(&codex_dir)
-        .with_context(|| format!("failed to create {}", codex_dir.display()))?;
-    let auth_path = codex_dir.join("auth.json");
-    ensure_codex_local_proxy_auth(&auth_path, Some(&cfg.api_key))?;
-    validate_codex_oauth_auth(&auth_path)?;
-    prepare_codex_oauth_files(&codex_dir, true)?;
-    let env_path = codex_dir.join(".env");
-    write_codex_ide_env(&env_path, &cfg.listen, &cfg.ca_cert_path)?;
-    let desktop_root = saiai_config_dir()?.join("desktop");
-    write_desktop_account_id(&auth_path, &desktop_root)?;
-    prepare_desktop_onboarding_state(&codex_dir)?;
-
+fn verify_macos_codex_bundle(bundle: &Path) -> Result<()> {
     let requirement = "identifier \"com.openai.codex\" and anchor apple generic and certificate leaf[subject.OU] = \"2DC432GLL2\"";
-    let signature = ProcessCommand::new("/usr/bin/codesign")
+    let status = ProcessCommand::new("/usr/bin/codesign")
         .args(["--verify", "--deep", "--strict"])
         .arg(format!("-R={requirement}"))
         .arg(bundle)
         .status()
         .context("failed to verify the OpenAI Desktop signature")?;
-    if !signature.success() {
+    if !status.success() {
         bail!(
             "OpenAI Desktop failed signature verification: {}",
             bundle.display()
         );
     }
-
-    stop_macos_packaged_desktop(bundle)?;
-    let workspace = env::current_dir().context("failed to resolve the Desktop workspace")?;
-    let target = codex_new_thread_url(&workspace);
-    let mut activation_error = String::new();
-    let mut activated = false;
-    for attempt in 1..=10 {
-        let output = ProcessCommand::new("/usr/bin/open")
-            .arg("-n")
-            .arg("-a")
-            .arg(bundle)
-            .arg(&target)
-            .output()
-            .context("failed to activate packaged OpenAI Desktop")?;
-        if output.status.success() {
-            activated = true;
-            break;
-        }
-        activation_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if attempt < 10 {
-            std::thread::sleep(Duration::from_millis(500));
-        }
-    }
-    if !activated {
-        bail!("packaged OpenAI Desktop activation failed after retries: {activation_error}");
-    }
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while std::time::Instant::now() < deadline {
-        if macos_packaged_desktop_running(bundle).unwrap_or(false) {
-            println!("Starting packaged OpenAI Desktop through the SAIAI local proxy.");
-            println!("  application={}", bundle.display());
-            println!("  CODEX_HOME={}", codex_dir.display());
-            println!("  environment={}", env_path.display());
-            println!("  proxy=http://{}", cfg.listen);
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    bail!("packaged OpenAI Desktop activation returned without a running app process")
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1534,6 +1537,13 @@ fn stop_macos_packaged_desktop(bundle: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
+fn codex_new_thread_url(workspace: &Path) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("path", &workspace.display().to_string());
+    format!("codex://threads/new?{}", serializer.finish())
+}
+
+#[cfg(target_os = "macos")]
 fn macos_packaged_desktop_cleanup_bundles(selected: &Path) -> Vec<PathBuf> {
     let mut bundles = vec![selected.to_path_buf()];
     if let Some(home) = home_dir() {
@@ -1567,19 +1577,6 @@ fn macos_packaged_desktop_bundle_process_running(bundle: &Path) -> Result<bool> 
     Ok(status.success())
 }
 
-#[cfg(target_os = "macos")]
-fn macos_packaged_desktop_running(bundle: &Path) -> Result<bool> {
-    let pattern = bundle.join("Contents/MacOS").display().to_string();
-    let status = ProcessCommand::new("/usr/bin/pgrep")
-        .args(["-f", &pattern])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("failed to inspect packaged OpenAI Desktop processes")?;
-    Ok(status.success())
-}
-
 #[cfg(target_os = "windows")]
 fn run_windows_desktop(args: &[String]) -> Result<()> {
     let cfg = read_saiai_config().context("SAIAI local proxy is not configured")?;
@@ -1587,38 +1584,56 @@ fn run_windows_desktop(args: &[String]) -> Result<()> {
         .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
     ensure_local_proxy_running(&cfg.listen)?;
 
-    if resolve_windows_desktop_override()?.is_none()
-        && let Some(package) = resolve_windows_packaged_desktop()?
-    {
-        return run_windows_packaged_desktop(args, &cfg, &package);
-    }
+    let package = if resolve_windows_desktop_override()?.is_none() {
+        resolve_windows_packaged_desktop()?
+    } else {
+        None
+    };
 
-    let source_codex = codex_config_dir()?;
     let desktop_root = saiai_config_dir()?.join("desktop");
     let desktop_home = desktop_root.join("home");
     let desktop_codex = desktop_root.join("codex");
     let desktop_user_data = desktop_root.join("user-data");
-    for directory in [&desktop_home, &desktop_codex, &desktop_user_data] {
+    let desktop_roaming_app_data = desktop_home.join("AppData/Roaming");
+    let desktop_local_app_data = desktop_home.join("AppData/Local");
+    for directory in [
+        &desktop_home,
+        &desktop_codex,
+        &desktop_user_data,
+        &desktop_roaming_app_data,
+        &desktop_local_app_data,
+    ] {
         fs::create_dir_all(directory)
             .with_context(|| format!("failed to create {}", directory.display()))?;
     }
-    ensure_desktop_oauth_auth(
-        &source_codex.join("auth.json"),
-        &desktop_codex.join("auth.json"),
-    )?;
-    validate_codex_oauth_auth(&desktop_codex.join("auth.json"))?;
-    prepare_codex_oauth_files(&desktop_codex, true)?;
-    write_desktop_account_id(&desktop_codex.join("auth.json"), &desktop_root)?;
-    prepare_desktop_onboarding_state(&desktop_codex)?;
+    prepare_isolated_desktop_state(&cfg, &desktop_root, &desktop_codex)?;
 
-    let executable = resolve_windows_desktop_executable()?;
+    let executable = if let Some(package) = &package {
+        let executable = package.install_location.join("app/ChatGPT.exe");
+        if !executable.is_file() {
+            bail!(
+                "OpenAI.Codex AppX executable is unavailable: {}",
+                executable.display()
+            );
+        }
+        stop_windows_packaged_desktop(package)?;
+        executable
+    } else {
+        resolve_windows_desktop_executable()?
+    };
     let fixed_timezone = resolve_chatgpt_timezone()?;
     let proxy = format!("http://{}", cfg.listen);
+    let spki = local_proxy_chatgpt_spki(&cfg.listen)?;
     let mut launch_args = vec![
         format!("--user-data-dir={}", desktop_user_data.display()),
         format!("--proxy-server={proxy}"),
+        format!("--ignore-certificate-errors-spki-list={spki}"),
     ];
-    launch_args.extend(args.iter().cloned());
+    launch_args.extend(
+        args.iter()
+            .filter(|arg| !arg.starts_with("--ignore-certificate-errors-spki-list="))
+            .cloned(),
+    );
 
     let mut command = ProcessCommand::new(&executable);
     command.args(launch_args);
@@ -1629,6 +1644,8 @@ fn run_windows_desktop(args: &[String]) -> Result<()> {
     command
         .env("HOME", &desktop_home)
         .env("USERPROFILE", &desktop_home)
+        .env("APPDATA", &desktop_roaming_app_data)
+        .env("LOCALAPPDATA", &desktop_local_app_data)
         .env("CODEX_HOME", &desktop_codex)
         .env("CODEX_ELECTRON_USER_DATA_PATH", &desktop_user_data)
         .env("CODEX_CA_CERTIFICATE", &cfg.ca_cert_path)
@@ -1706,24 +1723,11 @@ fn resolve_windows_desktop_executable() -> Result<PathBuf> {
 
 #[cfg(target_os = "windows")]
 struct WindowsPackagedDesktop {
-    app_id: String,
     install_location: PathBuf,
 }
 
 #[cfg(target_os = "windows")]
 fn resolve_windows_packaged_desktop() -> Result<Option<WindowsPackagedDesktop>> {
-    let app_id = command_output(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Get-StartApps | Where-Object AppID -Like 'OpenAI.Codex_*!App' | Select-Object -First 1 -ExpandProperty AppID",
-        ],
-    )?;
-    if app_id.trim().is_empty() {
-        return Ok(None);
-    }
     let install_location = command_output(
         "powershell",
         &[
@@ -1733,6 +1737,9 @@ fn resolve_windows_packaged_desktop() -> Result<Option<WindowsPackagedDesktop>> 
             "Get-AppxPackage -Name 'OpenAI.Codex' | Sort-Object Version -Descending | Select-Object -First 1 -ExpandProperty InstallLocation",
         ],
     )?;
+    if install_location.trim().is_empty() {
+        return Ok(None);
+    }
     let install_location = PathBuf::from(install_location.trim());
     if !install_location.is_dir() {
         bail!(
@@ -1740,63 +1747,7 @@ fn resolve_windows_packaged_desktop() -> Result<Option<WindowsPackagedDesktop>> 
             install_location.display()
         );
     }
-    Ok(Some(WindowsPackagedDesktop {
-        app_id: app_id.trim().to_string(),
-        install_location,
-    }))
-}
-
-#[cfg(target_os = "windows")]
-fn run_windows_packaged_desktop(
-    args: &[String],
-    cfg: &SaiaiConfig,
-    package: &WindowsPackagedDesktop,
-) -> Result<()> {
-    if !args.is_empty() {
-        bail!("packaged Windows Desktop does not accept passthrough arguments");
-    }
-    let codex_dir = codex_config_dir()?;
-    fs::create_dir_all(&codex_dir)
-        .with_context(|| format!("failed to create {}", codex_dir.display()))?;
-    let auth_path = codex_dir.join("auth.json");
-    ensure_codex_local_proxy_auth(&auth_path, Some(&cfg.api_key))?;
-    validate_codex_oauth_auth(&auth_path)?;
-    prepare_codex_oauth_files(&codex_dir, true)?;
-    let env_path = codex_dir.join(".env");
-    write_codex_ide_env(&env_path, &cfg.listen, &cfg.ca_cert_path)?;
-    let desktop_root = saiai_config_dir()?.join("desktop");
-    write_desktop_account_id(&auth_path, &desktop_root)?;
-    prepare_desktop_onboarding_state(&codex_dir)?;
-
-    stop_windows_packaged_desktop(package)?;
-    let workspace = env::current_dir().context("failed to resolve the Desktop workspace")?;
-    let target = codex_new_thread_url(&workspace);
-    let status = ProcessCommand::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "& { param($target) Start-Process -FilePath $target }",
-        ])
-        .arg(&target)
-        .status()
-        .context("failed to activate packaged OpenAI Desktop")?;
-    if !status.success() {
-        bail!("packaged OpenAI Desktop activation exited with {status}");
-    }
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while std::time::Instant::now() < deadline {
-        if windows_packaged_desktop_running(package).unwrap_or(false) {
-            println!("Starting packaged OpenAI Desktop through the SAIAI local proxy.");
-            println!("  app_id={}", package.app_id);
-            println!("  CODEX_HOME={}", codex_dir.display());
-            println!("  environment={}", env_path.display());
-            println!("  proxy=http://{}", cfg.listen);
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    bail!("packaged OpenAI Desktop activation returned without a running app process")
+    Ok(Some(WindowsPackagedDesktop { install_location }))
 }
 
 #[cfg(target_os = "windows")]
@@ -1813,29 +1764,6 @@ fn stop_windows_packaged_desktop(package: &WindowsPackagedDesktop) -> Result<()>
         ],
     )?;
     Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn windows_packaged_desktop_running(package: &WindowsPackagedDesktop) -> Result<bool> {
-    let root = package.install_location.display().to_string();
-    let output = command_output(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "& { param($root) $process = Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1; if ($null -ne $process) { 'yes' } }",
-            &root,
-        ],
-    )?;
-    Ok(output.trim() == "yes")
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-fn codex_new_thread_url(workspace: &Path) -> String {
-    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-    serializer.append_pair("path", &workspace.display().to_string());
-    format!("codex://threads/new?{}", serializer.finish())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -1903,40 +1831,6 @@ fn validate_chatgpt_timezone(value: &str) -> Result<Option<String>> {
 fn validate_chatgpt_timezone(value: &str) -> Result<Option<String>> {
     validate_chatgpt_timezone_name(value)?;
     Ok(Some(value.to_string()))
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn ensure_desktop_oauth_auth(source: &Path, target: &Path) -> Result<()> {
-    if target.exists() {
-        let existing = load_json_object(target).ok();
-        let placeholder = existing
-            .as_ref()
-            .and_then(|auth| auth.get("tokens"))
-            .and_then(Value::as_object)
-            .and_then(|tokens| tokens.get("access_token"))
-            .and_then(Value::as_str)
-            .is_some_and(|token| token.starts_with("saiai-local-proxy-placeholder-"));
-        if !placeholder {
-            return Ok(());
-        }
-    }
-    if !source.exists() {
-        bail!(
-            "Desktop login requires an existing ChatGPT OAuth auth.json at {}; run the official Codex login once, then retry",
-            source.display()
-        );
-    }
-    validate_codex_oauth_auth(source)?;
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let bytes = fs::read(source)
-        .with_context(|| format!("failed to read OAuth auth.json from {}", source.display()))?;
-    write_bytes_atomic(target, &bytes, 0o600)
-        .with_context(|| format!("failed to copy OAuth auth.json to {}", target.display()))?;
-    println!("Copied existing ChatGPT OAuth state into the isolated Desktop CODEX_HOME.");
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -2012,6 +1906,43 @@ fn prepare_desktop_onboarding_state(codex_home: &Path) -> Result<()> {
             path.display()
         )
     })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn prepare_isolated_desktop_state(
+    cfg: &SaiaiConfig,
+    desktop_root: &Path,
+    desktop_codex: &Path,
+) -> Result<()> {
+    let auth_path = desktop_codex.join("auth.json");
+    replace_codex_local_proxy_auth(&auth_path, Some(&cfg.api_key))?;
+    validate_codex_oauth_auth(&auth_path)?;
+    prepare_codex_oauth_files(desktop_codex, true)?;
+    disable_codex_apps(&desktop_codex.join("config.toml"))?;
+    write_desktop_account_id(&auth_path, desktop_root)?;
+    prepare_desktop_onboarding_state(desktop_codex)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn disable_codex_apps(path: &Path) -> Result<()> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read Desktop config {}", path.display()))?;
+    let mut document = raw
+        .parse::<DocumentMut>()
+        .with_context(|| format!("failed to parse Desktop config {} as TOML", path.display()))?;
+    match document.get("features") {
+        None => document["features"] = Item::Table(Table::new()),
+        Some(item) if item.is_table() => {}
+        Some(_) => bail!(
+            "{} has a `features` entry that is not a table",
+            path.display()
+        ),
+    }
+    document["features"]
+        .as_table_mut()
+        .expect("features ensured to be a table")
+        .insert("apps", value(false));
+    write_bytes_atomic(path, document.to_string().as_bytes(), 0o600)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -2194,6 +2125,61 @@ fn ensure_local_proxy_running(listen: &str) -> Result<()> {
         std::thread::sleep(Duration::from_millis(100));
     }
     bail!("SAIAI local proxy did not become reachable at {listen}")
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn local_proxy_chatgpt_spki(listen: &str) -> Result<String> {
+    let addr = listen
+        .parse::<SocketAddr>()
+        .with_context(|| format!("invalid local proxy listen address {listen}"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .with_context(|| format!("failed to connect to SAIAI local proxy at {listen}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    stream
+        .write_all(
+            format!(
+                "CONNECT {CODEX_CERTIFICATE_CONTROL_HOST}:443 HTTP/1.1\r\nHost: {CODEX_CERTIFICATE_CONTROL_HOST}:443\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .context("failed to request the local proxy certificate identity")?;
+    stream.flush()?;
+
+    let mut reader = StdBufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    if !line
+        .split_whitespace()
+        .nth(1)
+        .is_some_and(|code| code == "200")
+    {
+        bail!("SAIAI local proxy did not accept the certificate identity request");
+    }
+    let mut spki = None;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 || line == "\r\n" || line == "\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name
+                .trim()
+                .eq_ignore_ascii_case(CODEX_CERTIFICATE_SPKI_HEADER)
+        {
+            spki = Some(value.trim().to_string());
+        }
+    }
+    let spki = spki.context(
+        "running SAIAI proxy does not expose a Desktop certificate pin; run `saiai restart` and retry",
+    )?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&spki)
+        .context("SAIAI local proxy returned an invalid Desktop certificate pin")?;
+    if decoded.len() != 32 {
+        bail!("SAIAI local proxy returned an invalid Desktop certificate pin length");
+    }
+    Ok(spki)
 }
 
 #[derive(Clone, Serialize, Deserialize)]

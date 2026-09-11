@@ -35,6 +35,8 @@ use zeroize::Zeroizing;
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
 const OPENAI_HOST: &str = "api.openai.com";
 const CHATGPT_HOST: &str = "chatgpt.com";
+const CERTIFICATE_CONTROL_HOST: &str = "certificate.saiai.local";
+const CERTIFICATE_SPKI_HEADER: &str = "x-saiai-leaf-spki-sha256";
 const CHATGPT_CHAT_PASSTHROUGH_ENV: &str = "SAIAI_CHATGPT_CHAT_PASSTHROUGH";
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HEADER_LINE: usize = 32 * 1024;
@@ -74,8 +76,14 @@ struct State {
     verbose: bool,
     chatgpt_chat_passthrough: bool,
     client: Client,
-    certs: Mutex<HashMap<String, Arc<ServerConfig>>>,
+    certs: Mutex<HashMap<String, ManagedCertificate>>,
     openai_trace: Option<Arc<OpenAITrace>>,
+}
+
+#[derive(Clone)]
+struct ManagedCertificate {
+    config: Arc<ServerConfig>,
+    spki_sha256: String,
 }
 
 struct ParsedConnect {
@@ -83,7 +91,7 @@ struct ParsedConnect {
     port: u16,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct IncomingRequest {
     method: String,
     target: String,
@@ -254,23 +262,25 @@ impl State {
     }
 
     fn tls_config_for_host(&self, host: &str) -> Result<Arc<ServerConfig>> {
-        let host = canonical_host(host);
+        Ok(Arc::clone(&self.certificate_for_host(host)?.config))
+    }
 
+    fn tls_spki_for_host(&self, host: &str) -> Result<String> {
+        Ok(self.certificate_for_host(host)?.spki_sha256)
+    }
+
+    fn certificate_for_host(&self, host: &str) -> Result<ManagedCertificate> {
+        let host = canonical_host(host);
         {
             let certs = self.lock_cert_cache();
-            if let Some(config) = certs.get(&host) {
-                return Ok(Arc::clone(config));
+            if let Some(certificate) = certs.get(&host) {
+                return Ok(certificate.clone());
             }
         }
 
-        let config = Arc::new(build_leaf_server_config(
-            &host,
-            &self.ca_cert_pem,
-            &self.ca_key_pem,
-        )?);
+        let certificate = build_leaf_server_config(&host, &self.ca_cert_pem, &self.ca_key_pem)?;
         let mut certs = self.lock_cert_cache();
-        let cached = certs.entry(host).or_insert_with(|| Arc::clone(&config));
-        Ok(Arc::clone(cached))
+        Ok(certs.entry(host).or_insert(certificate).clone())
     }
 
     fn upstream_url(&self, target: &str) -> Result<String> {
@@ -359,7 +369,7 @@ impl State {
         }));
     }
 
-    fn lock_cert_cache(&self) -> MutexGuard<'_, HashMap<String, Arc<ServerConfig>>> {
+    fn lock_cert_cache(&self) -> MutexGuard<'_, HashMap<String, ManagedCertificate>> {
         match self.certs.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -423,6 +433,20 @@ async fn handle_client(
     };
 
     let mut stream = reader.into_inner();
+    if connect.host == CERTIFICATE_CONTROL_HOST && connect.port == 443 {
+        let spki = state.tls_spki_for_host(CHATGPT_HOST)?;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 Connection Established\r\n{CERTIFICATE_SPKI_HEADER}: {spki}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .context("failed to return managed certificate identity")?;
+        stream.flush().await?;
+        return Ok(());
+    }
     if is_managed_host(&connect.host) && connect.port == 443 {
         stream
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -591,7 +615,7 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                                 })
                                 .is_ok();
                         if !ordinary_chat_forwarded {
-                            if let Some((status, body, reason)) =
+                            if let Some((status, body, reason, headers)) =
                                 chatgpt_account_sidecar_response(&request)
                             {
                                 if state.verbose {
@@ -600,12 +624,13 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                                         request.method, request.target, status, reason, close_after
                                     );
                                 }
-                                write_static_response(
+                                write_static_response_with_headers(
                                     reader.get_mut(),
                                     status,
                                     "application/json",
                                     &body,
                                     close_after,
+                                    headers,
                                 )
                                 .await?;
                                 if close_after {
@@ -1159,6 +1184,20 @@ async fn write_static_response<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    write_static_response_with_headers(writer, status, content_type, body, close_after, &[]).await
+}
+
+async fn write_static_response_with_headers<W>(
+    writer: &mut W,
+    status: StatusCode,
+    content_type: &'static str,
+    body: &[u8],
+    close_after: bool,
+    headers: &[(&str, &str)],
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let reason = status.canonical_reason().unwrap_or("");
     writer
         .write_all(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes())
@@ -1174,6 +1213,11 @@ where
     if !body.is_empty() {
         writer
             .write_all(format!("Content-Type: {content_type}\r\n").as_bytes())
+            .await?;
+    }
+    for (name, value) in headers {
+        writer
+            .write_all(format!("{name}: {value}\r\n").as_bytes())
             .await?;
     }
     writer.write_all(b"\r\n").await?;
@@ -1348,7 +1392,12 @@ fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse>
 
 fn chatgpt_account_sidecar_response(
     request: &IncomingRequest,
-) -> Option<(StatusCode, Vec<u8>, &'static str)> {
+) -> Option<(
+    StatusCode,
+    Vec<u8>,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+)> {
     let path = request_path(&request.target).ok()?;
     let account_id = header_value(&request.headers, "chatgpt-account-id")
         .map(str::to_owned)
@@ -1360,7 +1409,12 @@ fn chatgpt_account_sidecar_response(
         let id = request_json.get("id").cloned().unwrap_or(Value::Null);
         let method = request_json.get("method").and_then(Value::as_str);
         if id.is_null() || method.is_some_and(|value| value.starts_with("notifications/")) {
-            return Some((StatusCode::ACCEPTED, Vec::new(), "desktop_mcp_notification"));
+            return Some((
+                StatusCode::ACCEPTED,
+                Vec::new(),
+                "desktop_mcp_notification",
+                &[],
+            ));
         }
         let result = match method {
             Some("initialize") => json!({
@@ -1376,15 +1430,30 @@ fn chatgpt_account_sidecar_response(
             StatusCode::OK,
             serde_json::to_vec(&response).ok()?,
             "desktop_mcp_response",
+            &[],
         ));
     }
     let response = match path.as_str() {
         "/backend-api/accounts/optimized/check" | "/backend-api/wham/accounts/check" => json!({
             "account_ordering": [account_id],
-            "accounts": [{"id": account_id, "plan_type": "plus"}]
+            "default_account_id": account_id,
+            "accounts": [{
+                "id": account_id,
+                "account_user_id": "saiai-local-proxy-user",
+                "account_user_role": "standard-user",
+                "structure": "personal",
+                "plan_type": "plus",
+                "is_zdr": false,
+                "is_openai_internal": false,
+                "can_access_with_session": true,
+                "enable_account_switching": false,
+                "is_deactivated": false,
+                "name": null,
+                "profile_picture_url": null
+            }]
         }),
         "/backend-api/wham/statsig/bootstrap" => json!({
-            "statsigPayload": "{\"user\":{}}"
+            "statsigPayload": "{\"feature_gates\":{},\"dynamic_configs\":{},\"layer_configs\":{},\"has_updates\":true,\"time\":0,\"user\":{\"userID\":\"saiai-local-proxy-user\",\"customIDs\":{\"stableID\":\"saiai-local-proxy\"}}}"
         }),
         "/backend-api/conversations" => json!({
             "items": [],
@@ -1410,15 +1479,32 @@ fn chatgpt_account_sidecar_response(
             "account_id": account_id,
             "email": "staging@example.invalid"
         }),
+        // The Desktop rate-limit/sidebar code dereferences this array even
+        // when no checkout flow is enabled. Returning an empty collection is
+        // the neutral authenticated shape; `{}` makes the renderer panic on
+        // `payment_methods.length`.
+        "/backend-api/payments/payment_methods" => json!({
+            "payment_methods": []
+        }),
+        "/backend-api/devicecheck" | "/settings/user" => json!({}),
         _ if path.starts_with("/backend-api/accounts/") && path.ends_with("/settings") => {
             json!({"account_id": account_id, "settings": {}})
         }
         _ => return None,
     };
+    let headers = if matches!(path.as_str(), "/backend-api/devicecheck" | "/settings/user") {
+        &[(
+            "Set-Cookie",
+            "_devicecheck=saiai-local-proxy; Domain=.chatgpt.com; Path=/; Secure; HttpOnly; SameSite=Lax",
+        )][..]
+    } else {
+        &[]
+    };
     Some((
         StatusCode::OK,
         serde_json::to_vec(&response).ok()?,
         "desktop_account_identity",
+        headers,
     ))
 }
 
@@ -1536,7 +1622,7 @@ fn build_leaf_server_config(
     host: &str,
     ca_cert_pem: &str,
     ca_key_pem: &str,
-) -> Result<ServerConfig> {
+) -> Result<ManagedCertificate> {
     let ca_key = KeyPair::from_pem(ca_key_pem).context("failed to parse SAIAI CA key")?;
     let ca_params = CertificateParams::from_ca_cert_pem(ca_cert_pem)
         .context("failed to parse SAIAI CA certificate")?;
@@ -1549,6 +1635,8 @@ fn build_leaf_server_config(
     dn.push(DnType::CommonName, host);
     params.distinguished_name = dn;
     let leaf_key = KeyPair::generate().context("failed to generate leaf key")?;
+    let spki_sha256 =
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(leaf_key.public_key_der()));
     let leaf = params
         .signed_by(&leaf_key, &ca_cert, &ca_key)
         .context("failed to sign leaf certificate")?;
@@ -1562,7 +1650,10 @@ fn build_leaf_server_config(
         .with_single_cert(cert_chain, key)
         .context("failed to build TLS server config")?;
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(config)
+    Ok(ManagedCertificate {
+        config: Arc::new(config),
+        spki_sha256,
+    })
 }
 
 async fn read_line_limited<R>(reader: &mut R) -> Result<String>
@@ -1809,10 +1900,22 @@ mod tests {
             headers: vec![("ChatGPT-Account-ID".to_string(), "account-test".to_string())],
             body: Vec::new(),
         };
-        let (_, body, _) = chatgpt_account_sidecar_response(&conversations).unwrap();
+        let (_, body, _, _) = chatgpt_account_sidecar_response(&conversations).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["items"], json!([]));
         assert_eq!(body["total"], 0);
+
+        let accounts = IncomingRequest {
+            method: "GET".to_string(),
+            target: "/backend-api/wham/accounts/check".to_string(),
+            headers: vec![("ChatGPT-Account-ID".to_string(), "account-test".to_string())],
+            ..conversations.clone()
+        };
+        let (_, body, _, _) = chatgpt_account_sidecar_response(&accounts).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["default_account_id"], "account-test");
+        assert_eq!(body["accounts"][0]["account_user_role"], "standard-user");
+        assert_eq!(body["accounts"][0]["is_zdr"], false);
 
         let statsig = IncomingRequest {
             method: "GET".to_string(),
@@ -1821,9 +1924,12 @@ mod tests {
             headers: vec![("ChatGPT-Account-ID".to_string(), "account-test".to_string())],
             body: Vec::new(),
         };
-        let (_, body, _) = chatgpt_account_sidecar_response(&statsig).unwrap();
+        let (_, body, _, _) = chatgpt_account_sidecar_response(&statsig).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["statsigPayload"], "{\"user\":{}}");
+        let payload: Value =
+            serde_json::from_str(body["statsigPayload"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["has_updates"], true);
+        assert_eq!(payload["user"]["userID"], "saiai-local-proxy-user");
 
         let profile = IncomingRequest {
             method: "GET".to_string(),
@@ -1832,11 +1938,22 @@ mod tests {
             headers: vec![("ChatGPT-Account-ID".to_string(), "account-test".to_string())],
             body: Vec::new(),
         };
-        let (_, body, _) = chatgpt_account_sidecar_response(&profile).unwrap();
+        let (_, body, _, _) = chatgpt_account_sidecar_response(&profile).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert!(body["profile"].is_object());
         assert!(body["stats"].is_object());
         assert!(body["metadata"].is_object());
+
+        let payment_methods = IncomingRequest {
+            method: "GET".to_string(),
+            target: "/backend-api/payments/payment_methods".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let (_, body, _, _) = chatgpt_account_sidecar_response(&payment_methods).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["payment_methods"], json!([]));
 
         let mcp = IncomingRequest {
             method: "POST".to_string(),
@@ -1844,7 +1961,7 @@ mod tests {
             body: br#"{"jsonrpc":"2.0","id":7,"method":"initialize"}"#.to_vec(),
             ..conversations
         };
-        let (_, body, _) = chatgpt_account_sidecar_response(&mcp).unwrap();
+        let (_, body, _, _) = chatgpt_account_sidecar_response(&mcp).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["jsonrpc"], "2.0");
         assert_eq!(body["id"], 7);
@@ -1857,7 +1974,7 @@ mod tests {
             headers: vec![("ChatGPT-Account-ID".to_string(), "account-test".to_string())],
             body: br#"{"jsonrpc":"2.0","id":8,"method":"tools/list"}"#.to_vec(),
         };
-        let (_, body, _) = chatgpt_account_sidecar_response(&tools_list).unwrap();
+        let (_, body, _, _) = chatgpt_account_sidecar_response(&tools_list).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["id"], 8);
         assert_eq!(body["result"]["tools"], json!([]));
@@ -1866,9 +1983,22 @@ mod tests {
             body: br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_vec(),
             ..mcp
         };
-        let (status, body, _) = chatgpt_account_sidecar_response(&notification).unwrap();
+        let (status, body, _, _) = chatgpt_account_sidecar_response(&notification).unwrap();
         assert_eq!(status, StatusCode::ACCEPTED);
         assert!(body.is_empty());
+
+        let settings = IncomingRequest {
+            method: "POST".to_string(),
+            target: "/backend-api/devicecheck".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let (status, _, _, headers) = chatgpt_account_sidecar_response(&settings).unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("set-cookie") && value.starts_with("_devicecheck=")
+        }));
     }
 
     #[test]
@@ -1903,6 +2033,16 @@ mod tests {
 
         let config = state.tls_config_for_host(ANTHROPIC_HOST).unwrap();
         assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        let first = state.tls_spki_for_host(CHATGPT_HOST).unwrap();
+        let second = state.tls_spki_for_host(CHATGPT_HOST).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(first)
+                .unwrap()
+                .len(),
+            32
+        );
     }
 
     #[test]
