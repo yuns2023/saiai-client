@@ -1450,14 +1450,27 @@ fn run_macos_packaged_desktop(args: &[String], cfg: &SaiaiConfig, bundle: &Path)
     stop_macos_packaged_desktop(bundle)?;
     let workspace = env::current_dir().context("failed to resolve the Desktop workspace")?;
     let target = codex_new_thread_url(&workspace);
-    let status = ProcessCommand::new("/usr/bin/open")
-        .arg("-a")
-        .arg(bundle)
-        .arg(&target)
-        .status()
-        .context("failed to activate packaged OpenAI Desktop")?;
-    if !status.success() {
-        bail!("packaged OpenAI Desktop activation exited with {status}");
+    let mut activation_error = String::new();
+    let mut activated = false;
+    for attempt in 1..=10 {
+        let output = ProcessCommand::new("/usr/bin/open")
+            .arg("-n")
+            .arg("-a")
+            .arg(bundle)
+            .arg(&target)
+            .output()
+            .context("failed to activate packaged OpenAI Desktop")?;
+        if output.status.success() {
+            activated = true;
+            break;
+        }
+        activation_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if attempt < 10 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    if !activated {
+        bail!("packaged OpenAI Desktop activation failed after retries: {activation_error}");
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
@@ -1476,6 +1489,21 @@ fn run_macos_packaged_desktop(args: &[String], cfg: &SaiaiConfig, bundle: &Path)
 
 #[cfg(target_os = "macos")]
 fn stop_macos_packaged_desktop(bundle: &Path) -> Result<()> {
+    if !macos_packaged_desktop_running(bundle).unwrap_or(false) {
+        return Ok(());
+    }
+    let _ = ProcessCommand::new("/usr/bin/osascript")
+        .args(["-e", "tell application id \"com.openai.codex\" to quit"])
+        .status();
+    let graceful_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < graceful_deadline {
+        if !macos_packaged_desktop_running(bundle).unwrap_or(false) {
+            std::thread::sleep(Duration::from_millis(750));
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
     let pattern = bundle.join("Contents/MacOS").display().to_string();
     let _ = ProcessCommand::new("/usr/bin/pkill")
         .args(["-TERM", "-f", &pattern])
@@ -1483,6 +1511,7 @@ fn stop_macos_packaged_desktop(bundle: &Path) -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         if !macos_packaged_desktop_running(bundle).unwrap_or(false) {
+            std::thread::sleep(Duration::from_millis(750));
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -1494,6 +1523,7 @@ fn stop_macos_packaged_desktop(bundle: &Path) -> Result<()> {
     if !status.success() && macos_packaged_desktop_running(bundle).unwrap_or(false) {
         bail!("packaged OpenAI Desktop did not exit before relaunch");
     }
+    std::thread::sleep(Duration::from_millis(750));
     Ok(())
 }
 

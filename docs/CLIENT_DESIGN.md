@@ -146,7 +146,9 @@ Windows `OpenAI.Codex_*!App` 包则按官方客户端相同的 `codex://threads/
 `respect_system_proxy=false`，与 VSCode 路径共享无系统环境修改的代理合同。
 
 macOS 会校验 bundle identifier、OpenAI Team ID `2DC432GLL2` 和 codesign，并在
-激活前停止该 bundle 内的旧进程；Windows 通过稳定的 StartApps AppID 和 AppX
+激活前先请求应用正常退出，必要时才终止该 bundle 内的旧进程；进程退出后等待
+LaunchServices 稳定，并用 `open -n -a` 有界重试，避免紧接退出发生 `-600`。
+Windows 通过稳定的 StartApps AppID 和 AppX
 InstallLocation 识别包，只停止该安装目录中的 `ChatGPT`/`Codex` 进程。两者随后
 通过 `codex://` 打开当前 workspace，并确认包进程实际出现，不能再把内部 launcher
 stub 的零退出码当作 UI 启动成功。它们不修改系统代理、Keychain 或系统环境。
