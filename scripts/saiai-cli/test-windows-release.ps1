@@ -131,6 +131,22 @@ try {
     $oldStart = Invoke-SaiaiProcess -Path $installed -Arguments @("start") -CaptureOutput $false
     Assert-Saiai ($oldStart.ExitCode -eq 0) "Upgrade fixture could not start: $($oldStart.Output)"
 
+    # Keep a second process from the same installed image alive. The updater
+    # must terminate exact-path stragglers as well as the managed background
+    # PID before replacing the executable.
+    $stragglerInfo = [Diagnostics.ProcessStartInfo]::new()
+    $stragglerInfo.FileName = $installed
+    $stragglerInfo.UseShellExecute = $false
+    $stragglerInfo.CreateNoWindow = $true
+    $null = $stragglerInfo.ArgumentList.Add("logs")
+    $stragglerInfo.RedirectStandardOutput = $true
+    $stragglerInfo.RedirectStandardError = $true
+    $straggler = [Diagnostics.Process]::new()
+    $straggler.StartInfo = $stragglerInfo
+    $null = $straggler.Start()
+    Start-Sleep -Milliseconds 500
+    Assert-Saiai (-not $straggler.HasExited) "Upgrade straggler fixture exited before replacement"
+
     Remove-Item Env:SAIAI_SKIP_START
     $escapedSetup = $setupPowerShell.Replace("'", "''")
     $childScript = @"
@@ -142,6 +158,9 @@ exit 0
     $powerShellPath = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
     $upgrade = Invoke-SaiaiProcess -Path $powerShellPath -Arguments @("-NoProfile", "-NonInteractive", "-Command", $childScript) -CaptureOutput $false -TimeoutMilliseconds 20000
     Assert-Saiai ($upgrade.ExitCode -eq 0) "Running-client upgrade failed: $($upgrade.Output)"
+    $straggler.WaitForExit(5000) | Out-Null
+    Assert-Saiai ($straggler.HasExited) "Running-client upgrade left an exact-path SAIAI process alive"
+    $straggler.Dispose()
     Assert-Saiai ((Get-Sha256 $installed) -ceq (Get-Sha256 $binary)) "Running-client upgrade did not install the release binary"
     $upgradedStatus = Invoke-SaiaiProcess -Path $installed -Arguments @("status")
     Assert-Saiai ($upgradedStatus.ExitCode -eq 0) "Upgraded client status failed: $($upgradedStatus.Output)"

@@ -1489,7 +1489,8 @@ fn run_macos_packaged_desktop(args: &[String], cfg: &SaiaiConfig, bundle: &Path)
 
 #[cfg(target_os = "macos")]
 fn stop_macos_packaged_desktop(bundle: &Path) -> Result<()> {
-    if !macos_packaged_desktop_running(bundle).unwrap_or(false) {
+    let bundles = macos_packaged_desktop_cleanup_bundles(bundle);
+    if !macos_packaged_desktop_processes_running(&bundles) {
         return Ok(());
     }
     let _ = ProcessCommand::new("/usr/bin/osascript")
@@ -1497,34 +1498,73 @@ fn stop_macos_packaged_desktop(bundle: &Path) -> Result<()> {
         .status();
     let graceful_deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < graceful_deadline {
-        if !macos_packaged_desktop_running(bundle).unwrap_or(false) {
+        if !macos_packaged_desktop_processes_running(&bundles) {
             std::thread::sleep(Duration::from_millis(750));
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    let pattern = bundle.join("Contents/MacOS").display().to_string();
-    let _ = ProcessCommand::new("/usr/bin/pkill")
-        .args(["-TERM", "-f", &pattern])
-        .status();
+    for candidate in &bundles {
+        let pattern = candidate.join("Contents/").display().to_string();
+        let _ = ProcessCommand::new("/usr/bin/pkill")
+            .args(["-TERM", "-f", &pattern])
+            .status();
+    }
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if !macos_packaged_desktop_running(bundle).unwrap_or(false) {
+        if !macos_packaged_desktop_processes_running(&bundles) {
             std::thread::sleep(Duration::from_millis(750));
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let status = ProcessCommand::new("/usr/bin/pkill")
-        .args(["-KILL", "-f", &pattern])
-        .status()
-        .context("failed to force-stop packaged OpenAI Desktop")?;
-    if !status.success() && macos_packaged_desktop_running(bundle).unwrap_or(false) {
+    for candidate in &bundles {
+        let pattern = candidate.join("Contents/").display().to_string();
+        let _ = ProcessCommand::new("/usr/bin/pkill")
+            .args(["-KILL", "-f", &pattern])
+            .status()
+            .context("failed to force-stop packaged OpenAI Desktop")?;
+    }
+    if macos_packaged_desktop_processes_running(&bundles) {
         bail!("packaged OpenAI Desktop did not exit before relaunch");
     }
     std::thread::sleep(Duration::from_millis(750));
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_packaged_desktop_cleanup_bundles(selected: &Path) -> Vec<PathBuf> {
+    let mut bundles = vec![selected.to_path_buf()];
+    if let Some(home) = home_dir() {
+        bundles.push(home.join("Applications/ChatGPT.app"));
+        bundles.push(home.join("Applications/Codex.app"));
+    }
+    bundles.push(PathBuf::from("/Applications/ChatGPT.app"));
+    bundles.push(PathBuf::from("/Applications/Codex.app"));
+    bundles.sort();
+    bundles.dedup();
+    bundles
+}
+
+#[cfg(target_os = "macos")]
+fn macos_packaged_desktop_processes_running(bundles: &[PathBuf]) -> bool {
+    bundles
+        .iter()
+        .any(|bundle| macos_packaged_desktop_bundle_process_running(bundle).unwrap_or(false))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_packaged_desktop_bundle_process_running(bundle: &Path) -> Result<bool> {
+    let pattern = bundle.join("Contents/").display().to_string();
+    let status = ProcessCommand::new("/usr/bin/pgrep")
+        .args(["-f", &pattern])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("failed to inspect packaged OpenAI Desktop process tree")?;
+    Ok(status.success())
 }
 
 #[cfg(target_os = "macos")]

@@ -86,6 +86,29 @@ function Stop-SaiaiForReplacement {
     if ($stopExitCode -ne 0) {
         throw "Existing SAIAI client could not be stopped before update (exit $stopExitCode)."
     }
+
+    # The managed PID covers the background proxy, but an interrupted update or
+    # an older foreground invocation can leave another process holding this
+    # exact executable open. Terminate only processes whose resolved image path
+    # equals the install target; never kill by the generic saiai.exe name.
+    $resolvedPath = [System.IO.Path]::GetFullPath($Path)
+    $comparison = [System.StringComparison]::OrdinalIgnoreCase
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        $remaining = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_.ExecutablePath) -and
+            [string]::Equals([System.IO.Path]::GetFullPath($_.ExecutablePath), $resolvedPath, $comparison)
+        })
+        if ($remaining.Count -eq 0) {
+            return
+        }
+        foreach ($process in $remaining) {
+            Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+
+    throw "Existing SAIAI processes still hold the install target after forced termination: $resolvedPath"
 }
 
 function Move-SaiaiCandidate {
