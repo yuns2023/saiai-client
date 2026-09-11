@@ -138,17 +138,23 @@ Desktop/app-server 是否信任代理 CA 仍需独立验证，不能仅凭 CLI �
 当前 launcher 只覆盖由它直接启动的 Codex CLI 子进程。Codex Desktop 和 VSCode
 扩展不是该子进程，不能因为共享 `CODEX_HOME` 就推断它们已继承代理/CA 环境。
 Linux、macOS 和 Windows Desktop 现在有独立的 `saiai desktop`（`saiai chatgpt`
-别名）启动路径：
-它复制现有 OAuth `auth.json` 到 SAIAI 管理的隔离 `CODEX_HOME`，为 Electron/NSS
-创建独立 CA 数据库（Linux），并向 Desktop 与 app-server 注入本地代理变量。macOS
-直接启动 `/Applications` 或 `~/Applications` 中 `ChatGPT.app`/`Codex.app` app
-bundle，并从 `Info.plist` 的 `CFBundleExecutable` 解析真实可执行文件，附加
-进程级 `--proxy-server`，并同时设置 Codex、OpenSSL 和 Node CA 环境；它不修改
-系统代理、Keychain 或系统环境。三种平台都不修改
-用户原始 `.codex*` 目录或系统信任库。没有现有 OAuth `auth.json` 时，Desktop
-launcher 会明确报错；CLI 的本地代理占位 OAuth 不等价于 Desktop 的已登录状态。
-launcher 同时在隔离的 `.codex-global-state.json` 中标记首次项目引导已完成，
-跳过启动时的职业/个性化问卷；原始用户状态不受影响。
+别名）启动路径。Linux 和显式 `SAIAI_DESKTOP_BIN` 的普通可执行文件使用隔离的
+`CODEX_HOME`/user-data 和进程级代理/CA。官方 macOS `com.openai.codex` bundle 与
+Windows `OpenAI.Codex_*!App` 包则按官方客户端相同的 `codex://threads/new` 协议
+激活；协议激活由 LaunchServices/AppX broker 完成，不能继承 launcher 的临时环境，
+因此这两条路径使用正常 Codex home 中的受管 `.env`、OAuth 占位和
+`respect_system_proxy=false`，与 VSCode 路径共享无系统环境修改的代理合同。
+
+macOS 会校验 bundle identifier、OpenAI Team ID `2DC432GLL2` 和 codesign，并在
+激活前停止该 bundle 内的旧进程；Windows 通过稳定的 StartApps AppID 和 AppX
+InstallLocation 识别包，只停止该安装目录中的 `ChatGPT`/`Codex` 进程。两者随后
+通过 `codex://` 打开当前 workspace，并确认包进程实际出现，不能再把内部 launcher
+stub 的零退出码当作 UI 启动成功。它们不修改系统代理、Keychain 或系统环境。
+
+Linux/普通可执行文件仍会把现有 OAuth `auth.json` 复制到 SAIAI 管理的隔离
+`CODEX_HOME`，为 Electron/NSS 创建独立 CA 数据库（Linux），并在隔离的
+`.codex-global-state.json` 中标记首次项目引导已完成。官方包路径在正常 Codex home
+写入相同 onboarding 状态。没有可用 OAuth/占位 `auth.json` 时 launcher 会明确报错。
 
 普通 ChatGPT Chat 的固定时区是 Desktop 子进程设置，不是全局请求改写。默认值为
 `America/Los_Angeles`，也可以设置 `SAIAI_CHATGPT_TIMEZONE` 覆盖；launcher 会校验
@@ -181,13 +187,11 @@ TLS 变量，CLI 子进程路径继续使用 `CODEX_CA_CERTIFICATE`。显式 VSC
 `http.proxy` 可能覆盖扩展子进程的代理变量，命令输出会提示移除冲突设置。
 
 当前验证覆盖 Linux 官方扩展/app-server 的进程、OAuth 文件、HTTP(S) proxy、CA
-信任和 WebSocket 握手路径。macOS runner 覆盖 LaunchAgent 与 Desktop 子进程的
-app bundle executable、隔离目录、代理/CA/时区环境及参数合同；真实 ChatGPT.app
-的 TLS、登录控制面和普通 Chat/Codex 模型请求仍必须在隔离测试 Gateway 上实测。
-Windows 通过 `Get-AppxPackage` 动态解析 `OpenAI.Codex`/`OpenAI.ChatGPT` 的安装
-位置，支持 MSIX 包内 `app\\ChatGPT.exe`，并保留普通安装目录和
-`SAIAI_DESKTOP_BIN` 覆盖。Windows runner 验证原生编译和隔离子进程合同；真实
-商店应用的激活、TLS、登录控制面和模型流量仍需在隔离测试 Gateway 上实测。
+信任和 WebSocket 握手路径。macOS runner 覆盖 LaunchAgent、Info.plist executable
+解析和普通 Desktop 子进程合同；真实签名 `Codex.app` 的协议激活、TLS、登录控制面
+和模型请求仍必须在隔离测试 Gateway 上实测。Windows runner 验证原生编译、普通
+Desktop 子进程合同和 updater；真实 `OpenAI.Codex_*!App` 的协议激活、`.env`
+加载、TLS、登录控制面和模型流量同样需要现场闭环。
 
 Windows wrapper 替换已安装客户端时，先让客户端用 `/T /F` 停止其 PID 文件指向的
 后台进程树，并等待该 PID 消失，再在安装目录内用原子 `File.Replace` 替换可执行
