@@ -115,6 +115,19 @@ jobs:
           & "$PWD/scripts/saiai-cli/test-windows-runtime.ps1" `
             -BinaryPath "$PWD/tools/saiai-cli/target/${{ matrix.target }}/release/saiai.exe"
 
+      - name: Capture official Windows Codex through local proxy
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          foreach ($version in @("0.146.0", "0.153.4")) {
+            $prefix = Join-Path $env:RUNNER_TEMP "codex-$version"
+            npm install --global --prefix $prefix "@openai/codex@$version"
+            python scripts/saiai-cli/test-windows-codex-proxy.py `
+              --saiai tools/saiai-cli/target/${{ matrix.target }}/release/saiai.exe `
+              --codex-prefix $prefix `
+              --codex-version $version
+          }
+
       - name: Prepare release fixture
         shell: bash
         run: |

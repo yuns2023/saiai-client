@@ -96,9 +96,10 @@ saiai chatgpt
 ```
 
 该命令只在 Codex 子进程中设置 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和
-`CODEX_CA_CERTIFICATE`，并通过子进程参数启用 Codex 的
-`features.respect_system_proxy`；不会修改用户 shell、系统环境变量或把这个开关写入
-`config.toml`。启动前会备份并清理
+`CODEX_CA_CERTIFICATE`。Linux/macOS 通过子进程参数启用 Codex 的
+`features.respect_system_proxy`；Windows 则明确关闭该特性，使 Responses HTTP/WS
+使用子进程代理环境，避免 WinHTTP 返回 `DIRECT` 后绕过本地代理。它不会修改用户
+shell、系统环境变量或把这个开关写入 `config.toml`。启动前会备份并清理
 生效 `CODEX_HOME` 中的第三方 `base_url`、`model_providers` 和 WebSocket 开关，
 将根 provider 恢复为官方内置 `openai`，并保留 `auth.json` 中的 ChatGPT OAuth
 token。备份文件使用同目录的 `.bak-<timestamp>` 后缀。
@@ -134,7 +135,8 @@ saiai vscode
 
 该命令备份并清理同一 `CODEX_HOME` 中冲突的 provider/base URL，创建本地代理 OAuth
 占位状态，并在 Codex 专属 `.env` 中写入 loopback 代理、`SSL_CERT_FILE` 和
-`NO_PROXY`；同时仅在 Codex 配置中持久启用 `features.respect_system_proxy`。它不会
+`NO_PROXY`；同时按平台在 Codex 配置中写入 `features.respect_system_proxy`：
+Linux/macOS 为 `true`，Windows 为 `false`。它不会
 修改 shell 或操作系统环境变量，也不会写入第三方 `base_url`。配置完成后重启
 VSCode（或 reload window），继续正常使用官方 Codex 扩展。若用户显式配置了 VSCode
 的 `http.proxy`，该值可能优先于 Codex `.env`，需要移除冲突值。

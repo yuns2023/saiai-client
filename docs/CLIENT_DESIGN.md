@@ -76,9 +76,11 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
 旧的 `init-codex <base_url> <api_key> [--websockets]` 继续保留兼容。新的
 `saiai codex [-- <codex arguments>]` 是收敛方向：它遵守生效的 `CODEX_HOME`
 （默认 `~/.codex`），不写入第三方 `base_url`，而是在启动的 Codex 子进程中设置
-本地 HTTP 代理和 `CODEX_CA_CERTIFICATE`。当前 Codex 0.153.x 把读取系统代理放在
-`features.respect_system_proxy` 后面，因此 launcher 同时注入等价的子进程命令行
-覆盖；该开关不持久化到 `config.toml`，用户显式传入同名覆盖时保持用户参数。
+本地 HTTP 代理和 `CODEX_CA_CERTIFICATE`。Linux/macOS launcher 通过子进程命令行
+启用 `features.respect_system_proxy`。Windows 必须反向设置为 `false`：Codex 的
+Windows resolver 优先采用 WinHTTP/IE 结果，当系统返回 `DIRECT` 时不会再读取子进程
+`HTTP_PROXY`/`HTTPS_PROXY`；transport-default 的 reqwest/Tungstenite 才会读取这些
+变量。该开关不写入 CLI 的 `config.toml`，用户显式传入同名覆盖时保持用户参数。
 同理，合成 SAIAI 身份不能认证官方 hosted Apps MCP，launcher 默认对子进程设置
 `features.apps=false`，避免非模型控制面产生 `codex_apps` 451；显式用户覆盖仍优先。
 Codex 0.146.0、0.153.4 和 0.154.0 默认使用 `ab.chatgpt.com` 作为 Statsig OTEL
@@ -163,7 +165,8 @@ Codex、CLI 和 VSCode 路径不受影响。
 VSCode 使用一次性的 `saiai vscode` 配置入口，之后用户仍正常启动 VSCode 和官方
 Codex 扩展。该命令复用 CLI 的 OAuth 占位、第三方 provider/base URL 清理和备份
 逻辑，在 `CODEX_HOME/.env` 中写入 loopback HTTP(S) proxy、`NO_PROXY` 和
-`SSL_CERT_FILE`，并在 Codex 配置中持久启用 `features.respect_system_proxy`；它不
+`SSL_CERT_FILE`，并按同一平台规则在 Codex 配置中写入
+`features.respect_system_proxy`（Windows 为 `false`，Linux/macOS 为 `true`）；它不
 修改 shell 或系统环境变量，也不写第三方 `base_url`。官方扩展的 Codex app-server
 会读取 `.env` 中的标准代理和 `SSL_CERT_FILE`。实测 Codex 0.153.4 从 `.env` 读取
 代理和 `SSL_CERT_FILE` 后，HTTP 与 WebSocket 均到达隔离本地代理；仅把

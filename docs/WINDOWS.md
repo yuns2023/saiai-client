@@ -67,7 +67,9 @@ Codex 子进程。旧直连配置保留命令中的 `/v1`，本地代理配置�
 把合成 refresh token 发往 OpenAI。`saiai codex` 支持 PATH 中的原生 `codex.exe`，
 也支持 npm 安装生成的 `codex.cmd`；npm 布局会由 SAIAI 解析后直接通过 `node.exe`
 运行官方 launcher。Codex VSCode 扩展先执行
-一次 `saiai vscode`；该命令只写 Codex 专属 `.env` 和配置文件，不修改 Windows
+一次 `saiai vscode`；该命令只写 Codex 专属 `.env` 和配置文件，并将
+`features.respect_system_proxy` 设为 `false`，避免 WinHTTP 的 `DIRECT` 决策覆盖
+`.env` 中的 loopback 代理；它不修改 Windows
 系统环境变量。完成后重启 VSCode。Windows 的 VSCode/CA 路径仍须在发布 runner 上
 完成验证后才能作为正式支持声明。
 

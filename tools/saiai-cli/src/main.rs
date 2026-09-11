@@ -689,10 +689,10 @@ fn run_codex(args: &[String]) -> Result<()> {
     let files = prepare_codex_oauth_files(&codex_dir, false)?;
 
     let proxy = format!("http://{}", cfg.listen);
-    // Codex 0.153.x keeps system-proxy support behind the
-    // `respect_system_proxy` feature. The local-proxy launcher owns the
-    // proxy variables only in this child process, so enable the feature here
-    // instead of writing another routing/base_url setting to config.toml.
+    // The local-proxy launcher owns proxy variables only in this child
+    // process. Linux/macOS need Codex's system-proxy resolver, while Windows
+    // must keep it off: WinHTTP can resolve DIRECT before Codex considers the
+    // child environment, bypassing the loopback proxy entirely.
     command.args(codex_launcher_args(args));
     command.env("CODEX_HOME", &codex_dir);
     command.env("CODEX_CA_CERTIFICATE", &cfg.ca_cert_path);
@@ -976,7 +976,10 @@ fn codex_launcher_args(args: &[String]) -> Vec<String> {
     let mut launch_args = Vec::with_capacity(args.len() + 6);
     if !codex_args_override_feature(args, "respect_system_proxy") {
         launch_args.push("-c".to_string());
-        launch_args.push("features.respect_system_proxy=true".to_string());
+        launch_args.push(format!(
+            "features.respect_system_proxy={}",
+            codex_respect_system_proxy_enabled()
+        ));
     }
     // Codex defaults OTEL metrics to its hosted Statsig endpoint at
     // ab.chatgpt.com. That non-model control plane can be unreachable on the
@@ -997,6 +1000,14 @@ fn codex_launcher_args(args: &[String]) -> Vec<String> {
     }
     launch_args.extend(args.iter().cloned());
     launch_args
+}
+
+fn codex_respect_system_proxy_enabled() -> bool {
+    // On Windows the feature gives WinHTTP/IE proxy discovery precedence over
+    // HTTP_PROXY/HTTPS_PROXY. A DIRECT system decision therefore bypasses the
+    // child-only SAIAI proxy environment. Reqwest and Tungstenite both honor
+    // those environment variables in their transport-default mode.
+    !cfg!(windows)
 }
 
 fn codex_args_override_feature(args: &[String], feature: &str) -> bool {
@@ -1508,7 +1519,10 @@ fn enable_codex_system_proxy(document: &mut DocumentMut, path: &Path) -> Result<
     document["features"]
         .as_table_mut()
         .expect("features ensured to be a table")
-        .insert("respect_system_proxy", value(true));
+        .insert(
+            "respect_system_proxy",
+            value(codex_respect_system_proxy_enabled()),
+        );
     Ok(())
 }
 
@@ -5343,7 +5357,7 @@ base_url = "https://third-party.example/v1"
     }
 
     #[test]
-    fn enables_persistent_system_proxy_for_codex_ide() {
+    fn configures_platform_proxy_mode_for_codex_ide() {
         let mut doc = r#"
 model_provider = "third_party"
 
@@ -5366,7 +5380,7 @@ base_url = "https://third-party.example/v1"
         assert_eq!(doc["features"]["other_flag"].as_bool(), Some(true));
         assert_eq!(
             doc["features"]["respect_system_proxy"].as_bool(),
-            Some(true)
+            Some(codex_respect_system_proxy_enabled())
         );
         assert!(doc["features"].get("responses_websockets_v2").is_none());
     }
@@ -5743,7 +5757,10 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             codex_launcher_args(&args),
             vec![
                 "-c".to_string(),
-                "features.respect_system_proxy=true".to_string(),
+                format!(
+                    "features.respect_system_proxy={}",
+                    codex_respect_system_proxy_enabled()
+                ),
                 "-c".to_string(),
                 "otel.metrics_exporter=\"none\"".to_string(),
                 "-c".to_string(),
@@ -5785,7 +5802,10 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             "exec".to_string(),
         ];
         let launch_args = codex_launcher_args(&args);
-        assert!(launch_args.contains(&"features.respect_system_proxy=true".to_string()));
+        assert!(launch_args.contains(&format!(
+            "features.respect_system_proxy={}",
+            codex_respect_system_proxy_enabled()
+        )));
         assert!(launch_args.contains(&"otel.metrics_exporter=\"none\"".to_string()));
         assert!(!launch_args.contains(&"features.apps=false".to_string()));
         assert!(launch_args.ends_with(&args));

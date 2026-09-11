@@ -70,6 +70,7 @@ def verify_cli() -> None:
         'Value::String("chatgptAuthTokens".to_string())',
         '"features.apps=false".to_string()',
         '"otel.metrics_exporter=\\\"none\\\"".to_string()',
+        '"features.respect_system_proxy={}"',
         'directory.join("node_modules/@openai/codex/bin/codex.js")',
         'home.join(".local/bin/codex")',
         '"SAIAI_HOME"',
@@ -124,9 +125,18 @@ def verify_cli() -> None:
         "SAIAI_WINDOWS_NPM_CODEX",
         "features.apps=false",
         "otel.metrics_exporter=",
+        "features.respect_system_proxy=false",
         "service active: yes",
     ):
         require(required in windows_runtime, f"Windows repeat smoke is missing {required!r}")
+    windows_codex_capture = text("scripts/saiai-cli/test-windows-codex-proxy.py")
+    for required in (
+        "BLOCKED_PROVIDER_HOSTS",
+        'path == "/v1/responses"',
+        'auth.get("auth_mode") != "chatgptAuthTokens"',
+        "original_hosts",
+    ):
+        require(required in windows_codex_capture, f"Windows Codex capture is missing {required!r}")
 
 
 def verify_manifest_and_wrappers() -> None:
@@ -206,6 +216,12 @@ def verify_workflows_and_docs() -> None:
         "test-linux-service.py" in ci,
         "CI workflow does not exercise the Linux headless service fallback",
     )
+    for workflow in (ci, release):
+        require(
+            "test-windows-codex-proxy.py" in workflow
+            and '"0.146.0", "0.153.4"' in workflow,
+            "Windows workflows do not capture both supported official Codex versions",
+        )
     linux_service = text("scripts/saiai-cli/test-linux-service.py")
     for required in (
         "test-forced headless mode",

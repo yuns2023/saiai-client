@@ -136,6 +136,7 @@ try {
     $vscode = Invoke-SaiaiProcess -Path $binary -Arguments @("vscode") -CaptureOutput $false
     Assert-Saiai ($vscode.ExitCode -eq 0) "SAIAI Codex OAuth upgrade failed"
     $codexAuth = Get-Content -LiteralPath (Join-Path $env:CODEX_HOME "auth.json") -Raw | ConvertFrom-Json
+    $codexConfig = Get-Content -LiteralPath (Join-Path $env:CODEX_HOME "config.toml") -Raw
     Assert-Saiai ([string]$codexAuth.auth_mode -ceq "chatgptAuthTokens") "Managed legacy Codex auth was not upgraded to externally supplied token mode"
     Assert-Saiai ($null -eq $codexAuth.OPENAI_API_KEY) "Managed legacy Codex API key remains after upgrade"
     Assert-Saiai (-not [string]::IsNullOrWhiteSpace([string]$codexAuth.tokens.access_token)) "Codex OAuth placeholder access token is missing"
@@ -156,7 +157,8 @@ try {
     $npmCodex = Invoke-SaiaiProcess -Path $binary -Arguments @("codex", "--", "--version")
     Assert-Saiai ($npmCodex.ExitCode -eq 0) "SAIAI failed to launch a Windows npm Codex install: $($npmCodex.Output)"
     Assert-Saiai ($npmCodex.Output.Contains("SAIAI_WINDOWS_NPM_CODEX")) "SAIAI did not execute the npm Codex JavaScript launcher"
-    Assert-Saiai ($npmCodex.Output.Contains("features.respect_system_proxy=true")) "SAIAI omitted the child-only Codex proxy feature"
+    Assert-Saiai ($codexConfig.Contains("respect_system_proxy = false")) "Windows Codex IDE config can bypass the child proxy through WinHTTP DIRECT"
+    Assert-Saiai ($npmCodex.Output.Contains("features.respect_system_proxy=false")) "SAIAI did not force Windows Codex to use the child proxy environment"
     Assert-Saiai ($npmCodex.Output.Contains("otel.metrics_exporter=")) "SAIAI did not disable the unreachable Statsig OTEL endpoint"
     Assert-Saiai ($npmCodex.Output.Contains("features.apps=false")) "SAIAI did not disable the unsupported hosted Apps MCP control plane"
     Assert-Saiai ($npmCodex.Output.Contains("--version")) "SAIAI did not preserve Codex arguments"
