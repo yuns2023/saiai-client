@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import signal
@@ -129,13 +130,75 @@ def main() -> int:
         saiai_home = home / ".saiai"
         home.mkdir()
         claude_dir.mkdir()
+        codex_dir = home / ".codex"
+        codex_dir.mkdir()
 
         environment = os.environ.copy()
         environment.update(
             {
                 "HOME": str(home),
                 "CLAUDE_CONFIG_DIR": str(claude_dir),
+                "CODEX_HOME": str(codex_dir),
                 "SAIAI_HOME": str(saiai_home),
+            }
+        )
+
+        auth_path = codex_dir / "auth.json"
+        auth_path.write_text(
+            json.dumps(
+                {
+                    "auth_mode": "chatgptAuthTokens",
+                    "tokens": {
+                        "access_token": "TEST_ONLY_MACOS_DESKTOP_ACCESS",
+                        "refresh_token": "",
+                        "account_id": "test-only-macos-desktop-account",
+                    },
+                    "OPENAI_API_KEY": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        auth_path.chmod(0o600)
+
+        desktop_capture = temporary / "desktop-capture.json"
+        fake_chatgpt = temporary / "fake-chatgpt.py"
+        fake_chatgpt.write_text(
+            """#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+keys = [
+    "HOME",
+    "USERPROFILE",
+    "CODEX_HOME",
+    "CODEX_ELECTRON_USER_DATA_PATH",
+    "CODEX_CA_CERTIFICATE",
+    "SSL_CERT_FILE",
+    "NODE_EXTRA_CA_CERTS",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "TZ",
+]
+capture = {
+    "argv": sys.argv[1:],
+    "env": {key: os.environ.get(key) for key in keys},
+}
+Path(os.environ["SAIAI_DESKTOP_CAPTURE"]).write_text(
+    json.dumps(capture), encoding="utf-8"
+)
+""",
+            encoding="utf-8",
+        )
+        fake_chatgpt.chmod(0o700)
+        environment.update(
+            {
+                "SAIAI_CHATGPT_BIN": str(fake_chatgpt),
+                "SAIAI_CHATGPT_TIMEZONE": "America/Los_Angeles",
+                "SAIAI_DESKTOP_CAPTURE": str(desktop_capture),
             }
         )
 
@@ -161,6 +224,56 @@ def main() -> int:
             status = run_checked([str(binary), "status"], environment)
             if "service active: yes" not in status.stdout:
                 raise AssertionError(f"status did not find the LaunchAgent:\n{status.stdout}")
+
+            desktop = run_checked(
+                [str(binary), "chatgpt", "--", "--smoke-argument"], environment
+            )
+            if "Starting ChatGPT Desktop through the SAIAI local proxy." not in desktop.stdout:
+                raise AssertionError(
+                    f"desktop launcher did not report startup:\n{desktop.stdout}"
+                )
+            captured = json.loads(desktop_capture.read_text(encoding="utf-8"))
+            desktop_root = saiai_home / "desktop"
+            expected_desktop_home = desktop_root / "home"
+            expected_desktop_codex = desktop_root / "codex"
+            expected_user_data = desktop_root / "user-data"
+            expected_proxy = f"http://{LISTEN_HOST}:{LISTEN_PORT}"
+            expected_ca = str(claude_dir / "saiai-ca.crt")
+            expected_args = {
+                f"--user-data-dir={expected_user_data}",
+                f"--proxy-server={expected_proxy}",
+                "--smoke-argument",
+            }
+            if not expected_args.issubset(set(captured["argv"])):
+                raise AssertionError(f"desktop arguments are incomplete: {captured['argv']}")
+            expected_environment = {
+                "HOME": str(expected_desktop_home),
+                "USERPROFILE": str(expected_desktop_home),
+                "CODEX_HOME": str(expected_desktop_codex),
+                "CODEX_ELECTRON_USER_DATA_PATH": str(expected_user_data),
+                "CODEX_CA_CERTIFICATE": expected_ca,
+                "SSL_CERT_FILE": expected_ca,
+                "NODE_EXTRA_CA_CERTS": expected_ca,
+                "HTTP_PROXY": expected_proxy,
+                "HTTPS_PROXY": expected_proxy,
+                "ALL_PROXY": expected_proxy,
+                "TZ": "America/Los_Angeles",
+            }
+            for key, expected in expected_environment.items():
+                if captured["env"].get(key) != expected:
+                    raise AssertionError(
+                        f"desktop environment mismatch for {key}: {captured['env'].get(key)!r}"
+                    )
+            desktop_config = (expected_desktop_codex / "config.toml").read_text(
+                encoding="utf-8"
+            )
+            if "respect_system_proxy = false" not in desktop_config:
+                raise AssertionError(
+                    "macOS Desktop config did not disable platform DIRECT proxy precedence"
+                )
+            account_id = (desktop_root / "account-id").read_text(encoding="utf-8")
+            if account_id != "test-only-macos-desktop-account":
+                raise AssertionError("macOS Desktop account identity was not isolated")
 
             verify_logs_command(binary, environment)
 

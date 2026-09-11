@@ -1126,10 +1126,15 @@ fn run_desktop(args: &[String]) -> Result<()> {
         run_linux_desktop(args)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        run_macos_desktop(args)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = args;
-        bail!("SAIAI Desktop integration is currently implemented for Linux only");
+        bail!("SAIAI Desktop integration is currently implemented for Linux and macOS only");
     }
 }
 
@@ -1217,7 +1222,112 @@ fn run_linux_desktop(args: &[String]) -> Result<()> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "macos")]
+fn run_macos_desktop(args: &[String]) -> Result<()> {
+    let cfg = read_saiai_config().context("SAIAI local proxy is not configured")?;
+    let _runtime_ca = read_runtime_ca(&cfg)
+        .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
+    ensure_local_proxy_running(&cfg.listen)?;
+
+    let source_codex = codex_config_dir()?;
+    let desktop_root = saiai_config_dir()?.join("desktop");
+    let desktop_home = desktop_root.join("home");
+    let desktop_codex = desktop_root.join("codex");
+    let desktop_user_data = desktop_root.join("user-data");
+    for directory in [&desktop_home, &desktop_codex, &desktop_user_data] {
+        fs::create_dir_all(directory)
+            .with_context(|| format!("failed to create {}", directory.display()))?;
+    }
+    ensure_desktop_oauth_auth(
+        &source_codex.join("auth.json"),
+        &desktop_codex.join("auth.json"),
+    )?;
+    validate_codex_oauth_auth(&desktop_codex.join("auth.json"))?;
+    // The Desktop app-server runs outside the terminal launcher. Persist the
+    // macOS transport-default choice into its isolated config so a platform
+    // DIRECT result cannot bypass the child-only proxy environment.
+    prepare_codex_oauth_files(&desktop_codex, true)?;
+    write_desktop_account_id(&desktop_codex.join("auth.json"), &desktop_root)?;
+    prepare_desktop_onboarding_state(&desktop_codex)?;
+
+    let executable = resolve_macos_chatgpt_executable()?;
+    let fixed_timezone = resolve_chatgpt_timezone()?;
+    let proxy = format!("http://{}", cfg.listen);
+    let mut launch_args = vec![
+        format!("--user-data-dir={}", desktop_user_data.display()),
+        format!("--proxy-server={proxy}"),
+    ];
+    launch_args.extend(args.iter().cloned());
+
+    let mut command = ProcessCommand::new(&executable);
+    command.args(launch_args);
+    for name in CODEX_MANAGED_ENV {
+        command.env_remove(*name);
+    }
+    command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV);
+    command
+        .env("HOME", &desktop_home)
+        .env("USERPROFILE", &desktop_home)
+        .env("CODEX_HOME", &desktop_codex)
+        .env("CODEX_ELECTRON_USER_DATA_PATH", &desktop_user_data)
+        .env("CODEX_CA_CERTIFICATE", &cfg.ca_cert_path)
+        .env("SSL_CERT_FILE", &cfg.ca_cert_path)
+        .env("NODE_EXTRA_CA_CERTS", &cfg.ca_cert_path)
+        .env("HTTP_PROXY", &proxy)
+        .env("HTTPS_PROXY", &proxy)
+        .env("ALL_PROXY", &proxy)
+        .env("NO_PROXY", CODEX_LOCAL_PROXY_NO_PROXY)
+        .env("http_proxy", &proxy)
+        .env("https_proxy", &proxy)
+        .env("all_proxy", &proxy)
+        .env("no_proxy", CODEX_LOCAL_PROXY_NO_PROXY);
+    if let Some(timezone) = &fixed_timezone {
+        command.env("TZ", timezone);
+    }
+
+    println!("Starting ChatGPT Desktop through the SAIAI local proxy.");
+    println!("  application={}", executable.display());
+    println!("  CODEX_HOME={}", desktop_codex.display());
+    println!("  user-data-dir={}", desktop_user_data.display());
+    println!("  proxy={proxy}");
+    if let Some(timezone) = &fixed_timezone {
+        println!("  timezone={timezone} (Desktop child only)");
+    }
+    let status = command
+        .status()
+        .with_context(|| format!("failed to start {}", executable.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("ChatGPT Desktop exited with {status}")
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_chatgpt_executable() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("SAIAI_CHATGPT_BIN")
+        .map(PathBuf::from)
+        .filter(|path| is_unix_executable(path))
+    {
+        return Ok(path);
+    }
+
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(home) = home_dir() {
+        candidates.push(home.join("Applications/ChatGPT.app/Contents/MacOS/ChatGPT"));
+    }
+    candidates.push(PathBuf::from(
+        "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+    ));
+    candidates
+        .into_iter()
+        .find(|path| is_unix_executable(path))
+        .context(
+            "ChatGPT.app was not found in /Applications or ~/Applications; install ChatGPT Desktop first or set SAIAI_CHATGPT_BIN",
+        )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn resolve_chatgpt_timezone() -> Result<Option<String>> {
     let raw = env::var_os(SAIAI_CHATGPT_TIMEZONE_ENV);
     let Some(raw) = raw else {
@@ -1230,7 +1340,7 @@ fn resolve_chatgpt_timezone() -> Result<Option<String>> {
     resolve_chatgpt_timezone_value(Some(value))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn resolve_chatgpt_timezone_value(value: Option<&str>) -> Result<Option<String>> {
     let value = value.unwrap_or(DEFAULT_CHATGPT_TIMEZONE).trim();
     if value.is_empty() {
@@ -1242,7 +1352,7 @@ fn resolve_chatgpt_timezone_value(value: Option<&str>) -> Result<Option<String>>
     validate_chatgpt_timezone(value)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_chatgpt_timezone(value: &str) -> Result<Option<String>> {
     if value.len() > 128
         || value.starts_with('/')
@@ -1272,7 +1382,7 @@ fn validate_chatgpt_timezone(value: &str) -> Result<Option<String>> {
     Ok(Some(value.to_string()))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ensure_desktop_oauth_auth(source: &Path, target: &Path) -> Result<()> {
     if target.exists() {
         let existing = load_json_object(target).ok();
@@ -1354,7 +1464,7 @@ fn ensure_desktop_nss_ca(home: &Path, ca_cert: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn prepare_desktop_onboarding_state(codex_home: &Path) -> Result<()> {
     let path = codex_home.join(".codex-global-state.json");
     let mut root = if path.exists() {
@@ -1387,7 +1497,7 @@ fn prepare_desktop_onboarding_state(codex_home: &Path) -> Result<()> {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn write_desktop_account_id(auth_path: &Path, desktop_root: &Path) -> Result<()> {
     let auth = load_json_object(auth_path)?;
     let account_id = auth
@@ -5633,7 +5743,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn validates_optional_chatgpt_timezone() {
         assert_eq!(
