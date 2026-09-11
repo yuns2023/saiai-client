@@ -196,7 +196,7 @@ Path(os.environ["SAIAI_DESKTOP_CAPTURE"]).write_text(
         fake_chatgpt.chmod(0o700)
         environment.update(
             {
-                "SAIAI_CHATGPT_BIN": str(fake_chatgpt),
+                "SAIAI_DESKTOP_BIN": str(fake_chatgpt),
                 "SAIAI_CHATGPT_TIMEZONE": "America/Los_Angeles",
                 "SAIAI_DESKTOP_CAPTURE": str(desktop_capture),
             }

@@ -140,7 +140,8 @@ Desktop/app-server 是否信任代理 CA 仍需独立验证，不能仅凭 CLI �
 Linux 和 macOS Desktop 现在有独立的 `saiai desktop`（`saiai chatgpt` 别名）启动路径：
 它复制现有 OAuth `auth.json` 到 SAIAI 管理的隔离 `CODEX_HOME`，为 Electron/NSS
 创建独立 CA 数据库（Linux），并向 Desktop 与 app-server 注入本地代理变量。macOS
-直接启动 `/Applications` 或 `~/Applications` 中 app bundle 的真实可执行文件，附加
+直接启动 `/Applications` 或 `~/Applications` 中 `ChatGPT.app`/`Codex.app` app
+bundle 的真实可执行文件，附加
 进程级 `--proxy-server`，并同时设置 Codex、OpenSSL 和 Node CA 环境；它不修改
 系统代理、Keychain 或系统环境。两种平台都不修改
 用户原始 `.codex*` 目录或系统信任库。没有现有 OAuth `auth.json` 时，Desktop

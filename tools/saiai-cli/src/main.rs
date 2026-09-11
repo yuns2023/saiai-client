@@ -1305,25 +1305,31 @@ fn run_macos_desktop(args: &[String]) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn resolve_macos_chatgpt_executable() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("SAIAI_CHATGPT_BIN")
-        .map(PathBuf::from)
-        .filter(|path| is_unix_executable(path))
-    {
-        return Ok(path);
+    for variable in ["SAIAI_DESKTOP_BIN", "SAIAI_CHATGPT_BIN"] {
+        if let Some(path) = env::var_os(variable)
+            .map(PathBuf::from)
+            .filter(|path| is_unix_executable(path))
+        {
+            return Ok(path);
+        }
     }
 
-    let mut candidates = Vec::with_capacity(2);
+    let mut candidates = Vec::with_capacity(4);
     if let Some(home) = home_dir() {
         candidates.push(home.join("Applications/ChatGPT.app/Contents/MacOS/ChatGPT"));
+        candidates.push(home.join("Applications/Codex.app/Contents/MacOS/Codex"));
     }
     candidates.push(PathBuf::from(
         "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+    ));
+    candidates.push(PathBuf::from(
+        "/Applications/Codex.app/Contents/MacOS/Codex",
     ));
     candidates
         .into_iter()
         .find(|path| is_unix_executable(path))
         .context(
-            "ChatGPT.app was not found in /Applications or ~/Applications; install ChatGPT Desktop first or set SAIAI_CHATGPT_BIN",
+            "ChatGPT.app or Codex.app was not found in /Applications or ~/Applications; install an official Desktop app or set SAIAI_DESKTOP_BIN",
         )
 }
 
