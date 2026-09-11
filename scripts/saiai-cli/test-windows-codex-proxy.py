@@ -16,6 +16,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import threading
+import time
 import urllib.parse
 
 
@@ -25,6 +26,7 @@ BLOCKED_PROVIDER_HOSTS = ("chatgpt.com", "api.openai.com", "ab.chatgpt.com")
 
 class CaptureHandler(http.server.BaseHTTPRequestHandler):
     requests: list[tuple[str, str]] = []
+    responses_event = threading.Event()
 
     def _record(self) -> str:
         path = urllib.parse.urlsplit(self.path).path
@@ -47,6 +49,8 @@ class CaptureHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
         path = self._record()
+        if path == "/v1/responses":
+            self.responses_event.set()
         length = int(self.headers.get("Content-Length", "0"))
         if length:
             self.rfile.read(length)
@@ -124,30 +128,51 @@ def main() -> int:
             if init.returncode != 0:
                 raise RuntimeError("SAIAI init-codex failed in the Windows capture fixture")
 
+            capture = subprocess.Popen(
+                [
+                    str(saiai),
+                    "codex",
+                    "--",
+                    "exec",
+                    "--skip-git-repo-check",
+                    "--ephemeral",
+                    "-m",
+                    "gpt-5.1",
+                    "TEST_ONLY_PROXY_ROUTING_PROBE",
+                ],
+                cwd=root,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            deadline = time.monotonic() + 60
+            while (
+                time.monotonic() < deadline
+                and not CaptureHandler.responses_event.is_set()
+                and capture.poll() is None
+            ):
+                time.sleep(0.1)
+            capture_exit = capture.poll()
             try:
-                capture = run(
-                    [
-                        str(saiai),
-                        "codex",
-                        "--",
-                        "exec",
-                        "--skip-git-repo-check",
-                        "--ephemeral",
-                        "-m",
-                        "gpt-5.1",
-                        "TEST_ONLY_PROXY_ROUTING_PROBE",
-                    ],
-                    env,
-                    root,
-                )
+                if capture_exit is None:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(capture.pid), "/T", "/F"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=15,
+                        check=False,
+                    )
+                    capture.wait(timeout=15)
             finally:
                 run([str(saiai), "stop"], env, root, timeout=15)
 
             paths = list(CaptureHandler.requests)
-            if not any(method == "POST" and path == "/v1/responses" for method, path in paths):
+            if not CaptureHandler.responses_event.is_set():
                 raise AssertionError(
                     f"Codex {args.codex_version} did not send Responses through the loopback Gateway; "
-                    f"captured method/path pairs: {paths!r}; exit={capture.returncode}"
+                    f"captured method/path pairs: {paths!r}; exit={capture_exit}"
                 )
             auth = json.loads((root / "codex/auth.json").read_text(encoding="utf-8"))
             if auth.get("auth_mode") != "chatgptAuthTokens":
