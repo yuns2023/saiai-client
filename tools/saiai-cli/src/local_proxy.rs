@@ -1379,6 +1379,7 @@ fn is_forwarded_chatgpt_path(path: &str) -> bool {
         || path.starts_with("/chatgpt/backend-api/f/conversation/")
         || path == "/chatgpt/backend-api/conversation/init"
         || path == "/chatgpt/backend-api/sentinel/chat-requirements/prepare"
+        || path.starts_with("/chatgpt/backend-api/files/download/")
 }
 
 fn normalize_chatgpt_gateway_target(target: &str) -> Result<String> {
@@ -1406,7 +1407,8 @@ fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
     let allowed = path == "/backend-api/f/conversation"
         || path.starts_with("/backend-api/f/conversation/")
         || path == "/backend-api/conversation/init"
-        || path == "/backend-api/sentinel/chat-requirements/prepare";
+        || path == "/backend-api/sentinel/chat-requirements/prepare"
+        || path.starts_with("/backend-api/files/download/");
     if !allowed {
         bail!("unsupported ChatGPT ordinary Chat path: {path}");
     }
@@ -1909,9 +1911,19 @@ mod tests {
             normalize_chatgpt_chat_target("/backend-api/f/conversation/prepare").unwrap(),
             "/chatgpt/backend-api/f/conversation/prepare"
         );
+        assert_eq!(
+            normalize_chatgpt_chat_target(
+                "/backend-api/files/download/file_123?conversation_id=conv-1"
+            )
+            .unwrap(),
+            "/chatgpt/backend-api/files/download/file_123?conversation_id=conv-1"
+        );
         assert!(normalize_chatgpt_chat_target("/backend-api/conversations").is_err());
         assert!(is_forwarded_chatgpt_path(
             "/chatgpt/backend-api/f/conversation"
+        ));
+        assert!(is_forwarded_chatgpt_path(
+            "/chatgpt/backend-api/files/download/file_123"
         ));
         assert!(!is_forwarded_chatgpt_path("/backend-api/f/conversation"));
         assert!(!should_forward_request_header_to_gateway(

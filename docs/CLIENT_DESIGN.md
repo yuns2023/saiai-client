@@ -174,9 +174,12 @@ Linux/普通可执行文件仍会把现有 OAuth `auth.json` 复制到 SAIAI 管
 
 普通 Chat 协议的 Gateway 转发仍处于实验阶段，但客户端 allowlist 默认开启：
 本地代理会把经过 allowlist 的
-`/backend-api/f/conversation`、`conversation/init`、`f/conversation/prepare` 和
-`sentinel/chat-requirements/prepare` 路径转成带有 `/chatgpt/` 命名空间的 Gateway
-路径。`SAIAI_CHATGPT_CHAT_PASSTHROUGH=0` 仅作为当前代理进程的紧急关闭开关。
+`/backend-api/f/conversation`、`conversation/init`、`f/conversation/prepare`、
+`sentinel/chat-requirements/prepare` 和 `files/download/{file_id}` 路径转成带有
+`/chatgpt/` 命名空间的 Gateway 路径。图片/文件指针解析依赖
+`files/download/{file_id}` 返回官方的 `download_url`/`retry`/`error` JSON；该
+control-plane 请求不应被当作 Responses 或模型请求计费。`SAIAI_CHATGPT_CHAT_PASSTHROUGH=0`
+仅作为当前代理进程的紧急关闭开关。
 该路径不会把请求转换为 Responses；Gateway 仍以独立 feature flag 和计费保护决定
 是否允许最终 Chat 模型请求。旧 Gateway 上普通 Chat 仍不可用，但现有 Desktop
 Codex、CLI 和 VSCode 路径不受影响。
