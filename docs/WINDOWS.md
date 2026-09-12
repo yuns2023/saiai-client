@@ -63,7 +63,9 @@ Codex 子进程。旧直连配置保留命令中的 `/v1`，本地代理配置�
 避免代理转发时产生 `/v1/v1/*`。若旧初始化刚写入的 API Key 与 SAIAI 配置 Key
 完全一致，launcher
 会将该状态升级为仅供本地代理使用的 OAuth 占位；真实 OAuth 和不匹配的 API Key
-不会被覆盖。占位状态使用 Codex 的 `chatgptAuthTokens` 外部 token 模式，避免 Codex
+不会被覆盖。`saiai codex` 会清除旧第三方 provider，并保留一个固定指向
+`https://api.openai.com/v1` 的 `model_providers.OpenAI` 兼容别名，使旧线程能够
+恢复而不重新直连 Gateway。占位状态使用 Codex 的 `chatgptAuthTokens` 外部 token 模式，避免 Codex
 把合成 refresh token 发往 OpenAI。`saiai codex` 支持 PATH 中的原生 `codex.exe`，
 也支持 npm 安装生成的 `codex.cmd`；npm 布局会由 SAIAI 解析后直接通过 `node.exe`
 运行官方 launcher。Codex VSCode 扩展先执行

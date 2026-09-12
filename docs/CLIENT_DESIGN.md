@@ -112,8 +112,13 @@ Gateway 与 Key，避免破坏已经配置好的 Claude/ChatGPT 代理信任。�
 token 数据结构完整；禁止刷新由 auth mode 本身保证。
 
 启动前会先完成只读预检，然后备份并清理主 `config.toml` 及 profile 配置中的
-第三方 `base_url`、`model_providers` 覆盖，将根 provider 设置为
-内置 `openai`。用户已有的真实 `auth_mode = "chatgpt"` OAuth `tokens` 原样保留；
+第三方 `base_url`、provider 覆盖，将根 provider 设置为内置 `openai`。为恢复
+旧版 `init-codex` 创建的历史线程，清理后仅保留一个受管的
+`model_providers.OpenAI` 兼容别名：它固定指向 `https://api.openai.com/v1`，使用
+`wire_api = "responses"` 和 `requires_openai_auth = true`，不保留旧 Gateway、
+`env_key`、静态 token 或其他用户字段。新线程仍使用内置 `openai`，旧线程的
+provider ID 则通过该别名解析并继续经由 local-proxy。用户已有的真实
+`auth_mode = "chatgpt"` OAuth `tokens` 原样保留；
 SAIAI 创建或升级的占位状态使用 `auth_mode = "chatgptAuthTokens"`。第一阶段把
 `OPENAI_API_KEY` 置为空值，API-key-only 登录会被拒绝。所有备份都写在原目录下，
 命名为 `.bak-<timestamp>`。

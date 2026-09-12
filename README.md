@@ -101,9 +101,13 @@ saiai chatgpt
 HTTP/WS 使用子进程代理环境，避免 WinHTTP/SystemConfiguration 返回 `DIRECT` 后
 绕过本地代理。它不会修改用户
 shell、系统环境变量或把这个开关写入 `config.toml`。启动前会备份并清理
-生效 `CODEX_HOME` 中的第三方 `base_url`、`model_providers` 和 WebSocket 开关，
-将根 provider 恢复为官方内置 `openai`，并保留 `auth.json` 中的 ChatGPT OAuth
-token。备份文件使用同目录的 `.bak-<timestamp>` 后缀。
+生效 `CODEX_HOME` 中的第三方 `base_url`、provider 和 WebSocket 开关，将根
+provider 恢复为官方内置 `openai`。为兼容旧版 `init-codex` 创建的历史线程，
+配置会额外保留一个固定的 `model_providers.OpenAI` 别名；它只指向
+`https://api.openai.com/v1`、使用 `responses` 和 `requires_openai_auth`，不会
+保留旧的 Gateway、env_key 或其他用户字段。这样旧线程可以继续解析 provider，
+而请求仍经由 local-proxy；新线程仍使用内置 `openai`。备份文件使用同目录的
+`.bak-<timestamp>` 后缀。
 
 SAIAI 合成登录态不能认证官方 hosted Apps MCP，因此 launcher 默认仅在该 Codex
 子进程中设置 `features.apps=false`，避免出现与模型请求无关的 `codex_apps` 451

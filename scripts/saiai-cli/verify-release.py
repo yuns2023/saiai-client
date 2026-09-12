@@ -73,6 +73,10 @@ def verify_cli() -> None:
         '"features.respect_system_proxy={}"',
         'directory.join("node_modules/@openai/codex/bin/codex.js")',
         'home.join(".local/bin/codex")',
+        'const CODEX_LEGACY_PROVIDER_ID: &str = "OpenAI"',
+        'const CODEX_LEGACY_PROVIDER_BASE_URL: &str = "https://api.openai.com/v1"',
+        "install_codex_legacy_provider_alias",
+        "is_safe_codex_legacy_provider_alias",
         '"SAIAI_HOME"',
         'settings.remove("oauthAccount")',
         'state.remove("oauthAccount")',
@@ -252,6 +256,7 @@ def verify_workflows_and_docs() -> None:
         "SAIAI_HOME",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CLAUDE_STREAM_IDLE_TIMEOUT_MS=600000",
+        "model_providers.OpenAI",
         "二进制下载",
     ):
         require(required in combined_docs, f"public docs are missing {required!r}")

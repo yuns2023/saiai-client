@@ -90,6 +90,13 @@ const CODEX_CERTIFICATE_CONTROL_HOST: &str = "certificate.saiai.local";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const CODEX_CERTIFICATE_SPKI_HEADER: &str = "x-saiai-leaf-spki-sha256";
 const CODEX_PLACEHOLDER_ACCOUNT_ID: &str = "saiai-local-proxy-placeholder-account";
+// Historical `init-codex` sessions persisted the custom provider ID `OpenAI`.
+// Keep a single hardened alias for those sessions while new threads continue
+// to use Codex's built-in lowercase `openai` provider. The alias must point at
+// the host that the local proxy MITM route owns; never retain a user-supplied
+// Gateway or other third-party endpoint here.
+const CODEX_LEGACY_PROVIDER_ID: &str = "OpenAI";
+const CODEX_LEGACY_PROVIDER_BASE_URL: &str = "https://api.openai.com/v1";
 // Structurally valid but unsigned and therefore unusable against OpenAI. The
 // local proxy replaces request authentication at the Gateway boundary; these
 // claims only let Codex's local app-server expose an authenticated UI state.
@@ -2156,9 +2163,13 @@ fn clean_codex_oauth_document(document: &mut DocumentMut) {
         document.as_table_mut().remove(key);
     }
     // A custom provider can override the built-in endpoint even when the root
-    // provider looks harmless. The explicit `saiai codex` migration removes
-    // the whole table after backup, as requested by the managed mode.
+    // provider looks harmless. Remove every user-defined provider after the
+    // file has been backed up, then install only the fixed legacy alias below.
+    // Existing threads persist their provider ID, and historical SAIAI
+    // `init-codex` sessions used `OpenAI` (capital O/A); without this alias
+    // `thread/resume` fails before any network request is attempted.
     document.as_table_mut().remove("model_providers");
+    install_codex_legacy_provider_alias(document);
 
     // Let the built-in OpenAI provider keep its official Responses transport
     // defaults. The local proxy supports both HTTP fallback and WebSocket.
@@ -2173,6 +2184,28 @@ fn clean_codex_oauth_document(document: &mut DocumentMut) {
     if features.is_empty() {
         document.as_table_mut().remove("features");
     }
+}
+
+fn install_codex_legacy_provider_alias(document: &mut DocumentMut) {
+    let mut providers = Table::new();
+    let mut legacy = Table::new();
+    legacy.insert("name", value(CODEX_LEGACY_PROVIDER_ID));
+    legacy.insert("base_url", value(CODEX_LEGACY_PROVIDER_BASE_URL));
+    legacy.insert("wire_api", value("responses"));
+    legacy.insert("requires_openai_auth", value(true));
+    providers.insert(CODEX_LEGACY_PROVIDER_ID, Item::Table(legacy));
+    document["model_providers"] = Item::Table(providers);
+}
+
+fn is_safe_codex_legacy_provider_alias(item: &Item) -> bool {
+    let Some(table) = item.as_table() else {
+        return false;
+    };
+    table.len() == 4
+        && table["name"].as_str() == Some(CODEX_LEGACY_PROVIDER_ID)
+        && table["base_url"].as_str() == Some(CODEX_LEGACY_PROVIDER_BASE_URL)
+        && table["wire_api"].as_str() == Some("responses")
+        && table["requires_openai_auth"].as_bool() == Some(true)
 }
 
 fn ensure_local_proxy_running(listen: &str) -> Result<()> {
@@ -3970,6 +4003,24 @@ fn check_codex_config(report: &mut DoctorReport, cfg: Option<&SaiaiConfig>, requ
                         );
                     } else {
                         report.ok("Codex base_url", "no direct root endpoint override");
+                    }
+                    match document
+                        .get("model_providers")
+                        .and_then(Item::as_table)
+                        .and_then(|providers| providers.get(CODEX_LEGACY_PROVIDER_ID))
+                    {
+                        Some(alias) if is_safe_codex_legacy_provider_alias(alias) => report.ok(
+                            "Codex legacy provider",
+                            "managed OpenAI compatibility alias is present",
+                        ),
+                        Some(_) => report.error(
+                            "Codex legacy provider",
+                            "OpenAI compatibility alias is not managed; run `saiai codex` to replace it",
+                        ),
+                        None => report.warn(
+                            "Codex legacy provider",
+                            "compatibility alias is absent; historical OpenAI threads may not resume",
+                        ),
                     }
                 }
                 Err(err) => report.error("Codex config", format!("invalid TOML: {err}")),
@@ -6414,6 +6465,34 @@ mod tests {
         }
     }
 
+    fn assert_legacy_openai_alias(doc: &DocumentMut) {
+        let providers = doc["model_providers"]
+            .as_table()
+            .expect("legacy provider table should be present");
+        assert_eq!(
+            providers.len(),
+            1,
+            "only the managed compatibility alias remains"
+        );
+        let legacy = providers
+            .get(CODEX_LEGACY_PROVIDER_ID)
+            .and_then(Item::as_table)
+            .expect("legacy OpenAI provider alias should be a table");
+        assert!(is_safe_codex_legacy_provider_alias(
+            providers
+                .get(CODEX_LEGACY_PROVIDER_ID)
+                .expect("legacy provider alias should be present")
+        ));
+        assert_eq!(legacy.len(), 4, "legacy alias must not retain user fields");
+        assert_eq!(legacy["name"].as_str(), Some(CODEX_LEGACY_PROVIDER_ID));
+        assert_eq!(
+            legacy["base_url"].as_str(),
+            Some(CODEX_LEGACY_PROVIDER_BASE_URL)
+        );
+        assert_eq!(legacy["wire_api"].as_str(), Some("responses"));
+        assert_eq!(legacy["requires_openai_auth"].as_bool(), Some(true));
+    }
+
     #[test]
     fn cleans_third_party_codex_routes_for_oauth_launcher() {
         let mut doc = r#"
@@ -6430,6 +6509,14 @@ responses_websockets_v2 = true
 [model_providers.third_party]
 name = "third_party"
 base_url = "https://third-party.example/v1"
+
+[model_providers.OpenAI]
+name = "Old OpenAI"
+base_url = "https://test.saiai.top"
+wire_api = "chat"
+env_key = "OPENAI_API_KEY"
+experimental_bearer_token = "stale-token"
+query_params = { tenant = "old" }
 "#
         .parse::<DocumentMut>()
         .unwrap();
@@ -6440,7 +6527,7 @@ base_url = "https://third-party.example/v1"
         for key in ["base_url", "openai_base_url", "chatgpt_base_url"] {
             assert!(doc.get(key).is_none(), "{key} should be removed");
         }
-        assert!(doc.get("model_providers").is_none());
+        assert_legacy_openai_alias(&doc);
         assert_eq!(doc["features"]["other_flag"].as_bool(), Some(true));
         assert!(doc["features"].get("responses_websockets").is_none());
         assert!(doc["features"].get("responses_websockets_v2").is_none());
@@ -6466,7 +6553,7 @@ base_url = "https://third-party.example/v1"
         enable_codex_system_proxy(&mut doc, path).unwrap();
 
         assert_eq!(doc["model_provider"].as_str(), Some("openai"));
-        assert!(doc.get("model_providers").is_none());
+        assert_legacy_openai_alias(&doc);
         assert_eq!(doc["features"]["other_flag"].as_bool(), Some(true));
         assert_eq!(
             doc["features"]["respect_system_proxy"].as_bool(),
