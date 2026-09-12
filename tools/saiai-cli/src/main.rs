@@ -85,7 +85,9 @@ const CODEX_MANAGED_ENV: &[&str] = &[
 const CODEX_LOCAL_PROXY_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local";
 const CODEX_IDE_ENV_BEGIN: &str = "# BEGIN SAIAI CODEX IDE (managed)";
 const CODEX_IDE_ENV_END: &str = "# END SAIAI CODEX IDE (managed)";
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const CODEX_CERTIFICATE_CONTROL_HOST: &str = "certificate.saiai.local";
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const CODEX_CERTIFICATE_SPKI_HEADER: &str = "x-saiai-leaf-spki-sha256";
 const CODEX_PLACEHOLDER_ACCOUNT_ID: &str = "saiai-local-proxy-placeholder-account";
 // Structurally valid but unsigned and therefore unusable against OpenAI. The
@@ -627,18 +629,22 @@ fn initialize_codex_local_proxy_at(
     let proxy_base_url = codex_proxy_gateway_root(&args.base_url)?;
 
     if let Ok(raw) = fs::read_to_string(&config_path)
-        && let Ok(mut existing) = serde_json::from_str::<SaiaiConfig>(&raw)
+        && let Ok(existing) = serde_json::from_str::<SaiaiConfig>(&raw)
         && read_runtime_ca(&existing).is_ok()
     {
-        existing.providers.codex = Some(ProviderCredential {
-            base_url: proxy_base_url,
-            api_key: args.api_key.clone(),
-        });
-        write_saiai_config_at(&config_path, &existing)?;
+        let updated = update_saiai_provider_config_at(
+            &config_path,
+            ProviderKind::Codex,
+            ProviderCredential {
+                base_url: proxy_base_url,
+                api_key: args.api_key.clone(),
+            },
+            None,
+        )?;
         return Ok(CodexLocalProxyInit {
             config_path,
-            ca_cert_path: PathBuf::from(existing.ca_cert_path),
-            ca_key_path: PathBuf::from(existing.ca_key_path),
+            ca_cert_path: PathBuf::from(updated.ca_cert_path),
+            ca_key_path: PathBuf::from(updated.ca_key_path),
         });
     }
 

@@ -199,6 +199,13 @@ struct StaticResponse {
     reason: &'static str,
 }
 
+type AccountSidecarResponse = (
+    StatusCode,
+    Vec<u8>,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+);
+
 pub async fn run(cfg: Config) -> Result<()> {
     let state = Arc::new(State::new(cfg)?);
     let listener = TcpListener::bind(&state.listen)
@@ -1444,14 +1451,7 @@ fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse>
     }
 }
 
-fn chatgpt_account_sidecar_response(
-    request: &IncomingRequest,
-) -> Option<(
-    StatusCode,
-    Vec<u8>,
-    &'static str,
-    &'static [(&'static str, &'static str)],
-)> {
+fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<AccountSidecarResponse> {
     let path = request_path(&request.target).ok()?;
     let account_id = header_value(&request.headers, "chatgpt-account-id")
         .map(str::to_owned)
