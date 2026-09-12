@@ -43,7 +43,7 @@ Usage:
   saiai logs                                                      # follow user service logs
   saiai update                                                    # update this client binary
   saiai restart                                                   # restart user service
-  saiai doctor                                                    # check local proxy and Claude config
+  saiai doctor [claude|codex]                                    # check proxy and product config
   saiai --version                                                 # print version
   saiai init <base_url> <api_key>                                 # initialize Claude Code
   saiai init-codex <base_url> <api_key> [--websockets]            # initialize Codex CLI
@@ -230,7 +230,7 @@ fn main() -> Result<()> {
         Command::Logs => run_service_logs(),
         Command::Update => run_update(),
         Command::Restart => run_service_restart(),
-        Command::Doctor => run_doctor(),
+        Command::Doctor(target) => run_doctor(target),
         Command::Version => print_version(),
         Command::Init(init) => init_claude(init),
         Command::InitCodex(init) => init_codex(init),
@@ -256,7 +256,7 @@ enum Command {
     Logs,
     Update,
     Restart,
-    Doctor,
+    Doctor(DoctorTarget),
     Version,
     Init(InitArgs),
     InitCodex(InitArgs),
@@ -302,10 +302,12 @@ fn parse_command(args: &[String]) -> Result<Command> {
         "update" => return parse_no_arg_command("update", &args[1..], Command::Update),
         "restart" => return parse_no_arg_command("restart", &args[1..], Command::Restart),
         "doctor" => {
-            if args.len() == 1 {
-                return Ok(Command::Doctor);
-            }
-            bail!("Unexpected argument after doctor: {}\n\n{}", args[1], USAGE);
+            return match args.get(1).map(String::as_str) {
+                None => Ok(Command::Doctor(DoctorTarget::All)),
+                Some("claude") if args.len() == 2 => Ok(Command::Doctor(DoctorTarget::Claude)),
+                Some("codex") if args.len() == 2 => Ok(Command::Doctor(DoctorTarget::Codex)),
+                Some(value) => bail!("Unexpected doctor target: {value}\n\n{USAGE}"),
+            };
         }
         "-V" | "--version" | "version" => return Ok(Command::Version),
         "init" => return Ok(Command::Init(parse_named_args("init", &args[1..])?)),
@@ -350,6 +352,13 @@ fn parse_command(args: &[String]) -> Result<Command> {
     }
 
     bail!("Unknown command: {}\n\n{}", args[0], USAGE);
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DoctorTarget {
+    All,
+    Claude,
+    Codex,
 }
 
 fn parse_no_arg_command(command: &str, rest: &[String], parsed: Command) -> Result<Command> {
@@ -503,6 +512,7 @@ fn generate_installation_ca() -> Result<(String, String)> {
 }
 
 fn init_claude(args: InitArgs) -> Result<()> {
+    let service_was_active = managed_service_is_active();
     warn_process_env_conflicts();
     let paths = resolve_claude_config_paths().context("failed to resolve Claude config paths")?;
     let claude_dir = &paths.config_dir;
@@ -566,11 +576,13 @@ fn init_claude(args: InitArgs) -> Result<()> {
     println!("Foreground mode is still available with:");
     println!("  saiai");
     warn_claude_settings_overrides_for_paths(&paths);
+    restart_managed_service_if_needed(service_was_active)?;
 
     Ok(())
 }
 
 fn init_codex(args: InitArgs) -> Result<()> {
+    let service_was_active = managed_service_is_active();
     let codex_dir = codex_config_dir().context("failed to resolve Codex config directory")?;
     fs::create_dir_all(&codex_dir)
         .with_context(|| format!("failed to create {}", codex_dir.display()))?;
@@ -603,6 +615,7 @@ fn init_codex(args: InitArgs) -> Result<()> {
     println!("Existing TOML keys and JSON auth fields outside our scope were preserved.");
     println!("SAIAI local-proxy configuration is ready; run `saiai codex` for OAuth mode.");
     warn_claude_settings_overrides();
+    restart_managed_service_if_needed(service_was_active)?;
 
     Ok(())
 }
@@ -2827,6 +2840,45 @@ fn run_service_restart() -> Result<()> {
     bail!("saiai restart currently supports Linux, macOS, and Windows only");
 }
 
+#[cfg(target_os = "linux")]
+fn managed_service_is_active() -> bool {
+    if linux_background_state()
+        .ok()
+        .flatten()
+        .is_some_and(|state| linux_background_state_is_running(&state))
+    {
+        return true;
+    }
+    ensure_systemd_user_available().is_ok() && service_is_active().unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn managed_service_is_active() -> bool {
+    macos_launchd_running().unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn managed_service_is_active() -> bool {
+    windows_background_pid()
+        .ok()
+        .flatten()
+        .is_some_and(|pid| windows_pid_is_running(pid).unwrap_or(false))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn managed_service_is_active() -> bool {
+    false
+}
+
+fn restart_managed_service_if_needed(was_active: bool) -> Result<()> {
+    if !was_active {
+        return Ok(());
+    }
+    run_service_restart().context("failed to refresh the active SAIAI service")?;
+    println!("SAIAI managed service was active; restarted after configuration update.");
+    Ok(())
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn run_update() -> Result<()> {
     let cfg = read_saiai_config()?;
@@ -2935,9 +2987,14 @@ fn run_update() -> Result<()> {
     bail!("saiai update currently supports Linux, macOS, and Windows assets only");
 }
 
-fn run_doctor() -> Result<()> {
+fn run_doctor(target: DoctorTarget) -> Result<()> {
+    let check_claude = matches!(target, DoctorTarget::All | DoctorTarget::Claude);
+    let check_codex = matches!(target, DoctorTarget::All | DoctorTarget::Codex);
     let mut report = DoctorReport::new();
-    report.ok("version", format!("saiai {}", env!("CARGO_PKG_VERSION")));
+    report.ok(
+        "version",
+        format!("saiai {} ({target:?})", env!("CARGO_PKG_VERSION")),
+    );
     check_current_binary(&mut report);
     check_process_env_conflicts(&mut report);
     check_systemd_user_env_conflicts(&mut report);
@@ -2957,6 +3014,12 @@ fn run_doctor() -> Result<()> {
 
     if let Some(cfg) = &cfg {
         check_saiai_config(&mut report, cfg);
+        if check_claude {
+            check_provider_route(&mut report, cfg, ProviderKind::Claude);
+        }
+        if check_codex {
+            check_provider_route(&mut report, cfg, ProviderKind::Codex);
+        }
         check_process_proxy_env_conflicts(&mut report, &cfg.listen);
         check_persistent_proxy_env_conflicts(&mut report);
         check_systemd_user_proxy_env_conflicts(&mut report);
@@ -2966,9 +3029,14 @@ fn run_doctor() -> Result<()> {
         check_systemd_user_proxy_env_conflicts(&mut report);
     }
 
-    match resolve_claude_config_paths() {
-        Ok(paths) => check_claude_config(&mut report, cfg.as_ref(), &paths),
-        Err(err) => report.error("Claude config", err.to_string()),
+    if check_claude {
+        match resolve_claude_config_paths() {
+            Ok(paths) => check_claude_config(&mut report, cfg.as_ref(), &paths),
+            Err(err) => report.error("Claude config", err.to_string()),
+        }
+    }
+    if check_codex {
+        check_codex_config(&mut report, cfg.as_ref());
     }
 
     if let Some(cfg) = &cfg {
@@ -2996,7 +3064,12 @@ fn run_doctor() -> Result<()> {
             ),
             Err(err) => report.error("local proxy MITM", format!("{err:#}")),
         }
-        match runtime.block_on(check_gateway_health(&cfg.base_url)) {
+        let health_base = match target {
+            DoctorTarget::Claude => provider_route(cfg, ProviderKind::Claude).0,
+            DoctorTarget::Codex => provider_route(cfg, ProviderKind::Codex).0,
+            DoctorTarget::All => cfg.base_url.as_str(),
+        };
+        match runtime.block_on(check_gateway_health(health_base)) {
             Ok(status) => report.ok("SAIAI health", status),
             Err(err) => report.error("SAIAI health", err.to_string()),
         }
@@ -3591,6 +3664,48 @@ fn systemd_env_contains_key(output: &str, key: &str) -> bool {
     output.lines().any(|line| line.starts_with(&prefix))
 }
 
+fn provider_route(cfg: &SaiaiConfig, provider: ProviderKind) -> (&str, &str) {
+    let explicit = match provider {
+        ProviderKind::Claude => cfg.providers.claude.as_ref(),
+        ProviderKind::Codex => cfg.providers.codex.as_ref(),
+    };
+    match explicit {
+        Some(value) => (value.base_url.as_str(), value.api_key.as_str()),
+        None => (cfg.base_url.as_str(), cfg.api_key.as_str()),
+    }
+}
+
+fn check_provider_route(report: &mut DoctorReport, cfg: &SaiaiConfig, provider: ProviderKind) {
+    let explicit = match provider {
+        ProviderKind::Claude => cfg.providers.claude.is_some(),
+        ProviderKind::Codex => cfg.providers.codex.is_some(),
+    };
+    let (base_url, api_key) = provider_route(cfg, provider);
+    let label = format!("{} provider", provider.name());
+    if explicit {
+        report.ok(&label, "dedicated route configured");
+    } else {
+        report.warn(&label, "using legacy root base_url/api_key fallback");
+    }
+    match Url::parse(base_url.trim()) {
+        Ok(url)
+            if matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none() => {}
+        Ok(url) => report.error(
+            &format!("{} base_url", provider.name()),
+            format!("invalid or credential-bearing URL: {url}"),
+        ),
+        Err(err) => report.error(&format!("{} base_url", provider.name()), err.to_string()),
+    }
+    if api_key.trim().is_empty() {
+        report.error(&format!("{} api_key", provider.name()), "missing");
+    } else {
+        report.ok(&format!("{} api_key", provider.name()), "configured");
+    }
+}
+
 fn check_saiai_config(report: &mut DoctorReport, cfg: &SaiaiConfig) {
     if cfg.version == SAIAI_CONFIG_VERSION {
         report.ok("config version", SAIAI_CONFIG_VERSION.to_string());
@@ -3733,7 +3848,7 @@ fn check_claude_config(
     match env_string(env, "CLAUDE_CODE_OAUTH_TOKEN") {
         Some(value) if !value.trim().is_empty() => {
             if let Some(cfg) = cfg {
-                if value == cfg.api_key {
+                if value == provider_route(cfg, ProviderKind::Claude).1 {
                     report.ok(
                         "CLAUDE_CODE_OAUTH_TOKEN",
                         "configured and matches SAIAI config",
@@ -3785,6 +3900,88 @@ fn check_claude_state(report: &mut DoctorReport, path: &Path) {
         report.ok("Claude state", path.display().to_string());
     } else {
         report.warn("Claude state", "hasCompletedOnboarding is not true");
+    }
+}
+
+fn check_codex_config(report: &mut DoctorReport, cfg: Option<&SaiaiConfig>) {
+    let codex_dir = match codex_config_dir() {
+        Ok(path) => path,
+        Err(err) => {
+            report.error("Codex home", err.to_string());
+            return;
+        }
+    };
+    let config_path = codex_dir.join("config.toml");
+    let auth_path = codex_dir.join("auth.json");
+    if !config_path.is_file() {
+        report.error(
+            "Codex config",
+            format!("{} does not exist", config_path.display()),
+        );
+    } else {
+        match fs::read_to_string(&config_path) {
+            Ok(raw) => match raw.parse::<DocumentMut>() {
+                Ok(document) => {
+                    if document
+                        .get("model_provider")
+                        .and_then(Item::as_str)
+                        .is_some_and(|value| value == "openai")
+                    {
+                        report.ok("Codex provider", "built-in OpenAI provider selected");
+                    } else {
+                        report.warn(
+                            "Codex provider",
+                            "model_provider is not explicitly set to openai",
+                        );
+                    }
+                    if document.get("base_url").is_some()
+                        || document.get("openai_base_url").is_some()
+                        || document.get("chatgpt_base_url").is_some()
+                    {
+                        report.warn(
+                            "Codex base_url",
+                            "direct endpoint override remains; run `saiai codex` to migrate it",
+                        );
+                    } else {
+                        report.ok("Codex base_url", "no direct root endpoint override");
+                    }
+                }
+                Err(err) => report.error("Codex config", format!("invalid TOML: {err}")),
+            },
+            Err(err) => report.error("Codex config", err.to_string()),
+        }
+    }
+    if !auth_path.is_file() {
+        report.error(
+            "Codex auth",
+            format!("{} does not exist", auth_path.display()),
+        );
+    } else {
+        match validate_codex_oauth_auth(&auth_path) {
+            Ok(()) => report.ok("Codex auth", "ChatGPT OAuth token mode configured"),
+            Err(err) => report.error("Codex auth", format!("{err:#}")),
+        }
+    }
+    let env_path = codex_dir.join(".env");
+    if env_path.is_file() {
+        match fs::read_to_string(&env_path) {
+            Ok(raw) => {
+                if raw.lines().any(|line| line.contains("HTTP_PROXY=")) {
+                    report.ok("Codex .env", env_path.display().to_string());
+                } else {
+                    report.warn("Codex .env", "exists but has no managed HTTP_PROXY entry");
+                }
+            }
+            Err(err) => report.warn("Codex .env", format!("could not read: {err}")),
+        }
+    } else {
+        report.ok(
+            "Codex .env",
+            "not required for direct `saiai codex` child launch",
+        );
+    }
+    if cfg.is_none() {
+        report.warn("Codex route", "SAIAI config is unavailable");
     }
 }
 
@@ -6428,9 +6625,18 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     #[test]
     fn parses_doctor_and_version_commands() {
         match parse_command(&["doctor".to_string()]).unwrap() {
-            Command::Doctor => {}
+            Command::Doctor(DoctorTarget::All) => {}
             _ => panic!("expected doctor command"),
         }
+        assert!(matches!(
+            parse_command(&["doctor".to_string(), "claude".to_string()]).unwrap(),
+            Command::Doctor(DoctorTarget::Claude)
+        ));
+        assert!(matches!(
+            parse_command(&["doctor".to_string(), "codex".to_string()]).unwrap(),
+            Command::Doctor(DoctorTarget::Codex)
+        ));
+        assert!(parse_command(&["doctor".to_string(), "other".to_string()]).is_err());
         match parse_command(&["--version".to_string()]).unwrap() {
             Command::Version => {}
             _ => panic!("expected version command"),

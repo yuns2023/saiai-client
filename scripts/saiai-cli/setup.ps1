@@ -297,7 +297,14 @@ function Invoke-Saiai {
         # otherwise captures both values when callers assign Invoke-Saiai.
         if ($provided[0] -eq "init-codex") {
             & $installPath @provided | Out-Host
-            return [int]$LASTEXITCODE
+            $nativeExitCode = [int]$LASTEXITCODE
+            if ($nativeExitCode -ne 0) {
+                return $nativeExitCode
+            }
+            if ([string]$env:SAIAI_SKIP_START -eq "1") {
+                return 0
+            }
+            return Start-SaiaiBackground -Path $installPath
         }
 
         $claudeArguments = @("init") + $provided

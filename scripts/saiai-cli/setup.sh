@@ -203,6 +203,9 @@ esac
 
 if [ "${1:-}" = "init-codex" ]; then
   "${install_path}" "$@"
+  if [ "${SAIAI_SKIP_START:-0}" != "1" ]; then
+    "${install_path}" start
+  fi
 else
   "${install_path}" init "$@"
   if [ "${SAIAI_SKIP_START:-0}" != "1" ]; then

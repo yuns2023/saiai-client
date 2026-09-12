@@ -42,6 +42,16 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HEADER_LINE: usize = 32 * 1024;
 const MAX_HEADER_BYTES: usize = 256 * 1024;
 
+// Service-managed stdout/stderr is the primary diagnostic stream on all
+// supported platforms. Keep every proxy line timestamped consistently; this
+// is especially important for macOS/Windows file logs, where the service
+// manager does not add journal timestamps.
+macro_rules! eprintln {
+    ($($arg:tt)*) => {
+        ::std::eprintln!("[{}] {}", chrono::Utc::now().to_rfc3339(), format_args!($($arg)*));
+    };
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub listen: String,
