@@ -84,7 +84,7 @@ function Stop-SaiaiForReplacement {
     & $Path stop | Out-Host
     $stopExitCode = [int]$LASTEXITCODE
     if ($stopExitCode -ne 0) {
-        throw "Existing SAIAI client could not be stopped before update (exit $stopExitCode)."
+        Write-Warning "The managed SAIAI stop command returned exit $stopExitCode; continuing with exact-process cleanup."
     }
 
     # The managed PID covers the background proxy, but an interrupted update or
@@ -103,12 +103,39 @@ function Stop-SaiaiForReplacement {
             return
         }
         foreach ($process in $remaining) {
-            Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+            try {
+                Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+            }
+            catch {
+                Write-Warning "Could not stop SAIAI process $($process.ProcessId) from this PowerShell session: $($_.Exception.Message)"
+            }
         }
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
 
     throw "Existing SAIAI processes still hold the install target after forced termination: $resolvedPath"
+}
+
+function Get-SaiaiConfigPath {
+    if (-not [string]::IsNullOrWhiteSpace($env:SAIAI_HOME)) {
+        return [System.IO.Path]::GetFullPath((Join-Path $env:SAIAI_HOME "config.json"))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        return [System.IO.Path]::GetFullPath((Join-Path $env:USERPROFILE ".saiai\config.json"))
+    }
+    throw "Cannot resolve the per-user SAIAI config path. Set USERPROFILE or SAIAI_HOME."
+}
+
+function ConvertFrom-SaiaiSecureString {
+    param([Parameter(Mandatory = $true)][Security.SecureString]$Value)
+
+    $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Value)
+    try {
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
+    }
+    finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+    }
 }
 
 function Move-SaiaiCandidate {
@@ -171,8 +198,21 @@ function Invoke-Saiai {
     )
 
     $provided = @($Arguments)
-    if ($provided.Count -lt 2) {
-        Write-Error "Usage: Invoke-Saiai <base_url> <api_key> OR Invoke-Saiai init-codex <base_url> <api_key> [--websockets]"
+    if ($provided.Count -eq 0) {
+        # Restore the short `Invoke-Saiai` command. Reuse the already managed
+        # per-user config when present; on a fresh machine prompt for the key
+        # without echoing it, while keeping the public Gateway default concise.
+        $configPath = Get-SaiaiConfigPath
+        $existing = $null
+        if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+            try { $existing = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json } catch { $existing = $null }
+        }
+        $baseUrl = if ($env:SAIAI_BASE_URL) { [string]$env:SAIAI_BASE_URL } elseif ($existing.base_url) { [string]$existing.base_url } else { "https://api.saiai.top" }
+        $apiKey = if ($env:SAIAI_API_KEY) { [string]$env:SAIAI_API_KEY } elseif ($existing.api_key) { [string]$existing.api_key } else { ConvertFrom-SaiaiSecureString (Read-Host "SAIAI API key" -AsSecureString) }
+        $provided = @($baseUrl, $apiKey)
+    }
+    elseif ($provided.Count -lt 2) {
+        Write-Error "Usage: Invoke-Saiai [<base_url> <api_key>] OR Invoke-Saiai init-codex <base_url> <api_key> [--websockets]"
         return 2
     }
 

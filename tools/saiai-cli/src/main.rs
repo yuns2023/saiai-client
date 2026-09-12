@@ -30,7 +30,10 @@ use toml_edit::{DocumentMut, Item, Table, value};
 use url::Url;
 use uuid::Uuid;
 
+mod desktop_product;
 mod local_proxy;
+
+use desktop_product::DesktopProduct;
 
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
 const USAGE: &str = "\
@@ -49,8 +52,9 @@ Usage:
   saiai init-codex <base_url> <api_key> [--websockets]            # initialize Codex CLI
   saiai codex [-- <codex arguments>]                              # launch Codex through SAIAI local proxy
   saiai vscode                                                    # configure the Codex VSCode extension for SAIAI
-  saiai desktop [-- <Desktop arguments>]                        # launch Codex/ChatGPT Desktop through SAIAI
-  saiai chatgpt [-- <Desktop arguments>]                        # alias for desktop
+  saiai desktop [codex|chatgpt|claude|gemini] [-- <Desktop arguments>]
+                                                                  # launch a supported Desktop product through SAIAI
+  saiai chatgpt [-- <Desktop arguments>]                        # ChatGPT Desktop alias
   saiai init       --base-url <base_url> --api-key <api_key>      # initialize Claude Code
   saiai init-codex --base-url <base_url> --api-key <api_key> [--websockets]";
 
@@ -243,7 +247,7 @@ fn main() -> Result<()> {
         Command::InitCodex(init) => init_codex(init),
         Command::Codex(args) => run_codex(&args),
         Command::VSCode => configure_vscode(),
-        Command::Desktop(args) => run_desktop(&args),
+        Command::Desktop { product, args } => run_desktop(product, &args),
         #[cfg(target_os = "linux")]
         Command::RunLinuxBackgroundProxy => run_linux_background_proxy_worker(),
         #[cfg(target_os = "windows")]
@@ -269,7 +273,10 @@ enum Command {
     InitCodex(InitArgs),
     Codex(Vec<String>),
     VSCode,
-    Desktop(Vec<String>),
+    Desktop {
+        product: DesktopProduct,
+        args: Vec<String>,
+    },
     #[cfg(target_os = "linux")]
     RunLinuxBackgroundProxy,
     #[cfg(target_os = "windows")]
@@ -333,11 +340,24 @@ fn parse_command(args: &[String]) -> Result<Command> {
         }
         "vscode" => return parse_no_arg_command("vscode", &args[1..], Command::VSCode),
         "desktop" | "chatgpt" => {
-            let mut desktop_args = args[1..].to_vec();
+            let (product, start) = if args[0] == "chatgpt" {
+                (DesktopProduct::ChatGPT, 1)
+            } else if args
+                .get(1)
+                .is_some_and(|value| value != "--" && !value.starts_with('-'))
+            {
+                (DesktopProduct::parse(&args[1])?, 2)
+            } else {
+                (DesktopProduct::Codex, 1)
+            };
+            let mut desktop_args = args[start..].to_vec();
             if desktop_args.first().is_some_and(|arg| arg == "--") {
                 desktop_args.remove(0);
             }
-            return Ok(Command::Desktop(desktop_args));
+            return Ok(Command::Desktop {
+                product,
+                args: desktop_args,
+            });
         }
         #[cfg(target_os = "linux")]
         SAIAI_LINUX_BACKGROUND_COMMAND => {
@@ -1190,20 +1210,27 @@ fn is_codex_placeholder_access_token(token: &str) -> bool {
     token.starts_with("saiai-local-proxy-placeholder-") || token == CODEX_PLACEHOLDER_ACCESS_TOKEN
 }
 
-fn run_desktop(args: &[String]) -> Result<()> {
+fn run_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
+    if !product.has_adapter() {
+        bail!(
+            "SAIAI Desktop adapter for {} is not implemented yet; use `saiai desktop codex` or `saiai chatgpt`",
+            product.label()
+        );
+    }
+
     #[cfg(target_os = "linux")]
     {
-        run_linux_desktop(args)
+        run_linux_desktop(product, args)
     }
 
     #[cfg(target_os = "macos")]
     {
-        run_macos_desktop(args)
+        run_macos_desktop(product, args)
     }
 
     #[cfg(target_os = "windows")]
     {
-        run_windows_desktop(args)
+        run_windows_desktop(product, args)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -1216,7 +1243,7 @@ fn run_desktop(args: &[String]) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn run_linux_desktop(args: &[String]) -> Result<()> {
+fn run_linux_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
     let cfg = read_saiai_config().context("SAIAI local proxy is not configured")?;
     let _runtime_ca = read_runtime_ca(&cfg)
         .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
@@ -1276,6 +1303,7 @@ fn run_linux_desktop(args: &[String]) -> Result<()> {
     }
 
     println!("Starting ChatGPT Desktop through the SAIAI local proxy.");
+    println!("  product={}", product.label());
     println!("  CODEX_HOME={}", desktop_codex.display());
     println!("  user-data-dir={}", desktop_user_data.display());
     println!("  proxy={proxy}");
@@ -1293,7 +1321,7 @@ fn run_linux_desktop(args: &[String]) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn run_macos_desktop(args: &[String]) -> Result<()> {
+fn run_macos_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
     let cfg = read_saiai_config().context("SAIAI local proxy is not configured")?;
     let _runtime_ca = read_runtime_ca(&cfg)
         .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
@@ -1361,6 +1389,7 @@ fn run_macos_desktop(args: &[String]) -> Result<()> {
     }
 
     println!("Starting ChatGPT Desktop through the SAIAI local proxy.");
+    println!("  product={}", product.label());
     println!("  application={}", executable.display());
     println!("  CODEX_HOME={}", desktop_codex.display());
     println!("  user-data-dir={}", desktop_user_data.display());
@@ -1579,7 +1608,7 @@ fn stop_macos_packaged_desktop(bundle: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn codex_new_thread_url(workspace: &Path) -> String {
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
     serializer.append_pair("path", &workspace.display().to_string());
@@ -1621,17 +1650,17 @@ fn macos_packaged_desktop_bundle_process_running(bundle: &Path) -> Result<bool> 
 }
 
 #[cfg(target_os = "windows")]
-fn run_windows_desktop(args: &[String]) -> Result<()> {
+fn run_windows_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
     let cfg = read_saiai_config().context("SAIAI local proxy is not configured")?;
     let _runtime_ca = read_runtime_ca(&cfg)
         .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
     ensure_local_proxy_running(&cfg.listen)?;
 
-    let package = if resolve_windows_desktop_override()?.is_none() {
-        resolve_windows_packaged_desktop()?
-    } else {
-        None
-    };
+    if resolve_windows_desktop_override()?.is_none()
+        && let Some(package) = resolve_windows_packaged_desktop()?
+    {
+        return run_windows_packaged_desktop(product, args, &cfg, &package);
+    }
 
     let desktop_root = saiai_config_dir()?.join("desktop");
     let desktop_home = desktop_root.join("home");
@@ -1651,19 +1680,7 @@ fn run_windows_desktop(args: &[String]) -> Result<()> {
     }
     prepare_isolated_desktop_state(&cfg, &desktop_root, &desktop_codex)?;
 
-    let executable = if let Some(package) = &package {
-        let executable = package.install_location.join("app/ChatGPT.exe");
-        if !executable.is_file() {
-            bail!(
-                "OpenAI.Codex AppX executable is unavailable: {}",
-                executable.display()
-            );
-        }
-        stop_windows_packaged_desktop(package)?;
-        executable
-    } else {
-        resolve_windows_desktop_executable()?
-    };
+    let executable = resolve_windows_desktop_executable()?;
     let fixed_timezone = resolve_chatgpt_timezone()?;
     let proxy = format!("http://{}", cfg.listen);
     let spki = local_proxy_chatgpt_spki(&cfg.listen)?;
@@ -1707,6 +1724,7 @@ fn run_windows_desktop(args: &[String]) -> Result<()> {
     }
 
     println!("Starting OpenAI Desktop through the SAIAI local proxy.");
+    println!("  product={}", product.label());
     println!("  application={}", executable.display());
     println!("  CODEX_HOME={}", desktop_codex.display());
     println!("  user-data-dir={}", desktop_user_data.display());
@@ -1722,6 +1740,315 @@ fn run_windows_desktop(args: &[String]) -> Result<()> {
     } else {
         bail!("OpenAI Desktop exited with {status}")
     }
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_packaged_desktop(
+    product: DesktopProduct,
+    args: &[String],
+    cfg: &SaiaiConfig,
+    package: &WindowsPackagedDesktop,
+) -> Result<()> {
+    if !args.is_empty() {
+        bail!("packaged Windows Desktop does not accept passthrough arguments");
+    }
+    let codex_dir = codex_config_dir()?;
+    fs::create_dir_all(&codex_dir)
+        .with_context(|| format!("failed to create {}", codex_dir.display()))?;
+    let auth_path = codex_dir.join("auth.json");
+    // The packaged Desktop shares this auth cache with the official ChatGPT
+    // login. Preserve any existing real/placeholder cache; only create the
+    // SAIAI synthetic identity on a fresh install, where it enables the
+    // no-provider-login local-proxy test flow without clobbering a login.
+    if auth_path.is_file() {
+        println!(
+            "Preserving existing Desktop auth cache at {}.",
+            auth_path.display()
+        );
+    } else {
+        ensure_codex_local_proxy_auth(&auth_path, Some(&cfg.api_key))?;
+    }
+    prepare_codex_oauth_files(&codex_dir, true)?;
+    let env_path = codex_dir.join(".env");
+    write_codex_ide_env(&env_path, &cfg.listen, &cfg.ca_cert_path)?;
+    let desktop_root = saiai_config_dir()?.join("desktop");
+    write_desktop_account_id_with_fallback(&auth_path, &desktop_root, "saiai-local-proxy-user")?;
+    prepare_desktop_onboarding_state(&codex_dir)?;
+
+    let proxy_lease =
+        windows_begin_packaged_proxy_lease(&cfg.listen, Path::new(&cfg.ca_cert_path))?;
+    if let Err(error) = stop_windows_packaged_desktop(package) {
+        proxy_lease.restore()?;
+        return Err(error);
+    }
+    let workspace = env::current_dir().context("failed to resolve the Desktop workspace")?;
+    let target = codex_new_thread_url(&workspace);
+    let status = match ProcessCommand::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "& { param($target) Start-Process -FilePath $target }",
+        ])
+        .arg(&target)
+        .status()
+    {
+        Ok(status) => status,
+        Err(error) => {
+            proxy_lease.restore()?;
+            return Err(error).context("failed to activate packaged OpenAI Desktop");
+        }
+    };
+    if !status.success() {
+        proxy_lease.restore()?;
+        bail!("packaged OpenAI Desktop activation exited with {status}");
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if windows_packaged_desktop_running(package).unwrap_or(false) {
+            println!("Starting packaged OpenAI Desktop through the SAIAI local proxy.");
+            println!("  product={}", product.label());
+            println!("  app_id={}", package.app_id);
+            println!("  CODEX_HOME={}", codex_dir.display());
+            println!("  environment={}", env_path.display());
+            println!("  proxy=http://{}", cfg.listen);
+            println!("  system-proxy=temporary lease (restored when Desktop exits)");
+            if let Err(error) = proxy_lease.spawn_restore_watcher(&package.install_location) {
+                proxy_lease.restore()?;
+                return Err(error);
+            }
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    proxy_lease.restore()?;
+    bail!("packaged OpenAI Desktop activation returned without a running app process")
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WindowsInternetProxySettings {
+    proxy_enable: Option<i32>,
+    proxy_server: Option<String>,
+    auto_config_url: Option<String>,
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsPackagedProxyLease {
+    previous: WindowsInternetProxySettings,
+    managed_server: String,
+    added_ca_thumbprint: Option<String>,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsPackagedProxyLease {
+    fn restore(&self) -> Result<()> {
+        windows_write_internet_proxy(&self.previous)?;
+        windows_remove_user_ca(self.added_ca_thumbprint.as_deref())
+    }
+
+    fn spawn_restore_watcher(&self, package_root: &Path) -> Result<()> {
+        let state = serde_json::json!({
+            "root": package_root.display().to_string(),
+            "managed_server": self.managed_server,
+            "previous": self.previous,
+            "added_ca_thumbprint": self.added_ca_thumbprint,
+        });
+        let state_b64 =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&state)?);
+        let script = r#"
+$raw = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{STATE_B64}'))
+$state = $raw | ConvertFrom-Json
+$deadline = (Get-Date).AddSeconds(120)
+$seen = $false
+$goneSince = $null
+while ($true) {
+  $processes = @(Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue | Where-Object {
+    $_.Path -and $_.Path.StartsWith($state.root, [StringComparison]::OrdinalIgnoreCase)
+  })
+  if ($processes.Count -gt 0) {
+    $seen = $true
+    $goneSince = $null
+  } elseif ($seen) {
+    if ($null -eq $goneSince) { $goneSince = Get-Date }
+    if (((Get-Date) - $goneSince).TotalSeconds -ge 15) { break }
+  } elseif ((Get-Date) -ge $deadline) {
+    break
+  }
+  Start-Sleep -Seconds 2
+}
+$path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+$current = Get-ItemProperty $path
+$server = [string]$current.ProxyServer
+$auto = [string]$current.AutoConfigURL
+if ([int]$current.ProxyEnable -eq 1 -and $server -eq $state.managed_server -and [string]::IsNullOrEmpty($auto)) {
+  $previous = $state.previous
+  if ($null -eq $previous.proxy_enable) { Remove-ItemProperty $path -Name ProxyEnable -ErrorAction SilentlyContinue } else { Set-ItemProperty $path -Name ProxyEnable -Type DWord -Value ([int]$previous.proxy_enable) }
+  if ($null -eq $previous.proxy_server) { Remove-ItemProperty $path -Name ProxyServer -ErrorAction SilentlyContinue } else { Set-ItemProperty $path -Name ProxyServer -Type String -Value ([string]$previous.proxy_server) }
+  if ($null -eq $previous.auto_config_url) { Remove-ItemProperty $path -Name AutoConfigURL -ErrorAction SilentlyContinue } else { Set-ItemProperty $path -Name AutoConfigURL -Type String -Value ([string]$previous.auto_config_url) }
+}
+if ($state.added_ca_thumbprint) { Remove-Item "Cert:\CurrentUser\Root\$($state.added_ca_thumbprint)" -ErrorAction SilentlyContinue }
+"#
+        .replace("{STATE_B64}", &state_b64);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(
+            script
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        ProcessCommand::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-EncodedCommand",
+                &encoded,
+            ])
+            .spawn()
+            .context("failed to start the Desktop proxy restore watcher")?;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_begin_packaged_proxy_lease(
+    listen: &str,
+    ca_cert_path: &Path,
+) -> Result<WindowsPackagedProxyLease> {
+    let previous = windows_read_internet_proxy()?;
+    let managed_server = listen.to_string();
+    if windows_proxy_conflicts(&previous, &managed_server) {
+        bail!(
+            "Windows system proxy or PAC is already configured outside SAIAI; refusing to override it for packaged Desktop. Disable the conflicting proxy or use the direct Desktop override."
+        );
+    }
+    let added_ca_thumbprint = windows_install_user_ca(ca_cert_path)?;
+    if let Err(error) = windows_write_internet_proxy(&WindowsInternetProxySettings {
+        proxy_enable: Some(1),
+        proxy_server: Some(managed_server.clone()),
+        auto_config_url: None,
+    }) {
+        windows_remove_user_ca(added_ca_thumbprint.as_deref())?;
+        return Err(error);
+    }
+    Ok(WindowsPackagedProxyLease {
+        previous,
+        managed_server,
+        added_ca_thumbprint,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_install_user_ca(path: &Path) -> Result<Option<String>> {
+    let file = path.to_string_lossy().to_string();
+    let output = command_output(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "& { param($file) $cert=Get-PfxCertificate -FilePath $file; $thumb=$cert.Thumbprint; $existing=Get-ChildItem Cert:\\CurrentUser\\Root | Where-Object { $_.Thumbprint -eq $thumb }; if($existing){ 'EXISTING:' + $thumb } else { Import-Certificate -FilePath $file -CertStoreLocation Cert:\\CurrentUser\\Root | Out-Null; 'ADDED:' + $thumb } }",
+            &file,
+        ],
+    )?;
+    let value = output.trim();
+    if let Some(thumbprint) = value.strip_prefix("ADDED:") {
+        Ok(Some(thumbprint.trim().to_string()))
+    } else if value.starts_with("EXISTING:") {
+        Ok(None)
+    } else {
+        bail!("failed to install the SAIAI Desktop CA in the user trust store")
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_remove_user_ca(thumbprint: Option<&str>) -> Result<()> {
+    let Some(thumbprint) = thumbprint else {
+        return Ok(());
+    };
+    command_output(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "& { param($thumb) Remove-Item \"Cert:\\CurrentUser\\Root\\$thumb\" -ErrorAction SilentlyContinue }",
+            thumbprint,
+        ],
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_read_internet_proxy() -> Result<WindowsInternetProxySettings> {
+    let output = command_output(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$p=Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'; [pscustomobject]@{proxy_enable=if($null -eq $p.ProxyEnable){$null}else{[int]$p.ProxyEnable}; proxy_server=if([string]::IsNullOrEmpty([string]$p.ProxyServer)){$null}else{[string]$p.ProxyServer}; auto_config_url=if([string]::IsNullOrEmpty([string]$p.AutoConfigURL)){$null}else{[string]$p.AutoConfigURL}} | ConvertTo-Json -Compress",
+        ],
+    )?;
+    serde_json::from_str(&output).context("failed to parse Windows Internet proxy settings")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_proxy_conflicts(settings: &WindowsInternetProxySettings, managed: &str) -> bool {
+    if settings
+        .auto_config_url
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return true;
+    }
+    if settings.proxy_enable != Some(1) {
+        return false;
+    }
+    let current = settings
+        .proxy_server
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let managed = managed
+        .trim()
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    !current.eq_ignore_ascii_case(managed)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_write_internet_proxy(settings: &WindowsInternetProxySettings) -> Result<()> {
+    let enable = settings
+        .proxy_enable
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "__SAIAI_NULL__".to_string());
+    let server = settings
+        .proxy_server
+        .as_deref()
+        .unwrap_or("__SAIAI_NULL__")
+        .to_string();
+    let auto = settings
+        .auto_config_url
+        .as_deref()
+        .unwrap_or("__SAIAI_NULL__")
+        .to_string();
+    command_output(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "& { param($e,$s,$a) $path='HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'; if($e -eq '__SAIAI_NULL__'){Remove-ItemProperty $path -Name ProxyEnable -ErrorAction SilentlyContinue}else{Set-ItemProperty $path -Name ProxyEnable -Type DWord -Value ([int]$e)}; if($s -eq '__SAIAI_NULL__'){Remove-ItemProperty $path -Name ProxyServer -ErrorAction SilentlyContinue}else{Set-ItemProperty $path -Name ProxyServer -Type String -Value $s}; if($a -eq '__SAIAI_NULL__'){Remove-ItemProperty $path -Name AutoConfigURL -ErrorAction SilentlyContinue}else{Set-ItemProperty $path -Name AutoConfigURL -Type String -Value $a} }",
+            &enable,
+            &server,
+            &auto,
+        ],
+    )?;
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -1766,11 +2093,24 @@ fn resolve_windows_desktop_executable() -> Result<PathBuf> {
 
 #[cfg(target_os = "windows")]
 struct WindowsPackagedDesktop {
+    app_id: String,
     install_location: PathBuf,
 }
 
 #[cfg(target_os = "windows")]
 fn resolve_windows_packaged_desktop() -> Result<Option<WindowsPackagedDesktop>> {
+    let app_id = command_output(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-StartApps | Where-Object AppID -Like 'OpenAI.Codex_*!App' | Select-Object -First 1 -ExpandProperty AppID",
+        ],
+    )?;
+    if app_id.trim().is_empty() {
+        return Ok(None);
+    }
     let install_location = command_output(
         "powershell",
         &[
@@ -1790,7 +2130,10 @@ fn resolve_windows_packaged_desktop() -> Result<Option<WindowsPackagedDesktop>> 
             install_location.display()
         );
     }
-    Ok(Some(WindowsPackagedDesktop { install_location }))
+    Ok(Some(WindowsPackagedDesktop {
+        app_id: app_id.trim().to_string(),
+        install_location,
+    }))
 }
 
 #[cfg(target_os = "windows")]
@@ -1807,6 +2150,22 @@ fn stop_windows_packaged_desktop(package: &WindowsPackagedDesktop) -> Result<()>
         ],
     )?;
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_packaged_desktop_running(package: &WindowsPackagedDesktop) -> Result<bool> {
+    let root = package.install_location.display().to_string();
+    let count = command_output(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "& { param($root) $process = Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1; if ($null -ne $process) { 'yes' } }",
+            &root,
+        ],
+    )?;
+    Ok(count.trim() == "yes")
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -2028,6 +2387,32 @@ fn write_desktop_account_id(auth_path: &Path, desktop_root: &Path) -> Result<()>
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .context("Desktop OAuth auth.json has no account_id")?;
+    let path = desktop_root.join("account-id");
+    write_bytes_atomic(&path, account_id.as_bytes(), 0o600).with_context(|| {
+        format!(
+            "failed to write Desktop account identity {}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn write_desktop_account_id_with_fallback(
+    auth_path: &Path,
+    desktop_root: &Path,
+    fallback: &str,
+) -> Result<()> {
+    let account_id = load_json_object(auth_path)
+        .ok()
+        .and_then(|auth| {
+            auth.get("tokens")
+                .and_then(Value::as_object)
+                .and_then(|tokens| tokens.get("account_id"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| fallback.to_string());
     let path = desktop_root.join("account-id");
     write_bytes_atomic(&path, account_id.as_bytes(), 0o600).with_context(|| {
         format!(
@@ -5599,7 +5984,28 @@ fn stop_windows_background_proxy() -> Result<()> {
             .status()
             .context("failed to run taskkill")?;
         if !status.success() {
-            bail!("taskkill exited with {status}");
+            // Detached/background workers can reject taskkill's tree walk even
+            // when the owning user can still terminate the exact process.
+            // Retry narrowly through PowerShell before surfacing an error.
+            let fallback = ProcessCommand::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "& { param($pid) Stop-Process -Id $pid -Force -ErrorAction Stop }",
+                    &pid.to_string(),
+                ])
+                .status();
+            if fallback
+                .as_ref()
+                .map(|value| !value.success())
+                .unwrap_or(true)
+                && windows_pid_is_running(pid).unwrap_or(false)
+            {
+                bail!(
+                    "could not stop SAIAI background process {pid}; taskkill exited with {status} and the exact-process fallback was rejected. Run PowerShell as the same user or Administrator and retry."
+                );
+            }
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
@@ -6811,12 +7217,36 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         for command in ["desktop", "chatgpt"] {
             let args = vec![command.to_string(), "--".to_string(), "--help".to_string()];
             match parse_command(&args).unwrap() {
-                Command::Desktop(desktop_args) => {
-                    assert_eq!(desktop_args, vec!["--help".to_string()]);
+                Command::Desktop { product, args } => {
+                    assert_eq!(
+                        product,
+                        if command == "chatgpt" {
+                            DesktopProduct::ChatGPT
+                        } else {
+                            DesktopProduct::Codex
+                        }
+                    );
+                    assert_eq!(args, vec!["--help".to_string()]);
                 }
                 _ => panic!("expected Desktop launcher command"),
             }
         }
+
+        let claude = parse_command(&[
+            "desktop".to_string(),
+            "claude".to_string(),
+            "--".to_string(),
+            "--help".to_string(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            claude,
+            Command::Desktop {
+                product: DesktopProduct::Claude,
+                args
+            } if args == vec!["--help".to_string()]
+        ));
+        assert!(parse_command(&["desktop".to_string(), "unknown".to_string()]).is_err());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]

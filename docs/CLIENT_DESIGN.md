@@ -150,6 +150,14 @@ Windows `OpenAI.Codex_*!App` 包则按官方客户端相同的 `codex://threads/
 因此这两条路径使用正常 Codex home 中的受管 `.env`、OAuth 占位和
 `respect_system_proxy=false`，与 VSCode 路径共享无系统环境修改的代理合同。
 
+Desktop 启动入口按产品 target 解析：`saiai desktop codex`、
+`saiai desktop chatgpt`、`saiai desktop claude` 和 `saiai desktop gemini`。
+当前 Codex/ChatGPT target 复用已验证的 OpenAI Desktop adapter；Claude/Gemini
+target 先返回明确的 adapter 未实现错误。后续产品接入应实现独立 adapter，描述
+可执行文件发现、认证/配置目录、profile/onboarding、TLS/代理继承、模型目录和
+UI readiness；这些差异不应继续堆进一个 OpenAI 专用 launcher 分支。代理进程、
+CA、profile 生命周期、日志和 doctor 检查属于共享 Desktop runtime。
+
 macOS 会校验 bundle identifier、OpenAI Team ID `2DC432GLL2` 和 codesign，并在
 激活前先请求应用正常退出，必要时才终止该 bundle 内的旧进程；进程退出后等待
 LaunchServices 稳定，并用 `open -n -a` 有界重试，避免紧接退出发生 `-600`。

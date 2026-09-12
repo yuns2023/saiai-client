@@ -35,6 +35,11 @@ use zeroize::Zeroizing;
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
 const OPENAI_HOST: &str = "api.openai.com";
 const CHATGPT_HOST: &str = "chatgpt.com";
+// The packaged Desktop currently uses this host for authenticated Web/Wham
+// control-plane calls. It must receive the same local MITM/sidecar treatment
+// as chatgpt.com; otherwise CONNECT falls through to the real provider with
+// the SAIAI placeholder and the app appears logged out.
+const CHATGPT_AUX_HOST: &str = "ab.chatgpt.com";
 const CERTIFICATE_CONTROL_HOST: &str = "certificate.saiai.local";
 const CERTIFICATE_SPKI_HEADER: &str = "x-saiai-leaf-spki-sha256";
 const CHATGPT_CHAT_PASSTHROUGH_ENV: &str = "SAIAI_CHATGPT_CHAT_PASSTHROUGH";
@@ -343,7 +348,9 @@ impl State {
         let host = canonical_host(host);
         match host.as_str() {
             ANTHROPIC_HOST => self.claude_route.as_ref().unwrap_or(&self.default_route),
-            OPENAI_HOST | CHATGPT_HOST => self.codex_route.as_ref().unwrap_or(&self.default_route),
+            OPENAI_HOST | CHATGPT_HOST | CHATGPT_AUX_HOST => {
+                self.codex_route.as_ref().unwrap_or(&self.default_route)
+            }
             _ => &self.default_route,
         }
     }
@@ -658,7 +665,7 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                     forward_to_saiai(&state, reader.get_mut(), request, close_after, false).await?;
                 }
             }
-        } else if host == OPENAI_HOST || host == CHATGPT_HOST {
+        } else if host == OPENAI_HOST || host == CHATGPT_HOST || host == CHATGPT_AUX_HOST {
             state.trace_openai_request(
                 if is_websocket_upgrade(&request) {
                     "handshake"
@@ -668,7 +675,7 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                 "to_gateway",
                 &request,
             );
-            let is_chatgpt = host == CHATGPT_HOST;
+            let is_chatgpt = host == CHATGPT_HOST || host == CHATGPT_AUX_HOST;
             if is_chatgpt {
                 match normalize_chatgpt_gateway_target(&request.target) {
                     Ok(target) => request.target = target,
@@ -680,6 +687,22 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                                 })
                                 .is_ok();
                         if !ordinary_chat_forwarded {
+                            if !state.chatgpt_chat_passthrough
+                                && let Some(resp) = chatgpt_chat_disabled_response(&request)
+                            {
+                                write_static_response(
+                                    reader.get_mut(),
+                                    resp.status,
+                                    resp.content_type,
+                                    resp.body,
+                                    close_after,
+                                )
+                                .await?;
+                                if close_after {
+                                    return Ok(());
+                                }
+                                continue;
+                            }
                             if let Some((status, body, reason, headers)) =
                                 chatgpt_account_sidecar_response(&request)
                             {
@@ -1465,6 +1488,16 @@ fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse>
     }
 }
 
+fn chatgpt_chat_disabled_response(request: &IncomingRequest) -> Option<StaticResponse> {
+    normalize_chatgpt_chat_target(&request.target).ok()?;
+    Some(StaticResponse {
+        status: StatusCode::NOT_IMPLEMENTED,
+        content_type: "application/json",
+        body: br#"{"error":{"type":"chat_mode_temporarily_disabled","message":"Chat mode is temporarily unsupported; switch to Codex mode."}}"#,
+        reason: "chat_mode_temporarily_disabled",
+    })
+}
+
 fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<AccountSidecarResponse> {
     let path = request_path(&request.target).ok()?;
     let account_id = header_value(&request.headers, "chatgpt-account-id")
@@ -1520,6 +1553,11 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
                 "profile_picture_url": null
             }]
         }),
+        // Codex Desktop's model picker treats this authenticated control-plane
+        // response as the source of optional Daybreak access. A null root
+        // means no special access program is present; an object such as `{}`
+        // can be interpreted as a non-standard access state and hide Astra.
+        "/backend-api/accounts/verified_access" | "/accounts/verified_access" => Value::Null,
         "/backend-api/wham/statsig/bootstrap" => json!({
             "statsigPayload": "{\"feature_gates\":{},\"dynamic_configs\":{},\"layer_configs\":{},\"has_updates\":true,\"time\":0,\"user\":{\"userID\":\"saiai-local-proxy-user\",\"customIDs\":{\"stableID\":\"saiai-local-proxy\"}}}"
         }),
@@ -1605,7 +1643,10 @@ fn desktop_account_id_fallback() -> Option<String> {
 }
 
 fn is_managed_host(host: &str) -> bool {
-    host == ANTHROPIC_HOST || host == OPENAI_HOST || host == CHATGPT_HOST
+    host == ANTHROPIC_HOST
+        || host == OPENAI_HOST
+        || host == CHATGPT_HOST
+        || host == CHATGPT_AUX_HOST
 }
 
 fn is_websocket_upgrade(request: &IncomingRequest) -> bool {
@@ -1901,6 +1942,7 @@ mod tests {
         );
         assert!(normalize_chatgpt_gateway_target("/backend-api/conversations").is_err());
         assert!(is_managed_host(CHATGPT_HOST));
+        assert!(is_managed_host(CHATGPT_AUX_HOST));
     }
 
     #[test]
@@ -1938,6 +1980,27 @@ mod tests {
         ));
         assert!(!should_forward_request_header_to_gateway("Cookie", true));
         assert!(should_forward_request_header_to_gateway("originator", true));
+    }
+
+    #[test]
+    fn disables_ordinary_chat_with_explicit_unsupported_response() {
+        let request = IncomingRequest {
+            method: "POST".to_string(),
+            target: "/backend-api/f/conversation".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let response = chatgpt_chat_disabled_response(&request).unwrap();
+        assert_eq!(response.status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.reason, "chat_mode_temporarily_disabled");
+        assert!(
+            !chatgpt_chat_disabled_response(&IncomingRequest {
+                target: "/backend-api/codex/models".to_string(),
+                ..request
+            })
+            .is_some()
+        );
     }
 
     #[test]
@@ -1998,6 +2061,17 @@ mod tests {
         assert_eq!(body["default_account_id"], "account-test");
         assert_eq!(body["accounts"][0]["account_user_role"], "standard-user");
         assert_eq!(body["accounts"][0]["is_zdr"], false);
+
+        let verified_access = IncomingRequest {
+            method: "GET".to_string(),
+            target: "/backend-api/accounts/verified_access".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: vec![("ChatGPT-Account-ID".to_string(), "account-test".to_string())],
+            body: Vec::new(),
+        };
+        let (_, body, _, _) = chatgpt_account_sidecar_response(&verified_access).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(body.is_null());
 
         let statsig = IncomingRequest {
             method: "GET".to_string(),
@@ -2147,6 +2221,10 @@ mod tests {
         );
         assert_eq!(
             state.route_for_host(CHATGPT_HOST).api_key.as_str(),
+            "codex-key"
+        );
+        assert_eq!(
+            state.route_for_host(CHATGPT_AUX_HOST).api_key.as_str(),
             "codex-key"
         );
     }

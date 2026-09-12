@@ -154,6 +154,12 @@ NSS 数据库并导入本地 CA，避免修改系统信任库；首次使用需�
 因此不会每次启动都要求选择职业/个性化设置；这只影响 SAIAI 管理的 Desktop
 profile，不会改写原始 Codex 配置。
 
+桌面入口按产品 target 组织：`saiai desktop codex` 和
+`saiai desktop chatgpt` 使用当前 OpenAI Desktop adapter；`saiai desktop claude`
+与 `saiai desktop gemini` 已预留为独立 adapter 入口，当前会明确提示尚未实现。
+未来产品接入只需增加各自的 executable/config/auth/proxy/model/readiness adapter，
+共享 local-proxy、CA、profile、日志和进程生命周期管理。
+
 普通 ChatGPT Chat 默认使用固定的美国太平洋时区。也可以按次启动覆盖：
 
 ```bash
