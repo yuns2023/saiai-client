@@ -1938,12 +1938,42 @@ fn prepare_isolated_desktop_state(
     desktop_codex: &Path,
 ) -> Result<()> {
     let auth_path = desktop_codex.join("auth.json");
-    replace_codex_local_proxy_auth(&auth_path, Some(&cfg.api_key))?;
+    let source_auth_path = codex_config_dir()?.join("auth.json");
+    if !copy_real_codex_oauth_auth(&source_auth_path, &auth_path)?
+        && !copy_real_codex_oauth_auth(&auth_path, &auth_path)?
+    {
+        replace_codex_local_proxy_auth(&auth_path, Some(&cfg.api_key))?;
+    }
     validate_codex_oauth_auth(&auth_path)?;
     prepare_codex_oauth_files(desktop_codex, true)?;
     disable_codex_apps(&desktop_codex.join("config.toml"))?;
     write_desktop_account_id(&auth_path, desktop_root)?;
     prepare_desktop_onboarding_state(desktop_codex)
+}
+
+fn copy_real_codex_oauth_auth(source: &Path, target: &Path) -> Result<bool> {
+    if !source.is_file() {
+        return Ok(false);
+    }
+    let auth = match load_json_object(source) {
+        Ok(auth) => auth,
+        Err(_) => return Ok(false),
+    };
+    let access_token = auth
+        .get("tokens")
+        .and_then(Value::as_object)
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if is_codex_placeholder_access_token(access_token) {
+        return Ok(false);
+    }
+    validate_codex_oauth_auth(source)?;
+    let bytes = fs::read(source)
+        .with_context(|| format!("failed to read OAuth auth file {}", source.display()))?;
+    write_bytes_atomic(target, &bytes, 0o600)
+        .with_context(|| format!("failed to copy OAuth auth file to {}", target.display()))?;
+    Ok(true)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
