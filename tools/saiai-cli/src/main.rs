@@ -2881,6 +2881,7 @@ fn restart_managed_service_if_needed(was_active: bool) -> Result<()> {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn run_update() -> Result<()> {
+    let service_was_active = managed_service_is_active();
     let cfg = read_saiai_config()?;
     let asset = current_platform_asset_name()?;
     let base = cfg.base_url.trim().trim_end_matches('/');
@@ -2974,11 +2975,26 @@ fn run_update() -> Result<()> {
         return Ok(());
     }
 
-    finalize_update(&current_exe, &candidate_path, &backup_path)?;
+    finalize_update(
+        &current_exe,
+        &candidate_path,
+        &backup_path,
+        service_was_active,
+    )?;
 
     println!("Updated: {}", candidate_version.trim());
     println!("Backup: {}", backup_path.display());
-    println!("Restart service with: saiai restart");
+    if service_was_active {
+        #[cfg(not(target_os = "windows"))]
+        {
+            run_service_restart().context("failed to restart the active SAIAI service")?;
+            println!("Managed SAIAI service was active; restarted automatically.");
+        }
+        #[cfg(target_os = "windows")]
+        println!("Managed SAIAI service was active; restart was scheduled automatically.");
+    } else {
+        println!("SAIAI service was not active; run `saiai start` when needed.");
+    }
     Ok(())
 }
 
@@ -4739,7 +4755,12 @@ fn update_backup_name() -> String {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn finalize_update(current_exe: &Path, candidate_path: &Path, backup_path: &Path) -> Result<()> {
+fn finalize_update(
+    current_exe: &Path,
+    candidate_path: &Path,
+    backup_path: &Path,
+    _restart_service: bool,
+) -> Result<()> {
     fs::copy(current_exe, backup_path).with_context(|| {
         format!(
             "failed to back up {} to {}",
@@ -4758,7 +4779,12 @@ fn finalize_update(current_exe: &Path, candidate_path: &Path, backup_path: &Path
 }
 
 #[cfg(target_os = "windows")]
-fn finalize_update(current_exe: &Path, candidate_path: &Path, backup_path: &Path) -> Result<()> {
+fn finalize_update(
+    current_exe: &Path,
+    candidate_path: &Path,
+    backup_path: &Path,
+    restart_service: bool,
+) -> Result<()> {
     fs::copy(current_exe, backup_path).with_context(|| {
         format!(
             "failed to back up {} to {}",
@@ -4773,6 +4799,7 @@ fn finalize_update(current_exe: &Path, candidate_path: &Path, backup_path: &Path
         candidate_path,
         backup_path,
         &script_path,
+        restart_service,
     )?;
     fs::write(&script_path, script)
         .with_context(|| format!("failed to write {}", script_path.display()))?;
@@ -4801,19 +4828,30 @@ fn render_windows_update_script(
     candidate_path: &Path,
     backup_path: &Path,
     script_path: &Path,
+    restart_service: bool,
 ) -> Result<String> {
+    let restart = if restart_service {
+        format!(
+            "Start-Process -FilePath {} -ArgumentList 'restart' -WindowStyle Hidden\r\n",
+            powershell_quote_path(current_exe)?
+        )
+    } else {
+        String::new()
+    };
     Ok(format!(
         "$ErrorActionPreference = 'Stop'\r\n\
 try {{ Wait-Process -Id {pid} -Timeout 30 -ErrorAction SilentlyContinue }} catch {{}}\r\n\
 Start-Sleep -Milliseconds 300\r\n\
 Copy-Item -LiteralPath {} -Destination {} -Force\r\n\
 Move-Item -LiteralPath {} -Destination {} -Force\r\n\
-Remove-Item -LiteralPath {} -Force -ErrorAction SilentlyContinue\r\n",
+Remove-Item -LiteralPath {} -Force -ErrorAction SilentlyContinue\r\n\
+{}",
         powershell_quote_path(current_exe)?,
         powershell_quote_path(backup_path)?,
         powershell_quote_path(candidate_path)?,
         powershell_quote_path(current_exe)?,
         powershell_quote_path(script_path)?,
+        restart,
     ))
 }
 
