@@ -632,6 +632,17 @@ fn initialize_codex_local_proxy_at(
         && let Ok(existing) = serde_json::from_str::<SaiaiConfig>(&raw)
         && read_runtime_ca(&existing).is_ok()
     {
+        if existing.providers.claude.is_none()
+            && existing.providers.codex.is_none()
+            && legacy_claude_proxy_configured()
+        {
+            let mut migrated = existing;
+            migrated.providers.claude = Some(ProviderCredential {
+                base_url: migrated.base_url.clone(),
+                api_key: migrated.api_key.clone(),
+            });
+            write_saiai_config_at(&config_path, &migrated)?;
+        }
         let updated = update_saiai_provider_config_at(
             &config_path,
             ProviderKind::Codex,
@@ -2308,6 +2319,13 @@ fn update_saiai_provider_config_at(
         ProviderKind::Claude => config.providers.claude = Some(credential),
         ProviderKind::Codex => config.providers.codex = Some(credential),
     }
+    let selected = match provider {
+        ProviderKind::Claude => config.providers.claude.as_ref(),
+        ProviderKind::Codex => config.providers.codex.as_ref(),
+    }
+    .expect("selected provider credential was just inserted");
+    config.base_url = selected.base_url.clone();
+    config.api_key = selected.api_key.clone();
     write_saiai_config_at(path, &config)?;
     Ok(config)
 }
@@ -5594,6 +5612,30 @@ fn existing_runtime_ca_paths() -> Option<(PathBuf, PathBuf)> {
     Some((cert, key))
 }
 
+fn legacy_claude_proxy_configured() -> bool {
+    let Ok(paths) = resolve_claude_config_paths() else {
+        return false;
+    };
+    let Ok(settings) = load_json_object(&paths.settings_path) else {
+        return false;
+    };
+    let Some(env) = settings.get("env").and_then(Value::as_object) else {
+        return false;
+    };
+    [
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NODE_EXTRA_CA_CERTS",
+    ]
+    .into_iter()
+    .any(|key| {
+        env.get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    })
+}
+
 fn env_dir_override(var: &str) -> Option<PathBuf> {
     let raw = env::var_os(var)?;
     if raw.is_empty() {
@@ -6523,8 +6565,8 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert_eq!(second.ca_key_path, first.ca_key_path);
         assert_eq!(fs::read(&second.ca_cert_path).unwrap(), cert_before);
         assert_eq!(fs::read(&second.ca_key_path).unwrap(), key_before);
-        assert_eq!(updated.base_url, first_args.base_url);
-        assert_eq!(updated.api_key, first_args.api_key);
+        assert_eq!(updated.base_url, second_args.base_url);
+        assert_eq!(updated.api_key, second_args.api_key);
         assert_eq!(
             updated.providers.codex.as_ref().map(|value| &value.api_key),
             Some(&second_args.api_key)
@@ -6547,7 +6589,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         let config_path = temporary.path().join(SAIAI_CONFIG_FILENAME);
         let cert_path = temporary.path().join("saiai-ca.crt");
         let key_path = temporary.path().join("saiai-ca.key");
-        let initial = update_saiai_provider_config_at(
+        let _initial = update_saiai_provider_config_at(
             &config_path,
             ProviderKind::Claude,
             ProviderCredential {
@@ -6568,8 +6610,8 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         )
         .unwrap();
 
-        assert_eq!(updated.base_url, initial.base_url);
-        assert_eq!(updated.api_key, initial.api_key);
+        assert_eq!(updated.base_url, "https://codex.example.test");
+        assert_eq!(updated.api_key, "TEST_ONLY_CODEX_KEY");
         assert_eq!(
             updated
                 .providers
