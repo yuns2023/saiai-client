@@ -3036,7 +3036,11 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
         }
     }
     if check_codex {
-        check_codex_config(&mut report, cfg.as_ref());
+        check_codex_config(
+            &mut report,
+            cfg.as_ref(),
+            matches!(target, DoctorTarget::Codex),
+        );
     }
 
     if let Some(cfg) = &cfg {
@@ -3903,21 +3907,27 @@ fn check_claude_state(report: &mut DoctorReport, path: &Path) {
     }
 }
 
-fn check_codex_config(report: &mut DoctorReport, cfg: Option<&SaiaiConfig>) {
+fn check_codex_config(report: &mut DoctorReport, cfg: Option<&SaiaiConfig>, required: bool) {
     let codex_dir = match codex_config_dir() {
         Ok(path) => path,
         Err(err) => {
-            report.error("Codex home", err.to_string());
+            if required {
+                report.error("Codex home", err.to_string());
+            } else {
+                report.warn("Codex home", err.to_string());
+            }
             return;
         }
     };
     let config_path = codex_dir.join("config.toml");
     let auth_path = codex_dir.join("auth.json");
     if !config_path.is_file() {
-        report.error(
-            "Codex config",
-            format!("{} does not exist", config_path.display()),
-        );
+        let message = format!("{} does not exist", config_path.display());
+        if required {
+            report.error("Codex config", message);
+        } else {
+            report.warn("Codex config", message);
+        }
     } else {
         match fs::read_to_string(&config_path) {
             Ok(raw) => match raw.parse::<DocumentMut>() {
@@ -3952,10 +3962,12 @@ fn check_codex_config(report: &mut DoctorReport, cfg: Option<&SaiaiConfig>) {
         }
     }
     if !auth_path.is_file() {
-        report.error(
-            "Codex auth",
-            format!("{} does not exist", auth_path.display()),
-        );
+        let message = format!("{} does not exist", auth_path.display());
+        if required {
+            report.error("Codex auth", message);
+        } else {
+            report.warn("Codex auth", message);
+        }
     } else {
         match validate_codex_oauth_auth(&auth_path) {
             Ok(()) => report.ok("Codex auth", "ChatGPT OAuth token mode configured"),
