@@ -166,7 +166,7 @@ SAIAI_CHATGPT_TIMEZONE=America/Los_Angeles saiai chatgpt
 也不会修改系统环境或 Gateway 请求体。
 
 `saiai chatgpt` 默认转发普通 ChatGPT Chat 的明确 allowlist（包括
-`/backend-api/files/download/{file_id}` 图片/文件资产解析）到 Gateway 的独立
+`/backend-api/files/download/{file_id}` 与 `/backend-api/estuary/content` 图片/文件资产解析）到 Gateway 的独立
 `/chatgpt/backend-api/*` ingress，不做 Responses 协议转换。紧急排障时可仅对代理
 进程设置 `SAIAI_CHATGPT_CHAT_PASSTHROUGH=0` 关闭该路径；Gateway 端仍需显式启用
 普通 Chat，并在计费不可用时默认拒绝最终模型请求。
