@@ -12,6 +12,7 @@ import socket
 import subprocess
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 
 
@@ -120,9 +121,6 @@ def main() -> int:
         raise AssertionError(f"SAIAI binary is missing: {binary}")
     binary.chmod(binary.stat().st_mode | 0o111)
 
-    if port_is_open():
-        raise AssertionError(f"test port {LISTEN_HOST}:{LISTEN_PORT} is already in use")
-
     with tempfile.TemporaryDirectory(prefix="saiai-macos-service-") as temporary_text:
         temporary = Path(temporary_text)
         home = temporary / "home"
@@ -224,6 +222,14 @@ Path(os.environ["SAIAI_DESKTOP_CAPTURE"]).write_text(
             ],
             environment,
         )
+        config = json.loads((saiai_home / "config.json").read_text(encoding="utf-8"))
+        listen = urllib.parse.urlsplit("//" + config["listen"])
+        if listen.port is None:
+            raise AssertionError("SAIAI initialization wrote an invalid listen address")
+        global LISTEN_PORT
+        LISTEN_PORT = listen.port
+        if port_is_open():
+            raise AssertionError(f"test port {LISTEN_HOST}:{LISTEN_PORT} is already in use")
 
         plist = home / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
         try:
