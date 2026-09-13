@@ -92,13 +92,16 @@ try {
     Assert-Saiai ($LASTEXITCODE -eq 0) "SAIAI config command failed: $output"
     Assert-Saiai (-not $output.Contains($testKey)) "SAIAI output exposed the API key"
 
+    $saiaiConfig = Get-Content -LiteralPath (Join-Path $env:SAIAI_HOME "config.json") -Raw | ConvertFrom-Json
+    $proxyUrl = "http://$([string]$saiaiConfig.listen)"
+
     $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
     Assert-Saiai ($null -eq $settings.env.PSObject.Properties["ANTHROPIC_BASE_URL"]) "Direct gateway override remains"
     Assert-Saiai ([string]$settings.env.CLAUDE_CODE_OAUTH_TOKEN -ceq $testKey) "API key differs"
     Assert-Saiai ([string]$settings.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS -ceq "600000") "Timeout differs"
     Assert-Saiai ([string]$settings.env.KEEP_ME -ceq "yes") "Unrelated env was lost"
     Assert-Saiai ($null -eq $settings.env.PSObject.Properties["ANTHROPIC_AUTH_TOKEN"]) "Conflicting auth token remains"
-    Assert-Saiai ([string]$settings.env.http_proxy -ceq "http://127.0.0.1:19908") "Local proxy differs"
+    Assert-Saiai ([string]$settings.env.http_proxy -ceq $proxyUrl) "Local proxy differs"
     Assert-Saiai ([string]$settings.env.NODE_EXTRA_CA_CERTS -ceq $caPath) "CA path differs"
     Assert-Saiai (@($settings.permissions.allow) -contains "Read") "Unrelated settings were lost"
 
@@ -180,7 +183,7 @@ fn main() {
     $desktopHome = Join-Path $desktopRoot "home"
     $desktopLines = @(Get-Content -LiteralPath $desktopCapture)
     Assert-Saiai ($desktopLines -contains "ARG=--user-data-dir=$desktopUserData") "Windows Desktop user-data argument differs"
-    Assert-Saiai ($desktopLines -contains "ARG=--proxy-server=http://127.0.0.1:19908") "Windows Desktop proxy argument differs"
+    Assert-Saiai ($desktopLines -contains "ARG=--proxy-server=$proxyUrl") "Windows Desktop proxy argument differs"
     Assert-Saiai ($desktopLines -contains "ARG=--smoke-argument") "Windows Desktop argument was not preserved"
     Assert-Saiai ($desktopLines -contains "ENV=HOME=$desktopHome") "Windows Desktop HOME is not isolated"
     Assert-Saiai ($desktopLines -contains "ENV=USERPROFILE=$desktopHome") "Windows Desktop USERPROFILE is not isolated"
@@ -189,7 +192,7 @@ fn main() {
     Assert-Saiai ($desktopLines -contains "ENV=CODEX_CA_CERTIFICATE=$caPath") "Windows Desktop Codex CA differs"
     Assert-Saiai ($desktopLines -contains "ENV=SSL_CERT_FILE=$caPath") "Windows Desktop SSL CA differs"
     Assert-Saiai ($desktopLines -contains "ENV=NODE_EXTRA_CA_CERTS=$caPath") "Windows Desktop Node CA differs"
-    Assert-Saiai ($desktopLines -contains "ENV=HTTP_PROXY=http://127.0.0.1:19908") "Windows Desktop HTTP proxy differs"
+    Assert-Saiai ($desktopLines -contains "ENV=HTTP_PROXY=$proxyUrl") "Windows Desktop HTTP proxy differs"
     Assert-Saiai ($desktopLines -contains "ENV=TZ=America/Los_Angeles") "Windows Desktop timezone differs"
     $desktopConfig = Get-Content -LiteralPath (Join-Path $desktopCodex "config.toml") -Raw
     Assert-Saiai ($desktopConfig.Contains("respect_system_proxy = false")) "Windows Desktop config can bypass the child proxy through WinHTTP DIRECT"
