@@ -2393,7 +2393,10 @@ fn copy_real_codex_oauth_auth(source: &Path, target: &Path) -> Result<bool> {
         .and_then(|tokens| tokens.get("access_token"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    if is_codex_placeholder_access_token(access_token) {
+    // API-key-only legacy auth is a valid source for Desktop local-proxy
+    // mode. It has no OAuth token to copy; the caller will create an isolated
+    // SAIAI placeholder instead of requiring `saiai codex` first.
+    if access_token.trim().is_empty() || is_codex_placeholder_access_token(access_token) {
         return Ok(false);
     }
     validate_codex_oauth_auth(source)?;
@@ -7143,6 +7146,18 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         ensure_codex_local_proxy_auth(&path, Some("TEST_ONLY_MANAGED_KEY")).unwrap();
 
         assert_eq!(read_str(&path), real);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn treats_legacy_api_key_auth_as_desktop_placeholder_source() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("auth.json");
+        let target = dir.path().join("desktop-auth.json");
+        write_str(&source, r#"{"OPENAI_API_KEY":"TEST_ONLY_KEY"}"#);
+
+        assert!(!copy_real_codex_oauth_auth(&source, &target).unwrap());
+        assert!(!target.exists());
     }
 
     fn json_str<'a>(map: &'a Map<String, Value>, key: &str) -> &'a str {

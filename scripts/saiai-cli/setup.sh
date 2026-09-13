@@ -238,9 +238,10 @@ esac
 
 if [ "${1:-}" = "init-codex" ]; then
   "${install_path}" "$@"
-  if [ "${SAIAI_SKIP_START:-0}" != "1" ]; then
-    "${install_path}" start
-  fi
+  # Codex legacy initialization only writes config and the independent proxy
+  # settings. `saiai codex` and Desktop launchers start the proxy on demand;
+  # avoid a second LaunchAgent restart after native init-codex already handled
+  # an active service.
 else
   "${install_path}" init "$@"
   if [ "${SAIAI_SKIP_START:-0}" != "1" ]; then

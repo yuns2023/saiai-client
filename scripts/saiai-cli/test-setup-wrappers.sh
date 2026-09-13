@@ -109,8 +109,7 @@ test "${codex_invocation[1]}" = "init-codex"
 test "${codex_invocation[2]}" = "https://gateway.example.test/v1"
 test "${codex_invocation[3]}" = "TEST_ONLY_CODEX_KEY"
 test "${codex_invocation[4]}" = "--websockets"
-test "${codex_invocation[5]}" = "CALL"
-test "${codex_invocation[6]}" = "start"
+test "${#codex_invocation[@]}" -eq 5
 test "$(grep -Fc '/manifest.json' "${curl_log}")" -eq 3
 test "$(grep -Fc '/saiai-linux-x86_64' "${curl_log}")" -eq 1
 
@@ -122,8 +121,7 @@ test "${reused_invocation[0]}" = "CALL"
 test "${reused_invocation[1]}" = "init-codex"
 test "${reused_invocation[2]}" = "https://reuse.example.test"
 test "${reused_invocation[3]}" = "TEST_ONLY_REUSED_CODEX_KEY"
-test "${reused_invocation[4]}" = "CALL"
-test "${reused_invocation[5]}" = "start"
+test "${#reused_invocation[@]}" -eq 4
 test "$(grep -Fc '/manifest.json' "${curl_log}")" -eq 4
 test "$(grep -Fc '/saiai-linux-x86_64' "${curl_log}")" -eq 1
 
