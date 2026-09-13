@@ -7150,7 +7150,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
-    fn treats_legacy_api_key_auth_as_desktop_placeholder_source() {
+    fn treats_legacy_api_credential_auth_as_desktop_placeholder_source() {
         let dir = TempDir::new().unwrap();
         let source = dir.path().join("auth.json");
         let target = dir.path().join("desktop-auth.json");
