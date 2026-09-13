@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use base64::Engine;
 use chrono::Utc;
 use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
@@ -14,7 +14,7 @@ use std::env;
 #[cfg(windows)]
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::io::{BufRead, BufReader as StdBufReader};
 use std::io::{ErrorKind, Write};
 use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream};
@@ -89,9 +89,9 @@ const CODEX_MANAGED_ENV: &[&str] = &[
 const CODEX_LOCAL_PROXY_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local";
 const CODEX_IDE_ENV_BEGIN: &str = "# BEGIN SAIAI CODEX IDE (managed)";
 const CODEX_IDE_ENV_END: &str = "# END SAIAI CODEX IDE (managed)";
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const CODEX_CERTIFICATE_CONTROL_HOST: &str = "certificate.saiai.local";
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const CODEX_CERTIFICATE_SPKI_HEADER: &str = "x-saiai-leaf-spki-sha256";
 const CODEX_PLACEHOLDER_ACCOUNT_ID: &str = "saiai-local-proxy-placeholder-account";
 // Historical `init-codex` sessions persisted the custom provider ID `OpenAI`.
@@ -1288,9 +1288,14 @@ fn run_linux_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
         .context("ChatGPT Desktop was not found; install the ChatGPT Desktop package first")?;
     let fixed_timezone = resolve_chatgpt_timezone()?;
 
-    let mut launch_args = vec![format!("--user-data-dir={}", desktop_user_data.display())];
-    launch_args.extend(args.iter().cloned());
     let proxy = format!("http://{}", cfg.listen);
+    let spki = local_proxy_chatgpt_spki(&cfg.listen)?;
+    let mut launch_args = vec![
+        format!("--user-data-dir={}", desktop_user_data.display()),
+        format!("--proxy-server={proxy}"),
+        format!("--ignore-certificate-errors-spki-list={spki}"),
+    ];
+    launch_args.extend(args.iter().cloned());
     let mut command = ProcessCommand::new(&executable);
     command.args(launch_args);
     // Electron writes diagnostic messages through Node's console even after
@@ -2266,6 +2271,21 @@ fn validate_chatgpt_timezone(value: &str) -> Result<Option<String>> {
 
 #[cfg(target_os = "linux")]
 fn ensure_desktop_nss_ca(home: &Path, ca_cert: &str) -> Result<()> {
+    // Chromium can use the pinned local-proxy leaf SPKI passed by the Linux
+    // launcher. `certutil` is supplied by `libnss3-tools`, which is not part
+    // of every ChatGPT Desktop package; absence must not prevent launch.
+    if ProcessCommand::new("certutil")
+        .arg("-V")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_err()
+    {
+        eprintln!(
+            "warning: certutil is unavailable; using the Desktop SPKI certificate pin instead of an NSS database"
+        );
+        return Ok(());
+    }
     let db_dir = home.join(".pki/nssdb");
     fs::create_dir_all(&db_dir)
         .with_context(|| format!("failed to create {}", db_dir.display()))?;
@@ -2640,7 +2660,7 @@ fn ensure_local_proxy_running(listen: &str) -> Result<()> {
     bail!("SAIAI local proxy did not become reachable at {listen}")
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn local_proxy_chatgpt_spki(listen: &str) -> Result<String> {
     let addr = listen
         .parse::<SocketAddr>()
@@ -6791,31 +6811,27 @@ fn merge_codex_features(doc: &mut DocumentMut, websockets: bool, path: &Path) ->
     Ok(())
 }
 
-/// Upsert `OPENAI_API_KEY` into `~/.codex/auth.json` while preserving every
-/// other field. If the file exists but isn't a JSON object, refuse to write so
-/// we don't silently destroy a non-standard auth payload (the backup is
-/// already on disk).
+/// Write the legacy API-key-only shape to `~/.codex/auth.json`. Historical
+/// OAuth fields (`auth_mode`, `tokens`, refresh metadata, and account IDs)
+/// must not coexist with `OPENAI_API_KEY`: Codex otherwise chooses the wrong
+/// credential mode for direct Gateway requests. The caller has already backed
+/// up the previous file before reaching this function.
 fn merge_codex_auth(path: &Path, api_key: &str) -> Result<()> {
-    let mut auth: Map<String, Value> = if !path.exists() {
-        Map::new()
-    } else {
+    if path.exists() {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        if raw.trim().is_empty() {
-            Map::new()
-        } else {
+        if !raw.trim().is_empty() {
             let parsed: Value = serde_json::from_str(&raw)
                 .with_context(|| format!("failed to parse {}", path.display()))?;
-            match parsed {
-                Value::Object(map) => map,
-                _ => bail!(
+            if !parsed.is_object() {
+                bail!(
                     "{} exists but is not a JSON object; refusing to overwrite (backup is preserved)",
                     path.display()
-                ),
+                );
             }
         }
-    };
-
+    }
+    let mut auth = Map::new();
     auth.insert(
         "OPENAI_API_KEY".to_string(),
         Value::String(api_key.to_string()),
@@ -8284,8 +8300,19 @@ custom_header = "kept"
         let auth_dir = TempDir::new().unwrap();
         let auth_path = auth_dir.path().join("auth.json");
 
+        write_str(
+            &auth_path,
+            r#"{"auth_mode":"chatgptAuthTokens","tokens":{"access_token":"stale"},"account_id":"stale","OPENAI_API_KEY":"old"}"#,
+        );
         merge_codex_auth(&auth_path, "sk-test").unwrap();
         let auth_after_first = fs::read(&auth_path).unwrap();
+        assert_eq!(
+            load_json_object(&auth_path).unwrap(),
+            Map::from_iter([(
+                "OPENAI_API_KEY".to_string(),
+                Value::String("sk-test".to_string())
+            )])
+        );
 
         // Toggle ws on then off through the config path; auth.json must not
         // change.
