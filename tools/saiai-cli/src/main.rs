@@ -578,6 +578,15 @@ fn init_claude(args: InitArgs) -> Result<()> {
 
     ensure_installation_ca(&ca_path, &ca_key_path, &timestamp)?;
 
+    let saiai_config = update_saiai_provider_config(
+        ProviderKind::Claude,
+        ProviderCredential {
+            base_url: args.base_url.clone(),
+            api_key: args.api_key.clone(),
+        },
+        Some((ca_path.clone(), ca_key_path.clone())),
+    )?;
+
     let mut settings = load_json_object(settings_path)?;
     clean_claude_settings(&mut settings);
     let env_value = settings
@@ -586,7 +595,7 @@ fn init_claude(args: InitArgs) -> Result<()> {
         .unwrap_or_default();
     let mut env_obj = env_value;
     apply_common_claude_env(&mut env_obj, &args.api_key);
-    apply_claude_local_proxy_env(&mut env_obj, DEFAULT_LOCAL_PROXY_LISTEN, &ca_path);
+    apply_claude_local_proxy_env(&mut env_obj, &saiai_config.listen, &ca_path);
     settings.insert("env".to_string(), Value::Object(env_obj));
     write_json_object(settings_path, Value::Object(settings))?;
 
@@ -594,15 +603,6 @@ fn init_claude(args: InitArgs) -> Result<()> {
     clean_claude_state(&mut state);
     state.insert("hasCompletedOnboarding".to_string(), Value::Bool(true));
     write_json_object(state_path, Value::Object(state))?;
-
-    update_saiai_provider_config(
-        ProviderKind::Claude,
-        ProviderCredential {
-            base_url: args.base_url,
-            api_key: args.api_key,
-        },
-        Some((ca_path.clone(), ca_key_path.clone())),
-    )?;
 
     println!("SAIAI configured Claude Code for local proxy mode.");
     println!("Updated:");
@@ -723,7 +723,7 @@ fn initialize_codex_local_proxy_at(
         version: SAIAI_CONFIG_VERSION,
         base_url: proxy_base_url.clone(),
         api_key: args.api_key.clone(),
-        listen: DEFAULT_LOCAL_PROXY_LISTEN.to_string(),
+        listen: select_local_proxy_listen(None)?,
         ca_cert_path: ca_cert_path.display().to_string(),
         ca_key_path: ca_key_path.display().to_string(),
         chatgpt_chat_passthrough: true,
@@ -2747,6 +2747,35 @@ struct ProviderCredential {
     api_key: String,
 }
 
+fn select_local_proxy_listen(existing: Option<&str>) -> Result<String> {
+    if let Some(listen) = existing.filter(|value| !value.trim().is_empty()) {
+        if let Ok(addr) = listen.parse::<SocketAddr>()
+            && addr.ip().is_loopback()
+        {
+            // Keep the current port when our managed service owns it. On a
+            // repeat initialization this avoids needless proxy churn.
+            if managed_service_is_active()
+                && TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
+            {
+                return Ok(listen.to_string());
+            }
+            // Preserve an available existing port; only replace it when an
+            // unrelated process has claimed it.
+            if StdTcpListener::bind(addr).is_ok() {
+                return Ok(listen.to_string());
+            }
+        }
+    }
+
+    let listener = StdTcpListener::bind(("127.0.0.1", 0))
+        .context("failed to allocate a loopback port for the SAIAI local proxy")?;
+    let port = listener
+        .local_addr()
+        .context("failed to read the allocated SAIAI local proxy port")?
+        .port();
+    Ok(format!("127.0.0.1:{port}"))
+}
+
 #[derive(Clone, Copy)]
 enum ProviderKind {
     Claude,
@@ -2784,7 +2813,7 @@ fn update_saiai_provider_config_at(
         version: SAIAI_CONFIG_VERSION,
         base_url: credential.base_url.clone(),
         api_key: credential.api_key.clone(),
-        listen: DEFAULT_LOCAL_PROXY_LISTEN.to_string(),
+        listen: String::new(),
         ca_cert_path: ca_paths
             .as_ref()
             .map(|(cert, _)| cert.display().to_string())
@@ -2796,6 +2825,8 @@ fn update_saiai_provider_config_at(
         chatgpt_chat_passthrough: true,
         providers: ProviderCredentials::default(),
     });
+    let existing_listen = (!config.listen.trim().is_empty()).then_some(config.listen.as_str());
+    config.listen = select_local_proxy_listen(existing_listen)?;
 
     if config.version != SAIAI_CONFIG_VERSION
         || config.ca_cert_path.trim().is_empty()
@@ -7365,7 +7396,9 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             config.providers.codex.as_ref().map(|value| &value.api_key),
             Some(&args.api_key)
         );
-        assert_eq!(config.listen, DEFAULT_LOCAL_PROXY_LISTEN);
+        let listen_addr = config.listen.parse::<SocketAddr>().unwrap();
+        assert!(listen_addr.ip().is_loopback());
+        assert_ne!(listen_addr.port(), 0);
         assert_eq!(
             config.ca_cert_path,
             initialized.ca_cert_path.display().to_string()

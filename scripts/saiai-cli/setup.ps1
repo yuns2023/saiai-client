@@ -342,10 +342,10 @@ function Invoke-Saiai {
             if ($nativeExitCode -ne 0) {
                 return $nativeExitCode
             }
-            if ([string]$env:SAIAI_SKIP_START -eq "1") {
-                return 0
-            }
-            return Start-SaiaiBackground -Path $installPath
+            # Native init-codex already refreshes an active managed service.
+            # Do not start it a second time here; `saiai codex`, Claude, and
+            # Desktop launchers start the proxy on demand.
+            return 0
         }
 
         $claudeArguments = @("init") + $provided
