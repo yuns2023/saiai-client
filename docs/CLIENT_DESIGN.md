@@ -8,7 +8,9 @@
 
 稳定边界：
 
-- 代理只监听 loopback，默认 `127.0.0.1:19908`。
+- 代理只监听 loopback。首次初始化会分配一个可用的随机 loopback 端口并持久化到
+  `SAIAI_HOME/config.json`；重复初始化在端口仍由 SAIAI 管理时复用它，被其它进程占用
+  时重新分配。
 - 不创建隔离 home 或 generation，也不调用 Gateway bootstrap。
 - 初始化、doctor 和 release 验证不发送模型请求。
 - 同一命令可重复执行；新 Base URL/Key 覆盖旧值。
