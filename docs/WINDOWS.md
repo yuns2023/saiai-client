@@ -52,10 +52,12 @@ CA；私钥只保存在本机，不包含在 release 中。
 ## Codex CLI
 
 ```powershell
-irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai init-codex 'https://api.saiai.top/v1' 'YOUR_API_KEY'
+irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai init-codex
 ```
 
-WebSocket 模式在末尾加 `--websockets`。配置写入 `%USERPROFILE%\.codex`，或
+该短命令复用 `%USERPROFILE%\\.saiai\\config.json` 中已管理的 Gateway 和 Key；首次运行会
+安全提示输入 Key。WebSocket 模式仍使用带参数的兼容命令，在末尾加 `--websockets`。
+配置写入 `%USERPROFILE%\\.codex`，或
 `CODEX_HOME` 指定的目录。该命令保留旧直连配置，同时在 `%USERPROFILE%\.saiai`
 准备本地代理配置和独立安装 CA；不会修改 Claude 配置或立即启动代理。随后运行
 `saiai codex` 即进入 OAuth/local-proxy 模式，代理会按需启动，并且代理环境只注入
@@ -81,5 +83,5 @@ Codex 子进程。旧直连配置保留命令中的 `/v1`，本地代理配置�
 `saiai-previous.exe`。如需人工回退，应先执行 `saiai stop`，再恢复备份并重新
 启动；用户配置文件自身也会留下带时间戳的备份。
 
-命令直接包含 API Key，因此 Key 会出现在剪贴板、PowerShell 历史和进程参数
-中；这是 WebUI 一键配置路径的明确取舍。SAIAI 程序自身不会打印 Key。
+普通 WebUI 命令不包含 API Key，因此不会把 Key 暴露在剪贴板、PowerShell 历史和进程参数
+中；SAIAI 程序自身也不会打印 Key。带参数的旧兼容命令仍会产生相应的 shell 历史记录。

@@ -198,7 +198,8 @@ function Invoke-Saiai {
     )
 
     $provided = @($Arguments)
-    if ($provided.Count -eq 0) {
+    $codexMode = $provided.Count -eq 1 -and $provided[0] -eq "init-codex"
+    if ($provided.Count -eq 0 -or $codexMode) {
         # Restore the short `Invoke-Saiai` command. Reuse the already managed
         # per-user config when present; on a fresh machine prompt for the key
         # without echoing it, while keeping the public Gateway default concise.
@@ -209,7 +210,7 @@ function Invoke-Saiai {
         }
         $baseUrl = if ($env:SAIAI_BASE_URL) { [string]$env:SAIAI_BASE_URL } elseif ($existing.base_url) { [string]$existing.base_url } else { "https://api.saiai.top" }
         $apiKey = if ($env:SAIAI_API_KEY) { [string]$env:SAIAI_API_KEY } elseif ($existing.api_key) { [string]$existing.api_key } else { ConvertFrom-SaiaiSecureString (Read-Host "SAIAI API key" -AsSecureString) }
-        $provided = @($baseUrl, $apiKey)
+        $provided = if ($codexMode) { @("init-codex", $baseUrl, $apiKey) } else { @($baseUrl, $apiKey) }
     }
     elseif ($provided.Count -lt 2) {
         Write-Error "Usage: Invoke-Saiai [<base_url> <api_key>] OR Invoke-Saiai init-codex <base_url> <api_key> [--websockets]"

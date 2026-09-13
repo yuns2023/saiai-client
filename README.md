@@ -8,23 +8,26 @@ home 或 generation。
 
 ## 一键配置
 
-WebUI 会生成已经包含当前 Gateway 地址和 API Key 的一行命令。macOS / Linux
+Codex WebUI 会生成复用本机受管配置的一行短命令。macOS / Linux
 形式如下：
 
 ```bash
-curl -fsSL https://api.saiai.top/saiai-cli/setup.sh | bash -s -- 'https://api.saiai.top' 'YOUR_API_KEY'
+curl -fsSL https://api.saiai.top/saiai-cli/setup.sh | bash -s -- init-codex
 ```
 
 PowerShell：
 
 ```powershell
-irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai 'https://api.saiai.top' 'YOUR_API_KEY'
+irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai init-codex
 ```
 
-命令会完成安装、初始化并启动用户级本地代理，可以反复执行。Base URL 或 Key
-改变时会覆盖 SAIAI 管理的值、保留无关配置并刷新服务。由于一键命令直接包含
-Key，Key 会出现在剪贴板、终端命令和 shell 历史中；客户端自身不会把 Key
-打印到输出。
+命令会完成安装、初始化并启动用户级本地代理，可以反复执行；它从独立的
+`~/.saiai/config.json`（Windows 为 `%USERPROFILE%\\.saiai\\config.json`）复用 Base URL 和
+Key。首次运行会安全提示输入 Key，不会把 Key 放入剪贴板、终端命令或 shell 历史。
+WebSocket 页签和旧兼容方式仍支持显式 `init-codex <base_url> <api_key> --websockets`。
+
+Claude Code 仍可使用带 Base URL/Key 的兼容初始化命令；配置完成后，重复执行也可
+只使用 `Invoke-Saiai`（PowerShell）或 `setup.sh <base_url> <api_key>` 重新应用现有配置。
 
 wrapper 每次只下载很小的 `manifest.json`。如果本机二进制 SHA-256 已等于
 manifest 中的当前版本，就跳过二进制下载，但仍会重新应用配置。Windows
