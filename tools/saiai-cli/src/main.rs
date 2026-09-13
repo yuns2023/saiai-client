@@ -462,7 +462,11 @@ fn parse_named_args(command: &str, args: &[String]) -> Result<InitArgs> {
     if base_url.is_empty() || api_key.is_empty() {
         bail!(USAGE);
     }
-    let base_url = normalize_base_url(&base_url)?;
+    let base_url = if command == "init-codex" {
+        normalize_codex_base_url(&base_url)?
+    } else {
+        normalize_base_url(&base_url)?
+    };
     validate_api_key(&api_key)?;
     Ok(InitArgs {
         base_url,
@@ -490,6 +494,18 @@ fn normalize_base_url(raw: &str) -> Result<String> {
     }
     let path = url.path().trim_end_matches('/').to_string();
     url.set_path(if path.is_empty() { "/" } else { &path });
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn normalize_codex_base_url(raw: &str) -> Result<String> {
+    let normalized = normalize_base_url(raw)?;
+    let mut url = Url::parse(&normalized).context("The Codex base URL is not valid")?;
+    let path = url.path().trim_end_matches('/');
+    if path.is_empty() {
+        url.set_path("/v1");
+    } else if !path.ends_with("/v1") {
+        url.set_path(&format!("{path}/v1"));
+    }
     Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
@@ -1277,6 +1293,13 @@ fn run_linux_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
     let proxy = format!("http://{}", cfg.listen);
     let mut command = ProcessCommand::new(&executable);
     command.args(launch_args);
+    // Electron writes diagnostic messages through Node's console even after
+    // its parent terminal/TTY has gone away. Do not let a closed terminal
+    // pipe turn a healthy Desktop process into `write EIO`.
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     for name in CODEX_MANAGED_ENV {
         command.env_remove(*name);
     }
@@ -1364,6 +1387,12 @@ fn run_macos_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
 
     let mut command = ProcessCommand::new(&executable);
     command.args(launch_args);
+    // See the Linux launcher: Desktop diagnostics must not inherit a fragile
+    // terminal pipe from the SAIAI wrapper.
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     for name in CODEX_MANAGED_ENV {
         command.env_remove(*name);
     }
@@ -6696,10 +6725,12 @@ fn merge_codex_openai_provider(
     // wire_api must remain "responses": the saiai backend dropped the
     // /v1/chat/completions compatibility layer (see backend changelog).
     openai.insert("wire_api", value("responses"));
-    // Codex 0.149.0+ requires this flag for custom providers to use the
-    // credential stored in auth.json instead of rejecting the request with
-    // API_KEY_REQUIRED / 401.
-    openai.insert("requires_openai_auth", value(true));
+    // Legacy `init-codex` is API-key mode. Setting this to true makes Codex
+    // interpret the custom provider as OAuth-backed and direct requests then
+    // reach the SAIAI Gateway with the wrong credential shape. OAuth/local-
+    // proxy mode uses the built-in lowercase `openai` provider in its isolated
+    // runtime and does not depend on this legacy provider flag.
+    openai.insert("requires_openai_auth", value(false));
     // Drop any `env_key` written by older SAIAI helper builds. Setting it to
     // `OPENAI_API_KEY` made Codex prefer the shell env over the api_key
     // SAIAI writes into ~/.codex/auth.json — a footgun whenever the user
@@ -6856,7 +6887,7 @@ mod tests {
         assert_eq!(openai["name"].as_str(), Some("OpenAI"));
         assert_eq!(openai["base_url"].as_str(), Some(base_url));
         assert_eq!(openai["wire_api"].as_str(), Some("responses"));
-        assert_eq!(openai["requires_openai_auth"].as_bool(), Some(true));
+        assert_eq!(openai["requires_openai_auth"].as_bool(), Some(false));
         assert!(
             openai.get("env_key").is_none(),
             "env_key must not be set; Codex would otherwise prefer shell env over auth.json",
@@ -7329,6 +7360,22 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert_eq!(
             codex_proxy_gateway_root("https://gateway.example.test/prefix").unwrap(),
             "https://gateway.example.test/prefix"
+        );
+    }
+
+    #[test]
+    fn normalizes_legacy_codex_base_url_to_v1() {
+        assert_eq!(
+            normalize_codex_base_url("https://gateway.example.test").unwrap(),
+            "https://gateway.example.test/v1"
+        );
+        assert_eq!(
+            normalize_codex_base_url("https://gateway.example.test/prefix/").unwrap(),
+            "https://gateway.example.test/prefix/v1"
+        );
+        assert_eq!(
+            normalize_codex_base_url("https://gateway.example.test/v1").unwrap(),
+            "https://gateway.example.test/v1"
         );
     }
 

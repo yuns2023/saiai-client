@@ -91,8 +91,12 @@ metrics exporter。SAIAI 网络下该非模型端点可能不可达，因此 lau
 `init-codex` 在保留旧 `config.toml`/`auth.json` 直连配置的同时，也会在独立的
 `SAIAI_HOME` 中创建本地代理配置和安装 CA，使同一次 WebUI 初始化之后可以直接运行
 `saiai codex`。该兼容初始化不修改 Claude 配置，也不启动代理；launcher 按需启动。
-旧直连 Provider 继续使用传入的 `/v1` Base URL；写入本地代理配置时只移除末尾
+旧直连 Provider 使用带末尾 `/v1` 的 Base URL；`init-codex` 会为省略该后缀的旧命令
+自动补齐 `/v1`。写入本地代理配置时只移除末尾
 `/v1`，再透传客户端原始 `/v1/*` 路径，禁止形成 `/v1/v1/*`。
+legacy API-Key provider 保持 `requires_openai_auth = false`，让官方 Codex 读取
+`auth.json.OPENAI_API_KEY`；这个字段不能与 OAuth/local-proxy runtime 中的兼容别名
+混用，否则直启请求会以错误的认证形状到达 Gateway。
 若已有有效的 SAIAI 代理配置，它复用原 CA、监听地址和普通 Chat 开关，只替换
 Gateway 与 Key，避免破坏已经配置好的 Claude/ChatGPT 代理信任。随后 launcher
 只在旧 `auth.json.OPENAI_API_KEY` 与当前 SAIAI 配置 Key 完全一致时把该旧初始化
