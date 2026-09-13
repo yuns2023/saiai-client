@@ -2748,22 +2748,21 @@ struct ProviderCredential {
 }
 
 fn select_local_proxy_listen(existing: Option<&str>) -> Result<String> {
-    if let Some(listen) = existing.filter(|value| !value.trim().is_empty()) {
-        if let Ok(addr) = listen.parse::<SocketAddr>()
-            && addr.ip().is_loopback()
+    if let Some(listen) = existing.filter(|value| !value.trim().is_empty())
+        && let Ok(addr) = listen.parse::<SocketAddr>()
+        && addr.ip().is_loopback()
+    {
+        // Keep the current port when our managed service owns it. On a
+        // repeat initialization this avoids needless proxy churn.
+        if managed_service_is_active()
+            && TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
         {
-            // Keep the current port when our managed service owns it. On a
-            // repeat initialization this avoids needless proxy churn.
-            if managed_service_is_active()
-                && TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
-            {
-                return Ok(listen.to_string());
-            }
-            // Preserve an available existing port; only replace it when an
-            // unrelated process has claimed it.
-            if StdTcpListener::bind(addr).is_ok() {
-                return Ok(listen.to_string());
-            }
+            return Ok(listen.to_string());
+        }
+        // Preserve an available existing port; only replace it when an
+        // unrelated process has claimed it.
+        if StdTcpListener::bind(addr).is_ok() {
+            return Ok(listen.to_string());
         }
     }
 
