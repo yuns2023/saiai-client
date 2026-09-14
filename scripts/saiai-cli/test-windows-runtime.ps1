@@ -146,29 +146,28 @@ try {
     Assert-Saiai ([string]$codexAuth.tokens.refresh_token -ceq "") "Synthetic Codex auth must not contain a provider refresh token"
 
     $fakeDesktop = Join-Path $temporary "FakeOpenAIDesktop.exe"
+    $fakeDesktopSourcePath = Join-Path $temporary "fake_openai_desktop.rs"
     $desktopCapture = Join-Path $temporary "desktop-capture.txt"
     $fakeDesktopSource = @'
-using System;
-using System.Collections.Generic;
-using System.IO;
+use std::env;
+use std::fs;
 
-public static class FakeOpenAIDesktop
-{
-    public static int Main(string[] args)
-    {
-        var lines = new List<string>();
-        foreach (var arg in args) lines.Add("ARG=" + arg);
-        foreach (var key in new[] {
-            "HOME", "USERPROFILE", "CODEX_HOME", "CODEX_ELECTRON_USER_DATA_PATH",
-            "CODEX_CA_CERTIFICATE", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS",
-            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "TZ"
-        }) lines.Add("ENV=" + key + "=" + Environment.GetEnvironmentVariable(key));
-        File.WriteAllLines(Environment.GetEnvironmentVariable("SAIAI_DESKTOP_CAPTURE"), lines);
-        return 0;
+fn main() {
+    let mut lines = env::args().skip(1).map(|arg| format!("ARG={arg}")).collect::<Vec<_>>();
+    for key in [
+        "HOME", "USERPROFILE", "CODEX_HOME", "CODEX_ELECTRON_USER_DATA_PATH",
+        "CODEX_CA_CERTIFICATE", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS",
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "TZ",
+    ] {
+        lines.push(format!("ENV={key}={}", env::var(key).unwrap_or_default()));
     }
+    let capture = env::var("SAIAI_DESKTOP_CAPTURE").expect("capture path");
+    fs::write(capture, lines.join("\n") + "\n").expect("write capture");
 }
 '@
-    Add-Type -TypeDefinition $fakeDesktopSource -OutputAssembly $fakeDesktop -OutputType ConsoleApplication
+    [IO.File]::WriteAllText($fakeDesktopSourcePath, $fakeDesktopSource)
+    & rustc $fakeDesktopSourcePath -o $fakeDesktop
+    Assert-Saiai ($LASTEXITCODE -eq 0) "Failed to build the Windows Desktop smoke fixture"
     $env:SAIAI_DESKTOP_BIN = $fakeDesktop
     $env:SAIAI_CHATGPT_TIMEZONE = "America/Los_Angeles"
     $env:SAIAI_DESKTOP_CAPTURE = $desktopCapture
