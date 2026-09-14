@@ -108,6 +108,10 @@ goto configured
 :configure_codex
 "%INSTALL_PATH%" %*
 set "SAIAI_EXIT=%ERRORLEVEL%"
+if not "%SAIAI_EXIT%"=="0" goto configured
+if "%SAIAI_SKIP_START%"=="1" goto configured
+"%INSTALL_PATH%" start
+set "SAIAI_EXIT=%ERRORLEVEL%"
 
 :configured
 rd /s /q "%TEMP_ROOT%" >nul 2>nul

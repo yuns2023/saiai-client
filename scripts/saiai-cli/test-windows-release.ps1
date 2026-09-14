@@ -113,9 +113,11 @@ try {
 
     $settingsPath = Join-Path $env:CLAUDE_CONFIG_DIR "settings.json"
     $settings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+    $proxyConfig = Get-Content -LiteralPath (Join-Path $env:SAIAI_HOME "config.json") -Raw | ConvertFrom-Json
+    $proxyUrl = "http://$([string]$proxyConfig.listen)"
     Assert-Saiai ([string]$settings.env.CLAUDE_CODE_OAUTH_TOKEN -ceq $testKey) "PowerShell wrapper did not apply the key"
     Assert-Saiai ($null -eq $settings.env.PSObject.Properties["ANTHROPIC_BASE_URL"]) "PowerShell wrapper left a direct gateway override"
-    Assert-Saiai ([string]$settings.env.http_proxy -ceq "http://127.0.0.1:19908") "PowerShell wrapper did not apply the local proxy"
+    Assert-Saiai ([string]$settings.env.http_proxy -ceq $proxyUrl) "PowerShell wrapper did not apply the local proxy"
 
     $second = Invoke-Saiai "https://new-gateway.example.test" "TEST_ONLY_WINDOWS_REPLACEMENT_KEY"
     Assert-Saiai ($second -is [int]) "Repeat PowerShell wrapper returned a non-scalar exit code"
@@ -131,6 +133,22 @@ try {
     $oldStart = Invoke-SaiaiProcess -Path $installed -Arguments @("start") -CaptureOutput $false
     Assert-Saiai ($oldStart.ExitCode -eq 0) "Upgrade fixture could not start: $($oldStart.Output)"
 
+    # Keep a second process from the same installed image alive. The updater
+    # must terminate exact-path stragglers as well as the managed background
+    # PID before replacing the executable.
+    $stragglerInfo = [Diagnostics.ProcessStartInfo]::new()
+    $stragglerInfo.FileName = $installed
+    $stragglerInfo.UseShellExecute = $false
+    $stragglerInfo.CreateNoWindow = $true
+    $null = $stragglerInfo.ArgumentList.Add("logs")
+    $stragglerInfo.RedirectStandardOutput = $true
+    $stragglerInfo.RedirectStandardError = $true
+    $straggler = [Diagnostics.Process]::new()
+    $straggler.StartInfo = $stragglerInfo
+    $null = $straggler.Start()
+    Start-Sleep -Milliseconds 500
+    Assert-Saiai (-not $straggler.HasExited) "Upgrade straggler fixture exited before replacement"
+
     Remove-Item Env:SAIAI_SKIP_START
     $escapedSetup = $setupPowerShell.Replace("'", "''")
     $childScript = @"
@@ -142,6 +160,9 @@ exit 0
     $powerShellPath = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
     $upgrade = Invoke-SaiaiProcess -Path $powerShellPath -Arguments @("-NoProfile", "-NonInteractive", "-Command", $childScript) -CaptureOutput $false -TimeoutMilliseconds 45000
     Assert-Saiai ($upgrade.ExitCode -eq 0) "Running-client upgrade failed: $($upgrade.Output)"
+    $straggler.WaitForExit(5000) | Out-Null
+    Assert-Saiai ($straggler.HasExited) "Running-client upgrade left an exact-path SAIAI process alive"
+    $straggler.Dispose()
     Assert-Saiai ((Get-Sha256 $installed) -ceq (Get-Sha256 $binary)) "Running-client upgrade did not install the release binary"
     $upgradedStatus = Invoke-SaiaiProcess -Path $installed -Arguments @("status")
     Assert-Saiai ($upgradedStatus.ExitCode -eq 0) "Upgraded client status failed: $($upgradedStatus.Output)"
