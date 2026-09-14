@@ -140,7 +140,7 @@ if (`$result -ne 0) { exit `$result }
 exit 0
 "@
     $powerShellPath = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-    $upgrade = Invoke-SaiaiProcess -Path $powerShellPath -Arguments @("-NoProfile", "-NonInteractive", "-Command", $childScript) -CaptureOutput $true -TimeoutMilliseconds 45000
+    $upgrade = Invoke-SaiaiProcess -Path $powerShellPath -Arguments @("-NoProfile", "-NonInteractive", "-Command", $childScript) -CaptureOutput $false -TimeoutMilliseconds 45000
     Assert-Saiai ($upgrade.ExitCode -eq 0) "Running-client upgrade failed: $($upgrade.Output)"
     Assert-Saiai ((Get-Sha256 $installed) -ceq (Get-Sha256 $binary)) "Running-client upgrade did not install the release binary"
     $upgradedStatus = Invoke-SaiaiProcess -Path $installed -Arguments @("status")
