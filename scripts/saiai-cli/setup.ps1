@@ -94,8 +94,12 @@ function Move-SaiaiCandidate {
         [Parameter(Mandatory = $true)][string]$Destination
     )
 
+    # taskkill can return before Windows releases every executable handle held
+    # by the detached proxy worker. Retry long enough for that normal teardown
+    # race, but return as soon as the replacement succeeds.
+    $maximumAttempts = 120
     $lastError = $null
-    foreach ($attempt in 1..20) {
+    foreach ($attempt in 1..$maximumAttempts) {
         try {
             if (Test-Path -LiteralPath $Destination -PathType Leaf) {
                 # The staged candidate lives in the installation directory, so
@@ -112,12 +116,12 @@ function Move-SaiaiCandidate {
         }
         catch {
             $lastError = $_
-            if ($attempt -lt 20) {
-                Start-Sleep -Milliseconds 100
+            if ($attempt -lt $maximumAttempts) {
+                Start-Sleep -Milliseconds 250
             }
         }
     }
-    throw $lastError
+    throw "Could not replace existing SAIAI binary at $Destination after $maximumAttempts attempts: $($lastError.Exception.Message)"
 }
 
 function Start-SaiaiBackground {
