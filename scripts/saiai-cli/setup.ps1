@@ -107,7 +107,17 @@ function Move-SaiaiCandidate {
                 # File.Replace is the explicit Windows PowerShell 5.1 API for
                 # replacing an existing file; it avoids relying on the
                 # FileSystem provider's Move-Item error mapping.
-                [System.IO.File]::Replace($Source, $Destination, $null, $true)
+                # PowerShell binds a null backup path as an empty path, so use
+                # a unique same-volume temporary backup and remove it after
+                # replacement. The user-visible rollback backup is managed
+                # separately as saiai-previous.exe.
+                $replacementBackup = Join-Path (Split-Path -Parent $Destination) (".saiai.replace." + [guid]::NewGuid().ToString("N") + ".bak")
+                try {
+                    [System.IO.File]::Replace($Source, $Destination, $replacementBackup, $true)
+                }
+                finally {
+                    Remove-Item -LiteralPath $replacementBackup -Force -ErrorAction SilentlyContinue
+                }
             }
             else {
                 [System.IO.File]::Move($Source, $Destination)
