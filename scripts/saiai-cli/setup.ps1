@@ -97,7 +97,17 @@ function Move-SaiaiCandidate {
     $lastError = $null
     foreach ($attempt in 1..20) {
         try {
-            Move-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+                # The staged candidate lives in the installation directory, so
+                # it is on the same volume as the installed executable.
+                # File.Replace is the explicit Windows PowerShell 5.1 API for
+                # replacing an existing file; it avoids relying on the
+                # FileSystem provider's Move-Item error mapping.
+                [System.IO.File]::Replace($Source, $Destination, $null, $true)
+            }
+            else {
+                [System.IO.File]::Move($Source, $Destination)
+            }
             return
         }
         catch {
