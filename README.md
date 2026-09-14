@@ -1,6 +1,6 @@
 # SAIAI Client
 
-SAIAI Client `1.1.13` 使用托管本地代理模式。Claude Code 和 VSCode 通过用户
+SAIAI Client `1.1.14` 使用托管本地代理模式。Claude Code 和 VSCode 通过用户
 级 `saiai` 代理访问 Gateway；Codex CLI 通过 `saiai codex`、Codex VSCode 扩展
 通过一次性的 `saiai vscode` 配置使用同一用户级代理，
 旧的 `init-codex` 直接配置方式继续兼容。客户端不创建隔离
