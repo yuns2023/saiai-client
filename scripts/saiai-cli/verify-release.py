@@ -187,6 +187,14 @@ def verify_manifest_and_wrappers() -> None:
         "PowerShell wrapper does not retry Windows binary replacement",
     )
     require(
+        "[System.IO.File]::Replace($Source, $Destination, $null, $true)" in powershell,
+        "PowerShell wrapper does not explicitly replace an existing Windows binary",
+    )
+    require(
+        "Move-Item -LiteralPath $Source -Destination $Destination -Force" not in powershell,
+        "PowerShell wrapper still relies on Move-Item to replace an existing Windows binary",
+    )
+    require(
         "Start-SaiaiBackground" in powershell and "start | Out-Host" not in powershell,
         "PowerShell wrapper still starts the background proxy through an output pipeline",
     )
