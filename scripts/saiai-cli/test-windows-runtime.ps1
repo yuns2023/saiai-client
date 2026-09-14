@@ -72,6 +72,9 @@ $savedConfigDir = $env:CLAUDE_CONFIG_DIR
 $savedSaiaiHome = $env:SAIAI_HOME
 $savedCodexHome = $env:CODEX_HOME
 $savedPath = $env:PATH
+$savedDesktopBin = $env:SAIAI_DESKTOP_BIN
+$savedChatgptTimezone = $env:SAIAI_CHATGPT_TIMEZONE
+$savedDesktopCapture = $env:SAIAI_DESKTOP_CAPTURE
 
 try {
     $null = New-Item -ItemType Directory -Path $claudeDir -Force
@@ -142,6 +145,55 @@ try {
     Assert-Saiai (-not [string]::IsNullOrWhiteSpace([string]$codexAuth.tokens.access_token)) "Codex OAuth placeholder access token is missing"
     Assert-Saiai ([string]$codexAuth.tokens.refresh_token -ceq "") "Synthetic Codex auth must not contain a provider refresh token"
 
+    $fakeDesktop = Join-Path $temporary "FakeOpenAIDesktop.exe"
+    $fakeDesktopSourcePath = Join-Path $temporary "fake_openai_desktop.rs"
+    $desktopCapture = Join-Path $temporary "desktop-capture.txt"
+    $fakeDesktopSource = @'
+use std::env;
+use std::fs;
+
+fn main() {
+    let mut lines = env::args().skip(1).map(|arg| format!("ARG={arg}")).collect::<Vec<_>>();
+    for key in [
+        "HOME", "USERPROFILE", "CODEX_HOME", "CODEX_ELECTRON_USER_DATA_PATH",
+        "CODEX_CA_CERTIFICATE", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS",
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "TZ",
+    ] {
+        lines.push(format!("ENV={key}={}", env::var(key).unwrap_or_default()));
+    }
+    let capture = env::var("SAIAI_DESKTOP_CAPTURE").expect("capture path");
+    fs::write(capture, lines.join("\n") + "\n").expect("write capture");
+}
+'@
+    [IO.File]::WriteAllText($fakeDesktopSourcePath, $fakeDesktopSource)
+    & rustc $fakeDesktopSourcePath -o $fakeDesktop
+    Assert-Saiai ($LASTEXITCODE -eq 0) "Failed to build the Windows Desktop smoke fixture"
+    $env:SAIAI_DESKTOP_BIN = $fakeDesktop
+    $env:SAIAI_CHATGPT_TIMEZONE = "America/Los_Angeles"
+    $env:SAIAI_DESKTOP_CAPTURE = $desktopCapture
+    $desktop = Invoke-SaiaiProcess -Path $binary -Arguments @("desktop", "--", "--smoke-argument")
+    Assert-Saiai ($desktop.ExitCode -eq 0) "SAIAI Windows Desktop launch failed: $($desktop.Output)"
+    Assert-Saiai ($desktop.Output.Contains("Starting OpenAI Desktop through the SAIAI local proxy.")) "Windows Desktop launcher did not start the configured executable"
+    $desktopRoot = Join-Path $env:SAIAI_HOME "desktop"
+    $desktopCodex = Join-Path $desktopRoot "codex"
+    $desktopUserData = Join-Path $desktopRoot "user-data"
+    $desktopHome = Join-Path $desktopRoot "home"
+    $desktopLines = @(Get-Content -LiteralPath $desktopCapture)
+    Assert-Saiai ($desktopLines -contains "ARG=--user-data-dir=$desktopUserData") "Windows Desktop user-data argument differs"
+    Assert-Saiai ($desktopLines -contains "ARG=--proxy-server=http://127.0.0.1:19908") "Windows Desktop proxy argument differs"
+    Assert-Saiai ($desktopLines -contains "ARG=--smoke-argument") "Windows Desktop argument was not preserved"
+    Assert-Saiai ($desktopLines -contains "ENV=HOME=$desktopHome") "Windows Desktop HOME is not isolated"
+    Assert-Saiai ($desktopLines -contains "ENV=USERPROFILE=$desktopHome") "Windows Desktop USERPROFILE is not isolated"
+    Assert-Saiai ($desktopLines -contains "ENV=CODEX_HOME=$desktopCodex") "Windows Desktop CODEX_HOME is not isolated"
+    Assert-Saiai ($desktopLines -contains "ENV=CODEX_ELECTRON_USER_DATA_PATH=$desktopUserData") "Windows Desktop Electron user data is not isolated"
+    Assert-Saiai ($desktopLines -contains "ENV=CODEX_CA_CERTIFICATE=$caPath") "Windows Desktop Codex CA differs"
+    Assert-Saiai ($desktopLines -contains "ENV=SSL_CERT_FILE=$caPath") "Windows Desktop SSL CA differs"
+    Assert-Saiai ($desktopLines -contains "ENV=NODE_EXTRA_CA_CERTS=$caPath") "Windows Desktop Node CA differs"
+    Assert-Saiai ($desktopLines -contains "ENV=HTTP_PROXY=http://127.0.0.1:19908") "Windows Desktop HTTP proxy differs"
+    Assert-Saiai ($desktopLines -contains "ENV=TZ=America/Los_Angeles") "Windows Desktop timezone differs"
+    $desktopConfig = Get-Content -LiteralPath (Join-Path $desktopCodex "config.toml") -Raw
+    Assert-Saiai ($desktopConfig.Contains("respect_system_proxy = false")) "Windows Desktop config can bypass the child proxy through WinHTTP DIRECT"
+
     # Rust's std::process::Command does not execute .cmd files directly. A
     # normal Windows npm installation exposes codex.cmd plus the JavaScript
     # launcher, so verify SAIAI resolves it through node.exe without cmd.exe.
@@ -188,6 +240,9 @@ finally {
     $env:SAIAI_HOME = $savedSaiaiHome
     $env:CODEX_HOME = $savedCodexHome
     $env:PATH = $savedPath
+    $env:SAIAI_DESKTOP_BIN = $savedDesktopBin
+    $env:SAIAI_CHATGPT_TIMEZONE = $savedChatgptTimezone
+    $env:SAIAI_DESKTOP_CAPTURE = $savedDesktopCapture
     Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
 }
 
