@@ -190,6 +190,12 @@ def main() -> int:
             if init.returncode != 0:
                 raise RuntimeError("SAIAI init-codex failed in the capture fixture")
 
+            config = json.loads((root / "saiai" / "config.json").read_text())
+            listen = urllib.parse.urlsplit("//" + config["listen"])
+            proxy_port = listen.port
+            if proxy_port is None:
+                raise RuntimeError("SAIAI init-codex wrote an invalid listen address")
+
             proxy = subprocess.Popen(
                 [str(saiai), "--verbose"],
                 cwd=root,
@@ -199,7 +205,7 @@ def main() -> int:
                 stderr=subprocess.DEVNULL,
                 **process_group_options(),
             )
-            wait_for_proxy(proxy)
+            wait_for_proxy(proxy, proxy_port)
             capture = subprocess.Popen(
                 [
                     str(saiai),

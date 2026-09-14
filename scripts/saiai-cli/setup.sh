@@ -8,6 +8,7 @@ usage() {
   cat >&2 <<'EOF'
 Usage:
   setup.sh <base_url> <api_key>
+  setup.sh init-codex
   setup.sh init-codex <base_url> <api_key> [--websockets]
 
 The wrapper checks the release manifest on every run. It downloads the binary
@@ -22,7 +23,41 @@ Environment:
 EOF
 }
 
-if [ "$#" -lt 2 ]; then
+if [ "$#" -eq 1 ] && [ "$1" = "init-codex" ]; then
+  codex_mode=1
+  config_path="${SAIAI_HOME:-${HOME:?HOME is required}/.saiai}/config.json"
+  base_url=""
+  api_key=""
+  if [ -f "${config_path}" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+      read -r base_url api_key < <(python3 - "${config_path}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    config = json.load(handle)
+print(config.get("base_url", ""), config.get("api_key", ""))
+PY
+      )
+    elif command -v node >/dev/null 2>&1; then
+      read -r base_url api_key < <(node - "${config_path}" <<'JS'
+const fs = require("node:fs");
+const config = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+process.stdout.write(`${config.base_url ?? ""} ${config.api_key ?? ""}\n`);
+JS
+      )
+    fi
+  fi
+  if [ -z "${base_url}" ]; then
+    read -r -p "SAIAI Gateway URL [https://api.saiai.top]: " base_url
+    base_url="${base_url:-https://api.saiai.top}"
+  fi
+  if [ -z "${api_key}" ]; then
+    read -r -s -p "SAIAI API key: " api_key
+    printf '\n' >&2
+  fi
+  set -- init-codex "${base_url}" "${api_key}"
+elif [ "$#" -lt 2 ]; then
   usage
   exit 2
 fi
@@ -203,6 +238,10 @@ esac
 
 if [ "${1:-}" = "init-codex" ]; then
   "${install_path}" "$@"
+  # Codex legacy initialization only writes config and the independent proxy
+  # settings. `saiai codex` and Desktop launchers start the proxy on demand;
+  # avoid a second LaunchAgent restart after native init-codex already handled
+  # an active service.
 else
   "${install_path}" init "$@"
   if [ "${SAIAI_SKIP_START:-0}" != "1" ]; then

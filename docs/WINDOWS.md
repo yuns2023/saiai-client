@@ -55,7 +55,7 @@ CA；私钥只保存在本机，不包含在 release 中。
 irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai init-codex 'https://api.saiai.top/v1' 'YOUR_API_KEY'
 ```
 
-WebSocket 模式在末尾加 `--websockets`。配置写入 `%USERPROFILE%\.codex`，或
+该命令包含当前 Gateway 和 API Key，会写入 `%USERPROFILE%\\.codex`，或
 `CODEX_HOME` 指定的目录。该命令保留旧直连配置，同时在 `%USERPROFILE%\.saiai`
 准备本地代理配置和独立安装 CA；不会修改 Claude 配置或立即启动代理。随后运行
 `saiai codex` 即进入 OAuth/local-proxy 模式，代理会按需启动，并且代理环境只注入
@@ -63,7 +63,9 @@ Codex 子进程。旧直连配置保留命令中的 `/v1`，本地代理配置�
 避免代理转发时产生 `/v1/v1/*`。若旧初始化刚写入的 API Key 与 SAIAI 配置 Key
 完全一致，launcher
 会将该状态升级为仅供本地代理使用的 OAuth 占位；真实 OAuth 和不匹配的 API Key
-不会被覆盖。占位状态使用 Codex 的 `chatgptAuthTokens` 外部 token 模式，避免 Codex
+不会被覆盖。`saiai codex` 会清除旧第三方 provider，并保留一个固定指向
+`https://api.openai.com/v1` 的 `model_providers.OpenAI` 兼容别名，使旧线程能够
+恢复而不重新直连 Gateway。占位状态使用 Codex 的 `chatgptAuthTokens` 外部 token 模式，避免 Codex
 把合成 refresh token 发往 OpenAI。`saiai codex` 支持 PATH 中的原生 `codex.exe`，
 也支持 npm 安装生成的 `codex.cmd`；npm 布局会由 SAIAI 解析后直接通过 `node.exe`
 运行官方 launcher。Codex VSCode 扩展先执行
@@ -79,5 +81,5 @@ Codex 子进程。旧直连配置保留命令中的 `/v1`，本地代理配置�
 `saiai-previous.exe`。如需人工回退，应先执行 `saiai stop`，再恢复备份并重新
 启动；用户配置文件自身也会留下带时间戳的备份。
 
-命令直接包含 API Key，因此 Key 会出现在剪贴板、PowerShell 历史和进程参数
-中；这是 WebUI 一键配置路径的明确取舍。SAIAI 程序自身不会打印 Key。
+WebUI 只提供 Codex CLI，不提供 WebSocket 专用页签。由于命令包含 API Key，Key 会出现在
+剪贴板、PowerShell 历史和进程参数中；SAIAI 程序自身不会打印 Key。

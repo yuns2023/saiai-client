@@ -169,7 +169,8 @@ def main() -> int:
                 raise AssertionError(f"conflicting environment value remains: {removed}")
         if settings_env.get("KEEP_ME") != "yes" or settings["permissions"]["allow"] != ["Read"]:
             raise AssertionError("unrelated Claude settings were not preserved")
-        expected_proxy = "http://127.0.0.1:19908"
+        saiai_config = json.loads((home / ".saiai" / "config.json").read_text(encoding="utf-8"))
+        expected_proxy = f"http://{saiai_config['listen']}"
         for proxy_key in ("http_proxy", "https_proxy", "all_proxy"):
             if settings_env.get(proxy_key) != expected_proxy:
                 raise AssertionError(f"local proxy setting differs: {proxy_key}")
@@ -186,7 +187,6 @@ def main() -> int:
             raise AssertionError("Claude state cleanup did not preserve machine identity")
         if (claude_dir / ".credentials.json").exists():
             raise AssertionError("stale OAuth credentials remain")
-        saiai_config = json.loads((home / ".saiai" / "config.json").read_text(encoding="utf-8"))
         if saiai_config.get("version") != 2 or saiai_config.get("api_key") != first_key:
             raise AssertionError("local proxy config was not written")
 

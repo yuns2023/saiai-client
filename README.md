@@ -8,23 +8,25 @@ home 或 generation。
 
 ## 一键配置
 
-WebUI 会生成已经包含当前 Gateway 地址和 API Key 的一行命令。macOS / Linux
+Codex WebUI 会生成包含当前 Gateway 地址和 API Key 的一行短命令。macOS / Linux
 形式如下：
 
 ```bash
-curl -fsSL https://api.saiai.top/saiai-cli/setup.sh | bash -s -- 'https://api.saiai.top' 'YOUR_API_KEY'
+curl -fsSL https://api.saiai.top/saiai-cli/setup.sh | bash -s -- init-codex 'https://api.saiai.top/v1' 'YOUR_API_KEY'
 ```
 
 PowerShell：
 
 ```powershell
-irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai 'https://api.saiai.top' 'YOUR_API_KEY'
+irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai init-codex 'https://api.saiai.top/v1' 'YOUR_API_KEY'
 ```
 
-命令会完成安装、初始化并启动用户级本地代理，可以反复执行。Base URL 或 Key
-改变时会覆盖 SAIAI 管理的值、保留无关配置并刷新服务。由于一键命令直接包含
-Key，Key 会出现在剪贴板、终端命令和 shell 历史中；客户端自身不会把 Key
-打印到输出。
+命令会完成安装、初始化并启动用户级本地代理，可以反复执行；它会替换受管 Base URL
+和 Key，保留无关配置。由于命令包含 Key，Key 会出现在剪贴板、终端命令和 shell
+历史中；客户端自身不会把 Key 打印到输出。WebUI 只提供 Codex CLI，不提供
+WebSocket 专用页签。
+
+Claude Code 仍可使用带 Base URL/Key 的兼容初始化命令。
 
 wrapper 每次只下载很小的 `manifest.json`。如果本机二进制 SHA-256 已等于
 manifest 中的当前版本，就跳过二进制下载，但仍会重新应用配置。Windows
@@ -101,9 +103,13 @@ saiai chatgpt
 HTTP/WS 使用子进程代理环境，避免 WinHTTP/SystemConfiguration 返回 `DIRECT` 后
 绕过本地代理。它不会修改用户
 shell、系统环境变量或把这个开关写入 `config.toml`。启动前会备份并清理
-生效 `CODEX_HOME` 中的第三方 `base_url`、`model_providers` 和 WebSocket 开关，
-将根 provider 恢复为官方内置 `openai`，并保留 `auth.json` 中的 ChatGPT OAuth
-token。备份文件使用同目录的 `.bak-<timestamp>` 后缀。
+生效 `CODEX_HOME` 中的第三方 `base_url`、provider 和 WebSocket 开关，将根
+provider 恢复为官方内置 `openai`。为兼容旧版 `init-codex` 创建的历史线程，
+配置会额外保留一个固定的 `model_providers.OpenAI` 别名；它只指向
+`https://api.openai.com/v1`、使用 `responses` 和 `requires_openai_auth`，不会
+保留旧的 Gateway、env_key 或其他用户字段。这样旧线程可以继续解析 provider，
+而请求仍经由 local-proxy；新线程仍使用内置 `openai`。备份文件使用同目录的
+`.bak-<timestamp>` 后缀。
 
 SAIAI 合成登录态不能认证官方 hosted Apps MCP，因此 launcher 默认仅在该 Codex
 子进程中设置 `features.apps=false`，避免出现与模型请求无关的 `codex_apps` 451
@@ -150,6 +156,12 @@ NSS 数据库并导入本地 CA，避免修改系统信任库；首次使用需�
 因此不会每次启动都要求选择职业/个性化设置；这只影响 SAIAI 管理的 Desktop
 profile，不会改写原始 Codex 配置。
 
+桌面入口按产品 target 组织：`saiai desktop codex` 和
+`saiai desktop chatgpt` 使用当前 OpenAI Desktop adapter；`saiai desktop claude`
+与 `saiai desktop gemini` 已预留为独立 adapter 入口，当前会明确提示尚未实现。
+未来产品接入只需增加各自的 executable/config/auth/proxy/model/readiness adapter，
+共享 local-proxy、CA、profile、日志和进程生命周期管理。
+
 普通 ChatGPT Chat 默认使用固定的美国太平洋时区。也可以按次启动覆盖：
 
 ```bash
@@ -161,7 +173,8 @@ SAIAI_CHATGPT_TIMEZONE=America/Los_Angeles saiai chatgpt
 `SAIAI_CHATGPT_TIMEZONE=system`。它不会改变 Codex CLI/VSCode 的 Responses 请求，
 也不会修改系统环境或 Gateway 请求体。
 
-`saiai chatgpt` 默认转发普通 ChatGPT Chat 的明确 allowlist 到 Gateway 的独立
+`saiai chatgpt` 默认转发普通 ChatGPT Chat 的明确 allowlist（包括
+`/backend-api/files/download/{file_id}` 与 `/backend-api/estuary/content` 图片/文件资产解析）到 Gateway 的独立
 `/chatgpt/backend-api/*` ingress，不做 Responses 协议转换。紧急排障时可仅对代理
 进程设置 `SAIAI_CHATGPT_CHAT_PASSTHROUGH=0` 关闭该路径；Gateway 端仍需显式启用
 普通 Chat，并在计费不可用时默认拒绝最终模型请求。
@@ -170,7 +183,6 @@ SAIAI_CHATGPT_TIMEZONE=America/Los_Angeles saiai chatgpt
 
 ```bash
 saiai init-codex https://api.saiai.top/v1 YOUR_API_KEY
-saiai init-codex https://api.saiai.top/v1 YOUR_API_KEY --websockets
 ```
 
 该命令合并 `~/.codex/config.toml` 和 `~/.codex/auth.json`，保留不属于 SAIAI

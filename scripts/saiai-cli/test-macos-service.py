@@ -12,6 +12,7 @@ import socket
 import subprocess
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 
 
@@ -120,9 +121,6 @@ def main() -> int:
         raise AssertionError(f"SAIAI binary is missing: {binary}")
     binary.chmod(binary.stat().st_mode | 0o111)
 
-    if port_is_open():
-        raise AssertionError(f"test port {LISTEN_HOST}:{LISTEN_PORT} is already in use")
-
     with tempfile.TemporaryDirectory(prefix="saiai-macos-service-") as temporary_text:
         temporary = Path(temporary_text)
         home = temporary / "home"
@@ -161,7 +159,11 @@ def main() -> int:
         auth_path.chmod(0o600)
 
         desktop_capture = temporary / "desktop-capture.json"
-        fake_chatgpt = temporary / "fake-chatgpt.py"
+        fake_bundle = home / "Applications" / "Codex.app"
+        fake_contents = fake_bundle / "Contents"
+        fake_macos = fake_contents / "MacOS"
+        fake_macos.mkdir(parents=True)
+        fake_chatgpt = fake_macos / "FixtureDesktop"
         fake_chatgpt.write_text(
             """#!/usr/bin/env python3
 import json
@@ -194,9 +196,18 @@ Path(os.environ["SAIAI_DESKTOP_CAPTURE"]).write_text(
             encoding="utf-8",
         )
         fake_chatgpt.chmod(0o700)
+        (fake_contents / "Info.plist").write_text(
+            """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>FixtureDesktop</string>
+<key>CFBundleIdentifier</key><string>top.saiai.fixture-codex</string>
+</dict></plist>
+""",
+            encoding="utf-8",
+        )
         environment.update(
             {
-                "SAIAI_CHATGPT_BIN": str(fake_chatgpt),
                 "SAIAI_CHATGPT_TIMEZONE": "America/Los_Angeles",
                 "SAIAI_DESKTOP_CAPTURE": str(desktop_capture),
             }
@@ -211,6 +222,14 @@ Path(os.environ["SAIAI_DESKTOP_CAPTURE"]).write_text(
             ],
             environment,
         )
+        config = json.loads((saiai_home / "config.json").read_text(encoding="utf-8"))
+        listen = urllib.parse.urlsplit("//" + config["listen"])
+        if listen.port is None:
+            raise AssertionError("SAIAI initialization wrote an invalid listen address")
+        global LISTEN_PORT
+        LISTEN_PORT = listen.port
+        if port_is_open():
+            raise AssertionError(f"test port {LISTEN_HOST}:{LISTEN_PORT} is already in use")
 
         plist = home / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
         try:
