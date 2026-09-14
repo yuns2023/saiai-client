@@ -2,8 +2,8 @@
 
 ## 目标
 
-`saiai` 为 Claude Code 和 VSCode 提供用户级托管本地代理，同时保留 Codex CLI
-直接配置。WebUI 的一行命令完成安装、配置并启动代理；用户也可以用
+`saiai` 为 Claude Code、VSCode 和新的 `saiai codex` 启动路径提供用户级托管本地
+代理，同时保留旧的 Codex CLI 直接配置。WebUI 的一行命令完成安装、配置并启动代理；用户也可以用
 `saiai start/stop/status/logs/restart` 管理服务，或直接运行 `saiai` 使用前台模式。
 
 稳定边界：
@@ -47,12 +47,12 @@ Claude 路径解析遵守 `CLAUDE_CONFIG_DIR`。未设置时使用：
 大写或其他值（包括 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 和对应小写键）
 可能覆盖本地代理时会明确提示用户清理后再启动 Claude Code。
 
-本地代理终止 `api.anthropic.com` 的本机 TLS，并把 Anthropic 请求转发到配置的
-Gateway；其他 `CONNECT` 请求作为任意目标和任意 TCP 端口的直接隧道处理，让
-系统 TUN、Fake-IP 和用户自己的出站规则接管实际流量。它不提供 UDP 转发，也不
-处理明文 HTTP 的 absolute-form 请求。由于该接口不认证且可访问任意目标，代理
-核心必须强制只监听 loopback，不能仅依赖初始化器生成的默认地址。Gateway Key
-由代理从私有配置读取，程序不会把 Key 打印到输出或请求日志。
+本地代理终止 `api.anthropic.com` 和 Codex 使用的 `api.openai.com` 本机 TLS，
+分别把允许的请求转发到配置的 Gateway；其他 `CONNECT` 请求作为任意目标和任意
+TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出站规则接管实际流量。
+它不提供 UDP 转发，也不处理明文 HTTP 的 absolute-form 请求。由于该接口不认证且
+可访问任意目标，代理核心必须强制只监听 loopback，不能仅依赖初始化器生成的默认
+地址。Gateway Key 由代理从私有配置读取，程序不会把 Key 打印到输出或请求日志。
 
 ## 用户服务
 
@@ -71,11 +71,113 @@ Gateway；其他 `CONNECT` 请求作为任意目标和任意 TCP 端口的直接
 `start/status/logs/restart/stop` 的真实 LaunchAgent 生命周期；两个 Linux 静态
 资产也必须在强制 `systemctl --user` 失败的环境中完成同一套 fallback 生命周期。
 
-## Codex 配置
+## Codex 启动与配置
 
-路径遵守 `CODEX_HOME`，默认是 `~/.codex`。客户端合并 `config.toml` 与
-`auth.json`，保留不属于 SAIAI 的字段。OpenAI provider 使用 Responses API；
-`--websockets` 可开启对应传输配置。
+旧的 `init-codex <base_url> <api_key> [--websockets]` 继续保留兼容。新的
+`saiai codex [-- <codex arguments>]` 是收敛方向：它遵守生效的 `CODEX_HOME`
+（默认 `~/.codex`），不写入第三方 `base_url`，而是在启动的 Codex 子进程中设置
+本地 HTTP 代理和 `CODEX_CA_CERTIFICATE`。Linux launcher 通过子进程命令行启用
+`features.respect_system_proxy`。Windows/macOS 必须反向设置为 `false`：Codex 的
+平台 resolver 优先采用 WinHTTP/IE 或 SystemConfiguration 结果，当系统返回 `DIRECT`
+时不会再读取子进程 `HTTP_PROXY`/`HTTPS_PROXY`；transport-default 的
+reqwest/Tungstenite 才会读取这些
+变量。该开关不写入 CLI 的 `config.toml`，用户显式传入同名覆盖时保持用户参数。
+同理，合成 SAIAI 身份不能认证官方 hosted Apps MCP，launcher 默认对子进程设置
+`features.apps=false`，避免非模型控制面产生 `codex_apps` 451；显式用户覆盖仍优先。
+Codex 0.146.0、0.153.4 和 0.154.0 默认使用 `ab.chatgpt.com` 作为 Statsig OTEL
+metrics exporter。SAIAI 网络下该非模型端点可能不可达，因此 launcher 默认对子进程
+设置 `otel.metrics_exporter="none"`；不改写持久配置，显式用户覆盖仍优先。
+
+`init-codex` 在保留旧 `config.toml`/`auth.json` 直连配置的同时，也会在独立的
+`SAIAI_HOME` 中创建本地代理配置和安装 CA，使同一次 WebUI 初始化之后可以直接运行
+`saiai codex`。该兼容初始化不修改 Claude 配置，也不启动代理；launcher 按需启动。
+旧直连 Provider 继续使用传入的 `/v1` Base URL；写入本地代理配置时只移除末尾
+`/v1`，再透传客户端原始 `/v1/*` 路径，禁止形成 `/v1/v1/*`。
+若已有有效的 SAIAI 代理配置，它复用原 CA、监听地址和普通 Chat 开关，只替换
+Gateway 与 Key，避免破坏已经配置好的 Claude/ChatGPT 代理信任。随后 launcher
+只在旧 `auth.json.OPENAI_API_KEY` 与当前 SAIAI 配置 Key 完全一致时把该旧初始化
+状态升级为本地代理 OAuth 占位；不同的 API Key 或真实 ChatGPT OAuth 原样保留，
+不做模糊识别。
+
+在已安装 Codex、但尚未生成 OAuth `auth.json` 的环境中，`saiai codex` 会在目标
+`CODEX_HOME` 中创建一个仅供本地代理使用的 ChatGPT OAuth 形状占位文件，然后完成
+正常配置迁移。占位 token 不代表 provider 凭证，只有本地代理正在运行且由 Gateway
+替换认证时才有意义；绕过本地代理会失败。该行为让首次启动不要求用户额外执行
+官方登录流程。
+占位状态使用 Codex 原生的 `auth_mode = "chatgptAuthTokens"`：它表示 token 由外部
+宿主提供，不允许 Codex 将合成 refresh token 发往 OpenAI。占位状态包含一个无签名、
+固定 SAIAI 虚拟声明的 ID token，使 VSCode app-server 的
+`account/read` 能返回本地登录态；它不能通过 OpenAI 签名校验，也不能在绕过本地代理
+时作为 provider 凭证。占位 refresh token 为空，`last_refresh` 仅用于保持 Codex
+token 数据结构完整；禁止刷新由 auth mode 本身保证。
+
+启动前会先完成只读预检，然后备份并清理主 `config.toml` 及 profile 配置中的
+第三方 `base_url`、`model_providers` 覆盖，将根 provider 设置为
+内置 `openai`。用户已有的真实 `auth_mode = "chatgpt"` OAuth `tokens` 原样保留；
+SAIAI 创建或升级的占位状态使用 `auth_mode = "chatgptAuthTokens"`。第一阶段把
+`OPENAI_API_KEY` 置为空值，API-key-only 登录会被拒绝。所有备份都写在原目录下，
+命名为 `.bak-<timestamp>`。
+
+启动器优先解析 PATH 中的原生 Codex。Linux 额外识别官方安装器默认的
+`~/.local/bin/codex`，即使当前 shell 尚未重新加载 profile；Windows 同时识别原生
+`codex.exe` 和 npm 的 `codex.cmd` 布局，npm 情况直接以 `node.exe` 运行官方
+JavaScript launcher，避免 Rust `Command` 无法直接执行 `.cmd`。
+
+本地代理对 `api.openai.com:443` 终止 TLS 后，将 `/v1/responses` 和 `/v1/models`
+的 HTTP 与 WebSocket 请求转发到 Gateway。Codex 原始方法、路径、query、JSON body、
+WebSocket 帧、User-Agent、`originator`、session/thread/request id 等头保持不变；
+只有代理发往 Gateway 时的 `Authorization` 使用 SAIAI Key。代理仍只监听 loopback，
+用户 shell 和系统环境不变。
+
+Desktop 可能使用 `chatgpt.com/backend-api/codex/*` 而不是
+`api.openai.com/v1/*`。代理现在识别这类 managed host，并将 Responses/models
+路径映射到 Gateway 的 `/v1/*` ingress；业务 body 和客户端身份 header 仍保持。
+Desktop/app-server 是否信任代理 CA 仍需独立验证，不能仅凭 CLI 的
+`CODEX_CA_CERTIFICATE` child 环境变量推断。
+
+当前 launcher 只覆盖由它直接启动的 Codex CLI 子进程。Codex Desktop 和 VSCode
+扩展不是该子进程，不能因为共享 `CODEX_HOME` 就推断它们已继承代理/CA 环境。
+Linux Desktop 现在有独立的 `saiai desktop`（`saiai chatgpt` 别名）启动路径：
+它复制现有 OAuth `auth.json` 到 SAIAI 管理的隔离 `CODEX_HOME`，为 Electron/NSS
+创建独立 CA 数据库，并向 Desktop 与 app-server 注入本地代理变量。它不修改
+`/home/*/.codex*` 原目录或系统信任库。没有现有 OAuth `auth.json` 时，Desktop
+launcher 会明确报错；CLI 的本地代理占位 OAuth 不等价于 Desktop 的已登录状态。
+launcher 同时在隔离的 `.codex-global-state.json` 中标记首次项目引导已完成，
+跳过启动时的职业/个性化问卷；原始用户状态不受影响。
+
+普通 ChatGPT Chat 的固定时区是 Desktop 子进程设置，不是全局请求改写。默认值为
+`America/Los_Angeles`，也可以设置 `SAIAI_CHATGPT_TIMEZONE` 覆盖；launcher 会校验
+对应的 IANA zoneinfo 文件，
+只向该 Electron 子进程设置 `TZ`，并移除控制变量本身；父 shell、系统环境和
+原始 `CODEX_HOME` 均不变。Desktop 会据此生成 `timezone` 与
+`timezone_offset_min`。设置 `SAIAI_CHATGPT_TIMEZONE=system` 可恢复系统真实时区。
+该选项目前仅影响 ChatGPT Desktop 普通 Chat，不向 Codex Responses body 强行添加
+未知字段，也不用于绕过服务端客户端策略。
+
+普通 Chat 协议的 Gateway 转发仍处于实验阶段，但客户端 allowlist 默认开启：
+本地代理会把经过 allowlist 的
+`/backend-api/f/conversation`、`conversation/init`、`f/conversation/prepare` 和
+`sentinel/chat-requirements/prepare` 路径转成带有 `/chatgpt/` 命名空间的 Gateway
+路径。`SAIAI_CHATGPT_CHAT_PASSTHROUGH=0` 仅作为当前代理进程的紧急关闭开关。
+该路径不会把请求转换为 Responses；Gateway 仍以独立 feature flag 和计费保护决定
+是否允许最终 Chat 模型请求。旧 Gateway 上普通 Chat 仍不可用，但现有 Desktop
+Codex、CLI 和 VSCode 路径不受影响。
+
+VSCode 使用一次性的 `saiai vscode` 配置入口，之后用户仍正常启动 VSCode 和官方
+Codex 扩展。该命令复用 CLI 的 OAuth 占位、第三方 provider/base URL 清理和备份
+逻辑，在 `CODEX_HOME/.env` 中写入 loopback HTTP(S) proxy、`NO_PROXY` 和
+`SSL_CERT_FILE`，并按同一平台规则在 Codex 配置中写入
+`features.respect_system_proxy`（Linux 为 `true`，Windows/macOS 为 `false`）；它不
+修改 shell 或系统环境变量，也不写第三方 `base_url`。官方扩展的 Codex app-server
+会读取 `.env` 中的标准代理和 `SSL_CERT_FILE`。实测 Codex 0.153.4 从 `.env` 读取
+代理和 `SSL_CERT_FILE` 后，HTTP 与 WebSocket 均到达隔离本地代理；仅把
+`CODEX_CA_CERTIFICATE` 写入 `.env` 则不足以建立信任，因此 IDE 路径固定使用标准
+TLS 变量，CLI 子进程路径继续使用 `CODEX_CA_CERTIFICATE`。显式 VSCode
+`http.proxy` 可能覆盖扩展子进程的代理变量，命令输出会提示移除冲突设置。
+
+当前验证覆盖 Linux 官方扩展/app-server 的进程、OAuth 文件、HTTP(S) proxy、CA
+信任和 WebSocket 握手路径；真正发布前仍需在 Windows/macOS runner 上验证对应
+路径与用户服务生命周期。
 
 ## 更新短路径
 

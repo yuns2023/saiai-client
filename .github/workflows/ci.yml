@@ -126,6 +126,18 @@ jobs:
           & "$PWD/scripts/saiai-cli/test-windows-runtime.ps1" `
             -BinaryPath "$PWD/tools/saiai-cli/target/debug/saiai.exe"
 
+      - name: Capture official Windows Codex through local proxy
+        shell: pwsh
+        run: |
+          foreach ($version in @("0.146.0", "0.153.4")) {
+            $prefix = Join-Path $env:RUNNER_TEMP "codex-$version"
+            npm install --global --prefix $prefix "@openai/codex@$version"
+            python scripts/saiai-cli/test-windows-codex-proxy.py `
+              --saiai tools/saiai-cli/target/debug/saiai.exe `
+              --codex-prefix $prefix `
+              --codex-version $version
+          }
+
   client-macos:
     name: Native macOS local proxy (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
@@ -162,3 +174,13 @@ jobs:
         run: >-
           python3 scripts/saiai-cli/test-macos-service.py
           --binary tools/saiai-cli/target/debug/saiai
+
+      - name: Capture official macOS Codex through local proxy
+        if: matrix.arch == 'arm64'
+        run: |
+          prefix="$RUNNER_TEMP/codex-0.153.4"
+          npm install --global --prefix "$prefix" @openai/codex@0.153.4
+          python3 scripts/saiai-cli/test-windows-codex-proxy.py \
+            --saiai tools/saiai-cli/target/debug/saiai \
+            --codex-prefix "$prefix/bin" \
+            --codex-version 0.153.4

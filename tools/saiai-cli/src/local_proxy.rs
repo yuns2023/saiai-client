@@ -1,11 +1,17 @@
 use anyhow::{Context, Result, bail};
-use futures_util::StreamExt;
+use base64::Engine;
+use futures_util::{SinkExt, StreamExt};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use reqwest::{Client, Method, StatusCode};
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -15,10 +21,21 @@ use tokio::io::{
 use tokio::net::{TcpListener, TcpStream, lookup_host};
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::{HeaderName, HeaderValue};
+use tokio_tungstenite::tungstenite::protocol::Role;
 use url::Url;
 use zeroize::Zeroizing;
 
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
+const OPENAI_HOST: &str = "api.openai.com";
+const CHATGPT_HOST: &str = "chatgpt.com";
+const CHATGPT_CHAT_PASSTHROUGH_ENV: &str = "SAIAI_CHATGPT_CHAT_PASSTHROUGH";
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HEADER_LINE: usize = 32 * 1024;
 const MAX_HEADER_BYTES: usize = 256 * 1024;
@@ -31,6 +48,7 @@ pub struct Config {
     pub ca_cert_pem: String,
     pub ca_key_pem: String,
     pub verbose: bool,
+    pub chatgpt_chat_passthrough: bool,
 }
 
 impl std::fmt::Debug for Config {
@@ -42,6 +60,7 @@ impl std::fmt::Debug for Config {
             .field("api_key", &"[redacted]")
             .field("runtime_ca", &true)
             .field("verbose", &self.verbose)
+            .field("chatgpt_chat_passthrough", &self.chatgpt_chat_passthrough)
             .finish()
     }
 }
@@ -53,8 +72,10 @@ struct State {
     ca_cert_pem: String,
     ca_key_pem: Zeroizing<String>,
     verbose: bool,
+    chatgpt_chat_passthrough: bool,
     client: Client,
     certs: Mutex<HashMap<String, Arc<ServerConfig>>>,
+    openai_trace: Option<Arc<OpenAITrace>>,
 }
 
 struct ParsedConnect {
@@ -69,6 +90,56 @@ struct IncomingRequest {
     http_version: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+}
+
+struct OpenAITrace {
+    file: Mutex<fs::File>,
+}
+
+impl OpenAITrace {
+    fn from_env() -> Result<Option<Arc<Self>>> {
+        if env::var("SAIAI_OPENAI_TRACE").ok().as_deref() != Some("1") {
+            return Ok(None);
+        }
+        let path = env::var("SAIAI_OPENAI_TRACE_PATH")
+            .unwrap_or_else(|_| "/tmp/saiai-openai-trace.jsonl".to_string());
+        let path = std::path::PathBuf::from(path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create OpenAI trace directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open OpenAI trace {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("failed to protect OpenAI trace {}", path.display()))?;
+        }
+        eprintln!("OpenAI trace enabled path={}", path.display());
+        Ok(Some(Arc::new(Self {
+            file: Mutex::new(file),
+        })))
+    }
+
+    fn write(&self, record: Value) {
+        let Ok(mut file) = self.file.lock() else {
+            return;
+        };
+        let Ok(mut bytes) = serde_json::to_vec(&record) else {
+            return;
+        };
+        bytes.push(b'\n');
+        let _ = file.write_all(&bytes);
+        let _ = file.flush();
+    }
 }
 
 struct UpstreamResponseOutcome {
@@ -92,7 +163,7 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     eprintln!("saiai local proxy listening on http://{}", state.listen);
     eprintln!(
-        "forwarding Claude Code Anthropic traffic to {}",
+        "forwarding managed Claude/OpenAI traffic to {}",
         state.base_url
     );
     eprintln!("press Ctrl-C to stop");
@@ -160,6 +231,13 @@ impl State {
             .pool_idle_timeout(Duration::from_secs(90))
             .build()
             .context("failed to build upstream HTTP client")?;
+        let openai_trace = OpenAITrace::from_env()?;
+        let chatgpt_chat_passthrough = match env::var(CHATGPT_CHAT_PASSTHROUGH_ENV).ok().as_deref()
+        {
+            Some("0") => false,
+            Some("1") => true,
+            _ => cfg.chatgpt_chat_passthrough,
+        };
 
         Ok(Self {
             listen: cfg.listen,
@@ -168,8 +246,10 @@ impl State {
             ca_cert_pem: cfg.ca_cert_pem,
             ca_key_pem: Zeroizing::new(cfg.ca_key_pem),
             verbose: cfg.verbose,
+            chatgpt_chat_passthrough,
             client,
             certs: Mutex::new(HashMap::new()),
+            openai_trace,
         })
     }
 
@@ -196,6 +276,87 @@ impl State {
     fn upstream_url(&self, target: &str) -> Result<String> {
         let path_query = path_query_from_target(target)?;
         Ok(format!("{}{}", self.base_url, path_query))
+    }
+
+    fn websocket_upstream_url(&self, target: &str) -> Result<Url> {
+        let mut url = Url::parse(&self.upstream_url(target)?)
+            .context("failed to parse Gateway WebSocket URL")?;
+        let scheme = match url.scheme() {
+            "http" => "ws",
+            "https" => "wss",
+            scheme => bail!("unsupported Gateway WebSocket scheme {scheme}"),
+        };
+        url.set_scheme(scheme)
+            .map_err(|_| anyhow::anyhow!("failed to set Gateway WebSocket scheme"))?;
+        Ok(url)
+    }
+
+    fn trace_openai_request(&self, event: &str, direction: &str, request: &IncomingRequest) {
+        let Some(trace) = &self.openai_trace else {
+            return;
+        };
+        let mut headers = Map::new();
+        for (name, value) in &request.headers {
+            let name = name.to_ascii_lowercase();
+            let value = if matches!(
+                name.as_str(),
+                "authorization" | "proxy-authorization" | "cookie"
+            ) {
+                "<redacted>".to_string()
+            } else {
+                value.clone()
+            };
+            headers.insert(name, Value::String(value));
+        }
+        trace.write(json!({
+            "event": event,
+            "direction": direction,
+            "method": request.method,
+            "path": request.target,
+            "headers": headers,
+            "body": String::from_utf8_lossy(&request.body),
+        }));
+    }
+
+    fn trace_openai_frame(&self, direction: &str, message: &Message) {
+        let Some(trace) = &self.openai_trace else {
+            return;
+        };
+        let (kind, body) = match message {
+            Message::Text(text) => ("text", Value::String(text.to_string())),
+            Message::Binary(bytes) => (
+                "binary",
+                json!({
+                    "bytes": bytes.len(),
+                    "sha256": format!("{:x}", Sha256::digest(bytes)),
+                }),
+            ),
+            Message::Ping(bytes) => (
+                "ping",
+                json!({
+                    "bytes": bytes.len(),
+                    "sha256": format!("{:x}", Sha256::digest(bytes)),
+                }),
+            ),
+            Message::Pong(bytes) => (
+                "pong",
+                json!({
+                    "bytes": bytes.len(),
+                    "sha256": format!("{:x}", Sha256::digest(bytes)),
+                }),
+            ),
+            Message::Close(frame) => (
+                "close",
+                json!(frame.as_ref().map(|value| value.reason.to_string())),
+            ),
+            Message::Frame(_) => ("frame", Value::Null),
+        };
+        trace.write(json!({
+            "event": "frame",
+            "direction": direction,
+            "kind": kind,
+            "body": body,
+        }));
     }
 
     fn lock_cert_cache(&self) -> MutexGuard<'_, HashMap<String, Arc<ServerConfig>>> {
@@ -262,18 +423,18 @@ async fn handle_client(
     };
 
     let mut stream = reader.into_inner();
-    if connect.host == ANTHROPIC_HOST && connect.port == 443 {
+    if is_managed_host(&connect.host) && connect.port == 443 {
         stream
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await
-            .context("failed to acknowledge Anthropic CONNECT")?;
+            .context("failed to acknowledge managed CONNECT")?;
         if state.verbose {
             eprintln!(
                 "mitm accepted host={}:{} remote={}",
                 connect.host, connect.port, peer
             );
         }
-        serve_anthropic_tls(state, stream).await
+        serve_managed_tls(state, stream, &connect.host).await
     } else {
         serve_direct_tunnel(stream, &connect.host, connect.port, &peer, state.verbose).await
     }
@@ -340,8 +501,8 @@ async fn serve_direct_tunnel(
     Ok(())
 }
 
-async fn serve_anthropic_tls(state: Arc<State>, stream: TcpStream) -> Result<()> {
-    let tls_config = state.tls_config_for_host(ANTHROPIC_HOST)?;
+async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> Result<()> {
+    let tls_config = state.tls_config_for_host(host)?;
     let acceptor = TlsAcceptor::from(tls_config);
     let tls_stream = acceptor
         .accept(stream)
@@ -351,7 +512,7 @@ async fn serve_anthropic_tls(state: Arc<State>, stream: TcpStream) -> Result<()>
     let mut handled_requests = 0usize;
 
     loop {
-        let request = match read_http_request(&mut reader).await {
+        let mut request = match read_http_request(&mut reader).await {
             Ok(request) => request,
             Err(err) => {
                 if handled_requests > 0 && is_idle_http_connection_end(&err) {
@@ -371,27 +532,129 @@ async fn serve_anthropic_tls(state: Arc<State>, stream: TcpStream) -> Result<()>
         handled_requests += 1;
         let close_after = request_wants_close(&request);
 
-        if let Some(resp) = local_sidecar_response(&request) {
-            if state.verbose {
-                eprintln!(
-                    "local sidecar response method={} target={} status={} reason={} close_after={}",
-                    request.method, request.target, resp.status, resp.reason, close_after
-                );
-            }
-            write_static_response(
-                reader.get_mut(),
-                resp.status,
-                resp.content_type,
-                resp.body,
-                close_after,
-            )
-            .await?;
-        } else {
-            let path = request_path(&request.target)?;
-            if !is_forwarded_anthropic_path(&path) {
+        if host == ANTHROPIC_HOST {
+            if let Some(resp) = local_sidecar_response(&request) {
                 if state.verbose {
                     eprintln!(
-                        "local sidecar fallback method={} target={} status=204 reason=unknown_anthropic_sidecar close_after={}",
+                        "local sidecar response method={} target={} status={} reason={} close_after={}",
+                        request.method, request.target, resp.status, resp.reason, close_after
+                    );
+                }
+                write_static_response(
+                    reader.get_mut(),
+                    resp.status,
+                    resp.content_type,
+                    resp.body,
+                    close_after,
+                )
+                .await?;
+            } else {
+                let path = request_path(&request.target)?;
+                if !is_forwarded_anthropic_path(&path) {
+                    if state.verbose {
+                        eprintln!(
+                            "local sidecar fallback method={} target={} status=204 reason=unknown_anthropic_sidecar close_after={}",
+                            request.method, request.target, close_after
+                        );
+                    }
+                    write_static_response(
+                        reader.get_mut(),
+                        StatusCode::NO_CONTENT,
+                        "text/plain",
+                        b"",
+                        close_after,
+                    )
+                    .await?;
+                } else {
+                    forward_to_saiai(&state, reader.get_mut(), request, close_after, false).await?;
+                }
+            }
+        } else if host == OPENAI_HOST || host == CHATGPT_HOST {
+            state.trace_openai_request(
+                if is_websocket_upgrade(&request) {
+                    "handshake"
+                } else {
+                    "request"
+                },
+                "to_gateway",
+                &request,
+            );
+            let is_chatgpt = host == CHATGPT_HOST;
+            if is_chatgpt {
+                match normalize_chatgpt_gateway_target(&request.target) {
+                    Ok(target) => request.target = target,
+                    Err(_) => {
+                        let ordinary_chat_forwarded = state.chatgpt_chat_passthrough
+                            && normalize_chatgpt_chat_target(&request.target)
+                                .map(|target| {
+                                    request.target = target;
+                                })
+                                .is_ok();
+                        if !ordinary_chat_forwarded {
+                            if let Some((status, body, reason)) =
+                                chatgpt_account_sidecar_response(&request)
+                            {
+                                if state.verbose {
+                                    eprintln!(
+                                        "chatgpt account sidecar response method={} target={} status={} reason={} close_after={}",
+                                        request.method, request.target, status, reason, close_after
+                                    );
+                                }
+                                write_static_response(
+                                    reader.get_mut(),
+                                    status,
+                                    "application/json",
+                                    &body,
+                                    close_after,
+                                )
+                                .await?;
+                                if close_after {
+                                    return Ok(());
+                                }
+                                continue;
+                            }
+                            if let Some(resp) = chatgpt_sidecar_response(&request) {
+                                if state.verbose {
+                                    eprintln!(
+                                        "chatgpt sidecar response method={} target={} status={} reason={} close_after={}",
+                                        request.method,
+                                        request.target,
+                                        resp.status,
+                                        resp.reason,
+                                        close_after
+                                    );
+                                }
+                                write_static_response(
+                                    reader.get_mut(),
+                                    resp.status,
+                                    resp.content_type,
+                                    resp.body,
+                                    close_after,
+                                )
+                                .await?;
+                                if close_after {
+                                    return Ok(());
+                                }
+                                continue;
+                            }
+                            return normalize_chatgpt_gateway_target(&request.target).map(|_| ());
+                        }
+                    }
+                }
+            }
+            if is_websocket_upgrade(&request) {
+                let client_stream = reader.into_inner();
+                return serve_openai_websocket(state, client_stream, request).await;
+            }
+            let path = request_path(&request.target)?;
+            if is_forwarded_openai_path(&path) {
+                // Codex's OAuth request shape is preserved; only the Gateway
+                // credential is substituted at this upstream boundary.
+                forward_to_saiai(&state, reader.get_mut(), request, close_after, true).await?;
+            } else {
+                if state.verbose {
+                    eprintln!(
+                        "openai sidecar fallback method={} target={} status=204 reason=unknown_openai_path close_after={}",
                         request.method, request.target, close_after
                     );
                 }
@@ -403,13 +666,131 @@ async fn serve_anthropic_tls(state: Arc<State>, stream: TcpStream) -> Result<()>
                     close_after,
                 )
                 .await?;
-            } else {
-                forward_to_saiai(&state, reader.get_mut(), request, close_after).await?;
             }
         }
 
         if close_after {
             return Ok(());
+        }
+    }
+}
+
+async fn serve_openai_websocket(
+    state: Arc<State>,
+    mut client_stream: TlsStream<TcpStream>,
+    request: IncomingRequest,
+) -> Result<()> {
+    let sec_key = header_value(&request.headers, "sec-websocket-key")
+        .context("OpenAI WebSocket request did not include Sec-WebSocket-Key")?;
+    let upstream_url = state.websocket_upstream_url(&request.target)?;
+    let mut upstream_request = upstream_url
+        .as_str()
+        .into_client_request()
+        .context("failed to build Gateway WebSocket request")?;
+
+    // Preserve Codex's WebSocket handshake and client metadata while changing
+    // only the destination and the Gateway credential. The generated request
+    // key is replaced with Codex's key so the client-facing accept value is
+    // derived from the exact incoming handshake.
+    let upstream_headers = upstream_request.headers_mut();
+    for (name, value) in &request.headers {
+        if name.eq_ignore_ascii_case("sec-websocket-extensions") {
+            // The Rust upstream relay does not enable a compression codec.
+            // Do not negotiate permessage-deflate on that leg; otherwise the
+            // upstream can send RSV1 frames that the relay cannot decode.
+            continue;
+        }
+        if is_websocket_handshake_header(name)
+            || (should_forward_request_header(name) && !name.eq_ignore_ascii_case("authorization"))
+        {
+            let header_name = HeaderName::from_bytes(name.as_bytes())
+                .with_context(|| format!("invalid WebSocket header name {name:?}"))?;
+            let header_value = HeaderValue::from_str(value)
+                .with_context(|| format!("invalid WebSocket header value for {name:?}"))?;
+            upstream_headers.insert(header_name, header_value);
+        }
+    }
+    upstream_headers.insert(
+        HeaderName::from_static("authorization"),
+        HeaderValue::from_str(&format!("Bearer {}", *state.api_key))
+            .context("failed to build Gateway WebSocket authorization")?,
+    );
+    upstream_headers.insert(
+        HeaderName::from_static("host"),
+        HeaderValue::from_str(upstream_url.authority())
+            .context("invalid Gateway WebSocket host")?,
+    );
+
+    let (upstream_ws, upstream_response) = match connect_async(upstream_request).await {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = write_plain_error(&mut client_stream, StatusCode::BAD_GATEWAY).await;
+            return Err(error).context("failed to establish Gateway WebSocket");
+        }
+    };
+    if upstream_response.status().as_u16() != 101 {
+        let _ = write_plain_error(&mut client_stream, StatusCode::BAD_GATEWAY).await;
+        bail!(
+            "Gateway WebSocket handshake returned {}",
+            upstream_response.status()
+        );
+    }
+
+    let accept_key = tungstenite::handshake::derive_accept_key(sec_key.as_bytes());
+    // The client-facing side uses a raw WebSocket stream without an extension
+    // codec. Do not accept permessage-deflate back to Codex; otherwise Codex
+    // may send frames with RSV1 set and the raw client-side relay rejects them
+    // as compressed.
+    let negotiated_headers = ["sec-websocket-protocol"]
+        .into_iter()
+        .filter_map(|name| {
+            upstream_response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| format!("Sec-WebSocket-Protocol: {value}\r\n"))
+        })
+        .collect::<String>();
+    client_stream
+        .write_all(
+            format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key}\r\n{negotiated_headers}\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .context("failed to acknowledge Codex WebSocket")?;
+
+    let client_ws = WebSocketStream::from_raw_socket(client_stream, Role::Server, None).await;
+    let (mut client_sink, mut client_source) = client_ws.split();
+    let (mut upstream_sink, mut upstream_source) = upstream_ws.split();
+
+    loop {
+        tokio::select! {
+            client_message = client_source.next() => {
+                match client_message {
+                    Some(Ok(message)) => {
+                        let is_close = message.is_close();
+                        state.trace_openai_frame("to_gateway", &message);
+                        upstream_sink.send(message).await.context("failed to forward Codex WebSocket frame to Gateway")?;
+                        if is_close { return Ok(()); }
+                    }
+                    Some(Err(error)) => return Err(error).context("Codex WebSocket read failed"),
+                    None => return Ok(()),
+                }
+            }
+            upstream_message = upstream_source.next() => {
+                match upstream_message {
+                    Some(Ok(message)) => {
+                        let is_close = message.is_close();
+                        state.trace_openai_frame("from_gateway", &message);
+                        client_sink.send(message).await.context("failed to forward Gateway WebSocket frame to Codex")?;
+                        if is_close { return Ok(()); }
+                    }
+                    Some(Err(error)) => return Err(error).context("Gateway WebSocket read failed"),
+                    None => return Ok(()),
+                }
+            }
         }
     }
 }
@@ -517,6 +898,7 @@ async fn forward_to_saiai<W>(
     writer: &mut W,
     request: IncomingRequest,
     close_after: bool,
+    replace_authorization: bool,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -531,11 +913,11 @@ where
         if name.eq_ignore_ascii_case("authorization") {
             has_authorization = true;
         }
-        if should_forward_request_header(name) {
+        if should_forward_request_header_to_gateway(name, replace_authorization) {
             builder = builder.header(name.as_str(), value.as_str());
         }
     }
-    if !has_authorization {
+    if replace_authorization || !has_authorization {
         builder = builder.bearer_auth(&*state.api_key);
     }
 
@@ -869,6 +1251,227 @@ fn is_forwarded_anthropic_path(path: &str) -> bool {
         || path.starts_with("/v1/models/")
 }
 
+fn is_forwarded_openai_path(path: &str) -> bool {
+    path == "/v1/responses"
+        || path.starts_with("/v1/responses/")
+        || path == "/v1/models"
+        || path.starts_with("/v1/models/")
+        || is_forwarded_chatgpt_path(path)
+}
+
+fn is_forwarded_chatgpt_path(path: &str) -> bool {
+    path == "/chatgpt/backend-api/f/conversation"
+        || path.starts_with("/chatgpt/backend-api/f/conversation/")
+        || path == "/chatgpt/backend-api/conversation/init"
+        || path == "/chatgpt/backend-api/sentinel/chat-requirements/prepare"
+}
+
+fn normalize_chatgpt_gateway_target(target: &str) -> Result<String> {
+    let path = request_path(target)?;
+    let normalized = if path == "/backend-api/codex/responses" {
+        "/v1/responses"
+    } else if path.starts_with("/backend-api/codex/responses/") {
+        return Ok(target.replacen("/backend-api/codex/responses", "/v1/responses", 1));
+    } else if path == "/backend-api/codex/models" {
+        "/v1/models"
+    } else if path.starts_with("/backend-api/codex/models/") {
+        return Ok(target.replacen("/backend-api/codex/models", "/v1/models", 1));
+    } else {
+        bail!("unsupported ChatGPT Codex path: {path}");
+    };
+    let query = target.split_once('?').map(|(_, value)| value);
+    Ok(match query {
+        Some(value) if !value.is_empty() => format!("{normalized}?{value}"),
+        _ => normalized.to_string(),
+    })
+}
+
+fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
+    let path = request_path(target)?;
+    let allowed = path == "/backend-api/f/conversation"
+        || path.starts_with("/backend-api/f/conversation/")
+        || path == "/backend-api/conversation/init"
+        || path == "/backend-api/sentinel/chat-requirements/prepare";
+    if !allowed {
+        bail!("unsupported ChatGPT ordinary Chat path: {path}");
+    }
+    Ok(target.replacen("/backend-api/", "/chatgpt/backend-api/", 1))
+}
+
+fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse> {
+    let path = request_path(&request.target).ok()?;
+    match path.as_str() {
+        "/ces/v1/rgstr" => Some(StaticResponse {
+            status: StatusCode::NO_CONTENT,
+            content_type: "text/plain",
+            body: b"",
+            reason: "desktop_telemetry_noop",
+        }),
+        "/backend-api/plugins/featured" => Some(StaticResponse {
+            status: StatusCode::OK,
+            content_type: "application/json",
+            body: br#"{"plugins":[],"pagination":{"total":0,"limit":200,"offset":0}}"#,
+            reason: "desktop_plugins_empty",
+        }),
+        "/backend-api/ps/plugins/suggested/codex" => Some(StaticResponse {
+            status: StatusCode::OK,
+            content_type: "application/json",
+            body: br#"{"plugins":[],"enabled":false}"#,
+            reason: "desktop_recommended_plugins_disabled",
+        }),
+        _ if path.starts_with("/backend-api/ps/plugins/") => Some(StaticResponse {
+            status: StatusCode::OK,
+            content_type: "application/json",
+            body: br#"{"plugins":[],"pagination":{"total":0,"limit":200,"offset":0}}"#,
+            reason: "desktop_plugins_empty",
+        }),
+        _ if path.starts_with("/backend-api/wham/")
+            || path.starts_with("/backend-api/")
+            || path.starts_with("/wham/")
+            || path.starts_with("/accounts/")
+            || path == "/me"
+            || path.starts_with("/settings/")
+            || path.starts_with("/beacons/")
+            || path == "/settings/user"
+            || path == "/automations" =>
+        {
+            Some(StaticResponse {
+                status: StatusCode::OK,
+                content_type: "application/json",
+                body: br#"{}"#,
+                reason: "desktop_account_sidecar_empty",
+            })
+        }
+        _ => None,
+    }
+}
+
+fn chatgpt_account_sidecar_response(
+    request: &IncomingRequest,
+) -> Option<(StatusCode, Vec<u8>, &'static str)> {
+    let path = request_path(&request.target).ok()?;
+    let account_id = header_value(&request.headers, "chatgpt-account-id")
+        .map(str::to_owned)
+        .or_else(|| oauth_claim_account_id(&request.headers))
+        .or_else(desktop_account_id_fallback)
+        .unwrap_or_else(|| "fixture-chatgpt-account".to_string());
+    if path == "/backend-api/ps/mcp" {
+        let request_json: Value = serde_json::from_slice(&request.body).ok()?;
+        let id = request_json.get("id").cloned().unwrap_or(Value::Null);
+        let method = request_json.get("method").and_then(Value::as_str);
+        if id.is_null() || method.is_some_and(|value| value.starts_with("notifications/")) {
+            return Some((StatusCode::ACCEPTED, Vec::new(), "desktop_mcp_notification"));
+        }
+        let result = match method {
+            Some("initialize") => json!({
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "saiai-local", "version": "1"}
+            }),
+            Some("tools/list") => json!({"tools": []}),
+            _ => json!({}),
+        };
+        let response = json!({"jsonrpc": "2.0", "id": id, "result": result});
+        return Some((
+            StatusCode::OK,
+            serde_json::to_vec(&response).ok()?,
+            "desktop_mcp_response",
+        ));
+    }
+    let response = match path.as_str() {
+        "/backend-api/accounts/optimized/check" | "/backend-api/wham/accounts/check" => json!({
+            "account_ordering": [account_id],
+            "accounts": [{"id": account_id, "plan_type": "plus"}]
+        }),
+        "/backend-api/wham/statsig/bootstrap" => json!({
+            "statsigPayload": "{\"user\":{}}"
+        }),
+        "/backend-api/conversations" => json!({
+            "items": [],
+            "total": 0,
+            "limit": 100,
+            "offset": 0
+        }),
+        "/backend-api/wham/profiles/me" | "/wham/profiles/me" => json!({
+            "profile": {
+                "display_name": null,
+                "username": null,
+                "profile_picture_url": null
+            },
+            "stats": {
+                "daily_usage_buckets": null
+            },
+            "metadata": {
+                "stats_error": null
+            }
+        }),
+        "/backend-api/me" => json!({
+            "id": account_id,
+            "account_id": account_id,
+            "email": "staging@example.invalid"
+        }),
+        _ if path.starts_with("/backend-api/accounts/") && path.ends_with("/settings") => {
+            json!({"account_id": account_id, "settings": {}})
+        }
+        _ => return None,
+    };
+    Some((
+        StatusCode::OK,
+        serde_json::to_vec(&response).ok()?,
+        "desktop_account_identity",
+    ))
+}
+
+fn oauth_claim_account_id(headers: &[(String, String)]) -> Option<String> {
+    let authorization = header_value(headers, "authorization")?;
+    let token = authorization.strip_prefix("Bearer ")?.trim();
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    claims
+        .get("https://api.openai.com/auth")
+        .and_then(Value::as_object)
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(Value::as_str)
+        .or_else(|| claims.get("chatgpt_account_id").and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
+fn desktop_account_id_fallback() -> Option<String> {
+    let root = env::var_os("SAIAI_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".saiai"))
+        })?;
+    let value = fs::read_to_string(root.join("desktop/account-id")).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn is_managed_host(host: &str) -> bool {
+    host == ANTHROPIC_HOST || host == OPENAI_HOST || host == CHATGPT_HOST
+}
+
+fn is_websocket_upgrade(request: &IncomingRequest) -> bool {
+    header_contains(&request.headers, "upgrade", "websocket")
+        && header_contains(&request.headers, "connection", "upgrade")
+        && header_value(&request.headers, "sec-websocket-key").is_some()
+}
+
+fn is_websocket_handshake_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "upgrade"
+            | "sec-websocket-key"
+            | "sec-websocket-version"
+            | "sec-websocket-extensions"
+            | "sec-websocket-protocol"
+    )
+}
+
 fn should_forward_request_header(name: &str) -> bool {
     !is_hop_by_hop_header(name)
         && !name.eq_ignore_ascii_case("host")
@@ -876,6 +1479,12 @@ fn should_forward_request_header(name: &str) -> bool {
         && !name.eq_ignore_ascii_case("transfer-encoding")
         && !name.eq_ignore_ascii_case("proxy-authorization")
         && !name.eq_ignore_ascii_case("proxy-connection")
+}
+
+fn should_forward_request_header_to_gateway(name: &str, replace_authorization: bool) -> bool {
+    should_forward_request_header(name)
+        && !(replace_authorization
+            && (name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("cookie")))
 }
 
 fn should_forward_response_header(name: &str) -> bool {
@@ -899,8 +1508,8 @@ fn is_hop_by_hop_header(name: &str) -> bool {
 }
 
 async fn connect_direct_target(host: &str, port: u16) -> Result<TcpStream> {
-    if host == ANTHROPIC_HOST && port == 443 {
-        bail!("Anthropic host must use local MITM route");
+    if is_managed_host(host) && port == 443 {
+        bail!("managed host must use local MITM route");
     }
     let addrs = lookup_host((host, port))
         .await
@@ -1113,6 +1722,172 @@ mod tests {
     }
 
     #[test]
+    fn detects_forwarded_openai_paths() {
+        assert!(is_forwarded_openai_path("/v1/responses"));
+        assert!(is_forwarded_openai_path("/v1/responses/compact"));
+        assert!(is_forwarded_openai_path("/v1/models"));
+        assert!(is_forwarded_openai_path("/v1/models/gpt-5.3-codex"));
+        assert!(!is_forwarded_openai_path("/backend-api/codex/models"));
+    }
+
+    #[test]
+    fn normalizes_chatgpt_codex_targets_for_gateway() {
+        assert_eq!(
+            normalize_chatgpt_gateway_target("/backend-api/codex/responses?stream=true").unwrap(),
+            "/v1/responses?stream=true"
+        );
+        assert_eq!(
+            normalize_chatgpt_gateway_target("/backend-api/codex/models/gpt-5").unwrap(),
+            "/v1/models/gpt-5"
+        );
+        assert!(normalize_chatgpt_gateway_target("/backend-api/conversations").is_err());
+        assert!(is_managed_host(CHATGPT_HOST));
+    }
+
+    #[test]
+    fn normalizes_ordinary_chatgpt_targets_only_when_allowlisted() {
+        assert_eq!(
+            normalize_chatgpt_chat_target("/backend-api/f/conversation?foo=bar").unwrap(),
+            "/chatgpt/backend-api/f/conversation?foo=bar"
+        );
+        assert_eq!(
+            normalize_chatgpt_chat_target("/backend-api/f/conversation/prepare").unwrap(),
+            "/chatgpt/backend-api/f/conversation/prepare"
+        );
+        assert!(normalize_chatgpt_chat_target("/backend-api/conversations").is_err());
+        assert!(is_forwarded_chatgpt_path(
+            "/chatgpt/backend-api/f/conversation"
+        ));
+        assert!(!is_forwarded_chatgpt_path("/backend-api/f/conversation"));
+        assert!(!should_forward_request_header_to_gateway(
+            "Authorization",
+            true
+        ));
+        assert!(!should_forward_request_header_to_gateway("Cookie", true));
+        assert!(should_forward_request_header_to_gateway("originator", true));
+    }
+
+    #[test]
+    fn serves_desktop_non_model_sidecars_locally() {
+        let request = IncomingRequest {
+            method: "GET".to_string(),
+            target: "/backend-api/wham/accounts/check".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let response = chatgpt_sidecar_response(&request).expect("desktop sidecar response");
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, br#"{}"#);
+
+        let telemetry = IncomingRequest {
+            target: "/ces/v1/rgstr".to_string(),
+            ..request
+        };
+        let response = chatgpt_sidecar_response(&telemetry).expect("telemetry sidecar response");
+        assert_eq!(response.status, StatusCode::NO_CONTENT);
+
+        let recommended_plugins = IncomingRequest {
+            method: "GET".to_string(),
+            target: "/backend-api/ps/plugins/suggested/codex?scope=GLOBAL".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let response = chatgpt_sidecar_response(&recommended_plugins).unwrap();
+        let body: Value = serde_json::from_slice(response.body).unwrap();
+        assert_eq!(body["plugins"], json!([]));
+        assert_eq!(body["enabled"], false);
+    }
+
+    #[test]
+    fn serves_desktop_control_plane_shapes_locally() {
+        let conversations = IncomingRequest {
+            method: "GET".to_string(),
+            target: "/backend-api/conversations?limit=100&offset=0".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: vec![("ChatGPT-Account-ID".to_string(), "account-test".to_string())],
+            body: Vec::new(),
+        };
+        let (_, body, _) = chatgpt_account_sidecar_response(&conversations).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["items"], json!([]));
+        assert_eq!(body["total"], 0);
+
+        let statsig = IncomingRequest {
+            method: "GET".to_string(),
+            target: "/backend-api/wham/statsig/bootstrap".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: vec![("ChatGPT-Account-ID".to_string(), "account-test".to_string())],
+            body: Vec::new(),
+        };
+        let (_, body, _) = chatgpt_account_sidecar_response(&statsig).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["statsigPayload"], "{\"user\":{}}");
+
+        let profile = IncomingRequest {
+            method: "GET".to_string(),
+            target: "/backend-api/wham/profiles/me".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: vec![("ChatGPT-Account-ID".to_string(), "account-test".to_string())],
+            body: Vec::new(),
+        };
+        let (_, body, _) = chatgpt_account_sidecar_response(&profile).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["profile"].is_object());
+        assert!(body["stats"].is_object());
+        assert!(body["metadata"].is_object());
+
+        let mcp = IncomingRequest {
+            method: "POST".to_string(),
+            target: "/backend-api/ps/mcp".to_string(),
+            body: br#"{"jsonrpc":"2.0","id":7,"method":"initialize"}"#.to_vec(),
+            ..conversations
+        };
+        let (_, body, _) = chatgpt_account_sidecar_response(&mcp).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 7);
+        assert_eq!(body["result"]["serverInfo"]["name"], "saiai-local");
+
+        let tools_list = IncomingRequest {
+            method: "POST".to_string(),
+            target: "/backend-api/ps/mcp".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: vec![("ChatGPT-Account-ID".to_string(), "account-test".to_string())],
+            body: br#"{"jsonrpc":"2.0","id":8,"method":"tools/list"}"#.to_vec(),
+        };
+        let (_, body, _) = chatgpt_account_sidecar_response(&tools_list).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["id"], 8);
+        assert_eq!(body["result"]["tools"], json!([]));
+
+        let notification = IncomingRequest {
+            body: br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_vec(),
+            ..mcp
+        };
+        let (status, body, _) = chatgpt_account_sidecar_response(&notification).unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn detects_openai_websocket_handshake() {
+        let request = IncomingRequest {
+            method: "GET".to_string(),
+            target: "/v1/responses".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: vec![
+                ("Connection".to_string(), "Upgrade".to_string()),
+                ("Upgrade".to_string(), "websocket".to_string()),
+                ("Sec-WebSocket-Key".to_string(), "key".to_string()),
+            ],
+            body: Vec::new(),
+        };
+        assert!(is_websocket_upgrade(&request));
+    }
+
+    #[test]
     fn builds_tls_config_with_explicit_crypto_provider() {
         let (ca_cert_pem, ca_key_pem) = test_ca();
         let state = State::new(Config {
@@ -1122,6 +1897,7 @@ mod tests {
             ca_cert_pem,
             ca_key_pem,
             verbose: false,
+            chatgpt_chat_passthrough: true,
         })
         .unwrap();
 
@@ -1209,7 +1985,17 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("Anthropic host must use local MITM route")
+                .contains("managed host must use local MITM route")
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_tunnel_cannot_bypass_openai_mitm_route() {
+        let error = connect_direct_target(OPENAI_HOST, 443).await.err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("managed host must use local MITM route")
         );
     }
 
@@ -1223,6 +2009,7 @@ mod tests {
             ca_cert_pem,
             ca_key_pem,
             verbose: false,
+            chatgpt_chat_passthrough: true,
         })
         .err()
         .unwrap();

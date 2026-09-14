@@ -45,7 +45,7 @@ def verify_cli() -> None:
     cargo = text("tools/saiai-cli/Cargo.toml")
     require('version = "1.1.7"' in cargo, "CLI version is not 1.1.7")
     require("saiai-core" not in cargo, "local-proxy client still links the V2 runtime core")
-    for dependency in ("reqwest", "tokio", "rustls", "rcgen", "zeroize", "libc"):
+    for dependency in ("reqwest", "tokio", "tokio-tungstenite", "rustls", "rcgen", "zeroize", "libc"):
         require(dependency in cargo, f"local-proxy dependency is missing: {dependency}")
 
     main = text("tools/saiai-cli/src/main.rs")
@@ -59,9 +59,20 @@ def verify_cli() -> None:
         "saiai doctor",
         "saiai init <base_url> <api_key>",
         "saiai init-codex <base_url> <api_key>",
+        "saiai codex [-- <codex arguments>]",
+        "initialize_codex_local_proxy",
+        "SAIAI local-proxy configuration is ready; run `saiai codex` for OAuth mode.",
+        '"CODEX_CA_CERTIFICATE"',
+        '"OPENAI_API_KEY"',
         '"CLAUDE_CODE_OAUTH_TOKEN"',
         '"CLAUDE_STREAM_IDLE_TIMEOUT_MS"',
         'const CLAUDE_STREAM_IDLE_TIMEOUT_MS: &str = "600000"',
+        'Value::String("chatgptAuthTokens".to_string())',
+        '"features.apps=false".to_string()',
+        '"otel.metrics_exporter=\\\"none\\\"".to_string()',
+        '"features.respect_system_proxy={}"',
+        'directory.join("node_modules/@openai/codex/bin/codex.js")',
+        'home.join(".local/bin/codex")',
         '"SAIAI_HOME"',
         'settings.remove("oauthAccount")',
         'state.remove("oauthAccount")',
@@ -100,14 +111,32 @@ def verify_cli() -> None:
     proxy = text("tools/saiai-cli/src/local_proxy.rs")
     require("ca_key_pem" in proxy, "local proxy does not require runtime CA material")
     require("piproxy-ca.key" not in proxy, "local proxy still embeds the historical shared CA key")
+    require('const OPENAI_HOST: &str = "api.openai.com"' in proxy, "Codex OpenAI MITM route is missing")
+    require("replace_authorization" in proxy, "Codex Gateway authorization boundary is missing")
+    require("serve_openai_websocket" in proxy, "Codex WebSocket bridge is missing")
     windows_runtime = text("scripts/saiai-cli/test-windows-runtime.ps1")
     for required in (
         "TEST_ONLY_WINDOWS_REPLACEMENT_KEY",
         "Repeated setup did not replace the API key",
         "Repeated setup replaced a valid CA key",
+        "Codex initialization did not normalize the local-proxy Gateway root",
+        "Codex local-proxy launcher is missing",
+        "Managed legacy Codex auth was not upgraded",
+        "SAIAI_WINDOWS_NPM_CODEX",
+        "features.apps=false",
+        "otel.metrics_exporter=",
+        "features.respect_system_proxy=false",
         "service active: yes",
     ):
         require(required in windows_runtime, f"Windows repeat smoke is missing {required!r}")
+    windows_codex_capture = text("scripts/saiai-cli/test-windows-codex-proxy.py")
+    for required in (
+        "BLOCKED_PROVIDER_HOSTS",
+        'path == "/v1/responses"',
+        'auth.get("auth_mode") != "chatgptAuthTokens"',
+        "original_hosts",
+    ):
+        require(required in windows_codex_capture, f"Windows Codex capture is missing {required!r}")
 
 
 def verify_manifest_and_wrappers() -> None:
@@ -187,6 +216,17 @@ def verify_workflows_and_docs() -> None:
         "test-linux-service.py" in ci,
         "CI workflow does not exercise the Linux headless service fallback",
     )
+    for workflow in (ci, release):
+        require(
+            "test-windows-codex-proxy.py" in workflow
+            and '"0.146.0", "0.153.4"' in workflow,
+            "Windows workflows do not capture both supported official Codex versions",
+        )
+        require(
+            "Capture official macOS Codex through local proxy" in workflow
+            and 'codex-prefix "$prefix/bin"' in workflow,
+            "macOS workflows do not capture the official Apple Silicon Codex client",
+        )
     linux_service = text("scripts/saiai-cli/test-linux-service.py")
     for required in (
         "test-forced headless mode",

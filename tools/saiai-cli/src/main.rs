@@ -9,6 +9,8 @@ use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
 use std::env;
+#[cfg(windows)]
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream};
@@ -41,6 +43,10 @@ Usage:
   saiai --version                                                 # print version
   saiai init <base_url> <api_key>                                 # initialize Claude Code
   saiai init-codex <base_url> <api_key> [--websockets]            # initialize Codex CLI
+  saiai codex [-- <codex arguments>]                              # launch Codex through SAIAI local proxy
+  saiai vscode                                                    # configure the Codex VSCode extension for SAIAI
+  saiai desktop [-- <ChatGPT arguments>]                         # launch ChatGPT Desktop through SAIAI
+  saiai chatgpt [-- <ChatGPT arguments>]                         # alias for desktop
   saiai init       --base-url <base_url> --api-key <api_key>      # initialize Claude Code
   saiai init-codex --base-url <base_url> --api-key <api_key> [--websockets]";
 
@@ -53,6 +59,40 @@ const DEFAULT_LOCAL_PROXY_LISTEN: &str = "127.0.0.1:19908";
 // traffic remains routed through the SAIAI local proxy.
 const DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local,downloads.claude.ai";
 const SAIAI_CONFIG_FILENAME: &str = "config.json";
+
+// `saiai codex` owns these variables only in the Codex child process. The
+// invoking shell and the user's system environment are never modified.
+const CODEX_MANAGED_ENV: &[&str] = &[
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "CODEX_ACCESS_TOKEN",
+    "CODEX_CA_CERTIFICATE",
+    "SSL_CERT_FILE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
+const CODEX_LOCAL_PROXY_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local";
+const CODEX_IDE_ENV_BEGIN: &str = "# BEGIN SAIAI CODEX IDE (managed)";
+const CODEX_IDE_ENV_END: &str = "# END SAIAI CODEX IDE (managed)";
+const CODEX_PLACEHOLDER_ACCESS_TOKEN: &str = "saiai-local-proxy-placeholder-access";
+const CODEX_PLACEHOLDER_ACCOUNT_ID: &str = "saiai-local-proxy-placeholder-account";
+// Structurally valid but unsigned and therefore unusable against OpenAI. The
+// local proxy replaces request authentication at the Gateway boundary; these
+// claims only let Codex's local app-server expose an authenticated UI state.
+const CODEX_PLACEHOLDER_ID_TOKEN: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InNhaWFpLWxvY2FsLXByb3h5QGludmFsaWQiLCJleHAiOjQxMDI0NDQ4MDAsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3BsYW5fdHlwZSI6InBsdXMiLCJjaGF0Z3B0X3VzZXJfaWQiOiJzYWlhaS1sb2NhbC1wcm94eS11c2VyIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoic2FpYWktbG9jYWwtcHJveHktYWNjb3VudCJ9fQ.c2FpYWktbG9jYWwtcHJveHk";
+
+// Optional fixed timezone for ChatGPT Desktop ordinary Chat. It is read by
+// the launcher and applied only to the Desktop child process; the parent
+// shell and system timezone are never modified.
+const SAIAI_CHATGPT_TIMEZONE_ENV: &str = "SAIAI_CHATGPT_TIMEZONE";
+const DEFAULT_CHATGPT_TIMEZONE: &str = "America/Los_Angeles";
 
 // Remove stale routing, authentication, model, proxy, and CA values before
 // installing the exact local-proxy environment. Unrelated user settings are
@@ -183,6 +223,9 @@ fn main() -> Result<()> {
         Command::Version => print_version(),
         Command::Init(init) => init_claude(init),
         Command::InitCodex(init) => init_codex(init),
+        Command::Codex(args) => run_codex(&args),
+        Command::VSCode => configure_vscode(),
+        Command::Desktop(args) => run_desktop(&args),
         #[cfg(target_os = "linux")]
         Command::RunLinuxBackgroundProxy => run_linux_background_proxy_worker(),
         #[cfg(target_os = "windows")]
@@ -206,6 +249,9 @@ enum Command {
     Version,
     Init(InitArgs),
     InitCodex(InitArgs),
+    Codex(Vec<String>),
+    VSCode,
+    Desktop(Vec<String>),
     #[cfg(target_os = "linux")]
     RunLinuxBackgroundProxy,
     #[cfg(target_os = "windows")]
@@ -257,6 +303,21 @@ fn parse_command(args: &[String]) -> Result<Command> {
                 "init-codex",
                 &args[1..],
             )?));
+        }
+        "codex" => {
+            let mut codex_args = args[1..].to_vec();
+            if codex_args.first().is_some_and(|arg| arg == "--") {
+                codex_args.remove(0);
+            }
+            return Ok(Command::Codex(codex_args));
+        }
+        "vscode" => return parse_no_arg_command("vscode", &args[1..], Command::VSCode),
+        "desktop" | "chatgpt" => {
+            let mut desktop_args = args[1..].to_vec();
+            if desktop_args.first().is_some_and(|arg| arg == "--") {
+                desktop_args.remove(0);
+            }
+            return Ok(Command::Desktop(desktop_args));
         }
         #[cfg(target_os = "linux")]
         SAIAI_LINUX_BACKGROUND_COMMAND => {
@@ -475,6 +536,7 @@ fn init_claude(args: InitArgs) -> Result<()> {
         listen: DEFAULT_LOCAL_PROXY_LISTEN.to_string(),
         ca_cert_path: ca_path.display().to_string(),
         ca_key_path: ca_key_path.display().to_string(),
+        chatgpt_chat_passthrough: true,
     })?;
 
     println!("SAIAI configured Claude Code for local proxy mode.");
@@ -510,11 +572,15 @@ fn init_codex(args: InitArgs) -> Result<()> {
 
     merge_codex_config(&config_path, &args.base_url, args.websockets)?;
     merge_codex_auth(&auth_path, &args.api_key)?;
+    let proxy_init = initialize_codex_local_proxy(&args, &timestamp)?;
 
     println!("SAIAI configured Codex CLI for saiai gateway.");
     println!("Updated:");
     println!("  {}", config_path.display());
     println!("  {}", auth_path.display());
+    println!("  {}", proxy_init.config_path.display());
+    println!("  {}", proxy_init.ca_cert_path.display());
+    println!("  {}", proxy_init.ca_key_path.display());
     if args.websockets {
         println!(
             "Default provider set to `OpenAI` pointing at SAIAI (wire_api = responses, websockets enabled)."
@@ -523,9 +589,984 @@ fn init_codex(args: InitArgs) -> Result<()> {
         println!("Default provider set to `OpenAI` pointing at SAIAI (wire_api = responses).");
     }
     println!("Existing TOML keys and JSON auth fields outside our scope were preserved.");
+    println!("SAIAI local-proxy configuration is ready; run `saiai codex` for OAuth mode.");
     warn_claude_settings_overrides();
 
     Ok(())
+}
+
+struct CodexLocalProxyInit {
+    config_path: PathBuf,
+    ca_cert_path: PathBuf,
+    ca_key_path: PathBuf,
+}
+
+fn initialize_codex_local_proxy(args: &InitArgs, timestamp: &str) -> Result<CodexLocalProxyInit> {
+    let config_dir = saiai_config_dir()?;
+    initialize_codex_local_proxy_at(&config_dir, args, timestamp)
+}
+
+fn initialize_codex_local_proxy_at(
+    config_dir: &Path,
+    args: &InitArgs,
+    timestamp: &str,
+) -> Result<CodexLocalProxyInit> {
+    fs::create_dir_all(config_dir)
+        .with_context(|| format!("failed to create {}", config_dir.display()))?;
+    let config_path = config_dir.join(SAIAI_CONFIG_FILENAME);
+    let proxy_base_url = codex_proxy_gateway_root(&args.base_url)?;
+
+    if let Ok(raw) = fs::read_to_string(&config_path)
+        && let Ok(mut existing) = serde_json::from_str::<SaiaiConfig>(&raw)
+        && read_runtime_ca(&existing).is_ok()
+    {
+        existing.base_url = proxy_base_url.clone();
+        existing.api_key = args.api_key.clone();
+        write_saiai_config_at(&config_path, &existing)?;
+        return Ok(CodexLocalProxyInit {
+            config_path,
+            ca_cert_path: PathBuf::from(existing.ca_cert_path),
+            ca_key_path: PathBuf::from(existing.ca_key_path),
+        });
+    }
+
+    backup_if_exists(&config_path, timestamp)?;
+    let ca_cert_path = config_dir.join(SAIAI_CA_FILENAME);
+    let ca_key_path = config_dir.join(SAIAI_CA_KEY_FILENAME);
+    ensure_installation_ca(&ca_cert_path, &ca_key_path, timestamp)?;
+    write_saiai_config_at(
+        &config_path,
+        &SaiaiConfig {
+            version: SAIAI_CONFIG_VERSION,
+            base_url: proxy_base_url,
+            api_key: args.api_key.clone(),
+            listen: DEFAULT_LOCAL_PROXY_LISTEN.to_string(),
+            ca_cert_path: ca_cert_path.display().to_string(),
+            ca_key_path: ca_key_path.display().to_string(),
+            chatgpt_chat_passthrough: true,
+        },
+    )?;
+    Ok(CodexLocalProxyInit {
+        config_path,
+        ca_cert_path,
+        ca_key_path,
+    })
+}
+
+fn codex_proxy_gateway_root(base_url: &str) -> Result<String> {
+    let mut url = Url::parse(base_url).context("failed to parse Codex Gateway base URL")?;
+    let path = url.path().trim_end_matches('/');
+    let root_path = path.strip_suffix("/v1").unwrap_or(path).to_string();
+    url.set_path(if root_path.is_empty() {
+        "/"
+    } else {
+        &root_path
+    });
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+/// Launch the real Codex executable with a child-only SAIAI proxy environment.
+///
+/// This mode deliberately keeps Codex's built-in OpenAI provider and ChatGPT
+/// OAuth credential. The local proxy changes the network route and performs
+/// the Gateway authentication at its own upstream boundary; it does not write
+/// a third-party `base_url` into Codex configuration.
+fn run_codex(args: &[String]) -> Result<()> {
+    let codex_dir = codex_config_dir().context("failed to resolve Codex config directory")?;
+    let auth_path = codex_dir.join("auth.json");
+    // Resolve the executable before mutating auth/config or starting the
+    // proxy. Official installers may add ~/.local/bin only for future
+    // terminals, and Windows npm installs expose a .cmd shim that Rust's
+    // Command cannot execute directly.
+    let mut command = codex_process_command().context("failed to resolve Codex executable")?;
+    let cfg = read_saiai_config()
+        .context("SAIAI local proxy is not configured; run the SAIAI Claude setup first")?;
+    let _runtime_ca = read_runtime_ca(&cfg)
+        .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
+    ensure_codex_local_proxy_auth(&auth_path, Some(&cfg.api_key))?;
+    validate_codex_oauth_auth(&auth_path)?;
+    ensure_local_proxy_running(&cfg.listen)?;
+    let files = prepare_codex_oauth_files(&codex_dir, false)?;
+
+    let proxy = format!("http://{}", cfg.listen);
+    // The local-proxy launcher owns proxy variables only in this child
+    // process. Linux/macOS need Codex's system-proxy resolver, while Windows
+    // must keep it off: WinHTTP can resolve DIRECT before Codex considers the
+    // child environment, bypassing the loopback proxy entirely.
+    command.args(codex_launcher_args(args));
+    command.env("CODEX_HOME", &codex_dir);
+    command.env("CODEX_CA_CERTIFICATE", &cfg.ca_cert_path);
+    command
+        .env("HTTP_PROXY", &proxy)
+        .env("HTTPS_PROXY", &proxy)
+        .env("ALL_PROXY", &proxy)
+        .env("NO_PROXY", CODEX_LOCAL_PROXY_NO_PROXY)
+        .env("http_proxy", &proxy)
+        .env("https_proxy", &proxy)
+        .env("all_proxy", &proxy)
+        .env("no_proxy", CODEX_LOCAL_PROXY_NO_PROXY);
+    for name in CODEX_MANAGED_ENV {
+        if !matches!(
+            *name,
+            "HTTP_PROXY"
+                | "HTTPS_PROXY"
+                | "ALL_PROXY"
+                | "NO_PROXY"
+                | "http_proxy"
+                | "https_proxy"
+                | "all_proxy"
+                | "no_proxy"
+                | "CODEX_CA_CERTIFICATE"
+        ) {
+            command.env_remove(*name);
+        }
+    }
+
+    println!("Starting Codex through the SAIAI local proxy.");
+    println!("  CODEX_HOME={}", codex_dir.display());
+    println!("  proxy={proxy}");
+    println!(
+        "  migrated {} Codex config file(s) with backups",
+        files.len()
+    );
+    let status = command.status().context("failed to start codex")?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("codex exited with {status}")
+    }
+}
+
+#[cfg(not(windows))]
+fn codex_process_command() -> Result<ProcessCommand> {
+    let path_directories = env::var_os("PATH")
+        .map(|path| env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if let Some(program) = find_unix_executable(&path_directories, "codex") {
+        return Ok(ProcessCommand::new(program));
+    }
+
+    if let Some(home) = home_dir() {
+        let official_installer_program = home.join(".local/bin/codex");
+        if is_unix_executable(&official_installer_program) {
+            return Ok(ProcessCommand::new(official_installer_program));
+        }
+    }
+
+    bail!(
+        "Codex executable was not found in PATH or ~/.local/bin; install Codex and open a new terminal"
+    )
+}
+
+#[cfg(not(windows))]
+fn find_unix_executable(directories: &[PathBuf], name: &str) -> Option<PathBuf> {
+    directories
+        .iter()
+        .map(|directory| directory.join(name))
+        .find(|candidate| is_unix_executable(candidate))
+}
+
+#[cfg(not(windows))]
+fn is_unix_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(windows)]
+fn codex_process_command() -> Result<ProcessCommand> {
+    let search_path = env::var_os("PATH").context("PATH is unavailable")?;
+    let launch = resolve_windows_codex_launch(&search_path)?;
+    let mut command = ProcessCommand::new(launch.program);
+    command.args(launch.prefix_args);
+    Ok(command)
+}
+
+#[cfg(windows)]
+struct WindowsCodexLaunch {
+    program: PathBuf,
+    prefix_args: Vec<OsString>,
+}
+
+#[cfg(windows)]
+fn resolve_windows_codex_launch(search_path: &OsStr) -> Result<WindowsCodexLaunch> {
+    let mut npm_shim_seen = false;
+    for directory in env::split_paths(search_path) {
+        for name in ["codex.exe", "codex.com"] {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Ok(WindowsCodexLaunch {
+                    program: candidate,
+                    prefix_args: Vec::new(),
+                });
+            }
+        }
+
+        for name in ["codex.cmd", "codex.bat"] {
+            let shim = directory.join(name);
+            if !shim.is_file() {
+                continue;
+            }
+            npm_shim_seen = true;
+            let entrypoint = directory.join("node_modules/@openai/codex/bin/codex.js");
+            if !entrypoint.is_file() {
+                continue;
+            }
+            let node = [directory.join("node.exe"), directory.join("node.com")]
+                .into_iter()
+                .find(|candidate| candidate.is_file())
+                .or_else(|| find_windows_program(search_path, &["node.exe", "node.com"]));
+            if let Some(node) = node {
+                return Ok(WindowsCodexLaunch {
+                    program: node,
+                    prefix_args: vec![entrypoint.into_os_string()],
+                });
+            }
+        }
+    }
+
+    if npm_shim_seen {
+        bail!(
+            "Codex npm command shim was found, but its Node.js entrypoint could not be resolved; reinstall Codex CLI and open a new terminal"
+        );
+    }
+    bail!("Codex executable was not found in PATH; install Codex CLI and open a new terminal")
+}
+
+#[cfg(windows)]
+fn find_windows_program(search_path: &OsStr, names: &[&str]) -> Option<PathBuf> {
+    for directory in env::split_paths(search_path) {
+        for name in names {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Configure Codex's application-local environment for the official VSCode
+/// extension. Unlike `saiai codex`, the extension is not our direct child, so
+/// the proxy variables must live in Codex's own `.env` file. This never
+/// changes the invoking shell or the operating-system environment.
+fn configure_vscode() -> Result<()> {
+    let codex_dir = codex_config_dir().context("failed to resolve Codex config directory")?;
+    fs::create_dir_all(&codex_dir)
+        .with_context(|| format!("failed to create {}", codex_dir.display()))?;
+    let auth_path = codex_dir.join("auth.json");
+    let cfg = read_saiai_config()
+        .context("SAIAI local proxy is not configured; run the SAIAI setup first")?;
+    ensure_codex_local_proxy_auth(&auth_path, Some(&cfg.api_key))?;
+    validate_codex_oauth_auth(&auth_path)?;
+    let _runtime_ca = read_runtime_ca(&cfg)
+        .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
+
+    let files = prepare_codex_oauth_files(&codex_dir, true)?;
+    let env_path = codex_dir.join(".env");
+    write_codex_ide_env(&env_path, &cfg.listen, &cfg.ca_cert_path)?;
+    ensure_local_proxy_running(&cfg.listen)?;
+
+    println!("SAIAI configured the Codex VSCode extension for local proxy mode.");
+    println!("  CODEX_HOME={}", codex_dir.display());
+    println!("  environment={}", env_path.display());
+    println!("  proxy=http://{}", cfg.listen);
+    println!(
+        "  migrated {} Codex config file(s) with backups",
+        files.len()
+    );
+    println!("Restart VSCode (or reload its window) before starting a new Codex session.");
+    println!(
+        "If VSCode has an explicit `http.proxy`, remove it when it overrides the SAIAI proxy."
+    );
+    Ok(())
+}
+
+fn write_codex_ide_env(path: &Path, listen: &str, ca_cert_path: &str) -> Result<()> {
+    let raw = if path.exists() {
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?
+    } else {
+        String::new()
+    };
+    let merged = merge_codex_ide_env(&raw, listen, ca_cert_path);
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S%.9f").to_string();
+    backup_if_exists(path, &timestamp)?;
+    write_bytes_atomic(path, merged.as_bytes(), 0o600)
+}
+
+fn merge_codex_ide_env(raw: &str, listen: &str, ca_cert_path: &str) -> String {
+    let mut kept = Vec::new();
+    let mut in_managed_block = false;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed == CODEX_IDE_ENV_BEGIN {
+            in_managed_block = true;
+            continue;
+        }
+        if trimmed == CODEX_IDE_ENV_END {
+            in_managed_block = false;
+            continue;
+        }
+        if in_managed_block || dotenv_assignment_key(line).is_some_and(is_managed_codex_env) {
+            continue;
+        }
+        kept.push(line);
+    }
+    while kept.last().is_some_and(|line| line.trim().is_empty()) {
+        kept.pop();
+    }
+
+    let proxy = format!("http://{listen}");
+    if !kept.is_empty() {
+        kept.push("");
+    }
+    kept.push(CODEX_IDE_ENV_BEGIN);
+    let mut output = kept.join("\n");
+    for (key, value) in [
+        // Codex loads standard TLS variables from CODEX_HOME/.env before it
+        // constructs the IDE/app-server HTTP clients. Its Codex-specific CA
+        // variable is only reliable when present in the process environment,
+        // which is why the direct CLI launcher still uses that variable.
+        ("SSL_CERT_FILE", ca_cert_path),
+        ("HTTP_PROXY", proxy.as_str()),
+        ("HTTPS_PROXY", proxy.as_str()),
+        ("ALL_PROXY", proxy.as_str()),
+        ("NO_PROXY", CODEX_LOCAL_PROXY_NO_PROXY),
+        ("http_proxy", proxy.as_str()),
+        ("https_proxy", proxy.as_str()),
+        ("all_proxy", proxy.as_str()),
+        ("no_proxy", CODEX_LOCAL_PROXY_NO_PROXY),
+    ] {
+        output.push('\n');
+        output.push_str(key);
+        output.push('=');
+        output.push_str(&serde_json::to_string(value).expect("string serialization cannot fail"));
+    }
+    output.push('\n');
+    output.push_str(CODEX_IDE_ENV_END);
+    output.push('\n');
+    output
+}
+
+fn dotenv_assignment_key(line: &str) -> Option<&str> {
+    let mut assignment = line.trim_start();
+    if let Some(rest) = assignment.strip_prefix("export ") {
+        assignment = rest.trim_start();
+    }
+    let (key, _) = assignment.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|character| character == '_' || character.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some(key)
+}
+
+fn is_managed_codex_env(key: &str) -> bool {
+    CODEX_MANAGED_ENV
+        .iter()
+        .any(|candidate| key.eq_ignore_ascii_case(candidate))
+}
+
+fn codex_launcher_args(args: &[String]) -> Vec<String> {
+    let mut launch_args = Vec::with_capacity(args.len() + 6);
+    if !codex_args_override_feature(args, "respect_system_proxy") {
+        launch_args.push("-c".to_string());
+        launch_args.push(format!(
+            "features.respect_system_proxy={}",
+            codex_respect_system_proxy_enabled()
+        ));
+    }
+    // Codex defaults OTEL metrics to its hosted Statsig endpoint at
+    // ab.chatgpt.com. That non-model control plane can be unreachable on the
+    // same networks that require SAIAI and should not delay or add errors to
+    // a local-proxy model session. Keep this child-only and honor an explicit
+    // caller override.
+    if !codex_args_override_config_key(args, "otel.metrics_exporter") {
+        launch_args.push("-c".to_string());
+        launch_args.push("otel.metrics_exporter=\"none\"".to_string());
+    }
+    // A synthetic SAIAI identity cannot authenticate Codex's hosted Apps MCP
+    // endpoint. Disable that optional control plane for this launcher so it
+    // does not emit a misleading startup failure. A caller can explicitly
+    // re-enable it and that later argument wins.
+    if !codex_args_override_feature(args, "apps") {
+        launch_args.push("-c".to_string());
+        launch_args.push("features.apps=false".to_string());
+    }
+    launch_args.extend(args.iter().cloned());
+    launch_args
+}
+
+fn codex_respect_system_proxy_enabled() -> bool {
+    // On Windows and macOS the feature gives platform system-proxy discovery
+    // precedence over HTTP_PROXY/HTTPS_PROXY. A DIRECT system decision
+    // therefore bypasses the child-only SAIAI proxy environment. Reqwest and
+    // Tungstenite both honor those variables in transport-default mode.
+    cfg!(target_os = "linux")
+}
+
+fn codex_args_override_feature(args: &[String], feature: &str) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let value = if arg == "-c" || arg == "--config" || arg == "--enable" || arg == "--disable" {
+            i += 1;
+            args.get(i).map(String::as_str)
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            Some(value)
+        } else if let Some(value) = arg.strip_prefix("--enable=") {
+            Some(value)
+        } else {
+            arg.strip_prefix("--disable=")
+        };
+
+        if value.is_some_and(|value| {
+            let key = value.split_once('=').map_or(value, |(key, _)| key).trim();
+            key == feature || key == format!("features.{feature}")
+        }) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn codex_args_override_config_key(args: &[String], expected_key: &str) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let value = if arg == "-c" || arg == "--config" {
+            i += 1;
+            args.get(i).map(String::as_str)
+        } else {
+            arg.strip_prefix("--config=")
+        };
+        if value.is_some_and(|value| {
+            value.split_once('=').map_or(value, |(key, _)| key).trim() == expected_key
+        }) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn ensure_codex_local_proxy_auth(path: &Path, expected_legacy_api_key: Option<&str>) -> Result<()> {
+    let existed = path.exists();
+    let mut auth = if existed {
+        load_json_object(path)?
+    } else {
+        Map::new()
+    };
+    if existed {
+        let existing_access = auth
+            .get("tokens")
+            .and_then(Value::as_object)
+            .and_then(|tokens| tokens.get("access_token"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let managed_legacy_api_key = existing_access.is_empty()
+            && expected_legacy_api_key.is_some_and(|expected| {
+                !expected.is_empty()
+                    && auth
+                        .get("OPENAI_API_KEY")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value == expected)
+            });
+        if !existing_access.starts_with("saiai-local-proxy-placeholder-") && !managed_legacy_api_key
+        {
+            return Ok(());
+        }
+    }
+
+    auth.insert(
+        "auth_mode".to_string(),
+        // Codex owns refresh-token rotation in `chatgpt` mode. SAIAI's
+        // synthetic local identity is supplied by an external host and must
+        // never be sent to the provider refresh endpoint, so use Codex's
+        // dedicated external-token mode instead.
+        Value::String("chatgptAuthTokens".to_string()),
+    );
+    auth.insert(
+        "tokens".to_string(),
+        serde_json::json!({
+            "id_token": CODEX_PLACEHOLDER_ID_TOKEN,
+            "access_token": CODEX_PLACEHOLDER_ACCESS_TOKEN,
+            "refresh_token": "",
+            "account_id": CODEX_PLACEHOLDER_ACCOUNT_ID
+        }),
+    );
+    auth.insert("OPENAI_API_KEY".to_string(), Value::Null);
+    auth.insert(
+        "last_refresh".to_string(),
+        Value::String(Utc::now().to_rfc3339()),
+    );
+    write_json_object(path, Value::Object(auth)).with_context(|| {
+        format!(
+            "failed to create local-proxy OAuth auth file {}; the placeholder is only safe when the local proxy is active",
+            path.display()
+        )
+    })?;
+    let verb = if existed { "Updated" } else { "Created" };
+    println!(
+        "{verb} local-proxy OAuth auth placeholder at {} (no provider login required).",
+        path.display()
+    );
+    Ok(())
+}
+
+fn run_desktop(args: &[String]) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        run_linux_desktop(args)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = args;
+        bail!("SAIAI Desktop integration is currently implemented for Linux only");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_desktop(args: &[String]) -> Result<()> {
+    let cfg = read_saiai_config().context("SAIAI local proxy is not configured")?;
+    let _runtime_ca = read_runtime_ca(&cfg)
+        .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
+    ensure_local_proxy_running(&cfg.listen)?;
+
+    let source_codex = codex_config_dir()?;
+    let desktop_root = saiai_config_dir()?.join("desktop");
+    let desktop_home = desktop_root.join("home");
+    let desktop_codex = desktop_root.join("codex");
+    let desktop_user_data = desktop_root.join("user-data");
+    fs::create_dir_all(&desktop_codex)
+        .with_context(|| format!("failed to create {}", desktop_codex.display()))?;
+    fs::create_dir_all(&desktop_user_data)
+        .with_context(|| format!("failed to create {}", desktop_user_data.display()))?;
+    ensure_desktop_oauth_auth(
+        &source_codex.join("auth.json"),
+        &desktop_codex.join("auth.json"),
+    )?;
+    validate_codex_oauth_auth(&desktop_codex.join("auth.json"))?;
+    write_desktop_account_id(&desktop_codex.join("auth.json"), &desktop_root)?;
+    prepare_desktop_onboarding_state(&desktop_codex)?;
+    ensure_desktop_nss_ca(&desktop_home, &cfg.ca_cert_path)?;
+
+    let executable = env::var_os("SAIAI_CHATGPT_BIN")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            ["/usr/bin/chatgpt", "/usr/lib/chatgpt/ChatGPT"]
+                .iter()
+                .map(PathBuf::from)
+                .find(|path| path.is_file())
+        })
+        .context("ChatGPT Desktop was not found; install the ChatGPT Desktop package first")?;
+    let fixed_timezone = resolve_chatgpt_timezone()?;
+
+    let mut launch_args = vec![format!("--user-data-dir={}", desktop_user_data.display())];
+    launch_args.extend(args.iter().cloned());
+    let proxy = format!("http://{}", cfg.listen);
+    let mut command = ProcessCommand::new(&executable);
+    command.args(launch_args);
+    for name in CODEX_MANAGED_ENV {
+        command.env_remove(*name);
+    }
+    // Do not pass the SAIAI control variable into Electron. If configured,
+    // apply the validated IANA timezone only to this Desktop child process.
+    command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV);
+    command
+        .env("HOME", &desktop_home)
+        .env("USERPROFILE", &desktop_home)
+        .env("CODEX_HOME", &desktop_codex)
+        .env("CODEX_ELECTRON_USER_DATA_PATH", &desktop_user_data)
+        .env("CODEX_CA_CERTIFICATE", &cfg.ca_cert_path)
+        .env("NSS_DEFAULT_DB_TYPE", "sql")
+        .env("HTTP_PROXY", &proxy)
+        .env("HTTPS_PROXY", &proxy)
+        .env("ALL_PROXY", &proxy)
+        .env("NO_PROXY", CODEX_LOCAL_PROXY_NO_PROXY)
+        .env("http_proxy", &proxy)
+        .env("https_proxy", &proxy)
+        .env("all_proxy", &proxy)
+        .env("no_proxy", CODEX_LOCAL_PROXY_NO_PROXY);
+    if let Some(timezone) = &fixed_timezone {
+        command.env("TZ", timezone);
+    }
+
+    println!("Starting ChatGPT Desktop through the SAIAI local proxy.");
+    println!("  CODEX_HOME={}", desktop_codex.display());
+    println!("  user-data-dir={}", desktop_user_data.display());
+    println!("  proxy={proxy}");
+    if let Some(timezone) = &fixed_timezone {
+        println!("  timezone={timezone} (Desktop child only)");
+    }
+    let status = command
+        .status()
+        .with_context(|| format!("failed to start {}", executable.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("ChatGPT Desktop exited with {status}")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_chatgpt_timezone() -> Result<Option<String>> {
+    let raw = env::var_os(SAIAI_CHATGPT_TIMEZONE_ENV);
+    let Some(raw) = raw else {
+        return resolve_chatgpt_timezone_value(None);
+    };
+    let value = raw
+        .to_str()
+        .context("SAIAI_CHATGPT_TIMEZONE must be valid UTF-8")?
+        .trim();
+    resolve_chatgpt_timezone_value(Some(value))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_chatgpt_timezone_value(value: Option<&str>) -> Result<Option<String>> {
+    let value = value.unwrap_or(DEFAULT_CHATGPT_TIMEZONE).trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.eq_ignore_ascii_case("system") {
+        return Ok(None);
+    }
+    validate_chatgpt_timezone(value)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_chatgpt_timezone(value: &str) -> Result<Option<String>> {
+    if value.len() > 128
+        || value.starts_with('/')
+        || value.contains('\\')
+        || value
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '+' | '-' | '.'))
+    {
+        bail!("{SAIAI_CHATGPT_TIMEZONE_ENV} must be an IANA timezone such as America/Los_Angeles");
+    }
+    let zoneinfo_path = Path::new("/usr/share/zoneinfo").join(value);
+    let metadata = fs::metadata(&zoneinfo_path).with_context(|| {
+        format!(
+            "{SAIAI_CHATGPT_TIMEZONE_ENV} does not exist in {}",
+            zoneinfo_path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        bail!(
+            "{SAIAI_CHATGPT_TIMEZONE_ENV} is not a zoneinfo file: {}",
+            zoneinfo_path.display()
+        );
+    }
+    Ok(Some(value.to_string()))
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_desktop_oauth_auth(source: &Path, target: &Path) -> Result<()> {
+    if target.exists() {
+        let existing = load_json_object(target).ok();
+        let placeholder = existing
+            .as_ref()
+            .and_then(|auth| auth.get("tokens"))
+            .and_then(Value::as_object)
+            .and_then(|tokens| tokens.get("access_token"))
+            .and_then(Value::as_str)
+            .is_some_and(|token| token.starts_with("saiai-local-proxy-placeholder-"));
+        if !placeholder {
+            return Ok(());
+        }
+    }
+    if !source.exists() {
+        bail!(
+            "Desktop login requires an existing ChatGPT OAuth auth.json at {}; run the official Codex login once, then retry",
+            source.display()
+        );
+    }
+    validate_codex_oauth_auth(source)?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::copy(source, target).with_context(|| {
+        format!(
+            "failed to copy OAuth auth.json from {} to {}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(target, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to protect {}", target.display()))?;
+    println!("Copied existing ChatGPT OAuth state into the isolated Desktop CODEX_HOME.");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_desktop_nss_ca(home: &Path, ca_cert: &str) -> Result<()> {
+    let db_dir = home.join(".pki/nssdb");
+    fs::create_dir_all(&db_dir)
+        .with_context(|| format!("failed to create {}", db_dir.display()))?;
+    let db = format!("sql:{}", db_dir.display());
+    let cert_db = db_dir.join("cert9.db");
+    if !cert_db.exists() {
+        let status = ProcessCommand::new("certutil")
+            .args(["-N", "-d", &db, "--empty-password"])
+            .status()
+            .context("failed to initialize the Desktop NSS database")?;
+        if !status.success() {
+            bail!("certutil failed to initialize the Desktop NSS database");
+        }
+    }
+    let _ = ProcessCommand::new("certutil")
+        .args(["-D", "-d", &db, "-n", "saiai-local-proxy"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let status = ProcessCommand::new("certutil")
+        .args([
+            "-A",
+            "-d",
+            &db,
+            "-n",
+            "saiai-local-proxy",
+            "-t",
+            "C,,",
+            "-a",
+            "-i",
+            ca_cert,
+        ])
+        .status()
+        .context("failed to import the SAIAI CA into the Desktop NSS database")?;
+    if !status.success() {
+        bail!("certutil failed to import the SAIAI CA into the Desktop NSS database");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_desktop_onboarding_state(codex_home: &Path) -> Result<()> {
+    let path = codex_home.join(".codex-global-state.json");
+    let mut root = if path.exists() {
+        Value::Object(load_json_object(&path)?)
+    } else {
+        Value::Object(Map::new())
+    };
+    let object = root
+        .as_object_mut()
+        .context("Desktop global state must contain a JSON object")?;
+    let atom_state = object
+        .entry("electron-persisted-atom-state".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let atom_state = atom_state
+        .as_object_mut()
+        .context("Desktop persisted atom state must contain a JSON object")?;
+    atom_state.insert(
+        "electron:onboarding-projectless-completed".to_string(),
+        Value::Bool(true),
+    );
+    atom_state.insert(
+        "electron:onboarding-hide-first-new-thread-promos".to_string(),
+        Value::Bool(true),
+    );
+    write_json_object(&path, root).with_context(|| {
+        format!(
+            "failed to prepare Desktop onboarding state {}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn write_desktop_account_id(auth_path: &Path, desktop_root: &Path) -> Result<()> {
+    let auth = load_json_object(auth_path)?;
+    let account_id = auth
+        .get("tokens")
+        .and_then(Value::as_object)
+        .and_then(|tokens| tokens.get("account_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .context("Desktop OAuth auth.json has no account_id")?;
+    let path = desktop_root.join("account-id");
+    write_bytes_atomic(&path, account_id.as_bytes(), 0o600).with_context(|| {
+        format!(
+            "failed to write Desktop account identity {}",
+            path.display()
+        )
+    })
+}
+
+fn validate_codex_oauth_auth(path: &Path) -> Result<()> {
+    let auth = load_json_object(path)
+        .with_context(|| format!("failed to load OAuth auth file {}", path.display()))?;
+    let auth_mode = auth.get("auth_mode").and_then(Value::as_str).unwrap_or("");
+    if !matches!(auth_mode, "chatgpt" | "chatgptAuthTokens") {
+        bail!(
+            "{} is not in ChatGPT token mode; first-phase `saiai codex` does not accept API-key-only auth",
+            path.display()
+        );
+    }
+    let access_token = auth
+        .get("tokens")
+        .and_then(Value::as_object)
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if access_token.trim().is_empty() {
+        bail!(
+            "{} has no ChatGPT OAuth access token; run `codex login` before `saiai codex`",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn prepare_codex_oauth_files(codex_dir: &Path, persist_system_proxy: bool) -> Result<Vec<PathBuf>> {
+    let config_path = codex_dir.join("config.toml");
+    let auth_path = codex_dir.join("auth.json");
+    let mut documents = Vec::new();
+
+    let raw = if config_path.exists() {
+        fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?
+    } else {
+        String::new()
+    };
+    let document = if raw.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        raw.parse::<DocumentMut>().with_context(|| {
+            format!(
+                "failed to parse {} as TOML; no file was modified",
+                config_path.display()
+            )
+        })?
+    };
+    documents.push((config_path.clone(), document));
+
+    if codex_dir.is_dir() {
+        for entry in fs::read_dir(codex_dir)
+            .with_context(|| format!("failed to list {}", codex_dir.display()))?
+        {
+            let path = entry?.path();
+            if path == config_path
+                || !path.is_file()
+                || !path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".config.toml"))
+            {
+                continue;
+            }
+            let raw = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let document = raw.parse::<DocumentMut>().with_context(|| {
+                format!(
+                    "failed to parse {} as TOML; no file was modified",
+                    path.display()
+                )
+            })?;
+            documents.push((path, document));
+        }
+    }
+
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S%.9f").to_string();
+    backup_if_exists(&config_path, &timestamp)?;
+    backup_if_exists(&auth_path, &timestamp)?;
+    for (path, _) in &documents {
+        if path != &config_path {
+            backup_if_exists(path, &timestamp)?;
+        }
+    }
+
+    let mut written = Vec::with_capacity(documents.len());
+    for (path, mut document) in documents {
+        clean_codex_oauth_document(&mut document);
+        if persist_system_proxy {
+            enable_codex_system_proxy(&mut document, &path)?;
+        }
+        write_bytes_atomic(path.as_path(), document.to_string().as_bytes(), 0o600)?;
+        written.push(path);
+    }
+
+    let mut auth = load_json_object(&auth_path)?;
+    // Keep the OAuth token object intact. A null API-key field matches Codex's
+    // normal OAuth shape while preventing API-key precedence in mixed installs.
+    auth.insert("OPENAI_API_KEY".to_string(), Value::Null);
+    write_json_object(&auth_path, Value::Object(auth))?;
+    Ok(written)
+}
+
+fn enable_codex_system_proxy(document: &mut DocumentMut, path: &Path) -> Result<()> {
+    match document.get("features") {
+        None => document["features"] = Item::Table(Table::new()),
+        Some(item) if item.is_table() => {}
+        Some(_) => bail!(
+            "{} has a `features` entry that is not a table; refusing to overwrite (backup is preserved)",
+            path.display()
+        ),
+    }
+    document["features"]
+        .as_table_mut()
+        .expect("features ensured to be a table")
+        .insert(
+            "respect_system_proxy",
+            value(codex_respect_system_proxy_enabled()),
+        );
+    Ok(())
+}
+
+fn clean_codex_oauth_document(document: &mut DocumentMut) {
+    document["model_provider"] = value("openai");
+    for key in ["base_url", "openai_base_url", "chatgpt_base_url"] {
+        document.as_table_mut().remove(key);
+    }
+    // A custom provider can override the built-in endpoint even when the root
+    // provider looks harmless. The explicit `saiai codex` migration removes
+    // the whole table after backup, as requested by the managed mode.
+    document.as_table_mut().remove("model_providers");
+
+    // Let the built-in OpenAI provider keep its official Responses transport
+    // defaults. The local proxy supports both HTTP fallback and WebSocket.
+    if !document.get("features").is_some_and(Item::is_table) {
+        return;
+    }
+    let features = document["features"]
+        .as_table_mut()
+        .expect("features table created above");
+    features.remove("responses_websockets");
+    features.remove("responses_websockets_v2");
+    if features.is_empty() {
+        document.as_table_mut().remove("features");
+    }
+}
+
+fn ensure_local_proxy_running(listen: &str) -> Result<()> {
+    let addr = listen
+        .parse::<SocketAddr>()
+        .with_context(|| format!("invalid local proxy listen address {listen}"))?;
+    if TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
+        return Ok(());
+    }
+    run_service_start().context("failed to start the SAIAI local proxy")?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    bail!("SAIAI local proxy did not become reachable at {listen}")
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -537,6 +1578,12 @@ struct SaiaiConfig {
     ca_cert_path: String,
     #[serde(default)]
     ca_key_path: String,
+    #[serde(default = "default_true")]
+    chatgpt_chat_passthrough: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -596,6 +1643,7 @@ fn run_local_proxy(verbose: bool) -> Result<()> {
         ca_cert_pem,
         ca_key_pem,
         verbose,
+        chatgpt_chat_passthrough: cfg.chatgpt_chat_passthrough,
     }))
 }
 
@@ -3752,12 +4800,16 @@ fn saiai_config_path() -> Result<PathBuf> {
 
 fn write_saiai_config(config: &SaiaiConfig) -> Result<()> {
     let path = saiai_config_path()?;
+    write_saiai_config_at(&path, config)
+}
+
+fn write_saiai_config_at(path: &Path, config: &SaiaiConfig) -> Result<()> {
     let parent = path
         .parent()
         .context("failed to resolve SAIAI config parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
     let value = serde_json::to_value(config).context("failed to serialize SAIAI config")?;
-    write_json_object(&path, value)
+    write_json_object(path, value)
 }
 
 fn read_saiai_config() -> Result<SaiaiConfig> {
@@ -4206,6 +5258,27 @@ mod tests {
         fs::read_to_string(path).unwrap()
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn resolves_only_executable_unix_codex_candidates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let candidate = dir.path().join("codex");
+        write_str(&candidate, "#!/bin/sh\nexit 0\n");
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            find_unix_executable(&[dir.path().to_path_buf()], "codex"),
+            None
+        );
+
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            find_unix_executable(&[dir.path().to_path_buf()], "codex"),
+            Some(candidate)
+        );
+    }
+
     fn parse(path: &Path) -> DocumentMut {
         read_str(path).parse::<DocumentMut>().unwrap()
     }
@@ -4249,6 +5322,197 @@ mod tests {
                 "expected supports_websockets to be absent when websockets=false",
             );
         }
+    }
+
+    #[test]
+    fn cleans_third_party_codex_routes_for_oauth_launcher() {
+        let mut doc = r#"
+model_provider = "third_party"
+openai_base_url = "https://third-party.example/v1"
+chatgpt_base_url = "https://another.example"
+base_url = "https://legacy.example"
+
+[features]
+other_flag = true
+responses_websockets = true
+responses_websockets_v2 = true
+
+[model_providers.third_party]
+name = "third_party"
+base_url = "https://third-party.example/v1"
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+
+        clean_codex_oauth_document(&mut doc);
+
+        assert_eq!(doc["model_provider"].as_str(), Some("openai"));
+        for key in ["base_url", "openai_base_url", "chatgpt_base_url"] {
+            assert!(doc.get(key).is_none(), "{key} should be removed");
+        }
+        assert!(doc.get("model_providers").is_none());
+        assert_eq!(doc["features"]["other_flag"].as_bool(), Some(true));
+        assert!(doc["features"].get("responses_websockets").is_none());
+        assert!(doc["features"].get("responses_websockets_v2").is_none());
+    }
+
+    #[test]
+    fn configures_platform_proxy_mode_for_codex_ide() {
+        let mut doc = r#"
+model_provider = "third_party"
+
+[features]
+other_flag = true
+responses_websockets_v2 = true
+
+[model_providers.third_party]
+base_url = "https://third-party.example/v1"
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+        let path = Path::new("config.toml");
+
+        clean_codex_oauth_document(&mut doc);
+        enable_codex_system_proxy(&mut doc, path).unwrap();
+
+        assert_eq!(doc["model_provider"].as_str(), Some("openai"));
+        assert!(doc.get("model_providers").is_none());
+        assert_eq!(doc["features"]["other_flag"].as_bool(), Some(true));
+        assert_eq!(
+            doc["features"]["respect_system_proxy"].as_bool(),
+            Some(codex_respect_system_proxy_enabled())
+        );
+        assert!(doc["features"].get("responses_websockets_v2").is_none());
+    }
+
+    #[test]
+    fn codex_ide_env_replaces_conflicts_and_preserves_unrelated_values() {
+        let raw = r#"# user comment
+USER_SETTING=keep-me
+export HTTP_PROXY=https://old-proxy.example
+CUSTOM_BASE_URL=https://unrelated.example/v1
+OPENAI_API_KEY=remove-me
+
+# BEGIN SAIAI CODEX IDE (managed)
+HTTPS_PROXY="http://127.0.0.1:1111"
+# END SAIAI CODEX IDE (managed)
+"#;
+
+        let merged = merge_codex_ide_env(raw, "127.0.0.1:19908", "/tmp/SAIAI CA/saiai-ca.crt");
+
+        assert!(merged.contains("# user comment\nUSER_SETTING=keep-me"));
+        assert!(!merged.contains("old-proxy"));
+        assert!(!merged.contains("remove-me"));
+        assert!(merged.contains("CUSTOM_BASE_URL=https://unrelated.example/v1"));
+        assert_eq!(merged.matches(CODEX_IDE_ENV_BEGIN).count(), 1);
+        assert_eq!(merged.matches(CODEX_IDE_ENV_END).count(), 1);
+        assert!(merged.contains("HTTP_PROXY=\"http://127.0.0.1:19908\""));
+        assert!(merged.contains("http_proxy=\"http://127.0.0.1:19908\""));
+        assert!(merged.contains("SSL_CERT_FILE=\"/tmp/SAIAI CA/saiai-ca.crt\""));
+        assert!(!merged.contains("OPENAI_API_KEY="));
+        assert_eq!(
+            merge_codex_ide_env(&merged, "127.0.0.1:19908", "/tmp/SAIAI CA/saiai-ca.crt",),
+            merged
+        );
+    }
+
+    #[test]
+    fn accepts_chatgpt_managed_and_external_token_auth_for_codex_launcher() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        write_str(
+            &path,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"oauth-test"}}"#,
+        );
+        validate_codex_oauth_auth(&path).unwrap();
+
+        write_str(
+            &path,
+            r#"{"auth_mode":"chatgptAuthTokens","tokens":{"access_token":"external-oauth-test"}}"#,
+        );
+        validate_codex_oauth_auth(&path).unwrap();
+
+        write_str(&path, r#"{"OPENAI_API_KEY":"sk-test"}"#);
+        assert!(validate_codex_oauth_auth(&path).is_err());
+    }
+
+    #[test]
+    fn creates_and_upgrades_app_server_shaped_codex_placeholder_auth() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        ensure_codex_local_proxy_auth(&path, None).unwrap();
+
+        let created = load_json_object(&path).unwrap();
+        let created_tokens = created["tokens"].as_object().unwrap();
+        assert_eq!(created["auth_mode"].as_str(), Some("chatgptAuthTokens"));
+        assert_eq!(created["OPENAI_API_KEY"], Value::Null);
+        assert_eq!(
+            created_tokens["access_token"].as_str(),
+            Some(CODEX_PLACEHOLDER_ACCESS_TOKEN)
+        );
+        assert_eq!(created_tokens["refresh_token"].as_str(), Some(""));
+        assert_eq!(
+            created_tokens["id_token"]
+                .as_str()
+                .unwrap()
+                .split('.')
+                .count(),
+            3
+        );
+        assert!(
+            created["last_refresh"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty())
+        );
+
+        write_str(
+            &path,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"saiai-local-proxy-placeholder-old","refresh_token":"old","account_id":"old"},"unrelated":"keep"}"#,
+        );
+        ensure_codex_local_proxy_auth(&path, None).unwrap();
+        let upgraded = load_json_object(&path).unwrap();
+        assert_eq!(upgraded["unrelated"].as_str(), Some("keep"));
+        assert_eq!(upgraded["auth_mode"].as_str(), Some("chatgptAuthTokens"));
+        assert_eq!(
+            upgraded["tokens"]["id_token"].as_str(),
+            Some(CODEX_PLACEHOLDER_ID_TOKEN)
+        );
+    }
+
+    #[test]
+    fn upgrades_only_matching_legacy_saiai_api_key_auth() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        write_str(&path, r#"{"OPENAI_API_KEY":"TEST_ONLY_MANAGED_KEY"}"#);
+
+        ensure_codex_local_proxy_auth(&path, Some("TEST_ONLY_MANAGED_KEY")).unwrap();
+        let upgraded = load_json_object(&path).unwrap();
+        assert_eq!(upgraded["auth_mode"].as_str(), Some("chatgptAuthTokens"));
+        assert_eq!(
+            upgraded["tokens"]["access_token"].as_str(),
+            Some(CODEX_PLACEHOLDER_ACCESS_TOKEN)
+        );
+        assert_eq!(upgraded["OPENAI_API_KEY"], Value::Null);
+
+        write_str(&path, r#"{"OPENAI_API_KEY":"TEST_ONLY_UNRELATED_KEY"}"#);
+        ensure_codex_local_proxy_auth(&path, Some("TEST_ONLY_MANAGED_KEY")).unwrap();
+        assert_eq!(
+            load_json_object(&path).unwrap()["OPENAI_API_KEY"].as_str(),
+            Some("TEST_ONLY_UNRELATED_KEY")
+        );
+        assert!(validate_codex_oauth_auth(&path).is_err());
+    }
+
+    #[test]
+    fn preserves_existing_real_codex_oauth_auth() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        let real = r#"{"auth_mode":"chatgpt","tokens":{"id_token":"real.id.token","access_token":"real-access","refresh_token":"real-refresh","account_id":"real-account"},"last_refresh":"2026-09-09T00:00:00Z"}"#;
+        write_str(&path, real);
+
+        ensure_codex_local_proxy_auth(&path, Some("TEST_ONLY_MANAGED_KEY")).unwrap();
+
+        assert_eq!(read_str(&path), real);
     }
 
     fn json_str<'a>(map: &'a Map<String, Value>, key: &str) -> &'a str {
@@ -4328,6 +5592,238 @@ mod tests {
             Command::Version => {}
             _ => panic!("expected version command"),
         }
+    }
+
+    #[test]
+    fn parses_codex_launcher_arguments_without_consuming_them() {
+        let args = [
+            "codex".to_string(),
+            "--".to_string(),
+            "app-server".to_string(),
+            "--stdio".to_string(),
+        ];
+        match parse_command(&args).unwrap() {
+            Command::Codex(codex_args) => assert_eq!(
+                codex_args,
+                vec!["app-server".to_string(), "--stdio".to_string()]
+            ),
+            _ => panic!("expected codex launcher command"),
+        }
+    }
+
+    #[test]
+    fn parses_vscode_configuration_command_without_arguments() {
+        assert!(matches!(
+            parse_command(&["vscode".to_string()]).unwrap(),
+            Command::VSCode
+        ));
+        assert!(parse_command(&["vscode".to_string(), "extra".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parses_desktop_launcher_aliases_without_consuming_arguments() {
+        for command in ["desktop", "chatgpt"] {
+            let args = vec![command.to_string(), "--".to_string(), "--help".to_string()];
+            match parse_command(&args).unwrap() {
+                Command::Desktop(desktop_args) => {
+                    assert_eq!(desktop_args, vec!["--help".to_string()]);
+                }
+                _ => panic!("expected Desktop launcher command"),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validates_optional_chatgpt_timezone() {
+        assert_eq!(
+            resolve_chatgpt_timezone_value(None).unwrap().as_deref(),
+            Some(DEFAULT_CHATGPT_TIMEZONE)
+        );
+        assert_eq!(
+            resolve_chatgpt_timezone_value(Some("system")).unwrap(),
+            None
+        );
+        let resolved =
+            validate_chatgpt_timezone("America/Los_Angeles").expect("valid zoneinfo timezone");
+        assert_eq!(resolved.as_deref(), Some("America/Los_Angeles"));
+
+        assert!(validate_chatgpt_timezone("../etc/passwd").is_err());
+        assert!(validate_chatgpt_timezone("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn existing_saiai_config_defaults_chatgpt_passthrough_on() {
+        let config: SaiaiConfig = serde_json::from_value(serde_json::json!({
+            "version": SAIAI_CONFIG_VERSION,
+            "base_url": "https://gateway.example.test",
+            "api_key": "TEST_ONLY_KEY",
+            "listen": "127.0.0.1:19908",
+            "ca_cert_path": "/tmp/test-ca.crt",
+            "ca_key_path": "/tmp/test-ca.key"
+        }))
+        .unwrap();
+        assert!(config.chatgpt_chat_passthrough);
+    }
+
+    #[test]
+    fn init_codex_prepares_standalone_local_proxy_config() {
+        let temporary = tempfile::tempdir().unwrap();
+        let args = InitArgs {
+            base_url: "https://gateway.example.test/v1".to_string(),
+            api_key: "TEST_ONLY_CODEX_PROXY_KEY".to_string(),
+            websockets: false,
+        };
+
+        let initialized =
+            initialize_codex_local_proxy_at(temporary.path(), &args, "test-create").unwrap();
+        let config: SaiaiConfig =
+            serde_json::from_slice(&fs::read(&initialized.config_path).unwrap()).unwrap();
+
+        assert_eq!(config.version, SAIAI_CONFIG_VERSION);
+        assert_eq!(config.base_url, "https://gateway.example.test");
+        assert_eq!(config.api_key, args.api_key);
+        assert_eq!(config.listen, DEFAULT_LOCAL_PROXY_LISTEN);
+        assert_eq!(
+            config.ca_cert_path,
+            initialized.ca_cert_path.display().to_string()
+        );
+        assert_eq!(
+            config.ca_key_path,
+            initialized.ca_key_path.display().to_string()
+        );
+        assert!(config.chatgpt_chat_passthrough);
+        read_runtime_ca(&config).unwrap();
+    }
+
+    #[test]
+    fn codex_proxy_gateway_root_strips_only_terminal_v1() {
+        assert_eq!(
+            codex_proxy_gateway_root("https://gateway.example.test/v1").unwrap(),
+            "https://gateway.example.test"
+        );
+        assert_eq!(
+            codex_proxy_gateway_root("https://gateway.example.test/prefix/v1").unwrap(),
+            "https://gateway.example.test/prefix"
+        );
+        assert_eq!(
+            codex_proxy_gateway_root("https://gateway.example.test/prefix").unwrap(),
+            "https://gateway.example.test/prefix"
+        );
+    }
+
+    #[test]
+    fn init_codex_reuses_existing_proxy_ca_and_local_preferences() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first_args = InitArgs {
+            base_url: "https://first.example.test".to_string(),
+            api_key: "TEST_ONLY_FIRST_CODEX_PROXY_KEY".to_string(),
+            websockets: false,
+        };
+        let first =
+            initialize_codex_local_proxy_at(temporary.path(), &first_args, "test-first").unwrap();
+        let cert_before = fs::read(&first.ca_cert_path).unwrap();
+        let key_before = fs::read(&first.ca_key_path).unwrap();
+        let mut config: SaiaiConfig =
+            serde_json::from_slice(&fs::read(&first.config_path).unwrap()).unwrap();
+        config.listen = "127.0.0.1:29908".to_string();
+        config.chatgpt_chat_passthrough = false;
+        write_saiai_config_at(&first.config_path, &config).unwrap();
+
+        let second_args = InitArgs {
+            base_url: "https://second.example.test".to_string(),
+            api_key: "TEST_ONLY_SECOND_CODEX_PROXY_KEY".to_string(),
+            websockets: true,
+        };
+        let second =
+            initialize_codex_local_proxy_at(temporary.path(), &second_args, "test-second").unwrap();
+        let updated: SaiaiConfig =
+            serde_json::from_slice(&fs::read(&second.config_path).unwrap()).unwrap();
+
+        assert_eq!(second.ca_cert_path, first.ca_cert_path);
+        assert_eq!(second.ca_key_path, first.ca_key_path);
+        assert_eq!(fs::read(&second.ca_cert_path).unwrap(), cert_before);
+        assert_eq!(fs::read(&second.ca_key_path).unwrap(), key_before);
+        assert_eq!(updated.base_url, second_args.base_url);
+        assert_eq!(updated.api_key, second_args.api_key);
+        assert_eq!(updated.listen, "127.0.0.1:29908");
+        assert!(!updated.chatgpt_chat_passthrough);
+    }
+
+    #[test]
+    fn codex_launcher_enables_child_only_system_proxy_support() {
+        let args = vec!["exec".to_string(), "probe".to_string()];
+        assert_eq!(
+            codex_launcher_args(&args),
+            vec![
+                "-c".to_string(),
+                format!(
+                    "features.respect_system_proxy={}",
+                    codex_respect_system_proxy_enabled()
+                ),
+                "-c".to_string(),
+                "otel.metrics_exporter=\"none\"".to_string(),
+                "-c".to_string(),
+                "features.apps=false".to_string(),
+                "exec".to_string(),
+                "probe".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_launcher_preserves_explicit_feature_overrides() {
+        for args in [
+            vec![
+                "-c".to_string(),
+                "features.respect_system_proxy=false".to_string(),
+            ],
+            vec!["--enable=respect_system_proxy".to_string()],
+            vec!["--disable".to_string(), "respect_system_proxy".to_string()],
+        ] {
+            assert_eq!(
+                codex_launcher_args(&args),
+                [
+                    vec![
+                        "-c".to_string(),
+                        "otel.metrics_exporter=\"none\"".to_string(),
+                        "-c".to_string(),
+                        "features.apps=false".to_string(),
+                    ],
+                    args,
+                ]
+                .concat()
+            );
+        }
+
+        let args = vec![
+            "--enable".to_string(),
+            "apps".to_string(),
+            "exec".to_string(),
+        ];
+        let launch_args = codex_launcher_args(&args);
+        assert!(launch_args.contains(&format!(
+            "features.respect_system_proxy={}",
+            codex_respect_system_proxy_enabled()
+        )));
+        assert!(launch_args.contains(&"otel.metrics_exporter=\"none\"".to_string()));
+        assert!(!launch_args.contains(&"features.apps=false".to_string()));
+        assert!(launch_args.ends_with(&args));
+
+        let args = vec![
+            "--config".to_string(),
+            "otel.metrics_exporter=\"statsig\"".to_string(),
+            "exec".to_string(),
+        ];
+        let launch_args = codex_launcher_args(&args);
+        assert_eq!(
+            launch_args
+                .iter()
+                .filter(|value| value.starts_with("otel.metrics_exporter="))
+                .count(),
+            1
+        );
+        assert!(launch_args.ends_with(&args));
     }
 
     #[test]
