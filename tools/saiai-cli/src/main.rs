@@ -2418,6 +2418,20 @@ fn check_direct_linux_desktop_trust(report: &mut DoctorReport) {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn check_direct_macos_desktop_trust(report: &mut DoctorReport) {
+    // A direct LaunchServices/Dock launch cannot inherit the launcher's
+    // process-specific SPKI pin. Setting a user trust root in Keychain is an
+    // authorization-protected macOS action, so never attempt it from a
+    // non-interactive bootstrap or claim that a certificate merely present in
+    // Keychain is trusted. The managed launcher is deliberately the reliable
+    // no-Keychain fallback.
+    report.warn(
+        "direct macOS Desktop trust",
+        "SAIAI does not modify the login Keychain. A directly launched official App needs a user-approved SAIAI CA trust root; otherwise use `saiai desktop codex` (managed per-process SPKI pin)",
+    );
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn prepare_desktop_onboarding_state(codex_home: &Path) -> Result<()> {
     let path = codex_home.join(".codex-global-state.json");
@@ -3713,6 +3727,8 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
         );
         #[cfg(target_os = "linux")]
         check_direct_linux_desktop_trust(&mut report);
+        #[cfg(target_os = "macos")]
+        check_direct_macos_desktop_trust(&mut report);
     }
 
     if let Some(cfg) = &cfg {

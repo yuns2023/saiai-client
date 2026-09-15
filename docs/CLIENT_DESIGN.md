@@ -162,11 +162,12 @@ Gateway 的 OpenAI `/v1/initialize` 契约，也不是模型流量。当前本�
 当前 launcher 只覆盖由它直接启动的 Codex CLI 子进程。Codex Desktop 和 VSCode
 扩展不是该子进程，不能因为共享 `CODEX_HOME` 就推断它们已继承代理/CA 环境。
 Linux、macOS 和 Windows Desktop 现在有独立的 `saiai desktop`（`saiai chatgpt`
-别名）启动路径。Linux 和显式 `SAIAI_DESKTOP_BIN` 的普通可执行文件使用隔离的
-`CODEX_HOME`/user-data 和进程级代理/CA。官方 macOS `com.openai.codex` bundle 与
-Windows `OpenAI.Codex_*!App` 包则按官方客户端相同的 `codex://threads/new` 协议
-激活；协议激活由 LaunchServices/AppX broker 完成，不能继承 launcher 的临时环境，
-因此这两条路径使用正常 Codex home 中的受管 `.env`、OAuth 占位和
+别名）启动路径。Linux、macOS 和显式 `SAIAI_DESKTOP_BIN` 的普通可执行文件使用隔离的
+`CODEX_HOME`/user-data 和进程级代理/CA。对于官方 macOS `com.openai.codex` bundle，
+launcher 先以隔离 home、loopback 代理和当前 SAIAI 叶证书的 SPKI pin 启动 bundle
+executable，再用 `codex://threads/new` 激活窗口；pin 仅适用于该子进程，不会修改
+Keychain、系统代理或系统环境。Windows `OpenAI.Codex_*!App` 仍由 AppX broker 按
+`codex://threads/new` 协议激活，使用正常 Codex home 的受管 `.env`、OAuth 占位和
 `respect_system_proxy=false`，与 VSCode 路径共享无系统环境修改的代理合同。
 Linux 隔离启动器改写子进程 `HOME` 以避免复用正常 Codex state。若当前 X11 会话未
 导出 `XAUTHORITY`，它仅把调用用户现有且可读的 `~/.Xauthority` 路径传给该子进程；
@@ -189,12 +190,16 @@ InstallLocation 识别包，只停止该安装目录中的 `ChatGPT`/`Codex` 进
 通过 `codex://` 打开当前 workspace，并确认包进程实际出现，不能再把内部 launcher
 stub 的零退出码当作 UI 启动成功。它们不修改系统代理、Keychain 或系统环境。
 
-`saiai desktop` 的 Linux/普通可执行文件仍会把现有 OAuth `auth.json` 复制到 SAIAI
+`saiai desktop` 的 Linux/macOS/普通可执行文件会把现有 OAuth `auth.json` 复制到 SAIAI
 管理的隔离 `CODEX_HOME`，为 Electron/NSS 创建独立 CA 数据库（Linux），并在隔离的
-`.codex-global-state.json` 中标记首次项目引导已完成。官方包路径在正常 Codex home
-写入相同 onboarding 状态。macOS 不会从 Linux NSS 推导 Keychain 行为：当前只保证
-launcher 的进程级 SPKI pin 兜底，不修改 Keychain；直接官方 App 的 TLS/登录控制面
-仍需在真实 macOS 上现场验证。没有可用 OAuth/占位 `auth.json` 时 launcher 会明确报错。
+`.codex-global-state.json` 中标记首次项目引导已完成。macOS 不会从 Linux NSS 推导
+Keychain 行为，也不会静默安装用户信任根：2026-09-15 在 macOS 15.3.1 / ChatGPT Desktop
+26.908.70816 的现场验证中，非交互 `security add-trusted-cert` 被 macOS 以“需要用户交互”
+拒绝；没有该信任根的 direct `open -a ChatGPT` 在 15 秒启动观测中未到达 Codex 模型目录。相同环境的
+`saiai desktop codex` 以进程级 SPKI pin 启动后到达了模型目录（未发送模型请求）。因此 direct
+官方 App 仅在用户已明确授权登录 Keychain 信任 SAIAI CA 时才可能成立，且仍需按版本现场验证；
+否则支持的无弹窗路径是 `saiai desktop codex`。没有可用 OAuth/占位 `auth.json` 时 launcher
+会明确报错。
 
 普通 ChatGPT Chat 的固定时区是 Desktop 子进程设置，不是全局请求改写。默认值为
 `America/Los_Angeles`，也可以设置 `SAIAI_CHATGPT_TIMEZONE` 覆盖；launcher 会校验
