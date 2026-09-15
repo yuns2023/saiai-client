@@ -102,9 +102,14 @@ metrics exporter。SAIAI 网络下该非模型端点可能不可达，因此 lau
 
 `init-codex` 在独立的 `SAIAI_HOME` 中创建或更新本地代理配置和安装 CA，并同步
 `CODEX_HOME/.env` 的 loopback port、`SSL_CERT_FILE` 和 `NO_PROXY`，使同一次 WebUI
-初始化后可直接启动 CLI、VSCode app-server 或 Desktop。它不修改 Claude 配置，并会
-启动或刷新受管本地代理。输入 URL 可以带或不带末尾 `/v1`；本地代理配置只记录
-Gateway root，避免转发时形成 `/v1/v1/*`。
+初始化后可直接启动 CLI 与 VSCode app-server。Linux 还会将安装 CA 刷新到当前用户
+`~/.pki/nssdb` 的唯一 `saiai-local-proxy` 条目，以让直接启动的 Electron Desktop
+信任 loopback MITM；这不写系统信任库，也不触发系统弹窗。该用户级信任会影响同一
+用户使用该 NSS 数据库的应用，因此命令输出会明确披露它；缺少 `certutil`
+（`libnss3-tools`）时，CLI/VSCode 初始化照常完成，但直接 Desktop 必须改用
+`saiai desktop codex`。它不修改 Claude 配置，并会启动或刷新受管本地代理。输入
+URL 可以带或不带末尾 `/v1`；本地代理配置只记录 Gateway root，避免转发时形成
+`/v1/v1/*`。
 初始化会备份后清理旧的 `config.toml` `base_url`、自定义 provider 与 API-key-only
 auth；根 provider 固定为内置 `openai`，不保留 `model_providers.OpenAI` 历史线程
 兼容别名。SAIAI 不管理根 `model`、`review_model`、`model_reasoning_effort` 或模型
@@ -145,8 +150,12 @@ WebSocket 帧、User-Agent、`originator`、session/thread/request id 等头保�
 Desktop 可能使用 `chatgpt.com/backend-api/codex/*` 而不是
 `api.openai.com/v1/*`。代理现在识别这类 managed host，并将 Responses/models
 路径映射到 Gateway 的 `/v1/*` ingress；业务 body 和客户端身份 header 仍保持。
-Desktop/app-server 是否信任代理 CA 仍需独立验证，不能仅凭 CLI 的
-`CODEX_CA_CERTIFICATE` child 环境变量推断。
+Desktop/app-server 的 CA 信任必须独立验证，不能仅凭 CLI 的
+`CODEX_CA_CERTIFICATE` child 环境变量推断。Linux ChatGPT Desktop 26.901.51231 /
+Codex app-server 0.153.4 已实测：用户 NSS 导入后账户控制面从 CA 错误恢复；但该版本
+还会发送未纳入当前 Gateway 合约的 `/v1/initialize` 控制面请求。因此在该窄路径有
+本地 mock 与 Gateway 契约闭环前，`saiai desktop codex` 是 direct Desktop 的可靠兜底，
+不得把成功的账户查询宣称为完整 Desktop 支持。
 
 当前 launcher 只覆盖由它直接启动的 Codex CLI 子进程。Codex Desktop 和 VSCode
 扩展不是该子进程，不能因为共享 `CODEX_HOME` 就推断它们已继承代理/CA 环境。
@@ -174,10 +183,12 @@ InstallLocation 识别包，只停止该安装目录中的 `ChatGPT`/`Codex` 进
 通过 `codex://` 打开当前 workspace，并确认包进程实际出现，不能再把内部 launcher
 stub 的零退出码当作 UI 启动成功。它们不修改系统代理、Keychain 或系统环境。
 
-Linux/普通可执行文件仍会把现有 OAuth `auth.json` 复制到 SAIAI 管理的隔离
-`CODEX_HOME`，为 Electron/NSS 创建独立 CA 数据库（Linux），并在隔离的
+`saiai desktop` 的 Linux/普通可执行文件仍会把现有 OAuth `auth.json` 复制到 SAIAI
+管理的隔离 `CODEX_HOME`，为 Electron/NSS 创建独立 CA 数据库（Linux），并在隔离的
 `.codex-global-state.json` 中标记首次项目引导已完成。官方包路径在正常 Codex home
-写入相同 onboarding 状态。没有可用 OAuth/占位 `auth.json` 时 launcher 会明确报错。
+写入相同 onboarding 状态。macOS 不会从 Linux NSS 推导 Keychain 行为：当前只保证
+launcher 的进程级 SPKI pin 兜底，不修改 Keychain；直接官方 App 的 TLS/登录控制面
+仍需在真实 macOS 上现场验证。没有可用 OAuth/占位 `auth.json` 时 launcher 会明确报错。
 
 普通 ChatGPT Chat 的固定时区是 Desktop 子进程设置，不是全局请求改写。默认值为
 `America/Los_Angeles`，也可以设置 `SAIAI_CHATGPT_TIMEZONE` 覆盖；launcher 会校验

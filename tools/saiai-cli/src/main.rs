@@ -36,6 +36,8 @@ mod local_proxy;
 use desktop_product::DesktopProduct;
 
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
+#[cfg(target_os = "linux")]
+const SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME: &str = "saiai-local-proxy";
 const USAGE: &str = "\
 Usage:
   saiai                                                           # run local Claude Code proxy
@@ -610,6 +612,8 @@ fn init_codex(args: InitArgs) -> Result<()> {
 
     let proxy_init = initialize_codex_local_proxy(&args, &timestamp)?;
     let oauth_init = configure_codex_oauth_local_proxy(&codex_dir, &proxy_init)?;
+    #[cfg(target_os = "linux")]
+    ensure_direct_linux_desktop_trust(&proxy_init.ca_cert_path);
 
     println!("SAIAI configured Codex for local-proxy OAuth mode.");
     println!("Updated:");
@@ -2265,19 +2269,39 @@ fn ensure_desktop_nss_ca(home: &Path, ca_cert: &str) -> Result<()> {
     // Chromium can use the pinned local-proxy leaf SPKI passed by the Linux
     // launcher. `certutil` is supplied by `libnss3-tools`, which is not part
     // of every ChatGPT Desktop package; absence must not prevent launch.
-    if ProcessCommand::new("certutil")
-        .arg("-V")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_err()
-    {
+    if !ensure_nss_ca(home, Path::new(ca_cert))? {
         eprintln!(
             "warning: certutil is unavailable; using the Desktop SPKI certificate pin instead of an NSS database"
         );
-        return Ok(());
     }
-    let db_dir = home.join(".pki/nssdb");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_direct_linux_desktop_trust(ca_cert: &Path) {
+    let result = (|| -> Result<bool> {
+        let home = home_dir().context("failed to resolve the current user's home directory")?;
+        ensure_nss_ca(&home, ca_cert)
+    })();
+    match result {
+        Ok(true) => println!(
+            "Trusted the SAIAI CA in the current user's NSS database for direct Linux Desktop (no system trust store or dialog)."
+        ),
+        Ok(false) => eprintln!(
+            "WARN direct Linux Desktop trust was not installed because certutil is unavailable; install libnss3-tools, rerun `saiai init-codex`, or use `saiai desktop codex`."
+        ),
+        Err(err) => eprintln!(
+            "WARN direct Linux Desktop trust could not be updated ({err:#}); Codex CLI remains configured, and `saiai desktop codex` remains the reliable fallback."
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_nss_ca(home: &Path, ca_cert: &Path) -> Result<bool> {
+    if !nss_certutil_available() {
+        return Ok(false);
+    }
+    let db_dir = nss_database_dir(home);
     fs::create_dir_all(&db_dir)
         .with_context(|| format!("failed to create {}", db_dir.display()))?;
     let db = format!("sql:{}", db_dir.display());
@@ -2292,7 +2316,7 @@ fn ensure_desktop_nss_ca(home: &Path, ca_cert: &str) -> Result<()> {
         }
     }
     let _ = ProcessCommand::new("certutil")
-        .args(["-D", "-d", &db, "-n", "saiai-local-proxy"])
+        .args(["-D", "-d", &db, "-n", SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -2302,19 +2326,73 @@ fn ensure_desktop_nss_ca(home: &Path, ca_cert: &str) -> Result<()> {
             "-d",
             &db,
             "-n",
-            "saiai-local-proxy",
+            SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME,
             "-t",
             "C,,",
             "-a",
             "-i",
-            ca_cert,
+            ca_cert
+                .to_str()
+                .context("SAIAI CA path is not valid UTF-8")?,
         ])
         .status()
         .context("failed to import the SAIAI CA into the Desktop NSS database")?;
     if !status.success() {
         bail!("certutil failed to import the SAIAI CA into the Desktop NSS database");
     }
-    Ok(())
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn nss_database_dir(home: &Path) -> PathBuf {
+    home.join(".pki/nssdb")
+}
+
+#[cfg(target_os = "linux")]
+fn nss_certutil_available() -> bool {
+    ProcessCommand::new("certutil")
+        .arg("-V")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+#[cfg(target_os = "linux")]
+fn check_direct_linux_desktop_trust(report: &mut DoctorReport) {
+    if !nss_certutil_available() {
+        report.warn(
+            "direct Linux Desktop trust",
+            "certutil is unavailable; install libnss3-tools and rerun `saiai init-codex`, or use `saiai desktop codex`",
+        );
+        return;
+    }
+    let Some(home) = home_dir() else {
+        report.warn(
+            "direct Linux Desktop trust",
+            "could not resolve the current user's NSS database; use `saiai desktop codex`",
+        );
+        return;
+    };
+    let db_dir = nss_database_dir(&home);
+    let db = format!("sql:{}", db_dir.display());
+    let present = ProcessCommand::new("certutil")
+        .args(["-L", "-d", &db, "-n", SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if present {
+        report.ok(
+            "direct Linux Desktop trust",
+            format!("SAIAI CA entry is present in {}", db_dir.display()),
+        );
+    } else {
+        report.warn(
+            "direct Linux Desktop trust",
+            "SAIAI CA entry is absent from the current user's NSS database; rerun `saiai init-codex` or use `saiai desktop codex`",
+        );
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -3391,6 +3469,10 @@ fn configured_local_proxy_reachable() -> bool {
     TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok()
 }
 
+fn update_refresh_failure_is_recoverable(proxy_reachable: bool) -> bool {
+    proxy_reachable
+}
+
 fn start_managed_service_after_initialization(config_changed: bool) -> Result<()> {
     if should_skip_initialization_proxy_start(env::var("SAIAI_SKIP_START").ok().as_deref()) {
         println!("SAIAI local proxy start skipped (SAIAI_SKIP_START=1).");
@@ -3522,8 +3604,22 @@ fn run_update() -> Result<()> {
     if service_was_active {
         #[cfg(not(target_os = "windows"))]
         {
-            run_service_restart().context("failed to restart the active SAIAI service")?;
-            println!("Managed SAIAI service was active; restarted automatically.");
+            if let Err(err) = run_service_restart() {
+                // A user manager can race a completed replacement: for
+                // example, systemd or launchd may already have kept the
+                // managed proxy alive even though the refresh command reports
+                // an error. Do not misreport a successful binary replacement
+                // as a failed update when the local proxy remains reachable.
+                if update_refresh_failure_is_recoverable(configured_local_proxy_reachable()) {
+                    eprintln!(
+                        "WARN SAIAI client was updated and the local proxy remains reachable, but its automatic service refresh reported: {err:#}. Run `saiai restart` later to retry the refresh."
+                    );
+                } else {
+                    return Err(err).context("failed to restart the active SAIAI service");
+                }
+            } else {
+                println!("Managed SAIAI service was active; restarted automatically.");
+            }
         }
         #[cfg(target_os = "windows")]
         println!("Managed SAIAI service was active; restart was scheduled automatically.");
@@ -3592,6 +3688,8 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
             cfg.as_ref(),
             matches!(target, DoctorTarget::Codex),
         );
+        #[cfg(target_os = "linux")]
+        check_direct_linux_desktop_trust(&mut report);
     }
 
     if let Some(cfg) = &cfg {
@@ -6890,6 +6988,15 @@ requires_openai_auth = true
         assert!(!env.contains("19908"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scopes_direct_desktop_nss_database_to_the_current_user_home() {
+        assert_eq!(
+            nss_database_dir(Path::new("/tmp/saiai-user")),
+            PathBuf::from("/tmp/saiai-user/.pki/nssdb")
+        );
+    }
+
     #[test]
     fn codex_ide_env_replaces_conflicts_and_preserves_unrelated_values() {
         let raw = r#"# user comment
@@ -7244,6 +7351,8 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert!(!binary_changed_during_initialization(None));
         assert!(!binary_changed_during_initialization(Some("0")));
         assert!(binary_changed_during_initialization(Some("1")));
+        assert!(update_refresh_failure_is_recoverable(true));
+        assert!(!update_refresh_failure_is_recoverable(false));
     }
 
     #[test]
