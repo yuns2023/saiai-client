@@ -1331,6 +1331,17 @@ fn run_linux_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
         .env("https_proxy", &proxy)
         .env("all_proxy", &proxy)
         .env("no_proxy", CODEX_LOCAL_PROXY_NO_PROXY);
+    // The isolated Desktop home deliberately prevents the app from sharing
+    // normal Codex state. On X11, however, Chromium falls back to
+    // `$HOME/.Xauthority` when XAUTHORITY is not exported. Preserve a readable
+    // authority file from the invoking user's home for this child only, or
+    // Electron exits before it can reach the local proxy.
+    if env::var_os("XAUTHORITY").is_none()
+        && let Some(xauthority) =
+            fallback_linux_xauthority(home_dir().as_deref(), env::var_os("DISPLAY").is_some())
+    {
+        command.env("XAUTHORITY", xauthority);
+    }
     if let Some(timezone) = &fixed_timezone {
         command.env("TZ", timezone);
     }
@@ -2275,6 +2286,18 @@ fn ensure_desktop_nss_ca(home: &Path, ca_cert: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn fallback_linux_xauthority(
+    invoking_home: Option<&Path>,
+    has_x11_display: bool,
+) -> Option<PathBuf> {
+    if !has_x11_display {
+        return None;
+    }
+    let candidate = invoking_home?.join(".Xauthority");
+    candidate.is_file().then_some(candidate)
 }
 
 #[cfg(target_os = "linux")]
@@ -6995,6 +7018,21 @@ requires_openai_auth = true
             nss_database_dir(Path::new("/tmp/saiai-user")),
             PathBuf::from("/tmp/saiai-user/.pki/nssdb")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn falls_back_to_invoking_xauthority_only_for_x11() {
+        let home = TempDir::new().unwrap();
+        let xauthority = home.path().join(".Xauthority");
+        write_str(&xauthority, "test-only-x11-cookie");
+
+        assert_eq!(
+            fallback_linux_xauthority(Some(home.path()), true),
+            Some(xauthority)
+        );
+        assert_eq!(fallback_linux_xauthority(Some(home.path()), false), None);
+        assert_eq!(fallback_linux_xauthority(None, true), None);
     }
 
     #[test]

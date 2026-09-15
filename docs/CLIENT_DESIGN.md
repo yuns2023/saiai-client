@@ -152,10 +152,12 @@ Desktop 可能使用 `chatgpt.com/backend-api/codex/*` 而不是
 路径映射到 Gateway 的 `/v1/*` ingress；业务 body 和客户端身份 header 仍保持。
 Desktop/app-server 的 CA 信任必须独立验证，不能仅凭 CLI 的
 `CODEX_CA_CERTIFICATE` child 环境变量推断。Linux ChatGPT Desktop 26.901.51231 /
-Codex app-server 0.153.4 已实测：用户 NSS 导入后账户控制面从 CA 错误恢复；但该版本
-还会发送未纳入当前 Gateway 合约的 `/v1/initialize` 控制面请求。因此在该窄路径有
-本地 mock 与 Gateway 契约闭环前，`saiai desktop codex` 是受支持的隔离回退路径；
-不得把成功的账户查询宣称为完整 Desktop 支持。
+Codex app-server 0.153.4 已实测：用户 NSS 导入后账户控制面从 CA 错误恢复。Desktop
+还会向 `ab.chatgpt.com/v1/initialize` 发送 Statsig beta-eligibility 请求；它不是
+Gateway 的 OpenAI `/v1/initialize` 契约，也不是模型流量。当前本地代理不会将它
+转发到 Gateway；该请求失败时账户状态和本地 app-server 仍可完成初始化。不得把
+成功的账户查询或目录加载宣称为完整 Desktop 模型支持；未做模型请求的验证前，
+`saiai desktop codex` 仍是受支持的隔离回退路径。
 
 当前 launcher 只覆盖由它直接启动的 Codex CLI 子进程。Codex Desktop 和 VSCode
 扩展不是该子进程，不能因为共享 `CODEX_HOME` 就推断它们已继承代理/CA 环境。
@@ -166,6 +168,10 @@ Windows `OpenAI.Codex_*!App` 包则按官方客户端相同的 `codex://threads/
 激活；协议激活由 LaunchServices/AppX broker 完成，不能继承 launcher 的临时环境，
 因此这两条路径使用正常 Codex home 中的受管 `.env`、OAuth 占位和
 `respect_system_proxy=false`，与 VSCode 路径共享无系统环境修改的代理合同。
+Linux 隔离启动器改写子进程 `HOME` 以避免复用正常 Codex state。若当前 X11 会话未
+导出 `XAUTHORITY`，它仅把调用用户现有且可读的 `~/.Xauthority` 路径传给该子进程；
+不会复制、修改或写入该文件。这样 Electron 仍可连接已有 X server，而隔离 home、
+Codex state 和 user-data 保持独立。
 
 Desktop 启动入口按产品 target 解析：`saiai desktop codex`、
 `saiai desktop chatgpt`、`saiai desktop claude` 和 `saiai desktop gemini`。
