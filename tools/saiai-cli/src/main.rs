@@ -1234,8 +1234,7 @@ fn is_codex_placeholder_access_token(token: &str) -> bool {
 fn run_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
     if !product.has_adapter() {
         bail!(
-            "SAIAI Desktop currently supports Codex only; ordinary ChatGPT history, settings, and language are not supported. Use `saiai desktop codex`.",
-            product.label()
+            "SAIAI Desktop currently supports Codex only; ordinary ChatGPT history, settings, and language are not supported. Use `saiai desktop codex`."
         );
     }
 
