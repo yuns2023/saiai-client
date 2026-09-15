@@ -154,7 +154,7 @@ Desktop/app-server 的 CA 信任必须独立验证，不能仅凭 CLI 的
 `CODEX_CA_CERTIFICATE` child 环境变量推断。Linux ChatGPT Desktop 26.901.51231 /
 Codex app-server 0.153.4 已实测：用户 NSS 导入后账户控制面从 CA 错误恢复；但该版本
 还会发送未纳入当前 Gateway 合约的 `/v1/initialize` 控制面请求。因此在该窄路径有
-本地 mock 与 Gateway 契约闭环前，`saiai desktop codex` 是 direct Desktop 的可靠兜底，
+本地 mock 与 Gateway 契约闭环前，`saiai desktop codex` 是受支持的隔离回退路径；
 不得把成功的账户查询宣称为完整 Desktop 支持。
 
 当前 launcher 只覆盖由它直接启动的 Codex CLI 子进程。Codex Desktop 和 VSCode

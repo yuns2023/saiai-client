@@ -166,7 +166,7 @@ profile，不会改写原始 Codex 配置。
 数据库的应用，命令会明确说明该操作。没有 `certutil` 时，CLI/VSCode 仍可使用，
 Desktop 请使用 `saiai desktop codex`。`saiai doctor codex` 会报告该条目是否存在。
 目前 Linux Desktop 的账户控制面已验证，但 `/v1/initialize` 仍待按独立控制面契约
-闭环；在完成前，`saiai desktop codex` 是可靠兜底。macOS 不写 Keychain，直接官方
+闭环；在完成前，`saiai desktop codex` 是受支持的隔离回退。macOS 不写 Keychain，直接官方
 App 的 TLS/登录行为仍需在真实设备验证，当前无弹窗兜底同样是 `saiai desktop codex`。
 
 桌面入口按产品 target 组织：`saiai desktop codex` 和

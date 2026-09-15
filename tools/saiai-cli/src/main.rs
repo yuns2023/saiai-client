@@ -2291,7 +2291,7 @@ fn ensure_direct_linux_desktop_trust(ca_cert: &Path) {
             "WARN direct Linux Desktop trust was not installed because certutil is unavailable; install libnss3-tools, rerun `saiai init-codex`, or use `saiai desktop codex`."
         ),
         Err(err) => eprintln!(
-            "WARN direct Linux Desktop trust could not be updated ({err:#}); Codex CLI remains configured, and `saiai desktop codex` remains the reliable fallback."
+            "WARN direct Linux Desktop trust could not be updated ({err:#}); Codex CLI remains configured, and `saiai desktop codex` remains the supported isolated fallback."
         ),
     }
 }
