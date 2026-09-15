@@ -190,6 +190,7 @@ if [ -e "${install_path}" ] && [ ! -f "${install_path}" ]; then
 fi
 
 installed_matches=0
+binary_updated=0
 if [ -f "${install_path}" ]; then
   installed_sha256="$(sha256_file "${install_path}")"
   if [ "${installed_sha256}" = "${expected_sha256}" ]; then
@@ -200,6 +201,7 @@ fi
 if [ "${installed_matches}" -eq 1 ]; then
   echo "SAIAI ${release_version} is already installed; binary download skipped." >&2
 else
+  binary_updated=1
   echo "Downloading ${asset}..." >&2
   curl -fsSL --proto '=https,file,http' -o "${candidate_path}" "${asset_url}"
   actual_size="$(wc -c <"${candidate_path}" | tr -d '[:space:]')"
@@ -237,7 +239,7 @@ case ":${PATH:-}:" in
 esac
 
 if [ "${1:-}" = "init-codex" ]; then
-  "${install_path}" "$@"
+  SAIAI_BINARY_UPDATED="${binary_updated}" "${install_path}" "$@"
 else
-  "${install_path}" init "$@"
+  SAIAI_BINARY_UPDATED="${binary_updated}" "${install_path}" init "$@"
 fi

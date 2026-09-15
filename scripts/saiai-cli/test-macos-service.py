@@ -260,6 +260,20 @@ Path(os.environ["SAIAI_DESKTOP_CAPTURE"]).write_text(
             raise AssertionError("init-codex did not synchronize CODEX_HOME/.env to config listen")
         if "USER_SETTING=keep" not in codex_env:
             raise AssertionError("init-codex removed an unrelated CODEX_HOME/.env value")
+        unchanged_codex = run_checked(
+            [
+                str(binary),
+                "init-codex",
+                "https://codex-gateway.example.test/v1",
+                "TEST_ONLY_MACOS_CODEX_KEY",
+            ],
+            environment,
+        )
+        if "left running; binary and runtime configuration are unchanged" not in unchanged_codex.stdout:
+            raise AssertionError(
+                "unchanged init-codex did not preserve the LaunchAgent:\n"
+                f"{unchanged_codex.stdout}"
+            )
 
         plist = home / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
         try:

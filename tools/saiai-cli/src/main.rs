@@ -497,12 +497,12 @@ fn validate_api_key(api_key: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_installation_ca(cert_path: &Path, key_path: &Path, timestamp: &str) -> Result<()> {
+fn ensure_installation_ca(cert_path: &Path, key_path: &Path, timestamp: &str) -> Result<bool> {
     if let (Ok(cert_pem), Ok(key_pem)) =
         (fs::read_to_string(cert_path), fs::read_to_string(key_path))
         && local_proxy::validate_tls_config(&cert_pem, &key_pem).is_ok()
     {
-        return Ok(());
+        return Ok(false);
     }
 
     backup_if_exists(cert_path, timestamp)?;
@@ -514,7 +514,7 @@ fn ensure_installation_ca(cert_path: &Path, key_path: &Path, timestamp: &str) ->
         .with_context(|| format!("failed to write {}", cert_path.display()))?;
     write_bytes_atomic(key_path, key_pem.as_bytes(), 0o600)
         .with_context(|| format!("failed to write {}", key_path.display()))?;
-    Ok(())
+    Ok(true)
 }
 
 fn generate_installation_ca() -> Result<(String, String)> {
@@ -553,7 +553,7 @@ fn init_claude(args: InitArgs) -> Result<()> {
     backup_if_exists(state_path, &timestamp)?;
     remove_if_exists_with_backup(credentials_path, &timestamp)?;
 
-    ensure_installation_ca(&ca_path, &ca_key_path, &timestamp)?;
+    let ca_changed = ensure_installation_ca(&ca_path, &ca_key_path, &timestamp)?;
 
     let saiai_config = update_saiai_provider_config(
         ProviderKind::Claude,
@@ -572,7 +572,7 @@ fn init_claude(args: InitArgs) -> Result<()> {
         .unwrap_or_default();
     let mut env_obj = env_value;
     apply_common_claude_env(&mut env_obj, &args.api_key);
-    apply_claude_local_proxy_env(&mut env_obj, &saiai_config.listen, &ca_path);
+    apply_claude_local_proxy_env(&mut env_obj, &saiai_config.config.listen, &ca_path);
     settings.insert("env".to_string(), Value::Object(env_obj));
     write_json_object(settings_path, Value::Object(settings))?;
 
@@ -591,7 +591,7 @@ fn init_claude(args: InitArgs) -> Result<()> {
     println!("Removed stale Claude OAuth credentials if present:");
     println!("  {}", credentials_path.display());
     warn_claude_settings_overrides_for_paths(&paths);
-    start_managed_service_after_initialization()?;
+    start_managed_service_after_initialization(saiai_config.changed || ca_changed)?;
 
     Ok(())
 }
@@ -633,16 +633,22 @@ fn init_codex(args: InitArgs) -> Result<()> {
         "SAIAI local-proxy OAuth configuration is ready; run `saiai codex` or restart VSCode."
     );
     warn_claude_settings_overrides();
-    start_managed_service_after_initialization()?;
+    start_managed_service_after_initialization(proxy_init.config_changed)?;
 
     Ok(())
 }
 
 struct CodexLocalProxyInit {
     config_path: PathBuf,
+    config_changed: bool,
     listen: String,
     ca_cert_path: PathBuf,
     ca_key_path: PathBuf,
+}
+
+struct SaiaiConfigUpdate {
+    config: SaiaiConfig,
+    changed: bool,
 }
 
 struct CodexOAuthInitialization {
@@ -688,6 +694,7 @@ fn initialize_codex_local_proxy_at(
         && let Ok(existing) = serde_json::from_str::<SaiaiConfig>(&raw)
         && read_runtime_ca(&existing).is_ok()
     {
+        let mut migrated_legacy = false;
         if existing.providers.claude.is_none()
             && existing.providers.codex.is_none()
             && legacy_claude_proxy_configured()
@@ -698,6 +705,7 @@ fn initialize_codex_local_proxy_at(
                 api_key: migrated.api_key.clone(),
             });
             write_saiai_config_at(&config_path, &migrated)?;
+            migrated_legacy = true;
         }
         let updated = update_saiai_provider_config_at(
             &config_path,
@@ -710,16 +718,17 @@ fn initialize_codex_local_proxy_at(
         )?;
         return Ok(CodexLocalProxyInit {
             config_path,
-            listen: updated.listen,
-            ca_cert_path: PathBuf::from(updated.ca_cert_path),
-            ca_key_path: PathBuf::from(updated.ca_key_path),
+            config_changed: migrated_legacy || updated.changed,
+            listen: updated.config.listen,
+            ca_cert_path: PathBuf::from(updated.config.ca_cert_path),
+            ca_key_path: PathBuf::from(updated.config.ca_key_path),
         });
     }
 
     backup_if_exists(&config_path, timestamp)?;
     let ca_cert_path = config_dir.join(SAIAI_CA_FILENAME);
     let ca_key_path = config_dir.join(SAIAI_CA_KEY_FILENAME);
-    ensure_installation_ca(&ca_cert_path, &ca_key_path, timestamp)?;
+    let _ca_changed = ensure_installation_ca(&ca_cert_path, &ca_key_path, timestamp)?;
     let mut config = SaiaiConfig {
         version: SAIAI_CONFIG_VERSION,
         base_url: proxy_base_url.clone(),
@@ -737,6 +746,7 @@ fn initialize_codex_local_proxy_at(
     write_saiai_config_at(&config_path, &config)?;
     Ok(CodexLocalProxyInit {
         config_path,
+        config_changed: true,
         listen: config.listen,
         ca_cert_path,
         ca_key_path,
@@ -2669,7 +2679,7 @@ fn local_proxy_chatgpt_spki(listen: &str) -> Result<String> {
     Ok(spki)
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Eq, PartialEq)]
 struct SaiaiConfig {
     version: u32,
     base_url: String,
@@ -2684,7 +2694,7 @@ struct SaiaiConfig {
     providers: ProviderCredentials,
 }
 
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default, Eq, PartialEq)]
 struct ProviderCredentials {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude: Option<ProviderCredential>,
@@ -2692,7 +2702,13 @@ struct ProviderCredentials {
     codex: Option<ProviderCredential>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+impl ProviderCredentials {
+    fn is_empty(&self) -> bool {
+        self.claude.is_none() && self.codex.is_none()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Eq, PartialEq)]
 struct ProviderCredential {
     base_url: String,
     api_key: String,
@@ -2745,7 +2761,7 @@ fn update_saiai_provider_config(
     provider: ProviderKind,
     credential: ProviderCredential,
     ca_paths: Option<(PathBuf, PathBuf)>,
-) -> Result<SaiaiConfig> {
+) -> Result<SaiaiConfigUpdate> {
     let path = saiai_config_path()?;
     update_saiai_provider_config_at(&path, provider, credential, ca_paths)
 }
@@ -2755,10 +2771,11 @@ fn update_saiai_provider_config_at(
     provider: ProviderKind,
     credential: ProviderCredential,
     ca_paths: Option<(PathBuf, PathBuf)>,
-) -> Result<SaiaiConfig> {
+) -> Result<SaiaiConfigUpdate> {
     let existing = fs::read_to_string(path)
         .ok()
         .and_then(|raw| serde_json::from_str::<SaiaiConfig>(&raw).ok());
+    let previous = existing.clone();
     let mut config = existing.unwrap_or_else(|| SaiaiConfig {
         version: SAIAI_CONFIG_VERSION,
         base_url: credential.base_url.clone(),
@@ -2821,7 +2838,24 @@ fn update_saiai_provider_config_at(
     config.base_url = selected.base_url.clone();
     config.api_key = selected.api_key.clone();
     write_saiai_config_at(path, &config)?;
-    Ok(config)
+    Ok(SaiaiConfigUpdate {
+        changed: proxy_runtime_config_changed(previous.as_ref(), &config),
+        config,
+    })
+}
+
+fn proxy_runtime_config_changed(previous: Option<&SaiaiConfig>, current: &SaiaiConfig) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    previous.version != current.version
+        || previous.listen != current.listen
+        || previous.ca_cert_path != current.ca_cert_path
+        || previous.ca_key_path != current.ca_key_path
+        || previous.chatgpt_chat_passthrough != current.chatgpt_chat_passthrough
+        || previous.providers != current.providers
+        || (previous.providers.is_empty()
+            && (previous.base_url != current.base_url || previous.api_key != current.api_key))
 }
 
 fn default_true() -> bool {
@@ -3334,9 +3368,45 @@ fn should_skip_initialization_proxy_start(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
-fn start_managed_service_after_initialization() -> Result<()> {
+fn binary_changed_during_initialization(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn initialization_requires_proxy_refresh(
+    config_changed: bool,
+    binary_changed: bool,
+    managed_service_active: bool,
+    proxy_reachable: bool,
+) -> bool {
+    config_changed || binary_changed || !managed_service_active || !proxy_reachable
+}
+
+fn configured_local_proxy_reachable() -> bool {
+    let Ok(config) = read_saiai_config() else {
+        return false;
+    };
+    let Ok(address) = config.listen.parse::<SocketAddr>() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok()
+}
+
+fn start_managed_service_after_initialization(config_changed: bool) -> Result<()> {
     if should_skip_initialization_proxy_start(env::var("SAIAI_SKIP_START").ok().as_deref()) {
         println!("SAIAI local proxy start skipped (SAIAI_SKIP_START=1).");
+        return Ok(());
+    }
+    let binary_changed =
+        binary_changed_during_initialization(env::var("SAIAI_BINARY_UPDATED").ok().as_deref());
+    let managed_service_active = managed_service_is_active();
+    let proxy_reachable = configured_local_proxy_reachable();
+    if !initialization_requires_proxy_refresh(
+        config_changed,
+        binary_changed,
+        managed_service_active,
+        proxy_reachable,
+    ) {
+        println!("SAIAI local proxy left running; binary and runtime configuration are unchanged.");
         return Ok(());
     }
     run_service_start().context("failed to start or refresh the SAIAI local proxy")?;
@@ -6797,6 +6867,7 @@ requires_openai_auth = true
         );
         let proxy_init = CodexLocalProxyInit {
             config_path: codex.path().join("saiai-config.json"),
+            config_changed: true,
             listen: "127.0.0.1:31234".to_string(),
             ca_cert_path: PathBuf::from("/tmp/saiai-ca.crt"),
             ca_key_path: PathBuf::from("/tmp/saiai-ca.key"),
@@ -7154,6 +7225,59 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     }
 
     #[test]
+    fn initialization_only_refreshes_when_runtime_state_requires_it() {
+        assert!(!initialization_requires_proxy_refresh(
+            false, false, true, true
+        ));
+        assert!(initialization_requires_proxy_refresh(
+            true, false, true, true
+        ));
+        assert!(initialization_requires_proxy_refresh(
+            false, true, true, true
+        ));
+        assert!(initialization_requires_proxy_refresh(
+            false, false, false, true
+        ));
+        assert!(initialization_requires_proxy_refresh(
+            false, false, true, false
+        ));
+        assert!(!binary_changed_during_initialization(None));
+        assert!(!binary_changed_during_initialization(Some("0")));
+        assert!(binary_changed_during_initialization(Some("1")));
+    }
+
+    #[test]
+    fn ignores_legacy_root_mirror_when_provider_routes_are_unchanged() {
+        let providers = ProviderCredentials {
+            claude: Some(ProviderCredential {
+                base_url: "https://claude.example.test".to_string(),
+                api_key: "TEST_ONLY_CLAUDE_KEY".to_string(),
+            }),
+            codex: Some(ProviderCredential {
+                base_url: "https://codex.example.test".to_string(),
+                api_key: "TEST_ONLY_CODEX_KEY".to_string(),
+            }),
+        };
+        let previous = SaiaiConfig {
+            version: SAIAI_CONFIG_VERSION,
+            base_url: "https://claude.example.test".to_string(),
+            api_key: "TEST_ONLY_CLAUDE_KEY".to_string(),
+            listen: "127.0.0.1:19908".to_string(),
+            ca_cert_path: "/tmp/saiai-ca.crt".to_string(),
+            ca_key_path: "/tmp/saiai-ca.key".to_string(),
+            chatgpt_chat_passthrough: true,
+            providers: providers.clone(),
+        };
+        let current = SaiaiConfig {
+            base_url: "https://codex.example.test".to_string(),
+            api_key: "TEST_ONLY_CODEX_KEY".to_string(),
+            providers,
+            ..previous.clone()
+        };
+        assert!(!proxy_runtime_config_changed(Some(&previous), &current));
+    }
+
+    #[test]
     fn init_codex_prepares_standalone_local_proxy_config() {
         let temporary = tempfile::tempdir().unwrap();
         let args = InitArgs {
@@ -7241,6 +7365,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert_eq!(second.ca_key_path, first.ca_key_path);
         assert_eq!(fs::read(&second.ca_cert_path).unwrap(), cert_before);
         assert_eq!(fs::read(&second.ca_key_path).unwrap(), key_before);
+        assert!(second.config_changed);
         assert_eq!(updated.base_url, second_args.base_url);
         assert_eq!(updated.api_key, second_args.api_key);
         assert_eq!(
@@ -7286,10 +7411,12 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         )
         .unwrap();
 
-        assert_eq!(updated.base_url, "https://codex.example.test");
-        assert_eq!(updated.api_key, "TEST_ONLY_CODEX_KEY");
+        assert!(updated.changed);
+        assert_eq!(updated.config.base_url, "https://codex.example.test");
+        assert_eq!(updated.config.api_key, "TEST_ONLY_CODEX_KEY");
         assert_eq!(
             updated
+                .config
                 .providers
                 .claude
                 .as_ref()
@@ -7297,9 +7424,26 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             Some(&"TEST_ONLY_CLAUDE_KEY".to_string())
         );
         assert_eq!(
-            updated.providers.codex.as_ref().map(|value| &value.api_key),
+            updated
+                .config
+                .providers
+                .codex
+                .as_ref()
+                .map(|value| &value.api_key),
             Some(&"TEST_ONLY_CODEX_KEY".to_string())
         );
+
+        let unchanged = update_saiai_provider_config_at(
+            &config_path,
+            ProviderKind::Codex,
+            ProviderCredential {
+                base_url: "https://codex.example.test".to_string(),
+                api_key: "TEST_ONLY_CODEX_KEY".to_string(),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(!unchanged.changed);
     }
 
     #[test]

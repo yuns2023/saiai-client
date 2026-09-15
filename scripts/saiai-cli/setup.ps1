@@ -277,10 +277,12 @@ function Invoke-Saiai {
 
             $installedMatches = (Test-Path -LiteralPath $installPath -PathType Leaf) -and
                 ((Get-SaiaiSha256 -Path $installPath) -ceq $expectedSha256)
+            $binaryUpdated = $false
             if ($installedMatches) {
                 Write-Host "SAIAI $releaseVersion is already installed; binary download skipped." -ForegroundColor DarkGray
             }
             else {
+                $binaryUpdated = $true
                 Write-Host "Downloading $asset..." -ForegroundColor Cyan
                 $client.DownloadFile($assetUrl, $candidatePath)
                 if ((Get-Item -LiteralPath $candidatePath).Length -ne $expectedSize) {
@@ -316,15 +318,22 @@ function Invoke-Saiai {
         }
 
         Add-SaiaiPath -Directory $installDirectory
+        $previousBinaryUpdated = $env:SAIAI_BINARY_UPDATED
+        $env:SAIAI_BINARY_UPDATED = if ($binaryUpdated) { "1" } else { "0" }
         # Keep the native client's human-readable stdout visible without
         # mixing it into this function's scalar exit-code result. PowerShell
         # otherwise captures both values when callers assign Invoke-Saiai.
-        if ($provided[0] -eq "init-codex") {
-            return Invoke-SaiaiNative -Path $installPath -Arguments $provided
-        }
+        try {
+            if ($provided[0] -eq "init-codex") {
+                return Invoke-SaiaiNative -Path $installPath -Arguments $provided
+            }
 
-        $claudeArguments = @("init") + $provided
-        return Invoke-SaiaiNative -Path $installPath -Arguments $claudeArguments
+            $claudeArguments = @("init") + $provided
+            return Invoke-SaiaiNative -Path $installPath -Arguments $claudeArguments
+        }
+        finally {
+            $env:SAIAI_BINARY_UPDATED = $previousBinaryUpdated
+        }
     }
     finally {
         Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue

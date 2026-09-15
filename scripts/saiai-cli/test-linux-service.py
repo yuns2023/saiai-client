@@ -241,6 +241,19 @@ def main() -> int:
                 if mode != 0o600:
                     raise AssertionError(f"{private_path} has unsafe mode {mode:#o}")
 
+            unchanged = run_checked(
+                [str(binary), "init", gateway_url, TEST_KEY], environment
+            )
+            if "left running; binary and runtime configuration are unchanged" not in unchanged.stdout:
+                raise AssertionError(
+                    "unchanged initialization did not preserve the managed proxy:\n"
+                    f"{unchanged.stdout}"
+                )
+            same_pid = int(json.loads(state_path.read_text(encoding="utf-8"))["pid"])
+            if same_pid != first_pid:
+                raise AssertionError("unchanged initialization replaced the managed background process")
+            wait_for_port(port, True)
+
             status = run_checked([str(binary), "status"], environment)
             for expected in (
                 "service manager: background process",
