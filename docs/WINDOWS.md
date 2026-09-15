@@ -1,6 +1,6 @@
-# Windows 使用指南（SAIAI 1.1.6）
+# Windows 使用指南（SAIAI 1.1.19）
 
-SAIAI `1.1.6` 为 Claude Code 和 VSCode 提供用户级本地代理，不要求管理员权限。
+SAIAI `1.1.19` 为 Claude Code 和 VSCode 提供用户级本地代理，不要求管理员权限。
 
 ## 一键配置 Claude Code
 
@@ -9,6 +9,9 @@ SAIAI `1.1.6` 为 Claude Code 和 VSCode 提供用户级本地代理，不要求
 ```powershell
 irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai 'https://api.saiai.top' 'YOUR_API_KEY'
 ```
+
+该 wrapper 同时支持 Windows PowerShell 5.1 和 PowerShell 7；它以兼容的原生命令
+行方式调用已验证的 `saiai.exe`，不会依赖仅存在于新版 .NET 的参数 API。
 
 脚本根据 `PROCESSOR_ARCHITECTURE` / `PROCESSOR_ARCHITEW6432` 选择 x86_64 或
 ARM64 资产，验证 manifest、size 和 SHA-256。默认安装位置是

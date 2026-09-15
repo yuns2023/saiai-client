@@ -186,7 +186,7 @@ jobs:
             --setup-sh dist/setup.sh \
             --asset "${{ matrix.asset }}"
 
-      - name: Smoke-test native Windows bundle
+      - name: Smoke-test native Windows bundle and Windows PowerShell 5.1 setup wrapper
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
