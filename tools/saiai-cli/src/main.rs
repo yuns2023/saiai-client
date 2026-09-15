@@ -555,7 +555,6 @@ fn generate_installation_ca() -> Result<(String, String)> {
 }
 
 fn init_claude(args: InitArgs) -> Result<()> {
-    let service_was_active = managed_service_is_active();
     warn_process_env_conflicts();
     let paths = resolve_claude_config_paths().context("failed to resolve Claude config paths")?;
     let claude_dir = &paths.config_dir;
@@ -613,19 +612,13 @@ fn init_claude(args: InitArgs) -> Result<()> {
     println!("  {}", saiai_config_path()?.display());
     println!("Removed stale Claude OAuth credentials if present:");
     println!("  {}", credentials_path.display());
-    println!();
-    println!("Start the local proxy before using Claude Code:");
-    println!("  saiai start");
-    println!("Foreground mode is still available with:");
-    println!("  saiai");
     warn_claude_settings_overrides_for_paths(&paths);
-    restart_managed_service_if_needed(service_was_active)?;
+    start_managed_service_after_initialization()?;
 
     Ok(())
 }
 
 fn init_codex(args: InitArgs) -> Result<()> {
-    let service_was_active = managed_service_is_active();
     let codex_dir = codex_config_dir().context("failed to resolve Codex config directory")?;
     fs::create_dir_all(&codex_dir)
         .with_context(|| format!("failed to create {}", codex_dir.display()))?;
@@ -658,7 +651,7 @@ fn init_codex(args: InitArgs) -> Result<()> {
     println!("Existing TOML keys and JSON auth fields outside our scope were preserved.");
     println!("SAIAI local-proxy configuration is ready; run `saiai codex` for OAuth mode.");
     warn_claude_settings_overrides();
-    restart_managed_service_if_needed(service_was_active)?;
+    start_managed_service_after_initialization()?;
 
     Ok(())
 }
@@ -3370,12 +3363,17 @@ fn managed_service_is_active() -> bool {
     false
 }
 
-fn restart_managed_service_if_needed(was_active: bool) -> Result<()> {
-    if !was_active {
+fn should_skip_initialization_proxy_start(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn start_managed_service_after_initialization() -> Result<()> {
+    if should_skip_initialization_proxy_start(env::var("SAIAI_SKIP_START").ok().as_deref()) {
+        println!("SAIAI local proxy start skipped (SAIAI_SKIP_START=1).");
         return Ok(());
     }
-    run_service_restart().context("failed to refresh the active SAIAI service")?;
-    println!("SAIAI managed service was active; restarted after configuration update.");
+    run_service_start().context("failed to start or refresh the SAIAI local proxy")?;
+    println!("SAIAI local proxy started or refreshed after configuration update.");
     Ok(())
 }
 
@@ -6692,9 +6690,9 @@ fn as_object(value: Value) -> Option<Map<String, Value>> {
 
 /// Merge SAIAI's provider definition into `~/.codex/config.toml`, preserving any
 /// unrelated tables, comments and field ordering already written by the user
-/// or by `codex login`. CLI-managed root defaults are always rewritten to the
-/// values shipped with this binary (idempotent overwrite); unrelated keys are
-/// left untouched. When `websockets` is true, the SAIAI WebSocket transport is
+/// or by `codex login`. Model selection stays under the user's control; SAIAI
+/// does not add, overwrite, or remove model tuning. When `websockets` is true,
+/// the SAIAI WebSocket transport is
 /// enabled; when false, any previously-written WebSocket config is removed.
 ///
 /// The provider is written under the `OpenAI` namespace (matching the
@@ -6728,21 +6726,13 @@ fn merge_codex_config(path: &Path, base_url: &str, websockets: bool) -> Result<(
     Ok(())
 }
 
-/// Write CLI-managed root-level defaults. Each call rewrites these keys to the
-/// values shipped with this binary, even if the user previously customized
-/// them — same idempotent-overwrite contract as `init` (Claude). Unknown root
-/// keys are left untouched. Execution-safety controls are intentionally not
-/// managed here: `init-codex` must not enable full filesystem access, disable
-/// approvals, or set `dangerously_bypass_approvals_and_sandbox`.
+/// Write only the non-model root controls required by the legacy direct-provider
+/// route. Model choice, review-model choice, reasoning effort, and context
+/// budgets remain untouched, as do execution-safety controls.
 fn merge_codex_root_defaults(doc: &mut DocumentMut) {
-    doc["model"] = value("gpt-5.6-sol");
-    doc["review_model"] = value("gpt-5.4");
-    doc["model_reasoning_effort"] = value("xhigh");
     doc["disable_response_storage"] = value(true);
     doc["network_access"] = value("enabled");
     doc["windows_wsl_setup_acknowledged"] = value(true);
-    doc["model_context_window"] = value(1_000_000_i64);
-    doc["model_auto_compact_token_limit"] = value(900_000_i64);
     doc["model_provider"] = value("OpenAI");
 }
 
@@ -6938,18 +6928,25 @@ mod tests {
     }
 
     fn assert_managed_root(doc: &DocumentMut) {
-        assert_eq!(doc["model"].as_str(), Some("gpt-5.6-sol"));
-        assert_eq!(doc["review_model"].as_str(), Some("gpt-5.4"));
-        assert_eq!(doc["model_reasoning_effort"].as_str(), Some("xhigh"));
         assert_eq!(doc["disable_response_storage"].as_bool(), Some(true));
         assert_eq!(doc["network_access"].as_str(), Some("enabled"));
         assert_eq!(doc["windows_wsl_setup_acknowledged"].as_bool(), Some(true));
-        assert_eq!(doc["model_context_window"].as_integer(), Some(1_000_000));
-        assert_eq!(
-            doc["model_auto_compact_token_limit"].as_integer(),
-            Some(900_000),
-        );
         assert_eq!(doc["model_provider"].as_str(), Some("OpenAI"));
+    }
+
+    fn assert_no_forced_model_defaults(doc: &DocumentMut) {
+        for key in [
+            "model",
+            "review_model",
+            "model_reasoning_effort",
+            "model_context_window",
+            "model_auto_compact_token_limit",
+        ] {
+            assert!(
+                doc.get(key).is_none(),
+                "init-codex must not force the model tuning key {key}",
+            );
+        }
     }
 
     fn assert_managed_provider(doc: &DocumentMut, base_url: &str, websockets: bool) {
@@ -7393,6 +7390,14 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         }))
         .unwrap();
         assert!(config.chatgpt_chat_passthrough);
+    }
+
+    #[test]
+    fn initialization_proxy_start_can_be_explicitly_skipped() {
+        assert!(!should_skip_initialization_proxy_start(None));
+        assert!(!should_skip_initialization_proxy_start(Some("0")));
+        assert!(!should_skip_initialization_proxy_start(Some("true")));
+        assert!(should_skip_initialization_proxy_start(Some("1")));
     }
 
     #[test]
@@ -8124,6 +8129,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
 
         let doc = parse(&path);
         assert_managed_root(&doc);
+        assert_no_forced_model_defaults(&doc);
         assert_managed_provider(&doc, "https://example.com", false);
         assert!(
             doc.get("features").is_none(),
@@ -8173,6 +8179,7 @@ dangerously_bypass_approvals_and_sandbox = true
 
         let doc = parse(&path);
         assert_managed_root(&doc);
+        assert_no_forced_model_defaults(&doc);
         assert_managed_provider(&doc, "https://example.com", true);
         assert_eq!(
             doc["features"]["responses_websockets_v2"].as_bool(),
@@ -8231,7 +8238,9 @@ custom_header = "kept"
             Some("bar"),
         );
 
-        // Managed fields rewritten — including the previously-overridden ones.
+        // The user's model choice remains theirs; only the provider transport
+        // fields are managed by SAIAI.
+        assert_eq!(doc["model"].as_str(), Some("gpt-5.5"));
         assert_managed_root(&doc);
         assert_managed_provider(&doc, "https://example.com", true);
         assert_eq!(
@@ -8299,15 +8308,55 @@ custom_header = "kept"
     }
 
     #[test]
-    fn user_root_override_is_reset_to_managed_default() {
+    fn preserves_user_root_model_preferences() {
         let (_dir, path) = temp_config();
-        write_str(&path, "model = \"gpt-5.5\"\nreview_model = \"gpt-5.5\"\n");
+        write_str(
+            &path,
+            r#"model = "gpt-5.5"
+review_model = "gpt-5.5"
+model_reasoning_effort = "medium"
+model_context_window = 123456
+model_auto_compact_token_limit = 120000
+"#,
+        );
+
+        merge_codex_config(&path, "https://example.com", false).unwrap();
+
+        let doc = parse(&path);
+        assert_eq!(doc["model"].as_str(), Some("gpt-5.5"));
+        assert_eq!(doc["review_model"].as_str(), Some("gpt-5.5"));
+        assert_eq!(doc["model_reasoning_effort"].as_str(), Some("medium"));
+        assert_eq!(doc["model_context_window"].as_integer(), Some(123456));
+        assert_eq!(
+            doc["model_auto_compact_token_limit"].as_integer(),
+            Some(120000),
+        );
+    }
+
+    #[test]
+    fn leaves_existing_legacy_model_tuning_untouched() {
+        let (_dir, path) = temp_config();
+        write_str(
+            &path,
+            r#"model = "gpt-5.6-sol"
+review_model = "gpt-5.4"
+model_reasoning_effort = "xhigh"
+model_context_window = 1000000
+model_auto_compact_token_limit = 900000
+"#,
+        );
 
         merge_codex_config(&path, "https://example.com", false).unwrap();
 
         let doc = parse(&path);
         assert_eq!(doc["model"].as_str(), Some("gpt-5.6-sol"));
         assert_eq!(doc["review_model"].as_str(), Some("gpt-5.4"));
+        assert_eq!(doc["model_reasoning_effort"].as_str(), Some("xhigh"));
+        assert_eq!(doc["model_context_window"].as_integer(), Some(1_000_000));
+        assert_eq!(
+            doc["model_auto_compact_token_limit"].as_integer(),
+            Some(900_000),
+        );
     }
 
     #[test]

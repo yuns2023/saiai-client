@@ -134,17 +134,23 @@ function Move-SaiaiCandidate {
     throw "Could not replace existing SAIAI binary at $Destination after $maximumAttempts attempts: $($lastError.Exception.Message)"
 }
 
-function Start-SaiaiBackground {
-    param([Parameter(Mandatory = $true)][string]$Path)
+function Invoke-SaiaiNative {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
 
-    # Do not invoke `saiai start` through a PowerShell output pipeline. The
-    # detached Windows worker can inherit that pipeline's write handle, which
-    # keeps PowerShell waiting for EOF even after the start command exits.
-    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    # Native initialization may launch the detached local-proxy worker. Keep
+    # its stdout attached to the invoking console rather than a PowerShell
+    # output pipeline, whose inherited write handle could keep callers waiting
+    # after the initializer has exited.
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $Path
-    $startInfo.Arguments = "start"
     $startInfo.UseShellExecute = $false
-    $process = New-Object Diagnostics.Process
+    foreach ($argument in $Arguments) {
+        $null = $startInfo.ArgumentList.Add($argument)
+    }
+    $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
     try {
         $null = $process.Start()
@@ -270,20 +276,11 @@ function Invoke-Saiai {
         # mixing it into this function's scalar exit-code result. PowerShell
         # otherwise captures both values when callers assign Invoke-Saiai.
         if ($provided[0] -eq "init-codex") {
-            & $installPath @provided | Out-Host
-            return [int]$LASTEXITCODE
+            return Invoke-SaiaiNative -Path $installPath -Arguments $provided
         }
 
         $claudeArguments = @("init") + $provided
-        & $installPath @claudeArguments | Out-Host
-        $nativeExitCode = [int]$LASTEXITCODE
-        if ($nativeExitCode -ne 0) {
-            return $nativeExitCode
-        }
-        if ([string]$env:SAIAI_SKIP_START -eq "1") {
-            return 0
-        }
-        return Start-SaiaiBackground -Path $installPath
+        return Invoke-SaiaiNative -Path $installPath -Arguments $claudeArguments
     }
     finally {
         Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue

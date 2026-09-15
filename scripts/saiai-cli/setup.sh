@@ -13,13 +13,13 @@ Usage:
 
 The wrapper checks the release manifest on every run. It downloads the binary
 only when the installed binary differs, then always applies the supplied config.
-Claude setup also starts or refreshes the per-user local proxy service.
+Both Claude and Codex setup start or refresh the per-user local proxy service.
 
 Environment:
   SAIAI_DOWNLOAD_BASE  Flat manifest/asset base URL
                        (default: https://api.saiai.top/saiai-cli)
   SAIAI_INSTALL_DIR    Install directory (default: ~/.local/bin)
-  SAIAI_SKIP_START=1   Configure Claude without starting the proxy service
+  SAIAI_SKIP_START=1   Configure without starting the proxy service
 EOF
 }
 
@@ -238,13 +238,6 @@ esac
 
 if [ "${1:-}" = "init-codex" ]; then
   "${install_path}" "$@"
-  # Codex legacy initialization only writes config and the independent proxy
-  # settings. `saiai codex` and Desktop launchers start the proxy on demand;
-  # avoid a second LaunchAgent restart after native init-codex already handled
-  # an active service.
 else
   "${install_path}" init "$@"
-  if [ "${SAIAI_SKIP_START:-0}" != "1" ]; then
-    "${install_path}" start
-  fi
 fi

@@ -167,6 +167,18 @@ exit 0
     $upgradedStatus = Invoke-SaiaiProcess -Path $installed -Arguments @("status")
     Assert-Saiai ($upgradedStatus.ExitCode -eq 0) "Upgraded client status failed: $($upgradedStatus.Output)"
     Assert-Saiai ($upgradedStatus.Output.Contains("service active: yes")) "Upgraded background proxy is not active: $($upgradedStatus.Output)"
+
+    # Both initialization paths own one native start/refresh. Stopping first
+    # makes this prove that legacy Codex initialization starts a new managed
+    # proxy even when there was no active process to refresh.
+    & $installed stop *> $null
+    Assert-Saiai ($LASTEXITCODE -eq 0) "Could not stop the proxy before Codex initialization"
+    $codexInit = Invoke-Saiai init-codex "https://codex-gateway.example.test/v1" "TEST_ONLY_WINDOWS_CODEX_KEY"
+    Assert-Saiai ($codexInit -is [int]) "Codex PowerShell initialization returned a non-scalar exit code"
+    Assert-Saiai ($codexInit -eq 0) "Codex PowerShell initialization failed"
+    $codexStatus = Invoke-SaiaiProcess -Path $installed -Arguments @("status")
+    Assert-Saiai ($codexStatus.ExitCode -eq 0) "Codex-initialized client status failed: $($codexStatus.Output)"
+    Assert-Saiai ($codexStatus.Output.Contains("service active: yes")) "Codex initialization did not start the background proxy: $($codexStatus.Output)"
 }
 finally {
     $installedForCleanup = Join-Path $install "saiai.exe"

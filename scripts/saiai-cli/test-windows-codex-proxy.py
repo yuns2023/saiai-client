@@ -177,6 +177,11 @@ def main() -> int:
                     "PATH": str(codex_prefix) + os.pathsep + env.get("PATH", ""),
                 }
             )
+            # This fixture owns the proxy as a foreground process so it can
+            # inspect the exact loopback route. Suppress the production
+            # initializer's managed-service start only for this isolated test.
+            init_env = env.copy()
+            init_env["SAIAI_SKIP_START"] = "1"
             init = run(
                 [
                     str(saiai),
@@ -184,7 +189,7 @@ def main() -> int:
                     f"http://127.0.0.1:{server.server_port}/v1",
                     TEST_KEY,
                 ],
-                env,
+                init_env,
                 root,
             )
             if init.returncode != 0:

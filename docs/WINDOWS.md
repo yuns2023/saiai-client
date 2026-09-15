@@ -57,15 +57,17 @@ irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai init-codex 'ht
 
 该命令包含当前 Gateway 和 API Key，会写入 `%USERPROFILE%\\.codex`，或
 `CODEX_HOME` 指定的目录。该命令保留旧直连配置，同时在 `%USERPROFILE%\.saiai`
-准备本地代理配置和独立安装 CA；不会修改 Claude 配置或立即启动代理。随后运行
-`saiai codex` 即进入 OAuth/local-proxy 模式，代理会按需启动，并且代理环境只注入
+准备本地代理配置和独立安装 CA；不会修改 Claude 配置，并会启动或刷新受管本地代理。
+随后运行 `saiai codex` 即进入 OAuth/local-proxy 模式，并且代理环境只注入
 Codex 子进程。旧直连配置保留命令中的 `/v1`，本地代理配置会移除末尾 `/v1`，
 避免代理转发时产生 `/v1/v1/*`。若旧初始化刚写入的 API Key 与 SAIAI 配置 Key
 完全一致，launcher
 会将该状态升级为仅供本地代理使用的 OAuth 占位；真实 OAuth 和不匹配的 API Key
 不会被覆盖。`saiai codex` 会清除旧第三方 provider，并保留一个固定指向
 `https://api.openai.com/v1` 的 `model_providers.OpenAI` 兼容别名，使旧线程能够
-恢复而不重新直连 Gateway。占位状态使用 Codex 的 `chatgptAuthTokens` 外部 token 模式，避免 Codex
+恢复而不重新直连 Gateway。`model_providers.OpenAI.requires_openai_auth` 始终为 `true`；
+SAIAI 不会新增、覆盖或删除根 `model`、`review_model`、推理强度或模型上下文预算。
+占位状态使用 Codex 的 `chatgptAuthTokens` 外部 token 模式，避免 Codex
 把合成 refresh token 发往 OpenAI。`saiai codex` 支持 PATH 中的原生 `codex.exe`，
 也支持 npm 安装生成的 `codex.cmd`；npm 布局会由 SAIAI 解析后直接通过 `node.exe`
 运行官方 launcher。Codex VSCode 扩展先执行

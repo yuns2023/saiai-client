@@ -61,6 +61,8 @@ def verify_cli() -> None:
         "saiai init-codex <base_url> <api_key>",
         "saiai codex [-- <codex arguments>]",
         "initialize_codex_local_proxy",
+        "start_managed_service_after_initialization",
+        '"SAIAI_SKIP_START"',
         "SAIAI local-proxy configuration is ready; run `saiai codex` for OAuth mode.",
         '"CODEX_CA_CERTIFICATE"',
         '"OPENAI_API_KEY"',
@@ -107,6 +109,17 @@ def verify_cli() -> None:
         "include_str!(\"../../piproxy/internal/certs/assets/piproxy-ca.key\")",
     ):
         require(withdrawn not in main, f"CLI still exposes withdrawn V2 behavior: {withdrawn}")
+    for forced_model_default in (
+        'doc["model"] = value(',
+        'doc["review_model"] = value(',
+        'doc["model_reasoning_effort"] = value(',
+        'doc["model_context_window"] = value(',
+        'doc["model_auto_compact_token_limit"] = value(',
+    ):
+        require(
+            forced_model_default not in main,
+            f"CLI still forces the Codex model tuning key {forced_model_default!r}",
+        )
     require(not (ROOT / "tools/saiai-cli/src/v2.rs").exists(), "V2 CLI module still exists")
     proxy = text("tools/saiai-cli/src/local_proxy.rs")
     require("ca_key_pem" in proxy, "local proxy does not require runtime CA material")
@@ -127,6 +140,8 @@ def verify_cli() -> None:
         "otel.metrics_exporter=",
         "features.respect_system_proxy=false",
         "service active: yes",
+        "Claude initialization did not start the managed proxy",
+        "Codex initialization did not refresh the managed proxy",
     ):
         require(required in windows_runtime, f"Windows repeat smoke is missing {required!r}")
     windows_codex_capture = text("scripts/saiai-cli/test-windows-codex-proxy.py")
@@ -175,7 +190,11 @@ def verify_manifest_and_wrappers() -> None:
         require("bootstrap_schema_version" not in wrapper, f"{name} still requires V2 bootstrap")
     shell = (SCRIPT_DIR / "setup.sh").read_text(encoding="utf-8")
     require('"${install_path}" init "$@"' in shell, "Unix wrapper does not initialize Claude")
-    require('"${install_path}" start' in shell, "Unix wrapper does not start the local proxy")
+    require('"${install_path}" "$@"' in shell, "Unix wrapper does not initialize Codex")
+    require(
+        '"${install_path}" start' not in shell,
+        "Unix wrapper duplicates the native local-proxy start",
+    )
     require("installed_matches=1" in shell, "Unix wrapper cannot skip the binary download")
     powershell = (SCRIPT_DIR / "setup.ps1").read_text(encoding="utf-8")
     require(
@@ -195,13 +214,19 @@ def verify_manifest_and_wrappers() -> None:
         "PowerShell wrapper still relies on Move-Item to replace an existing Windows binary",
     )
     require(
-        "Start-SaiaiBackground" in powershell and "start | Out-Host" not in powershell,
-        "PowerShell wrapper still starts the background proxy through an output pipeline",
+        "Start-SaiaiBackground" not in powershell
+        and "Invoke-SaiaiNative" in powershell
+        and "& $installPath @provided | Out-Host" not in powershell,
+        "PowerShell wrapper does not delegate proxy start to the native initializer",
     )
     windows_release = text("scripts/saiai-cli/test-windows-release.ps1")
     require(
         "Running-client upgrade did not install the release binary" in windows_release,
         "Windows release smoke does not cover a running-client upgrade",
+    )
+    require(
+        "Codex initialization did not start the background proxy" in windows_release,
+        "Windows release smoke does not cover native Codex initialization start",
     )
 
 

@@ -88,9 +88,10 @@ try {
     $env:CLAUDE_CONFIG_DIR = $claudeDir
     $env:SAIAI_HOME = Join-Path $temporary ".saiai"
 
-    $output = & $binary init "https://gateway.example.test" $testKey 2>&1 | Out-String
-    Assert-Saiai ($LASTEXITCODE -eq 0) "SAIAI config command failed: $output"
-    Assert-Saiai (-not $output.Contains($testKey)) "SAIAI output exposed the API key"
+    # Initialization starts the detached proxy itself. Do not attach that
+    # worker to a PowerShell output-capture pipeline.
+    $initialization = Invoke-SaiaiProcess -Path $binary -Arguments @("init", "https://gateway.example.test", $testKey) -CaptureOutput $false -TimeoutMilliseconds 30000
+    Assert-Saiai ($initialization.ExitCode -eq 0) "SAIAI config command failed"
 
     $saiaiConfig = Get-Content -LiteralPath (Join-Path $env:SAIAI_HOME "config.json") -Raw | ConvertFrom-Json
     $proxyUrl = "http://$([string]$saiaiConfig.listen)"
@@ -111,12 +112,14 @@ try {
     Assert-Saiai (-not (Test-Path -LiteralPath $credentialsPath)) "OAuth credentials remain"
     Assert-Saiai (Test-Path -LiteralPath $caPath -PathType Leaf) "Installation CA was not generated"
     Assert-Saiai (Test-Path -LiteralPath $caKeyPath -PathType Leaf) "Installation CA key was not generated"
+    $initialStatus = Invoke-SaiaiProcess -Path $binary -Arguments @("status")
+    Assert-Saiai ($initialStatus.ExitCode -eq 0) "SAIAI status failed after initialization: $($initialStatus.Output)"
+    Assert-Saiai ($initialStatus.Output.Contains("service active: yes")) "Claude initialization did not start the managed proxy: $($initialStatus.Output)"
 
     $caHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $caPath).Hash
     $caKeyHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $caKeyPath).Hash
-    $repeatOutput = & $binary init "https://replacement.example.test" $replacementKey 2>&1 | Out-String
-    Assert-Saiai ($LASTEXITCODE -eq 0) "Repeated SAIAI config failed: $repeatOutput"
-    Assert-Saiai (-not $repeatOutput.Contains($replacementKey)) "Repeated config output exposed the API key"
+    $repeatInitialization = Invoke-SaiaiProcess -Path $binary -Arguments @("init", "https://replacement.example.test", $replacementKey) -CaptureOutput $false -TimeoutMilliseconds 30000
+    Assert-Saiai ($repeatInitialization.ExitCode -eq 0) "Repeated SAIAI config failed"
     Assert-Saiai ((Get-FileHash -Algorithm SHA256 -LiteralPath $caPath).Hash -ceq $caHash) "Repeated setup replaced a valid CA"
     Assert-Saiai ((Get-FileHash -Algorithm SHA256 -LiteralPath $caKeyPath).Hash -ceq $caKeyHash) "Repeated setup replaced a valid CA key"
     $repeatedSettings = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
@@ -126,9 +129,8 @@ try {
     Assert-Saiai ([string]$saiaiConfig.api_key -ceq $replacementKey) "Repeated setup config Key differs"
 
     $env:CODEX_HOME = Join-Path $temporary ".codex"
-    $codexOutput = & $binary init-codex "https://codex.example.test/v1" $codexKey 2>&1 | Out-String
-    Assert-Saiai ($LASTEXITCODE -eq 0) "SAIAI Codex initialization failed: $codexOutput"
-    Assert-Saiai (-not $codexOutput.Contains($codexKey)) "Codex initialization output exposed the API key"
+    $codexInitialization = Invoke-SaiaiProcess -Path $binary -Arguments @("init-codex", "https://codex.example.test/v1", $codexKey) -CaptureOutput $false -TimeoutMilliseconds 30000
+    Assert-Saiai ($codexInitialization.ExitCode -eq 0) "SAIAI Codex initialization failed"
     $codexProxyConfig = Get-Content -LiteralPath (Join-Path $env:SAIAI_HOME "config.json") -Raw | ConvertFrom-Json
     Assert-Saiai ([string]$codexProxyConfig.base_url -ceq "https://codex.example.test") "Codex initialization did not normalize the local-proxy Gateway root"
     Assert-Saiai ([string]$codexProxyConfig.api_key -ceq $codexKey) "Codex initialization did not update the local-proxy Key"
@@ -136,6 +138,9 @@ try {
     Assert-Saiai ((Get-FileHash -Algorithm SHA256 -LiteralPath $caKeyPath).Hash -ceq $caKeyHash) "Codex initialization replaced the existing CA key"
     Assert-Saiai (Test-Path -LiteralPath (Join-Path $env:CODEX_HOME "config.toml") -PathType Leaf) "Codex config was not created"
     Assert-Saiai (Test-Path -LiteralPath (Join-Path $env:CODEX_HOME "auth.json") -PathType Leaf) "Codex auth was not created"
+    $codexInitialStatus = Invoke-SaiaiProcess -Path $binary -Arguments @("status")
+    Assert-Saiai ($codexInitialStatus.ExitCode -eq 0) "SAIAI status failed after Codex initialization: $($codexInitialStatus.Output)"
+    Assert-Saiai ($codexInitialStatus.Output.Contains("service active: yes")) "Codex initialization did not refresh the managed proxy: $($codexInitialStatus.Output)"
     # `vscode` may start the detached proxy. Do not attach it to a PowerShell
     # output pipeline: the child can inherit the pipeline handle and keep
     # Out-String waiting for EOF after the command itself exits.

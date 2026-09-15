@@ -187,15 +187,15 @@ saiai init-codex https://api.saiai.top/v1 YOUR_API_KEY
 
 该命令合并 `~/.codex/config.toml` 和 `~/.codex/auth.json`，保留不属于 SAIAI
 管理范围的字段；同时在独立的 `SAIAI_HOME` 中创建或更新本地代理配置和安装 CA，
-因此同一次初始化后可以直接运行 `saiai codex`。它不会修改 Claude 配置或自动启动
-代理；`saiai codex` 会在需要时启动代理。旧直连 Provider 保留传入的 `/v1`，
+因此同一次初始化后可以直接运行 `saiai codex`。它不会修改 Claude 配置，并会启动
+或刷新受管代理。旧直连 Provider 保留传入的 `/v1`，
 本地代理配置则移除末尾 `/v1` 后再转发客户端原始 `/v1/*` 路径，避免产生
 `/v1/v1/*`。已有有效代理 CA、监听地址和普通 Chat
 开关会保留，只替换本次指定的 Gateway 和 Key。launcher 只在 `auth.json` 的旧
 API Key 与当前 SAIAI 配置 Key 完全一致时把它升级为本地代理 OAuth 占位；不同的
 API Key 和真实 OAuth 都不会被覆盖。Codex 0.149.0+ 使用自定义 Provider 时会写入
-`requires_openai_auth = true`，并将全局默认值设置为 `gpt-5.6-sol`、评审模型
-`gpt-5.4` 和 `model_reasoning_effort = "xhigh"`。执行权限相关的
+`requires_openai_auth = true`，但不会新增、覆盖或删除根 `model`、`review_model`、
+推理强度或模型上下文预算。执行权限相关的
 `sandbox_mode`、`approval_policy` 和 `dangerously_bypass_approvals_and_sandbox`
 不属于 SAIAI CLI 管理范围：已有值会原样保留，初始化不会自动启用全盘访问、关闭审批或绕过安全检查。
 
