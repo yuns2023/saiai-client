@@ -33,6 +33,23 @@ impl DesktopProduct {
     }
 
     pub const fn has_adapter(self) -> bool {
-        matches!(self, Self::Codex | Self::ChatGPT)
+        // The official Desktop executable remains branded ChatGPT, but the
+        // SAIAI Desktop contract currently covers only its Codex surface.
+        // Ordinary Chat has a distinct account/history/settings protocol and
+        // must not be implied by a working Codex launcher.
+        matches!(self, Self::Codex)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DesktopProduct;
+
+    #[test]
+    fn only_codex_has_a_supported_desktop_adapter() {
+        assert!(DesktopProduct::Codex.has_adapter());
+        assert!(!DesktopProduct::ChatGPT.has_adapter());
+        assert!(!DesktopProduct::Claude.has_adapter());
+        assert!(!DesktopProduct::Gemini.has_adapter());
     }
 }

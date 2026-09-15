@@ -36,6 +36,8 @@ mod local_proxy;
 use desktop_product::DesktopProduct;
 
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
+#[cfg(target_os = "linux")]
+const SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME: &str = "saiai-local-proxy";
 const USAGE: &str = "\
 Usage:
   saiai                                                           # run local Claude Code proxy
@@ -52,14 +54,14 @@ Usage:
   saiai init-codex <base_url> <api_key> [--websockets]            # initialize Codex CLI
   saiai codex [-- <codex arguments>]                              # launch Codex through SAIAI local proxy
   saiai vscode                                                    # configure the Codex VSCode extension for SAIAI
-  saiai desktop [codex|chatgpt|claude|gemini] [-- <Desktop arguments>]
-                                                                  # launch a supported Desktop product through SAIAI
-  saiai chatgpt [-- <Desktop arguments>]                        # ChatGPT Desktop alias
+  saiai desktop [codex] [-- <Desktop arguments>]                # launch Codex Desktop through SAIAI
   saiai init       --base-url <base_url> --api-key <api_key>      # initialize Claude Code
   saiai init-codex --base-url <base_url> --api-key <api_key> [--websockets]";
 
 const SAIAI_CA_FILENAME: &str = "saiai-ca.crt";
 const SAIAI_CA_KEY_FILENAME: &str = "saiai-ca.key";
+#[cfg(target_os = "windows")]
+const WINDOWS_PACKAGED_PROXY_LEASE_FILENAME: &str = "windows-packaged-proxy-lease.json";
 const SAIAI_CONFIG_VERSION: u32 = 2;
 const CLAUDE_STREAM_IDLE_TIMEOUT_MS: &str = "600000";
 const DEFAULT_LOCAL_PROXY_LISTEN: &str = "127.0.0.1:19908";
@@ -610,6 +612,8 @@ fn init_codex(args: InitArgs) -> Result<()> {
 
     let proxy_init = initialize_codex_local_proxy(&args, &timestamp)?;
     let oauth_init = configure_codex_oauth_local_proxy(&codex_dir, &proxy_init)?;
+    #[cfg(target_os = "linux")]
+    ensure_direct_linux_desktop_trust(&proxy_init.ca_cert_path);
 
     println!("SAIAI configured Codex for local-proxy OAuth mode.");
     println!("Updated:");
@@ -1230,10 +1234,13 @@ fn is_codex_placeholder_access_token(token: &str) -> bool {
 fn run_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
     if !product.has_adapter() {
         bail!(
-            "SAIAI Desktop adapter for {} is not implemented yet; use `saiai desktop codex` or `saiai chatgpt`",
-            product.label()
+            "SAIAI Desktop currently supports Codex only; ordinary ChatGPT history, settings, and language are not supported. Use `saiai desktop codex`."
         );
     }
+
+    println!(
+        "SAIAI Desktop scope: Codex only; the official ChatGPT sidebar, ordinary Chat history, settings, and language are not supported."
+    );
 
     #[cfg(target_os = "linux")]
     {
@@ -1327,6 +1334,17 @@ fn run_linux_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
         .env("https_proxy", &proxy)
         .env("all_proxy", &proxy)
         .env("no_proxy", CODEX_LOCAL_PROXY_NO_PROXY);
+    // The isolated Desktop home deliberately prevents the app from sharing
+    // normal Codex state. On X11, however, Chromium falls back to
+    // `$HOME/.Xauthority` when XAUTHORITY is not exported. Preserve a readable
+    // authority file from the invoking user's home for this child only, or
+    // Electron exits before it can reach the local proxy.
+    if env::var_os("XAUTHORITY").is_none()
+        && let Some(xauthority) =
+            fallback_linux_xauthority(home_dir().as_deref(), env::var_os("DISPLAY").is_some())
+    {
+        command.env("XAUTHORITY", xauthority);
+    }
     if let Some(timezone) = &fixed_timezone {
         command.env("TZ", timezone);
     }
@@ -1859,25 +1877,43 @@ struct WindowsInternetProxySettings {
 }
 
 #[cfg(target_os = "windows")]
-struct WindowsPackagedProxyLease {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WindowsPackagedProxyLeaseMarker {
+    generation: String,
     previous: WindowsInternetProxySettings,
     managed_server: String,
-    added_ca_thumbprint: Option<String>,
+    // Only certificates this client installed are listed here. A pre-existing
+    // user trust root must never be removed when the final Desktop lease ends.
+    added_ca_thumbprints: Vec<String>,
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsPackagedProxyLease {
+    marker_path: PathBuf,
+    marker: WindowsPackagedProxyLeaseMarker,
 }
 
 #[cfg(target_os = "windows")]
 impl WindowsPackagedProxyLease {
     fn restore(&self) -> Result<()> {
-        windows_write_internet_proxy(&self.previous)?;
-        windows_remove_user_ca(self.added_ca_thumbprint.as_deref())
+        let Some(marker) = read_windows_packaged_proxy_lease_marker(&self.marker_path)? else {
+            return Ok(());
+        };
+        // A newer launcher owns the active lease. An older launcher must not
+        // restore its proxy snapshot or remove the CA the newer AppX process
+        // is actively using.
+        if marker.generation != self.marker.generation {
+            return Ok(());
+        }
+        restore_windows_packaged_proxy_lease_marker(&marker)?;
+        remove_windows_packaged_proxy_lease_marker(&self.marker_path)
     }
 
     fn spawn_restore_watcher(&self, package_root: &Path) -> Result<()> {
         let state = serde_json::json!({
             "root": package_root.display().to_string(),
-            "managed_server": self.managed_server,
-            "previous": self.previous,
-            "added_ca_thumbprint": self.added_ca_thumbprint,
+            "lease_path": self.marker_path.display().to_string(),
+            "generation": self.marker.generation,
         });
         let state_b64 =
             base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&state)?);
@@ -1902,17 +1938,38 @@ while ($true) {
   }
   Start-Sleep -Seconds 2
 }
+$lease = $null
+try {
+  if (Test-Path -LiteralPath $state.lease_path) {
+    $lease = Get-Content -LiteralPath $state.lease_path -Raw | ConvertFrom-Json
+  }
+} catch {
+  exit 0
+}
+if ($null -eq $lease -or [string]$lease.generation -ne [string]$state.generation) {
+  exit 0
+}
 $path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
 $current = Get-ItemProperty $path
 $server = [string]$current.ProxyServer
 $auto = [string]$current.AutoConfigURL
-if ([int]$current.ProxyEnable -eq 1 -and $server -eq $state.managed_server -and [string]::IsNullOrEmpty($auto)) {
-  $previous = $state.previous
+if ([int]$current.ProxyEnable -eq 1 -and $server -eq [string]$lease.managed_server -and [string]::IsNullOrEmpty($auto)) {
+  $previous = $lease.previous
   if ($null -eq $previous.proxy_enable) { Remove-ItemProperty $path -Name ProxyEnable -ErrorAction SilentlyContinue } else { Set-ItemProperty $path -Name ProxyEnable -Type DWord -Value ([int]$previous.proxy_enable) }
   if ($null -eq $previous.proxy_server) { Remove-ItemProperty $path -Name ProxyServer -ErrorAction SilentlyContinue } else { Set-ItemProperty $path -Name ProxyServer -Type String -Value ([string]$previous.proxy_server) }
   if ($null -eq $previous.auto_config_url) { Remove-ItemProperty $path -Name AutoConfigURL -ErrorAction SilentlyContinue } else { Set-ItemProperty $path -Name AutoConfigURL -Type String -Value ([string]$previous.auto_config_url) }
 }
-if ($state.added_ca_thumbprint) { Remove-Item "Cert:\CurrentUser\Root\$($state.added_ca_thumbprint)" -ErrorAction SilentlyContinue }
+foreach ($thumb in @($lease.added_ca_thumbprints)) {
+  if (-not [string]::IsNullOrEmpty([string]$thumb)) {
+    Remove-Item -LiteralPath ("Cert:\CurrentUser\Root\" + [string]$thumb) -ErrorAction SilentlyContinue
+  }
+}
+try {
+  $latest = Get-Content -LiteralPath $state.lease_path -Raw | ConvertFrom-Json
+  if ([string]$latest.generation -eq [string]$state.generation) {
+    Remove-Item -LiteralPath $state.lease_path -ErrorAction SilentlyContinue
+  }
+} catch {}
 "#
         .replace("{STATE_B64}", &state_b64);
         let encoded = base64::engine::general_purpose::STANDARD.encode(
@@ -1941,27 +1998,157 @@ fn windows_begin_packaged_proxy_lease(
     listen: &str,
     ca_cert_path: &Path,
 ) -> Result<WindowsPackagedProxyLease> {
-    let previous = windows_read_internet_proxy()?;
+    let marker_path = windows_packaged_proxy_lease_marker_path()?;
+    let current = windows_read_internet_proxy()?;
+    let prior_marker = read_windows_packaged_proxy_lease_marker(&marker_path)?;
     let managed_server = listen.to_string();
-    if windows_proxy_conflicts(&previous, &managed_server) {
+    let prior_owns_current_proxy = prior_marker
+        .as_ref()
+        .is_some_and(|marker| windows_proxy_matches_managed(&current, &marker.managed_server));
+    if windows_proxy_conflicts(&current, &managed_server) && !prior_owns_current_proxy {
         bail!(
             "Windows system proxy or PAC is already configured outside SAIAI; refusing to override it for packaged Desktop. Disable the conflicting proxy or use the direct Desktop override."
         );
     }
-    let added_ca_thumbprint = windows_install_user_ca(ca_cert_path)?;
+
+    // Transfer ownership from a still-active SAIAI lease before stopping its
+    // AppX process. Its watcher observes the new generation and becomes a
+    // no-op instead of deleting the current CA underneath the replacement.
+    let previous = prior_marker
+        .as_ref()
+        .filter(|_| prior_owns_current_proxy)
+        .map(|marker| marker.previous.clone())
+        .unwrap_or_else(|| current.clone());
+    let mut marker = WindowsPackagedProxyLeaseMarker {
+        generation: Uuid::new_v4().to_string(),
+        previous,
+        managed_server: managed_server.clone(),
+        added_ca_thumbprints: prior_marker
+            .as_ref()
+            .filter(|_| prior_owns_current_proxy)
+            .map(|marker| marker.added_ca_thumbprints.clone())
+            .unwrap_or_default(),
+    };
+    write_windows_packaged_proxy_lease_marker(&marker_path, &marker)?;
+
+    let added_ca_thumbprint = match windows_install_user_ca(ca_cert_path) {
+        Ok(value) => value,
+        Err(error) => {
+            rollback_windows_packaged_proxy_lease_marker(
+                &marker_path,
+                &marker.generation,
+                prior_marker.as_ref().filter(|_| prior_owns_current_proxy),
+            )?;
+            return Err(error);
+        }
+    };
+    if let Some(thumbprint) = &added_ca_thumbprint
+        && !marker.added_ca_thumbprints.contains(thumbprint)
+    {
+        marker.added_ca_thumbprints.push(thumbprint.clone());
+        if let Err(error) = write_windows_packaged_proxy_lease_marker(&marker_path, &marker) {
+            marker.added_ca_thumbprints.pop();
+            windows_remove_user_ca(added_ca_thumbprint.as_deref())?;
+            rollback_windows_packaged_proxy_lease_marker(
+                &marker_path,
+                &marker.generation,
+                prior_marker.as_ref().filter(|_| prior_owns_current_proxy),
+            )?;
+            return Err(error);
+        }
+    }
     if let Err(error) = windows_write_internet_proxy(&WindowsInternetProxySettings {
         proxy_enable: Some(1),
         proxy_server: Some(managed_server.clone()),
         auto_config_url: None,
     }) {
         windows_remove_user_ca(added_ca_thumbprint.as_deref())?;
+        rollback_windows_packaged_proxy_lease_marker(
+            &marker_path,
+            &marker.generation,
+            prior_marker.as_ref().filter(|_| prior_owns_current_proxy),
+        )?;
         return Err(error);
     }
     Ok(WindowsPackagedProxyLease {
-        previous,
-        managed_server,
-        added_ca_thumbprint,
+        marker_path,
+        marker,
     })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_packaged_proxy_lease_marker_path() -> Result<PathBuf> {
+    Ok(saiai_config_dir()?
+        .join("desktop")
+        .join(WINDOWS_PACKAGED_PROXY_LEASE_FILENAME))
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_packaged_proxy_lease_marker(
+    path: &Path,
+) -> Result<Option<WindowsPackagedProxyLeaseMarker>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .with_context(|| format!("failed to parse {}", path.display()))
+}
+
+#[cfg(target_os = "windows")]
+fn write_windows_packaged_proxy_lease_marker(
+    path: &Path,
+    marker: &WindowsPackagedProxyLeaseMarker,
+) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(marker)
+        .context("failed to serialize Windows Desktop proxy lease")?;
+    bytes.push(b'\n');
+    write_bytes_atomic(path, &bytes, 0o600)
+}
+
+#[cfg(target_os = "windows")]
+fn remove_windows_packaged_proxy_lease_marker(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn rollback_windows_packaged_proxy_lease_marker(
+    path: &Path,
+    generation: &str,
+    prior: Option<&WindowsPackagedProxyLeaseMarker>,
+) -> Result<()> {
+    let Some(current) = read_windows_packaged_proxy_lease_marker(path)? else {
+        return Ok(());
+    };
+    if current.generation != generation {
+        return Ok(());
+    }
+    match prior {
+        Some(marker) => write_windows_packaged_proxy_lease_marker(path, marker),
+        None => remove_windows_packaged_proxy_lease_marker(path),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn restore_windows_packaged_proxy_lease_marker(
+    marker: &WindowsPackagedProxyLeaseMarker,
+) -> Result<()> {
+    let current = windows_read_internet_proxy()?;
+    if windows_proxy_matches_managed(&current, &marker.managed_server) {
+        windows_write_internet_proxy(&marker.previous)?;
+    }
+    for thumbprint in &marker.added_ca_thumbprints {
+        windows_remove_user_ca(Some(thumbprint))?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -2031,6 +2218,19 @@ fn windows_proxy_conflicts(settings: &WindowsInternetProxySettings, managed: &st
     if settings.proxy_enable != Some(1) {
         return false;
     }
+    !windows_proxy_matches_managed(settings, managed)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_proxy_matches_managed(settings: &WindowsInternetProxySettings, managed: &str) -> bool {
+    if settings.proxy_enable != Some(1)
+        || settings
+            .auto_config_url
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return false;
+    }
     let current = settings
         .proxy_server
         .as_deref()
@@ -2042,7 +2242,7 @@ fn windows_proxy_conflicts(settings: &WindowsInternetProxySettings, managed: &st
         .trim()
         .trim_start_matches("http://")
         .trim_end_matches('/');
-    !current.eq_ignore_ascii_case(managed)
+    current.eq_ignore_ascii_case(managed)
 }
 
 #[cfg(target_os = "windows")]
@@ -2265,19 +2465,51 @@ fn ensure_desktop_nss_ca(home: &Path, ca_cert: &str) -> Result<()> {
     // Chromium can use the pinned local-proxy leaf SPKI passed by the Linux
     // launcher. `certutil` is supplied by `libnss3-tools`, which is not part
     // of every ChatGPT Desktop package; absence must not prevent launch.
-    if ProcessCommand::new("certutil")
-        .arg("-V")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_err()
-    {
+    if !ensure_nss_ca(home, Path::new(ca_cert))? {
         eprintln!(
             "warning: certutil is unavailable; using the Desktop SPKI certificate pin instead of an NSS database"
         );
-        return Ok(());
     }
-    let db_dir = home.join(".pki/nssdb");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn fallback_linux_xauthority(
+    invoking_home: Option<&Path>,
+    has_x11_display: bool,
+) -> Option<PathBuf> {
+    if !has_x11_display {
+        return None;
+    }
+    let candidate = invoking_home?.join(".Xauthority");
+    candidate.is_file().then_some(candidate)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_direct_linux_desktop_trust(ca_cert: &Path) {
+    let result = (|| -> Result<bool> {
+        let home = home_dir().context("failed to resolve the current user's home directory")?;
+        ensure_nss_ca(&home, ca_cert)
+    })();
+    match result {
+        Ok(true) => println!(
+            "Trusted the SAIAI CA in the current user's NSS database for direct Linux Desktop (no system trust store or dialog)."
+        ),
+        Ok(false) => eprintln!(
+            "WARN direct Linux Desktop trust was not installed because certutil is unavailable; install libnss3-tools, rerun `saiai init-codex`, or use `saiai desktop codex`."
+        ),
+        Err(err) => eprintln!(
+            "WARN direct Linux Desktop trust could not be updated ({err:#}); Codex CLI remains configured, and `saiai desktop codex` remains the supported isolated fallback."
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_nss_ca(home: &Path, ca_cert: &Path) -> Result<bool> {
+    if !nss_certutil_available() {
+        return Ok(false);
+    }
+    let db_dir = nss_database_dir(home);
     fs::create_dir_all(&db_dir)
         .with_context(|| format!("failed to create {}", db_dir.display()))?;
     let db = format!("sql:{}", db_dir.display());
@@ -2292,7 +2524,7 @@ fn ensure_desktop_nss_ca(home: &Path, ca_cert: &str) -> Result<()> {
         }
     }
     let _ = ProcessCommand::new("certutil")
-        .args(["-D", "-d", &db, "-n", "saiai-local-proxy"])
+        .args(["-D", "-d", &db, "-n", SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -2302,19 +2534,87 @@ fn ensure_desktop_nss_ca(home: &Path, ca_cert: &str) -> Result<()> {
             "-d",
             &db,
             "-n",
-            "saiai-local-proxy",
+            SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME,
             "-t",
             "C,,",
             "-a",
             "-i",
-            ca_cert,
+            ca_cert
+                .to_str()
+                .context("SAIAI CA path is not valid UTF-8")?,
         ])
         .status()
         .context("failed to import the SAIAI CA into the Desktop NSS database")?;
     if !status.success() {
         bail!("certutil failed to import the SAIAI CA into the Desktop NSS database");
     }
-    Ok(())
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn nss_database_dir(home: &Path) -> PathBuf {
+    home.join(".pki/nssdb")
+}
+
+#[cfg(target_os = "linux")]
+fn nss_certutil_available() -> bool {
+    ProcessCommand::new("certutil")
+        .arg("-V")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
+#[cfg(target_os = "linux")]
+fn check_direct_linux_desktop_trust(report: &mut DoctorReport) {
+    if !nss_certutil_available() {
+        report.warn(
+            "direct Linux Desktop trust",
+            "certutil is unavailable; install libnss3-tools and rerun `saiai init-codex`, or use `saiai desktop codex`",
+        );
+        return;
+    }
+    let Some(home) = home_dir() else {
+        report.warn(
+            "direct Linux Desktop trust",
+            "could not resolve the current user's NSS database; use `saiai desktop codex`",
+        );
+        return;
+    };
+    let db_dir = nss_database_dir(&home);
+    let db = format!("sql:{}", db_dir.display());
+    let present = ProcessCommand::new("certutil")
+        .args(["-L", "-d", &db, "-n", SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if present {
+        report.ok(
+            "direct Linux Desktop trust",
+            format!("SAIAI CA entry is present in {}", db_dir.display()),
+        );
+    } else {
+        report.warn(
+            "direct Linux Desktop trust",
+            "SAIAI CA entry is absent from the current user's NSS database; rerun `saiai init-codex` or use `saiai desktop codex`",
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn check_direct_macos_desktop_trust(report: &mut DoctorReport) {
+    // A direct LaunchServices/Dock launch cannot inherit the launcher's
+    // process-specific SPKI pin. Setting a user trust root in Keychain is an
+    // authorization-protected macOS action, so never attempt it from a
+    // non-interactive bootstrap or claim that a certificate merely present in
+    // Keychain is trusted. The managed launcher is deliberately the reliable
+    // no-Keychain fallback.
+    report.warn(
+        "direct macOS Desktop trust",
+        "SAIAI does not modify the login Keychain. A directly launched official App needs a user-approved SAIAI CA trust root; otherwise use `saiai desktop codex` (managed per-process SPKI pin)",
+    );
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -3391,6 +3691,10 @@ fn configured_local_proxy_reachable() -> bool {
     TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok()
 }
 
+fn update_refresh_failure_is_recoverable(proxy_reachable: bool) -> bool {
+    proxy_reachable
+}
+
 fn start_managed_service_after_initialization(config_changed: bool) -> Result<()> {
     if should_skip_initialization_proxy_start(env::var("SAIAI_SKIP_START").ok().as_deref()) {
         println!("SAIAI local proxy start skipped (SAIAI_SKIP_START=1).");
@@ -3522,8 +3826,22 @@ fn run_update() -> Result<()> {
     if service_was_active {
         #[cfg(not(target_os = "windows"))]
         {
-            run_service_restart().context("failed to restart the active SAIAI service")?;
-            println!("Managed SAIAI service was active; restarted automatically.");
+            if let Err(err) = run_service_restart() {
+                // A user manager can race a completed replacement: for
+                // example, systemd or launchd may already have kept the
+                // managed proxy alive even though the refresh command reports
+                // an error. Do not misreport a successful binary replacement
+                // as a failed update when the local proxy remains reachable.
+                if update_refresh_failure_is_recoverable(configured_local_proxy_reachable()) {
+                    eprintln!(
+                        "WARN SAIAI client was updated and the local proxy remains reachable, but its automatic service refresh reported: {err:#}. Run `saiai restart` later to retry the refresh."
+                    );
+                } else {
+                    return Err(err).context("failed to restart the active SAIAI service");
+                }
+            } else {
+                println!("Managed SAIAI service was active; restarted automatically.");
+            }
         }
         #[cfg(target_os = "windows")]
         println!("Managed SAIAI service was active; restart was scheduled automatically.");
@@ -3592,6 +3910,10 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
             cfg.as_ref(),
             matches!(target, DoctorTarget::Codex),
         );
+        #[cfg(target_os = "linux")]
+        check_direct_linux_desktop_trust(&mut report);
+        #[cfg(target_os = "macos")]
+        check_direct_macos_desktop_trust(&mut report);
     }
 
     if let Some(cfg) = &cfg {
@@ -6890,6 +7212,30 @@ requires_openai_auth = true
         assert!(!env.contains("19908"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scopes_direct_desktop_nss_database_to_the_current_user_home() {
+        assert_eq!(
+            nss_database_dir(Path::new("/tmp/saiai-user")),
+            PathBuf::from("/tmp/saiai-user/.pki/nssdb")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn falls_back_to_invoking_xauthority_only_for_x11() {
+        let home = TempDir::new().unwrap();
+        let xauthority = home.path().join(".Xauthority");
+        write_str(&xauthority, "test-only-x11-cookie");
+
+        assert_eq!(
+            fallback_linux_xauthority(Some(home.path()), true),
+            Some(xauthority)
+        );
+        assert_eq!(fallback_linux_xauthority(Some(home.path()), false), None);
+        assert_eq!(fallback_linux_xauthority(None, true), None);
+    }
+
     #[test]
     fn codex_ide_env_replaces_conflicts_and_preserves_unrelated_values() {
         let raw = r#"# user comment
@@ -7244,6 +7590,8 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert!(!binary_changed_during_initialization(None));
         assert!(!binary_changed_during_initialization(Some("0")));
         assert!(binary_changed_during_initialization(Some("1")));
+        assert!(update_refresh_failure_is_recoverable(true));
+        assert!(!update_refresh_failure_is_recoverable(false));
     }
 
     #[test]
@@ -7665,6 +8013,35 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             ])
             .is_err()
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_packaged_proxy_lease_marker_keeps_the_original_proxy_and_ca_ownership() {
+        let original = WindowsInternetProxySettings {
+            proxy_enable: Some(0),
+            proxy_server: None,
+            auto_config_url: None,
+        };
+        let marker = WindowsPackagedProxyLeaseMarker {
+            generation: "test-generation".to_string(),
+            previous: original.clone(),
+            managed_server: "127.0.0.1:64196".to_string(),
+            added_ca_thumbprints: vec!["TEST-CA".to_string()],
+        };
+        let active = WindowsInternetProxySettings {
+            proxy_enable: Some(1),
+            proxy_server: Some("http://127.0.0.1:64196/".to_string()),
+            auto_config_url: None,
+        };
+
+        assert!(windows_proxy_matches_managed(
+            &active,
+            &marker.managed_server
+        ));
+        assert!(!windows_proxy_conflicts(&active, &marker.managed_server));
+        assert_eq!(marker.previous.proxy_enable, Some(0));
+        assert_eq!(marker.added_ca_thumbprints, vec!["TEST-CA"]);
     }
 
     #[test]
