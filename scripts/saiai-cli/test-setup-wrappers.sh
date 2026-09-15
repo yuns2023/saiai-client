@@ -80,8 +80,7 @@ test "${first_invocation[0]}" = "CALL"
 test "${first_invocation[1]}" = "init"
 test "${first_invocation[2]}" = "https://gateway.example.test"
 test "${first_invocation[3]}" = "${first_key}"
-test "${first_invocation[4]}" = "CALL"
-test "${first_invocation[5]}" = "start"
+test "${#first_invocation[@]}" -eq 4
 test "$(grep -Fc '/manifest.json' "${curl_log}")" -eq 1
 test "$(grep -Fc '/saiai-linux-x86_64' "${curl_log}")" -eq 1
 if grep -Fq "${first_key}" "${output}"; then
@@ -96,8 +95,7 @@ test "${second_invocation[0]}" = "CALL"
 test "${second_invocation[1]}" = "init"
 test "${second_invocation[2]}" = "https://new-gateway.example.test"
 test "${second_invocation[3]}" = "${second_key}"
-test "${second_invocation[4]}" = "CALL"
-test "${second_invocation[5]}" = "start"
+test "${#second_invocation[@]}" -eq 4
 test "$(grep -Fc '/manifest.json' "${curl_log}")" -eq 2
 test "$(grep -Fc '/saiai-linux-x86_64' "${curl_log}")" -eq 1
 grep -Fq 'binary download skipped' "${output}"

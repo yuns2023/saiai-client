@@ -67,8 +67,10 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
   日志跟随使用 `/usr/bin/tail`，不以不兼容的 GNU `--version` 参数探测命令。
 - Windows 使用用户进程与 PID/日志状态文件，不要求管理员权限。
 
-一键 wrapper 在 Claude 初始化成功后执行 `saiai start`。自动化测试或明确需要只
-配置不启动时可设置 `SAIAI_SKIP_START=1`。Codex 初始化不会启动 Claude 代理。
+`init` 与 `init-codex` 都会在成功写入配置后启动或刷新同一个受管本地代理；因此
+无论初始化前服务是否存活，都不会留下已停止的旧代理。自动化测试或明确需要只配置
+不启动时可设置 `SAIAI_SKIP_START=1`。一键 wrapper 只调用原生命令，避免额外的第二次
+服务重启。
 发布前在 Intel 和 Apple Silicon macOS runner 上分别验证
 `start/status/logs/restart/stop` 的真实 LaunchAgent 生命周期；两个 Linux 静态
 资产也必须在强制 `systemctl --user` 失败的环境中完成同一套 fallback 生命周期。
@@ -92,12 +94,14 @@ metrics exporter。SAIAI 网络下该非模型端点可能不可达，因此 lau
 
 `init-codex` 在保留旧 `config.toml`/`auth.json` 直连配置的同时，也会在独立的
 `SAIAI_HOME` 中创建本地代理配置和安装 CA，使同一次 WebUI 初始化之后可以直接运行
-`saiai codex`。该兼容初始化不修改 Claude 配置，也不启动代理；launcher 按需启动。
+`saiai codex`。该兼容初始化不修改 Claude 配置，并会启动或刷新受管本地代理。
 旧直连 Provider 使用带末尾 `/v1` 的 Base URL；`init-codex` 会为省略该后缀的旧命令
 自动补齐 `/v1`。写入本地代理配置时只移除末尾
 `/v1`，再透传客户端原始 `/v1/*` 路径，禁止形成 `/v1/v1/*`。
 受管的 `model_providers.OpenAI` 始终写入 `requires_openai_auth = true`，包括
 旧版 `init-codex` 配置；这让旧 Codex 分组与 OAuth/local-proxy runtime 保持同一认证形状。
+SAIAI 不管理根 `model`、`review_model`、`model_reasoning_effort` 或模型上下文预算：
+初始化不会新增、覆盖或删除这些用户模型偏好。
 若已有有效的 SAIAI 代理配置，它复用原 CA、监听地址和普通 Chat 开关，只替换
 Gateway 与 Key，避免破坏已经配置好的 Claude/ChatGPT 代理信任。随后 launcher
 只在旧 `auth.json.OPENAI_API_KEY` 与当前 SAIAI 配置 Key 完全一致时把该旧初始化

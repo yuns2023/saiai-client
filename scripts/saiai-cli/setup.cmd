@@ -99,18 +99,10 @@ echo Installed SAIAI %RELEASE_VERSION% at %INSTALL_PATH%.
 if /I "%~1"=="init-codex" goto configure_codex
 "%INSTALL_PATH%" init %*
 set "SAIAI_EXIT=%ERRORLEVEL%"
-if not "%SAIAI_EXIT%"=="0" goto configured
-if "%SAIAI_SKIP_START%"=="1" goto configured
-"%INSTALL_PATH%" start
-set "SAIAI_EXIT=%ERRORLEVEL%"
 goto configured
 
 :configure_codex
 "%INSTALL_PATH%" %*
-set "SAIAI_EXIT=%ERRORLEVEL%"
-if not "%SAIAI_EXIT%"=="0" goto configured
-if "%SAIAI_SKIP_START%"=="1" goto configured
-"%INSTALL_PATH%" start
 set "SAIAI_EXIT=%ERRORLEVEL%"
 
 :configured
