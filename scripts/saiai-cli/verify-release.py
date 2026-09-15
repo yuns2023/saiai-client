@@ -43,7 +43,7 @@ def load_generator():
 
 def verify_cli() -> None:
     cargo = text("tools/saiai-cli/Cargo.toml")
-    require('version = "1.1.19"' in cargo, "CLI version is not 1.1.19")
+    require('version = "1.1.20"' in cargo, "CLI version is not 1.1.20")
     require("saiai-core" not in cargo, "local-proxy client still links the V2 runtime core")
     for dependency in ("reqwest", "tokio", "tokio-tungstenite", "rustls", "rcgen", "zeroize", "libc"):
         require(dependency in cargo, f"local-proxy dependency is missing: {dependency}")
@@ -63,7 +63,9 @@ def verify_cli() -> None:
         "initialize_codex_local_proxy",
         "start_managed_service_after_initialization",
         '"SAIAI_SKIP_START"',
-        "SAIAI local-proxy configuration is ready; run `saiai codex` for OAuth mode.",
+        "SAIAI configured Codex for local-proxy OAuth mode.",
+        "configure_codex_oauth_local_proxy",
+        "write_codex_ide_env(&env_path, &proxy_init.listen",
         '"CODEX_CA_CERTIFICATE"',
         '"OPENAI_API_KEY"',
         '"CLAUDE_CODE_OAUTH_TOKEN"',
@@ -120,6 +122,16 @@ def verify_cli() -> None:
             forced_model_default not in main,
             f"CLI still forces the Codex model tuning key {forced_model_default!r}",
         )
+    for withdrawn_direct_codex in (
+        "fn merge_codex_config",
+        "fn merge_codex_auth",
+        "CODEX_LEGACY_PROVIDER_ID",
+        "install_codex_legacy_provider_alias",
+    ):
+        require(
+            withdrawn_direct_codex not in main,
+            f"CLI still retains withdrawn direct Codex compatibility {withdrawn_direct_codex!r}",
+        )
     require(not (ROOT / "tools/saiai-cli/src/v2.rs").exists(), "V2 CLI module still exists")
     proxy = text("tools/saiai-cli/src/local_proxy.rs")
     require("ca_key_pem" in proxy, "local proxy does not require runtime CA material")
@@ -134,7 +146,8 @@ def verify_cli() -> None:
         "Repeated setup replaced a valid CA key",
         "Codex initialization did not normalize the local-proxy Gateway root",
         "Codex local-proxy launcher is missing",
-        "Managed legacy Codex auth was not upgraded",
+        "Codex initialization did not create local-proxy OAuth auth",
+        "Codex initialization did not synchronize the local proxy port",
         "SAIAI_WINDOWS_NPM_CODEX",
         "features.apps=false",
         "otel.metrics_exporter=",
@@ -169,7 +182,7 @@ def verify_manifest_and_wrappers() -> None:
         wrappers.mkdir()
         for name in WRAPPERS:
             (wrappers / name).write_bytes((name + "\n").encode())
-        manifest = generator.build_manifest(root, "1.1.19", ASSETS, wrappers)
+        manifest = generator.build_manifest(root, "1.1.20", ASSETS, wrappers)
         require(manifest.get("manifest_schema") == 1, "generated manifest schema differs")
         require(manifest.get("client_mode") == "local-proxy", "generated client mode differs")
         require(
@@ -287,6 +300,13 @@ def verify_workflows_and_docs() -> None:
         "start_time_ticks",
     ):
         require(required in linux_service, f"Linux service smoke is missing {required!r}")
+    macos_service = text("scripts/saiai-cli/test-macos-service.py")
+    for required in (
+        '"init-codex"',
+        "init-codex did not synchronize CODEX_HOME/.env to config listen",
+        "init-codex retained a direct-provider compatibility route",
+    ):
+        require(required in macos_service, f"macOS service smoke is missing {required!r}")
     for withdrawn in ("test-v2-", "V2 Preview", "saiai-core/Cargo.toml"):
         require(withdrawn not in release, f"release workflow still contains {withdrawn!r}")
         require(withdrawn not in ci, f"CI workflow still contains {withdrawn!r}")

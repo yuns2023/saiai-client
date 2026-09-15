@@ -129,6 +129,11 @@ try {
     Assert-Saiai ([string]$saiaiConfig.api_key -ceq $replacementKey) "Repeated setup config Key differs"
 
     $env:CODEX_HOME = Join-Path $temporary ".codex"
+    $null = New-Item -ItemType Directory -Path $env:CODEX_HOME -Force
+    [IO.File]::WriteAllText(
+        (Join-Path $env:CODEX_HOME ".env"),
+        "USER_SETTING=keep`nHTTP_PROXY=http://127.0.0.1:19908`n"
+    )
     $codexInitialization = Invoke-SaiaiProcess -Path $binary -Arguments @("init-codex", "https://codex.example.test/v1", $codexKey) -CaptureOutput $false -TimeoutMilliseconds 30000
     Assert-Saiai ($codexInitialization.ExitCode -eq 0) "SAIAI Codex initialization failed"
     $codexProxyConfig = Get-Content -LiteralPath (Join-Path $env:SAIAI_HOME "config.json") -Raw | ConvertFrom-Json
@@ -138,6 +143,16 @@ try {
     Assert-Saiai ((Get-FileHash -Algorithm SHA256 -LiteralPath $caKeyPath).Hash -ceq $caKeyHash) "Codex initialization replaced the existing CA key"
     Assert-Saiai (Test-Path -LiteralPath (Join-Path $env:CODEX_HOME "config.toml") -PathType Leaf) "Codex config was not created"
     Assert-Saiai (Test-Path -LiteralPath (Join-Path $env:CODEX_HOME "auth.json") -PathType Leaf) "Codex auth was not created"
+    Assert-Saiai (Test-Path -LiteralPath (Join-Path $env:CODEX_HOME ".env") -PathType Leaf) "Codex environment was not created"
+    $codexAuth = Get-Content -LiteralPath (Join-Path $env:CODEX_HOME "auth.json") -Raw | ConvertFrom-Json
+    $codexConfig = Get-Content -LiteralPath (Join-Path $env:CODEX_HOME "config.toml") -Raw
+    $codexEnv = Get-Content -LiteralPath (Join-Path $env:CODEX_HOME ".env") -Raw
+    Assert-Saiai ([string]$codexAuth.auth_mode -ceq "chatgptAuthTokens") "Codex initialization did not create local-proxy OAuth auth"
+    Assert-Saiai ($null -eq $codexAuth.OPENAI_API_KEY) "Codex API-key auth remains after OAuth initialization"
+    Assert-Saiai ($codexConfig.Contains('model_provider = "openai"')) "Codex initialization did not select the built-in provider"
+    Assert-Saiai (-not $codexConfig.Contains("[model_providers")) "Codex initialization retained a direct-provider compatibility route"
+    Assert-Saiai ($codexEnv.Contains("USER_SETTING=keep")) "Codex initialization removed unrelated environment configuration"
+    Assert-Saiai ($codexEnv.Contains("HTTP_PROXY=`"$proxyUrl`"")) "Codex initialization did not synchronize the local proxy port"
     $codexInitialStatus = Invoke-SaiaiProcess -Path $binary -Arguments @("status")
     Assert-Saiai ($codexInitialStatus.ExitCode -eq 0) "SAIAI status failed after Codex initialization: $($codexInitialStatus.Output)"
     Assert-Saiai ($codexInitialStatus.Output.Contains("service active: yes")) "Codex initialization did not refresh the managed proxy: $($codexInitialStatus.Output)"
@@ -145,11 +160,11 @@ try {
     # output pipeline: the child can inherit the pipeline handle and keep
     # Out-String waiting for EOF after the command itself exits.
     $vscode = Invoke-SaiaiProcess -Path $binary -Arguments @("vscode") -CaptureOutput $false
-    Assert-Saiai ($vscode.ExitCode -eq 0) "SAIAI Codex OAuth upgrade failed"
+    Assert-Saiai ($vscode.ExitCode -eq 0) "SAIAI Codex OAuth configuration refresh failed"
     $codexAuth = Get-Content -LiteralPath (Join-Path $env:CODEX_HOME "auth.json") -Raw | ConvertFrom-Json
     $codexConfig = Get-Content -LiteralPath (Join-Path $env:CODEX_HOME "config.toml") -Raw
-    Assert-Saiai ([string]$codexAuth.auth_mode -ceq "chatgptAuthTokens") "Managed legacy Codex auth was not upgraded to externally supplied token mode"
-    Assert-Saiai ($null -eq $codexAuth.OPENAI_API_KEY) "Managed legacy Codex API key remains after upgrade"
+    Assert-Saiai ([string]$codexAuth.auth_mode -ceq "chatgptAuthTokens") "Codex OAuth configuration is not retained after refresh"
+    Assert-Saiai ($null -eq $codexAuth.OPENAI_API_KEY) "Codex API-key auth remains after OAuth refresh"
     Assert-Saiai (-not [string]::IsNullOrWhiteSpace([string]$codexAuth.tokens.access_token)) "Codex OAuth placeholder access token is missing"
     Assert-Saiai ([string]$codexAuth.tokens.refresh_token -ceq "") "Synthetic Codex auth must not contain a provider refresh token"
 
