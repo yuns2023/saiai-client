@@ -1,10 +1,8 @@
 # SAIAI Client
 
-SAIAI Client `1.1.19` 使用托管本地代理模式。Claude Code 和 VSCode 通过用户
-级 `saiai` 代理访问 Gateway；Codex CLI 通过 `saiai codex`、Codex VSCode 扩展
-通过一次性的 `saiai vscode` 配置使用同一用户级代理，
-旧的 `init-codex` 直接配置方式继续兼容。客户端不创建隔离
-home 或 generation。
+SAIAI Client `1.1.20` 使用托管本地代理模式。Claude Code 和 VSCode 通过用户
+级 `saiai` 代理访问 Gateway；`init-codex`、Codex CLI、Codex VSCode 扩展和
+Desktop 使用同一套 OAuth/local-proxy 配置。客户端不创建隔离 home 或 generation。
 
 ## 一键配置
 
@@ -22,9 +20,12 @@ irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai init-codex 'ht
 ```
 
 命令会完成安装、初始化并启动用户级本地代理，可以反复执行；它会替换受管 Base URL
-和 Key，保留无关配置。由于命令包含 Key，Key 会出现在剪贴板、终端命令和 shell
-历史中；客户端自身不会把 Key 打印到输出。WebUI 只提供 Codex CLI，不提供
-WebSocket 专用页签。
+和 Key，清理旧的直连 provider，写入 OAuth/local-proxy `auth.json` 与 `.env`，并
+保留无关配置。`.env` 的 loopback 端口始终取自当前
+`~/.saiai/config.json`，不再遗留固定 `19908`。由于命令包含 Key，Key 会出现在
+剪贴板、终端命令和 shell 历史中；客户端自身不会把 Key 打印到输出。WebUI 只提供
+Codex CLI，不提供 WebSocket 专用页签；即使旧页面仍传入 `--websockets`，它也只是
+兼容接受，代理默认同时支持 Responses HTTP 和 WebSocket。
 
 Claude Code 仍可使用带 Base URL/Key 的兼容初始化命令。
 
@@ -97,19 +98,15 @@ saiai desktop
 saiai chatgpt
 ```
 
-该命令只在 Codex 子进程中设置 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和
+`saiai codex` 只在 Codex 子进程中设置 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和
 `CODEX_CA_CERTIFICATE`。Linux 通过子进程参数启用 Codex 的
 `features.respect_system_proxy`；Windows/macOS 则明确关闭该特性，使 Responses
 HTTP/WS 使用子进程代理环境，避免 WinHTTP/SystemConfiguration 返回 `DIRECT` 后
 绕过本地代理。它不会修改用户
 shell、系统环境变量或把这个开关写入 `config.toml`。启动前会备份并清理
 生效 `CODEX_HOME` 中的第三方 `base_url`、provider 和 WebSocket 开关，将根
-provider 恢复为官方内置 `openai`。为兼容旧版 `init-codex` 创建的历史线程，
-配置会额外保留一个固定的 `model_providers.OpenAI` 别名；它只指向
-`https://api.openai.com/v1`、使用 `responses` 和 `requires_openai_auth`，不会
-保留旧的 Gateway、env_key 或其他用户字段。这样旧线程可以继续解析 provider，
-而请求仍经由 local-proxy；新线程仍使用内置 `openai`。备份文件使用同目录的
-`.bak-<timestamp>` 后缀。
+provider 恢复为官方内置 `openai`，且不保留旧直连 SAIAI provider 或历史线程兼容
+别名。备份文件使用同目录的 `.bak-<timestamp>` 后缀。
 
 SAIAI 合成登录态不能认证官方 hosted Apps MCP，因此 launcher 默认仅在该 Codex
 子进程中设置 `features.apps=false`，避免出现与模型请求无关的 `codex_apps` 451
@@ -134,14 +131,16 @@ launcher 会直接运行 PATH 中的原生 Codex 可执行文件。Linux 官方�
 `codex.cmd` + `node_modules/@openai/codex/bin/codex.js` 布局；后者通过 `node.exe`
 安全启动，不依赖 `cmd.exe` 展开参数。
 
-Codex VSCode 扩展不是 `saiai codex` 的子进程，因此首次使用前执行：
+`init-codex` 已为 Codex VSCode 扩展写入同一 `CODEX_HOME/.env`。若需在不重新
+提供 Gateway/Key 的情况下修复或刷新扩展配置，也可以执行：
 
 ```bash
 saiai vscode
 ```
 
-该命令备份并清理同一 `CODEX_HOME` 中冲突的 provider/base URL，创建本地代理 OAuth
-占位状态，并在 Codex 专属 `.env` 中写入 loopback 代理、`SSL_CERT_FILE` 和
+该命令会重复应用相同的 OAuth/local-proxy 配置：清理同一 `CODEX_HOME` 中冲突的
+provider/base URL，创建或保留本地代理 OAuth 状态，并在 Codex 专属 `.env` 中写入
+当前 loopback 代理、`SSL_CERT_FILE` 和
 `NO_PROXY`；同时按平台在 Codex 配置中写入 `features.respect_system_proxy`：
 Linux 为 `true`，Windows/macOS 为 `false`。它不会
 修改 shell 或操作系统环境变量，也不会写入第三方 `base_url`。配置完成后重启
@@ -179,25 +178,11 @@ SAIAI_CHATGPT_TIMEZONE=America/Los_Angeles saiai chatgpt
 进程设置 `SAIAI_CHATGPT_CHAT_PASSTHROUGH=0` 关闭该路径；Gateway 端仍需显式启用
 普通 Chat，并在计费不可用时默认拒绝最终模型请求。
 
-旧的 API-key 初始化命令暂时保持兼容：
-
-```bash
-saiai init-codex https://api.saiai.top/v1 YOUR_API_KEY
-```
-
-该命令合并 `~/.codex/config.toml` 和 `~/.codex/auth.json`，保留不属于 SAIAI
-管理范围的字段；同时在独立的 `SAIAI_HOME` 中创建或更新本地代理配置和安装 CA，
-因此同一次初始化后可以直接运行 `saiai codex`。它不会修改 Claude 配置，并会启动
-或刷新受管代理。旧直连 Provider 保留传入的 `/v1`，
-本地代理配置则移除末尾 `/v1` 后再转发客户端原始 `/v1/*` 路径，避免产生
-`/v1/v1/*`。已有有效代理 CA、监听地址和普通 Chat
-开关会保留，只替换本次指定的 Gateway 和 Key。launcher 只在 `auth.json` 的旧
-API Key 与当前 SAIAI 配置 Key 完全一致时把它升级为本地代理 OAuth 占位；不同的
-API Key 和真实 OAuth 都不会被覆盖。Codex 0.149.0+ 使用自定义 Provider 时会写入
-`requires_openai_auth = true`，但不会新增、覆盖或删除根 `model`、`review_model`、
-推理强度或模型上下文预算。执行权限相关的
-`sandbox_mode`、`approval_policy` 和 `dangerously_bypass_approvals_and_sandbox`
-不属于 SAIAI CLI 管理范围：已有值会原样保留，初始化不会自动启用全盘访问、关闭审批或绕过安全检查。
+`init-codex` 不再提供 API-key 直连 Gateway 模式：输入的 Key 只保存在
+`SAIAI_HOME/config.json`，由 loopback proxy 在 Gateway 边界使用。它会备份后清理
+旧 `config.toml` provider/base URL 和 API-key-only `auth.json`，并创建本地 OAuth
+占位（已有真实 ChatGPT OAuth 会保留）。根模型选择、推理强度、上下文预算和执行安全
+设置不由 SAIAI 改写。
 
 ## 发布资产
 

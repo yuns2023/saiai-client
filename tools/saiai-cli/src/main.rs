@@ -94,13 +94,6 @@ const CODEX_CERTIFICATE_CONTROL_HOST: &str = "certificate.saiai.local";
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const CODEX_CERTIFICATE_SPKI_HEADER: &str = "x-saiai-leaf-spki-sha256";
 const CODEX_PLACEHOLDER_ACCOUNT_ID: &str = "saiai-local-proxy-placeholder-account";
-// Historical `init-codex` sessions persisted the custom provider ID `OpenAI`.
-// Keep a single hardened alias for those sessions while new threads continue
-// to use Codex's built-in lowercase `openai` provider. The alias must point at
-// the host that the local proxy MITM route owns; never retain a user-supplied
-// Gateway or other third-party endpoint here.
-const CODEX_LEGACY_PROVIDER_ID: &str = "OpenAI";
-const CODEX_LEGACY_PROVIDER_BASE_URL: &str = "https://api.openai.com/v1";
 // Structurally valid but unsigned and therefore unusable against OpenAI. The
 // local proxy replaces request authentication at the Gateway boundary; these
 // claims only let Codex's local app-server expose an authenticated UI state.
@@ -422,8 +415,9 @@ fn parse_named_args(command: &str, args: &[String]) -> Result<InitArgs> {
                 }
                 api_key = args[i].clone();
             }
-            // `--websockets` is a boolean flag (no value). Only meaningful for
-            // `init-codex`; reject it on `init` to surface mistakes early.
+            // Retain this legacy WebUI flag as a no-op on the local-proxy
+            // route. The proxy supports both HTTP and WebSocket Responses;
+            // `init-codex` no longer writes a direct-provider transport mode.
             "--websockets" if command == "init-codex" => {
                 websockets = true;
             }
@@ -462,11 +456,7 @@ fn parse_named_args(command: &str, args: &[String]) -> Result<InitArgs> {
     if base_url.is_empty() || api_key.is_empty() {
         bail!(USAGE);
     }
-    let base_url = if command == "init-codex" {
-        normalize_codex_base_url(&base_url)?
-    } else {
-        normalize_base_url(&base_url)?
-    };
+    let base_url = normalize_base_url(&base_url)?;
     validate_api_key(&api_key)?;
     Ok(InitArgs {
         base_url,
@@ -494,18 +484,6 @@ fn normalize_base_url(raw: &str) -> Result<String> {
     }
     let path = url.path().trim_end_matches('/').to_string();
     url.set_path(if path.is_empty() { "/" } else { &path });
-    Ok(url.as_str().trim_end_matches('/').to_string())
-}
-
-fn normalize_codex_base_url(raw: &str) -> Result<String> {
-    let normalized = normalize_base_url(raw)?;
-    let mut url = Url::parse(&normalized).context("The Codex base URL is not valid")?;
-    let path = url.path().trim_end_matches('/');
-    if path.is_empty() {
-        url.set_path("/v1");
-    } else if !path.ends_with("/v1") {
-        url.set_path(&format!("{path}/v1"));
-    }
     Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
@@ -630,26 +608,30 @@ fn init_codex(args: InitArgs) -> Result<()> {
     backup_if_exists(&config_path, &timestamp)?;
     backup_if_exists(&auth_path, &timestamp)?;
 
-    merge_codex_config(&config_path, &args.base_url, args.websockets)?;
-    merge_codex_auth(&auth_path, &args.api_key)?;
     let proxy_init = initialize_codex_local_proxy(&args, &timestamp)?;
+    let oauth_init = configure_codex_oauth_local_proxy(&codex_dir, &proxy_init)?;
 
-    println!("SAIAI configured Codex CLI for saiai gateway.");
+    println!("SAIAI configured Codex for local-proxy OAuth mode.");
     println!("Updated:");
     println!("  {}", config_path.display());
-    println!("  {}", auth_path.display());
+    println!("  {}", oauth_init.auth_path.display());
+    println!("  {}", oauth_init.env_path.display());
     println!("  {}", proxy_init.config_path.display());
     println!("  {}", proxy_init.ca_cert_path.display());
     println!("  {}", proxy_init.ca_key_path.display());
+    println!("  proxy=http://{}", proxy_init.listen);
+    println!(
+        "Migrated {} Codex config file(s) to the built-in OpenAI provider with backups.",
+        oauth_init.files.len()
+    );
     if args.websockets {
         println!(
-            "Default provider set to `OpenAI` pointing at SAIAI (wire_api = responses, websockets enabled)."
+            "`--websockets` is no longer needed: the local proxy supports Responses HTTP and WebSocket traffic."
         );
-    } else {
-        println!("Default provider set to `OpenAI` pointing at SAIAI (wire_api = responses).");
     }
-    println!("Existing TOML keys and JSON auth fields outside our scope were preserved.");
-    println!("SAIAI local-proxy configuration is ready; run `saiai codex` for OAuth mode.");
+    println!(
+        "SAIAI local-proxy OAuth configuration is ready; run `saiai codex` or restart VSCode."
+    );
     warn_claude_settings_overrides();
     start_managed_service_after_initialization()?;
 
@@ -658,8 +640,33 @@ fn init_codex(args: InitArgs) -> Result<()> {
 
 struct CodexLocalProxyInit {
     config_path: PathBuf,
+    listen: String,
     ca_cert_path: PathBuf,
     ca_key_path: PathBuf,
+}
+
+struct CodexOAuthInitialization {
+    auth_path: PathBuf,
+    env_path: PathBuf,
+    files: Vec<PathBuf>,
+}
+
+fn configure_codex_oauth_local_proxy(
+    codex_dir: &Path,
+    proxy_init: &CodexLocalProxyInit,
+) -> Result<CodexOAuthInitialization> {
+    let auth_path = codex_dir.join("auth.json");
+    ensure_codex_local_proxy_auth(&auth_path)?;
+    validate_codex_oauth_auth(&auth_path)?;
+    let files = prepare_codex_oauth_files(codex_dir, true)?;
+    let env_path = codex_dir.join(".env");
+    let ca_cert_path = proxy_init.ca_cert_path.to_string_lossy();
+    write_codex_ide_env(&env_path, &proxy_init.listen, &ca_cert_path)?;
+    Ok(CodexOAuthInitialization {
+        auth_path,
+        env_path,
+        files,
+    })
 }
 
 fn initialize_codex_local_proxy(args: &InitArgs, timestamp: &str) -> Result<CodexLocalProxyInit> {
@@ -703,6 +710,7 @@ fn initialize_codex_local_proxy_at(
         )?;
         return Ok(CodexLocalProxyInit {
             config_path,
+            listen: updated.listen,
             ca_cert_path: PathBuf::from(updated.ca_cert_path),
             ca_key_path: PathBuf::from(updated.ca_key_path),
         });
@@ -729,6 +737,7 @@ fn initialize_codex_local_proxy_at(
     write_saiai_config_at(&config_path, &config)?;
     Ok(CodexLocalProxyInit {
         config_path,
+        listen: config.listen,
         ca_cert_path,
         ca_key_path,
     })
@@ -764,10 +773,10 @@ fn run_codex(args: &[String]) -> Result<()> {
         .context("SAIAI local proxy is not configured; run the SAIAI Claude setup first")?;
     let _runtime_ca = read_runtime_ca(&cfg)
         .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
-    ensure_codex_local_proxy_auth(&auth_path, Some(&cfg.api_key))?;
+    let files = prepare_codex_oauth_files(&codex_dir, false)?;
+    ensure_codex_local_proxy_auth(&auth_path)?;
     validate_codex_oauth_auth(&auth_path)?;
     ensure_local_proxy_running(&cfg.listen)?;
-    let files = prepare_codex_oauth_files(&codex_dir, false)?;
 
     let proxy = format!("http://{}", cfg.listen);
     // The local-proxy launcher owns proxy variables only in this child
@@ -939,12 +948,12 @@ fn configure_vscode() -> Result<()> {
     let auth_path = codex_dir.join("auth.json");
     let cfg = read_saiai_config()
         .context("SAIAI local proxy is not configured; run the SAIAI setup first")?;
-    ensure_codex_local_proxy_auth(&auth_path, Some(&cfg.api_key))?;
-    validate_codex_oauth_auth(&auth_path)?;
     let _runtime_ca = read_runtime_ca(&cfg)
         .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
 
     let files = prepare_codex_oauth_files(&codex_dir, true)?;
+    ensure_codex_local_proxy_auth(&auth_path)?;
+    validate_codex_oauth_auth(&auth_path)?;
     let env_path = codex_dir.join(".env");
     write_codex_ide_env(&env_path, &cfg.listen, &cfg.ca_cert_path)?;
     ensure_local_proxy_running(&cfg.listen)?;
@@ -1137,22 +1146,15 @@ fn codex_args_override_config_key(args: &[String], expected_key: &str) -> bool {
     false
 }
 
-fn ensure_codex_local_proxy_auth(path: &Path, expected_legacy_api_key: Option<&str>) -> Result<()> {
-    write_codex_local_proxy_auth(path, expected_legacy_api_key, false)
+fn ensure_codex_local_proxy_auth(path: &Path) -> Result<()> {
+    write_codex_local_proxy_auth(path, false)
 }
 
-fn replace_codex_local_proxy_auth(
-    path: &Path,
-    expected_legacy_api_key: Option<&str>,
-) -> Result<()> {
-    write_codex_local_proxy_auth(path, expected_legacy_api_key, true)
+fn replace_codex_local_proxy_auth(path: &Path) -> Result<()> {
+    write_codex_local_proxy_auth(path, true)
 }
 
-fn write_codex_local_proxy_auth(
-    path: &Path,
-    expected_legacy_api_key: Option<&str>,
-    replace_existing: bool,
-) -> Result<()> {
+fn write_codex_local_proxy_auth(path: &Path, replace_existing: bool) -> Result<()> {
     let existed = path.exists();
     let mut auth = if existed {
         load_json_object(path)?
@@ -1166,15 +1168,11 @@ fn write_codex_local_proxy_auth(
             .and_then(|tokens| tokens.get("access_token"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        let managed_legacy_api_key = existing_access.is_empty()
-            && expected_legacy_api_key.is_some_and(|expected| {
-                !expected.is_empty()
-                    && auth
-                        .get("OPENAI_API_KEY")
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| value == expected)
-            });
-        if !is_codex_placeholder_access_token(existing_access) && !managed_legacy_api_key {
+        let existing_auth_mode = auth.get("auth_mode").and_then(Value::as_str).unwrap_or("");
+        let has_real_oauth = matches!(existing_auth_mode, "chatgpt" | "chatgptAuthTokens")
+            && !existing_access.trim().is_empty()
+            && !is_codex_placeholder_access_token(existing_access);
+        if has_real_oauth {
             return Ok(());
         }
     }
@@ -1266,7 +1264,7 @@ fn run_linux_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
         .with_context(|| format!("failed to create {}", desktop_codex.display()))?;
     fs::create_dir_all(&desktop_user_data)
         .with_context(|| format!("failed to create {}", desktop_user_data.display()))?;
-    prepare_isolated_desktop_state(&cfg, &desktop_root, &desktop_codex)?;
+    prepare_isolated_desktop_state(&desktop_root, &desktop_codex)?;
     ensure_desktop_nss_ca(&desktop_home, &cfg.ca_cert_path)?;
 
     let executable = env::var_os("SAIAI_CHATGPT_BIN")
@@ -1362,7 +1360,7 @@ fn run_macos_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
         fs::create_dir_all(directory)
             .with_context(|| format!("failed to create {}", directory.display()))?;
     }
-    prepare_isolated_desktop_state(&cfg, &desktop_root, &desktop_codex)?;
+    prepare_isolated_desktop_state(&desktop_root, &desktop_codex)?;
 
     let executable = resolve_macos_chatgpt_executable()?;
     if let Some(bundle) = &packaged_bundle {
@@ -1705,7 +1703,7 @@ fn run_windows_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
         fs::create_dir_all(directory)
             .with_context(|| format!("failed to create {}", directory.display()))?;
     }
-    prepare_isolated_desktop_state(&cfg, &desktop_root, &desktop_codex)?;
+    prepare_isolated_desktop_state(&desktop_root, &desktop_codex)?;
 
     let executable = resolve_windows_desktop_executable()?;
     let fixed_timezone = resolve_chatgpt_timezone()?;
@@ -1783,19 +1781,9 @@ fn run_windows_packaged_desktop(
     fs::create_dir_all(&codex_dir)
         .with_context(|| format!("failed to create {}", codex_dir.display()))?;
     let auth_path = codex_dir.join("auth.json");
-    // The packaged Desktop shares this auth cache with the official ChatGPT
-    // login. Preserve any existing real/placeholder cache; only create the
-    // SAIAI synthetic identity on a fresh install, where it enables the
-    // no-provider-login local-proxy test flow without clobbering a login.
-    if auth_path.is_file() {
-        println!(
-            "Preserving existing Desktop auth cache at {}.",
-            auth_path.display()
-        );
-    } else {
-        ensure_codex_local_proxy_auth(&auth_path, Some(&cfg.api_key))?;
-    }
     prepare_codex_oauth_files(&codex_dir, true)?;
+    ensure_codex_local_proxy_auth(&auth_path)?;
+    validate_codex_oauth_auth(&auth_path)?;
     let env_path = codex_dir.join(".env");
     write_codex_ide_env(&env_path, &cfg.listen, &cfg.ca_cert_path)?;
     let desktop_root = saiai_config_dir()?.join("desktop");
@@ -2353,17 +2341,13 @@ fn prepare_desktop_onboarding_state(codex_home: &Path) -> Result<()> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn prepare_isolated_desktop_state(
-    cfg: &SaiaiConfig,
-    desktop_root: &Path,
-    desktop_codex: &Path,
-) -> Result<()> {
+fn prepare_isolated_desktop_state(desktop_root: &Path, desktop_codex: &Path) -> Result<()> {
     let auth_path = desktop_codex.join("auth.json");
     let source_auth_path = codex_config_dir()?.join("auth.json");
     if !copy_real_codex_oauth_auth(&source_auth_path, &auth_path)?
         && !copy_real_codex_oauth_auth(&auth_path, &auth_path)?
     {
-        replace_codex_local_proxy_auth(&auth_path, Some(&cfg.api_key))?;
+        replace_codex_local_proxy_auth(&auth_path)?;
     }
     validate_codex_oauth_auth(&auth_path)?;
     prepare_codex_oauth_files(desktop_codex, true)?;
@@ -2593,13 +2577,9 @@ fn clean_codex_oauth_document(document: &mut DocumentMut) {
         document.as_table_mut().remove(key);
     }
     // A custom provider can override the built-in endpoint even when the root
-    // provider looks harmless. Remove every user-defined provider after the
-    // file has been backed up, then install only the fixed legacy alias below.
-    // Existing threads persist their provider ID, and historical SAIAI
-    // `init-codex` sessions used `OpenAI` (capital O/A); without this alias
-    // `thread/resume` fails before any network request is attempted.
+    // provider looks harmless. The managed OAuth route deliberately does not
+    // retain a compatibility alias for historical direct-Gateway sessions.
     document.as_table_mut().remove("model_providers");
-    install_codex_legacy_provider_alias(document);
 
     // Let the built-in OpenAI provider keep its official Responses transport
     // defaults. The local proxy supports both HTTP fallback and WebSocket.
@@ -2614,28 +2594,6 @@ fn clean_codex_oauth_document(document: &mut DocumentMut) {
     if features.is_empty() {
         document.as_table_mut().remove("features");
     }
-}
-
-fn install_codex_legacy_provider_alias(document: &mut DocumentMut) {
-    let mut providers = Table::new();
-    let mut legacy = Table::new();
-    legacy.insert("name", value(CODEX_LEGACY_PROVIDER_ID));
-    legacy.insert("base_url", value(CODEX_LEGACY_PROVIDER_BASE_URL));
-    legacy.insert("wire_api", value("responses"));
-    legacy.insert("requires_openai_auth", value(true));
-    providers.insert(CODEX_LEGACY_PROVIDER_ID, Item::Table(legacy));
-    document["model_providers"] = Item::Table(providers);
-}
-
-fn is_safe_codex_legacy_provider_alias(item: &Item) -> bool {
-    let Some(table) = item.as_table() else {
-        return false;
-    };
-    table.len() == 4
-        && table["name"].as_str() == Some(CODEX_LEGACY_PROVIDER_ID)
-        && table["base_url"].as_str() == Some(CODEX_LEGACY_PROVIDER_BASE_URL)
-        && table["wire_api"].as_str() == Some("responses")
-        && table["requires_openai_auth"].as_bool() == Some(true)
 }
 
 fn ensure_local_proxy_running(listen: &str) -> Result<()> {
@@ -3008,15 +2966,24 @@ fn run_service_start() -> Result<()> {
     warn_process_env_conflicts();
     warn_claude_settings_overrides();
     let cfg = read_saiai_config()?;
-    if !macos_launchd_running().unwrap_or(false) {
-        ensure_listen_available(&cfg.listen)?;
-    }
-    let plist_path = write_launchd_plist()?;
     let domain = launchctl_gui_domain()?;
     let target = launchctl_service_target(&domain);
-    let plist = plist_path.display().to_string();
-    let _ = run_launchctl(&["bootout", &domain, &plist]);
-    run_launchctl(&["bootstrap", &domain, &plist])?;
+    let loaded = macos_launchd_loaded(&target);
+    let plist = write_launchd_plist()?;
+    let plist_path = &plist.path;
+    let plist_text = plist_path.display().to_string();
+
+    // The proxy reads its current Gateway, key, CA, and listen address from
+    // config.json on every process start. Re-bootstrap only when LaunchAgent
+    // metadata itself changed; bootout/bootstrap can take several seconds on
+    // Intel macOS and is unnecessary for an ordinary init refresh.
+    if !loaded || plist.changed {
+        if loaded {
+            run_launchctl(&["bootout", &domain, &plist_text])?;
+        }
+        ensure_listen_available(&cfg.listen)?;
+        run_launchctl(&["bootstrap", &domain, &plist_text])?;
+    }
     run_launchctl(&["enable", &target])?;
     run_launchctl(&["kickstart", "-k", &target])?;
     println!("SAIAI LaunchAgent started.");
@@ -3731,18 +3698,7 @@ fn claude_settings_override_locations(settings: &Map<String, Value>) -> Vec<Stri
             }
         }
     }
-    if claude_root_model_looks_legacy_override(settings.get("model")) {
-        locations.push("model".to_string());
-    }
     locations
-}
-
-fn claude_root_model_looks_legacy_override(value: Option<&Value>) -> bool {
-    let Some(Value::String(value)) = value else {
-        return false;
-    };
-    let value = value.trim();
-    !value.is_empty() && (value.contains('[') || value.starts_with("deepseek-"))
 }
 
 fn json_value_is_set(value: Option<&Value>) -> bool {
@@ -4326,7 +4282,10 @@ fn check_claude_config(
 
     let overrides = claude_settings_override_locations(&settings);
     if overrides.is_empty() {
-        report.ok("Claude overrides", "no legacy model/behavior overrides");
+        report.ok(
+            "Claude overrides",
+            "no legacy routing or authentication overrides",
+        );
     } else {
         report.warn(
             "Claude overrides",
@@ -4464,28 +4423,18 @@ fn check_codex_config(report: &mut DoctorReport, cfg: Option<&SaiaiConfig>, requ
                     {
                         report.warn(
                             "Codex base_url",
-                            "direct endpoint override remains; run `saiai codex` to migrate it",
+                            "direct endpoint override remains; run `saiai init-codex` to migrate it",
                         );
                     } else {
                         report.ok("Codex base_url", "no direct root endpoint override");
                     }
-                    match document
-                        .get("model_providers")
-                        .and_then(Item::as_table)
-                        .and_then(|providers| providers.get(CODEX_LEGACY_PROVIDER_ID))
-                    {
-                        Some(alias) if is_safe_codex_legacy_provider_alias(alias) => report.ok(
-                            "Codex legacy provider",
-                            "managed OpenAI compatibility alias is present",
-                        ),
-                        Some(_) => report.error(
-                            "Codex legacy provider",
-                            "OpenAI compatibility alias is not managed; run `saiai codex` to replace it",
-                        ),
-                        None => report.warn(
-                            "Codex legacy provider",
-                            "compatibility alias is absent; historical OpenAI threads may not resume",
-                        ),
+                    if document.get("model_providers").is_some() {
+                        report.warn(
+                            "Codex providers",
+                            "custom provider configuration remains; run `saiai init-codex` to remove it",
+                        );
+                    } else {
+                        report.ok("Codex providers", "no custom provider compatibility route");
                     }
                 }
                 Err(err) => report.error("Codex config", format!("invalid TOML: {err}")),
@@ -4518,10 +4467,15 @@ fn check_codex_config(report: &mut DoctorReport, cfg: Option<&SaiaiConfig>, requ
             }
             Err(err) => report.warn("Codex .env", format!("could not read: {err}")),
         }
-    } else {
-        report.ok(
+    } else if required {
+        report.error(
             "Codex .env",
-            "not required for direct `saiai codex` child launch",
+            "missing; run `saiai init-codex` to configure the local proxy route",
+        );
+    } else {
+        report.warn(
+            "Codex .env",
+            "missing; run `saiai init-codex` before using an external Codex app-server",
         );
     }
     if cfg.is_none() {
@@ -5507,7 +5461,13 @@ fn systemd_path_setting(value: &str) -> Result<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn write_launchd_plist() -> Result<PathBuf> {
+struct LaunchdPlist {
+    path: PathBuf,
+    changed: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn write_launchd_plist() -> Result<LaunchdPlist> {
     let launch_agents_dir = launchd_agents_dir()?;
     fs::create_dir_all(&launch_agents_dir)
         .with_context(|| format!("failed to create {}", launch_agents_dir.display()))?;
@@ -5523,9 +5483,21 @@ fn write_launchd_plist() -> Result<PathBuf> {
     let working_dir = home_dir().context("failed to resolve home directory")?;
     let plist_path = launchd_plist_path()?;
     let content = render_launchd_plist(&exe, &saiai_home, &working_dir, &log_path)?;
-    write_bytes_atomic(&plist_path, content.as_bytes(), 0o644)
-        .with_context(|| format!("failed to write {}", plist_path.display()))?;
-    Ok(plist_path)
+    let changed = match fs::read_to_string(&plist_path) {
+        Ok(existing) => existing != content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", plist_path.display()));
+        }
+    };
+    if changed {
+        write_bytes_atomic(&plist_path, content.as_bytes(), 0o644)
+            .with_context(|| format!("failed to write {}", plist_path.display()))?;
+    }
+    Ok(LaunchdPlist {
+        path: plist_path,
+        changed,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -5622,7 +5594,12 @@ fn run_launchctl(args: &[&str]) -> Result<()> {
 fn macos_launchd_running() -> Result<bool> {
     let domain = launchctl_gui_domain()?;
     let target = launchctl_service_target(&domain);
-    Ok(command_output(MACOS_LAUNCHCTL_COMMAND, &["print", &target]).is_ok())
+    Ok(macos_launchd_loaded(&target))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_launchd_loaded(target: &str) -> bool {
+    command_output(MACOS_LAUNCHCTL_COMMAND, &["print", target]).is_ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -6688,201 +6665,6 @@ fn as_object(value: Value) -> Option<Map<String, Value>> {
     }
 }
 
-/// Merge SAIAI's provider definition into `~/.codex/config.toml`, preserving any
-/// unrelated tables, comments and field ordering already written by the user
-/// or by `codex login`. Model selection stays under the user's control; SAIAI
-/// does not add, overwrite, or remove model tuning. When `websockets` is true,
-/// the SAIAI WebSocket transport is
-/// enabled; when false, any previously-written WebSocket config is removed.
-///
-/// The provider is written under the `OpenAI` namespace (matching the
-/// historical name produced by both `codex login` and the admin UI's earlier
-/// manual config), keeping Codex's session/cache identity continuous across
-/// the manual-config → init-codex transition.
-fn merge_codex_config(path: &Path, base_url: &str, websockets: bool) -> Result<()> {
-    let raw = if path.exists() {
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?
-    } else {
-        String::new()
-    };
-
-    let mut doc: DocumentMut = if raw.trim().is_empty() {
-        DocumentMut::new()
-    } else {
-        raw.parse::<DocumentMut>().with_context(|| {
-            format!(
-                "failed to parse {} as TOML (existing file preserved as backup; not modified)",
-                path.display()
-            )
-        })?
-    };
-
-    merge_codex_root_defaults(&mut doc);
-    merge_codex_openai_provider(&mut doc, base_url, websockets, path)?;
-    merge_codex_features(&mut doc, websockets, path)?;
-
-    fs::write(path, doc.to_string())
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
-}
-
-/// Write only the non-model root controls required by the legacy direct-provider
-/// route. Model choice, review-model choice, reasoning effort, and context
-/// budgets remain untouched, as do execution-safety controls.
-fn merge_codex_root_defaults(doc: &mut DocumentMut) {
-    doc["disable_response_storage"] = value(true);
-    doc["network_access"] = value("enabled");
-    doc["windows_wsl_setup_acknowledged"] = value(true);
-    doc["model_provider"] = value("OpenAI");
-}
-
-/// Upsert `[model_providers.OpenAI]` with the gateway's contract fields. Other
-/// providers under `[model_providers]` (e.g. a user's experimental local
-/// proxy registered as `[model_providers.local]`) and any unknown keys inside
-/// `[model_providers.OpenAI]` itself (e.g. user-set `query_params`, custom
-/// headers) are preserved. When `websockets` is false, the managed
-/// `supports_websockets` key is explicitly removed so toggling off via
-/// `init-codex` (no flag) is reversible.
-///
-/// `name` is intentionally pinned to `"OpenAI"`, matching the namespace key.
-/// We do NOT preserve a user-set `name` — Codex CLI may use this string in
-/// internal indices/UI, and aligning name with namespace minimizes surprises
-/// when a user is migrating from manual config or v0.3.0.
-fn merge_codex_openai_provider(
-    doc: &mut DocumentMut,
-    base_url: &str,
-    websockets: bool,
-    path: &Path,
-) -> Result<()> {
-    // Refuse to silently overwrite if `model_providers` exists but isn't a
-    // table — same posture as `merge_codex_auth`'s non-object guard. The
-    // backup is already on disk, so the user can inspect and resolve.
-    match doc.get("model_providers") {
-        None => doc["model_providers"] = Item::Table(Table::new()),
-        Some(item) if item.is_table() => {}
-        Some(_) => bail!(
-            "{} has a `model_providers` entry that is not a table; refusing to overwrite (backup is preserved)",
-            path.display()
-        ),
-    }
-    let providers = doc["model_providers"]
-        .as_table_mut()
-        .expect("model_providers ensured to be a table above");
-
-    match providers.get("OpenAI") {
-        None => {
-            providers.insert("OpenAI", Item::Table(Table::new()));
-        }
-        Some(item) if item.is_table() => {}
-        Some(_) => bail!(
-            "{} has `[model_providers.OpenAI]` set to a non-table value; refusing to overwrite (backup is preserved)",
-            path.display()
-        ),
-    }
-    let openai = providers
-        .get_mut("OpenAI")
-        .and_then(Item::as_table_mut)
-        .expect("[model_providers.OpenAI] ensured to be a table above");
-
-    // `Table::insert` replaces in-place when the key already exists, preserving
-    // surrounding formatting; new keys append.
-    openai.insert("name", value("OpenAI"));
-    openai.insert("base_url", value(base_url));
-    // wire_api must remain "responses": the saiai backend dropped the
-    // /v1/chat/completions compatibility layer (see backend changelog).
-    openai.insert("wire_api", value("responses"));
-    // Keep every managed OpenAI provider OAuth-shaped. Historical Codex
-    // groups require this flag even when their configuration originated from
-    // the legacy init-codex command.
-    openai.insert("requires_openai_auth", value(true));
-    // Drop any `env_key` written by older SAIAI helper builds. Setting it to
-    // `OPENAI_API_KEY` made Codex prefer the shell env over the api_key
-    // SAIAI writes into ~/.codex/auth.json — a footgun whenever the user
-    // already had OPENAI_API_KEY exported. We rely on auth.json instead.
-    openai.remove("env_key");
-    if websockets {
-        openai.insert("supports_websockets", value(true));
-    } else {
-        openai.remove("supports_websockets");
-    }
-    Ok(())
-}
-
-/// Toggle the managed `[features].responses_websockets_v2` key. Other
-/// `[features]` entries written by the user are preserved. When the table is
-/// left empty after removing our managed key, the entire `[features]` table is
-/// dropped to keep the file clean.
-fn merge_codex_features(doc: &mut DocumentMut, websockets: bool, path: &Path) -> Result<()> {
-    if websockets {
-        match doc.get("features") {
-            None => doc["features"] = Item::Table(Table::new()),
-            Some(item) if item.is_table() => {}
-            Some(_) => bail!(
-                "{} has a `features` entry that is not a table; refusing to overwrite (backup is preserved)",
-                path.display()
-            ),
-        }
-        let features = doc["features"]
-            .as_table_mut()
-            .expect("features ensured to be a table above");
-        features.insert("responses_websockets_v2", value(true));
-        return Ok(());
-    }
-
-    // websockets == false: refuse non-table `features` symmetrically with the
-    // ws=true branch (the user's malformed value would otherwise be silently
-    // left in place, defeating the intent of "explicit cleanup"). Then remove
-    // our managed key and drop the table if empty.
-    match doc.get("features") {
-        None => return Ok(()),
-        Some(item) if item.is_table() => {}
-        Some(_) => bail!(
-            "{} has a `features` entry that is not a table; refusing to overwrite (backup is preserved)",
-            path.display()
-        ),
-    }
-    let features_now_empty;
-    {
-        let features = doc["features"]
-            .as_table_mut()
-            .expect("features ensured to be a table above");
-        features.remove("responses_websockets_v2");
-        features_now_empty = features.is_empty();
-    }
-    if features_now_empty {
-        doc.as_table_mut().remove("features");
-    }
-    Ok(())
-}
-
-/// Write the legacy API-key-only shape to `~/.codex/auth.json`. Historical
-/// OAuth fields (`auth_mode`, `tokens`, refresh metadata, and account IDs)
-/// must not coexist with `OPENAI_API_KEY`: Codex otherwise chooses the wrong
-/// credential mode for direct Gateway requests. The caller has already backed
-/// up the previous file before reaching this function.
-fn merge_codex_auth(path: &Path, api_key: &str) -> Result<()> {
-    if path.exists() {
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        if !raw.trim().is_empty() {
-            let parsed: Value = serde_json::from_str(&raw)
-                .with_context(|| format!("failed to parse {}", path.display()))?;
-            if !parsed.is_object() {
-                bail!(
-                    "{} exists but is not a JSON object; refusing to overwrite (backup is preserved)",
-                    path.display()
-                );
-            }
-        }
-    }
-    let mut auth = Map::new();
-    auth.insert(
-        "OPENAI_API_KEY".to_string(),
-        Value::String(api_key.to_string()),
-    );
-    write_json_object(path, Value::Object(auth))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6921,82 +6703,6 @@ mod tests {
         read_str(path).parse::<DocumentMut>().unwrap()
     }
 
-    fn temp_config() -> (TempDir, PathBuf) {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        (dir, path)
-    }
-
-    fn assert_managed_root(doc: &DocumentMut) {
-        assert_eq!(doc["disable_response_storage"].as_bool(), Some(true));
-        assert_eq!(doc["network_access"].as_str(), Some("enabled"));
-        assert_eq!(doc["windows_wsl_setup_acknowledged"].as_bool(), Some(true));
-        assert_eq!(doc["model_provider"].as_str(), Some("OpenAI"));
-    }
-
-    fn assert_no_forced_model_defaults(doc: &DocumentMut) {
-        for key in [
-            "model",
-            "review_model",
-            "model_reasoning_effort",
-            "model_context_window",
-            "model_auto_compact_token_limit",
-        ] {
-            assert!(
-                doc.get(key).is_none(),
-                "init-codex must not force the model tuning key {key}",
-            );
-        }
-    }
-
-    fn assert_managed_provider(doc: &DocumentMut, base_url: &str, websockets: bool) {
-        let openai = &doc["model_providers"]["OpenAI"];
-        assert_eq!(openai["name"].as_str(), Some("OpenAI"));
-        assert_eq!(openai["base_url"].as_str(), Some(base_url));
-        assert_eq!(openai["wire_api"].as_str(), Some("responses"));
-        assert_eq!(openai["requires_openai_auth"].as_bool(), Some(true));
-        assert!(
-            openai.get("env_key").is_none(),
-            "env_key must not be set; Codex would otherwise prefer shell env over auth.json",
-        );
-        if websockets {
-            assert_eq!(openai["supports_websockets"].as_bool(), Some(true));
-        } else {
-            assert!(
-                openai.get("supports_websockets").is_none(),
-                "expected supports_websockets to be absent when websockets=false",
-            );
-        }
-    }
-
-    fn assert_legacy_openai_alias(doc: &DocumentMut) {
-        let providers = doc["model_providers"]
-            .as_table()
-            .expect("legacy provider table should be present");
-        assert_eq!(
-            providers.len(),
-            1,
-            "only the managed compatibility alias remains"
-        );
-        let legacy = providers
-            .get(CODEX_LEGACY_PROVIDER_ID)
-            .and_then(Item::as_table)
-            .expect("legacy OpenAI provider alias should be a table");
-        assert!(is_safe_codex_legacy_provider_alias(
-            providers
-                .get(CODEX_LEGACY_PROVIDER_ID)
-                .expect("legacy provider alias should be present")
-        ));
-        assert_eq!(legacy.len(), 4, "legacy alias must not retain user fields");
-        assert_eq!(legacy["name"].as_str(), Some(CODEX_LEGACY_PROVIDER_ID));
-        assert_eq!(
-            legacy["base_url"].as_str(),
-            Some(CODEX_LEGACY_PROVIDER_BASE_URL)
-        );
-        assert_eq!(legacy["wire_api"].as_str(), Some("responses"));
-        assert_eq!(legacy["requires_openai_auth"].as_bool(), Some(true));
-    }
-
     #[test]
     fn cleans_third_party_codex_routes_for_oauth_launcher() {
         let mut doc = r#"
@@ -7031,7 +6737,7 @@ query_params = { tenant = "old" }
         for key in ["base_url", "openai_base_url", "chatgpt_base_url"] {
             assert!(doc.get(key).is_none(), "{key} should be removed");
         }
-        assert_legacy_openai_alias(&doc);
+        assert!(doc.get("model_providers").is_none());
         assert_eq!(doc["features"]["other_flag"].as_bool(), Some(true));
         assert!(doc["features"].get("responses_websockets").is_none());
         assert!(doc["features"].get("responses_websockets_v2").is_none());
@@ -7057,13 +6763,60 @@ base_url = "https://third-party.example/v1"
         enable_codex_system_proxy(&mut doc, path).unwrap();
 
         assert_eq!(doc["model_provider"].as_str(), Some("openai"));
-        assert_legacy_openai_alias(&doc);
+        assert!(doc.get("model_providers").is_none());
         assert_eq!(doc["features"]["other_flag"].as_bool(), Some(true));
         assert_eq!(
             doc["features"]["respect_system_proxy"].as_bool(),
             Some(codex_respect_system_proxy_enabled())
         );
         assert!(doc["features"].get("responses_websockets_v2").is_none());
+    }
+
+    #[test]
+    fn init_codex_oauth_setup_replaces_direct_route_and_syncs_env_port() {
+        let codex = TempDir::new().unwrap();
+        let config_path = codex.path().join("config.toml");
+        let auth_path = codex.path().join("auth.json");
+        let env_path = codex.path().join(".env");
+        write_str(
+            &config_path,
+            r#"model_provider = "OpenAI"
+base_url = "https://legacy.example/v1"
+
+[model_providers.OpenAI]
+name = "OpenAI"
+base_url = "https://legacy.example/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#,
+        );
+        write_str(&auth_path, r#"{"OPENAI_API_KEY":"TEST_ONLY_OLD_KEY"}"#);
+        write_str(
+            &env_path,
+            "USER_SETTING=keep\nHTTP_PROXY=http://127.0.0.1:19908\n",
+        );
+        let proxy_init = CodexLocalProxyInit {
+            config_path: codex.path().join("saiai-config.json"),
+            listen: "127.0.0.1:31234".to_string(),
+            ca_cert_path: PathBuf::from("/tmp/saiai-ca.crt"),
+            ca_key_path: PathBuf::from("/tmp/saiai-ca.key"),
+        };
+
+        let initialized = configure_codex_oauth_local_proxy(codex.path(), &proxy_init).unwrap();
+
+        assert_eq!(initialized.auth_path, auth_path);
+        assert_eq!(initialized.env_path, env_path);
+        let document = parse(&config_path);
+        assert_eq!(document["model_provider"].as_str(), Some("openai"));
+        assert!(document.get("base_url").is_none());
+        assert!(document.get("model_providers").is_none());
+        let auth = load_json_object(&auth_path).unwrap();
+        assert_eq!(auth["auth_mode"].as_str(), Some("chatgptAuthTokens"));
+        assert_eq!(auth["OPENAI_API_KEY"], Value::Null);
+        let env = read_str(&env_path);
+        assert!(env.contains("USER_SETTING=keep"));
+        assert!(env.contains("HTTP_PROXY=\"http://127.0.0.1:31234\""));
+        assert!(!env.contains("19908"));
     }
 
     #[test]
@@ -7121,7 +6874,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     fn creates_and_upgrades_app_server_shaped_codex_placeholder_auth() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("auth.json");
-        ensure_codex_local_proxy_auth(&path, None).unwrap();
+        ensure_codex_local_proxy_auth(&path).unwrap();
 
         let created = load_json_object(&path).unwrap();
         let created_tokens = created["tokens"].as_object().unwrap();
@@ -7150,7 +6903,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             &path,
             r#"{"auth_mode":"chatgpt","tokens":{"access_token":"saiai-local-proxy-placeholder-old","refresh_token":"old","account_id":"old"},"unrelated":"keep"}"#,
         );
-        ensure_codex_local_proxy_auth(&path, None).unwrap();
+        ensure_codex_local_proxy_auth(&path).unwrap();
         let upgraded = load_json_object(&path).unwrap();
         assert_eq!(upgraded["unrelated"].as_str(), Some("keep"));
         assert_eq!(upgraded["auth_mode"].as_str(), Some("chatgptAuthTokens"));
@@ -7161,12 +6914,12 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     }
 
     #[test]
-    fn upgrades_only_matching_legacy_saiai_api_key_auth() {
+    fn migrates_any_api_auth_to_local_proxy_oauth() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("auth.json");
         write_str(&path, r#"{"OPENAI_API_KEY":"TEST_ONLY_MANAGED_KEY"}"#);
 
-        ensure_codex_local_proxy_auth(&path, Some("TEST_ONLY_MANAGED_KEY")).unwrap();
+        ensure_codex_local_proxy_auth(&path).unwrap();
         let upgraded = load_json_object(&path).unwrap();
         assert_eq!(upgraded["auth_mode"].as_str(), Some("chatgptAuthTokens"));
         assert_eq!(
@@ -7176,12 +6929,12 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert_eq!(upgraded["OPENAI_API_KEY"], Value::Null);
 
         write_str(&path, r#"{"OPENAI_API_KEY":"TEST_ONLY_UNRELATED_KEY"}"#);
-        ensure_codex_local_proxy_auth(&path, Some("TEST_ONLY_MANAGED_KEY")).unwrap();
+        ensure_codex_local_proxy_auth(&path).unwrap();
         assert_eq!(
-            load_json_object(&path).unwrap()["OPENAI_API_KEY"].as_str(),
-            Some("TEST_ONLY_UNRELATED_KEY")
+            load_json_object(&path).unwrap()["tokens"]["access_token"].as_str(),
+            Some(CODEX_PLACEHOLDER_ACCESS_TOKEN)
         );
-        assert!(validate_codex_oauth_auth(&path).is_err());
+        validate_codex_oauth_auth(&path).unwrap();
     }
 
     #[test]
@@ -7191,7 +6944,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         let real = r#"{"auth_mode":"chatgpt","tokens":{"id_token":"real.id.token","access_token":"real-access","refresh_token":"real-refresh","account_id":"real-account"},"last_refresh":"2026-09-09T00:00:00Z"}"#;
         write_str(&path, real);
 
-        ensure_codex_local_proxy_auth(&path, Some("TEST_ONLY_MANAGED_KEY")).unwrap();
+        ensure_codex_local_proxy_auth(&path).unwrap();
 
         assert_eq!(read_str(&path), real);
     }
@@ -7449,22 +7202,6 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert_eq!(
             codex_proxy_gateway_root("https://gateway.example.test/prefix").unwrap(),
             "https://gateway.example.test/prefix"
-        );
-    }
-
-    #[test]
-    fn normalizes_legacy_codex_base_url_to_v1() {
-        assert_eq!(
-            normalize_codex_base_url("https://gateway.example.test").unwrap(),
-            "https://gateway.example.test/v1"
-        );
-        assert_eq!(
-            normalize_codex_base_url("https://gateway.example.test/prefix/").unwrap(),
-            "https://gateway.example.test/prefix/v1"
-        );
-        assert_eq!(
-            normalize_codex_base_url("https://gateway.example.test/v1").unwrap(),
-            "https://gateway.example.test/v1"
         );
     }
 
@@ -8031,28 +7768,21 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             vec![
                 "ANTHROPIC_MODEL",
                 "CLAUDE_CODE_ATTRIBUTION_HEADER",
-                "CLAUDE_CODE_SUBAGENT_MODEL",
-                "model"
+                "CLAUDE_CODE_SUBAGENT_MODEL"
             ]
             .into_iter()
-            .map(|key| {
-                if key == "model" {
-                    key.to_string()
-                } else {
-                    format!("env.{key}")
-                }
-            })
+            .map(|key| format!("env.{key}"))
             .collect::<Vec<_>>()
         );
     }
 
     #[test]
-    fn allows_native_claude_root_model_preference() {
+    fn allows_any_claude_root_model_preference() {
         let settings = serde_json::json!({
             "env": {
                 "http_proxy": "http://127.0.0.1:19908"
             },
-            "model": "sonnet"
+            "model": "deepseek-v4-pro[1m]"
         });
 
         assert!(claude_settings_override_locations(settings.as_object().unwrap()).is_empty());
@@ -8120,324 +7850,5 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             fs::read_to_string(backup_path).unwrap(),
             r#"{"claudeAiOauth":{"accessToken":"old"}}"#,
         );
-    }
-
-    #[test]
-    fn fresh_dir_ws_off_writes_managed_defaults_and_no_features_table() {
-        let (_dir, path) = temp_config();
-        merge_codex_config(&path, "https://example.com", false).unwrap();
-
-        let doc = parse(&path);
-        assert_managed_root(&doc);
-        assert_no_forced_model_defaults(&doc);
-        assert_managed_provider(&doc, "https://example.com", false);
-        assert!(
-            doc.get("features").is_none(),
-            "features table should not exist when websockets=false on fresh file",
-        );
-    }
-
-    #[test]
-    fn does_not_manage_execution_safety_controls() {
-        let (_dir, path) = temp_config();
-        merge_codex_config(&path, "https://example.com", false).unwrap();
-
-        let doc = parse(&path);
-        for key in [
-            "sandbox_mode",
-            "approval_policy",
-            "dangerously_bypass_approvals_and_sandbox",
-        ] {
-            assert!(
-                doc.get(key).is_none(),
-                "init-codex must not add execution-safety setting {key}",
-            );
-        }
-
-        write_str(
-            &path,
-            r#"sandbox_mode = "danger-full-access"
-approval_policy = "never"
-dangerously_bypass_approvals_and_sandbox = true
-"#,
-        );
-        merge_codex_config(&path, "https://example.com", false).unwrap();
-
-        let doc = parse(&path);
-        assert_eq!(doc["sandbox_mode"].as_str(), Some("danger-full-access"));
-        assert_eq!(doc["approval_policy"].as_str(), Some("never"));
-        assert_eq!(
-            doc["dangerously_bypass_approvals_and_sandbox"].as_bool(),
-            Some(true),
-        );
-    }
-
-    #[test]
-    fn fresh_dir_ws_on_writes_supports_websockets_and_features_flag() {
-        let (_dir, path) = temp_config();
-        merge_codex_config(&path, "https://example.com", true).unwrap();
-
-        let doc = parse(&path);
-        assert_managed_root(&doc);
-        assert_no_forced_model_defaults(&doc);
-        assert_managed_provider(&doc, "https://example.com", true);
-        assert_eq!(
-            doc["features"]["responses_websockets_v2"].as_bool(),
-            Some(true),
-        );
-    }
-
-    #[test]
-    fn preserves_unrelated_tables_and_overwrites_managed_openai_keys() {
-        let (_dir, path) = temp_config();
-        write_str(
-            &path,
-            r#"model = "gpt-5.5"
-custom_root = "kept"
-
-[foo]
-bar = "baz"
-
-[features]
-other_flag = true
-responses_websockets_v2 = false
-
-[model_providers.local]
-name = "Local"
-base_url = "https://local.example"
-
-[model_providers.OpenAI]
-name = "Old OpenAI"
-base_url = "https://old.example"
-wire_api = "chat"
-requires_openai_auth = true
-env_key = "OLD_KEY"
-query_params = { foo = "bar" }
-custom_header = "kept"
-"#,
-        );
-
-        merge_codex_config(&path, "https://example.com", true).unwrap();
-
-        let doc = parse(&path);
-        // Unrelated tables preserved.
-        assert_eq!(doc["custom_root"].as_str(), Some("kept"));
-        assert_eq!(doc["foo"]["bar"].as_str(), Some("baz"));
-        assert_eq!(doc["features"]["other_flag"].as_bool(), Some(true));
-        assert_eq!(
-            doc["model_providers"]["local"]["name"].as_str(),
-            Some("Local"),
-        );
-        // Unknown keys inside [model_providers.OpenAI] preserved.
-        assert_eq!(
-            doc["model_providers"]["OpenAI"]["custom_header"].as_str(),
-            Some("kept"),
-        );
-        assert_eq!(
-            doc["model_providers"]["OpenAI"]["query_params"]["foo"].as_str(),
-            Some("bar"),
-        );
-
-        // The user's model choice remains theirs; only the provider transport
-        // fields are managed by SAIAI.
-        assert_eq!(doc["model"].as_str(), Some("gpt-5.5"));
-        assert_managed_root(&doc);
-        assert_managed_provider(&doc, "https://example.com", true);
-        assert_eq!(
-            doc["features"]["responses_websockets_v2"].as_bool(),
-            Some(true),
-        );
-    }
-
-    #[test]
-    fn ws_toggle_off_clears_managed_ws_keys_and_keeps_unrelated_features() {
-        let (_dir, path) = temp_config();
-        write_str(&path, "[features]\nother_flag = true\n");
-
-        merge_codex_config(&path, "https://example.com", true).unwrap();
-        merge_codex_config(&path, "https://example.com", false).unwrap();
-
-        let doc = parse(&path);
-        assert!(
-            doc["model_providers"]["OpenAI"]
-                .get("supports_websockets")
-                .is_none(),
-        );
-        assert!(doc["features"].get("responses_websockets_v2").is_none());
-        assert_eq!(doc["features"]["other_flag"].as_bool(), Some(true));
-    }
-
-    #[test]
-    fn ws_off_drops_features_table_when_only_managed_key_remained() {
-        let (_dir, path) = temp_config();
-        write_str(&path, "[features]\nresponses_websockets_v2 = true\n");
-
-        merge_codex_config(&path, "https://example.com", false).unwrap();
-
-        let doc = parse(&path);
-        assert!(
-            doc.get("features").is_none(),
-            "empty features table should be dropped",
-        );
-    }
-
-    #[test]
-    fn ws_off_keeps_features_table_when_unrelated_keys_remain() {
-        let (_dir, path) = temp_config();
-        write_str(
-            &path,
-            "[features]\nother_flag = true\nresponses_websockets_v2 = true\n",
-        );
-
-        merge_codex_config(&path, "https://example.com", false).unwrap();
-
-        let doc = parse(&path);
-        assert!(doc.get("features").is_some());
-        assert_eq!(doc["features"]["other_flag"].as_bool(), Some(true));
-        assert!(doc["features"].get("responses_websockets_v2").is_none());
-    }
-
-    #[test]
-    fn idempotent_when_run_twice_with_same_args() {
-        let (_dir, path) = temp_config();
-        merge_codex_config(&path, "https://example.com", true).unwrap();
-        let first = read_str(&path);
-        merge_codex_config(&path, "https://example.com", true).unwrap();
-        let second = read_str(&path);
-        assert_eq!(second, first);
-    }
-
-    #[test]
-    fn preserves_user_root_model_preferences() {
-        let (_dir, path) = temp_config();
-        write_str(
-            &path,
-            r#"model = "gpt-5.5"
-review_model = "gpt-5.5"
-model_reasoning_effort = "medium"
-model_context_window = 123456
-model_auto_compact_token_limit = 120000
-"#,
-        );
-
-        merge_codex_config(&path, "https://example.com", false).unwrap();
-
-        let doc = parse(&path);
-        assert_eq!(doc["model"].as_str(), Some("gpt-5.5"));
-        assert_eq!(doc["review_model"].as_str(), Some("gpt-5.5"));
-        assert_eq!(doc["model_reasoning_effort"].as_str(), Some("medium"));
-        assert_eq!(doc["model_context_window"].as_integer(), Some(123456));
-        assert_eq!(
-            doc["model_auto_compact_token_limit"].as_integer(),
-            Some(120000),
-        );
-    }
-
-    #[test]
-    fn leaves_existing_legacy_model_tuning_untouched() {
-        let (_dir, path) = temp_config();
-        write_str(
-            &path,
-            r#"model = "gpt-5.6-sol"
-review_model = "gpt-5.4"
-model_reasoning_effort = "xhigh"
-model_context_window = 1000000
-model_auto_compact_token_limit = 900000
-"#,
-        );
-
-        merge_codex_config(&path, "https://example.com", false).unwrap();
-
-        let doc = parse(&path);
-        assert_eq!(doc["model"].as_str(), Some("gpt-5.6-sol"));
-        assert_eq!(doc["review_model"].as_str(), Some("gpt-5.4"));
-        assert_eq!(doc["model_reasoning_effort"].as_str(), Some("xhigh"));
-        assert_eq!(doc["model_context_window"].as_integer(), Some(1_000_000));
-        assert_eq!(
-            doc["model_auto_compact_token_limit"].as_integer(),
-            Some(900_000),
-        );
-    }
-
-    #[test]
-    fn rejects_non_table_model_providers() {
-        let (_dir, path) = temp_config();
-        write_str(&path, "model_providers = \"not a table\"\n");
-        let err = merge_codex_config(&path, "https://example.com", false).unwrap_err();
-        assert!(
-            format!("{err}").contains("model_providers"),
-            "error should mention model_providers, got: {err}",
-        );
-    }
-
-    #[test]
-    fn rejects_non_table_features() {
-        let (_dir, path) = temp_config();
-        write_str(&path, "features = \"not a table\"\n");
-        let err = merge_codex_config(&path, "https://example.com", true).unwrap_err();
-        assert!(
-            format!("{err}").contains("features"),
-            "error should mention features, got: {err}",
-        );
-    }
-
-    #[test]
-    fn rejects_non_table_features_on_ws_off_too() {
-        // Symmetric guard: ws=false should also refuse a malformed `features`
-        // entry rather than silently leaving it in place.
-        let (_dir, path) = temp_config();
-        write_str(&path, "features = \"not a table\"\n");
-        let err = merge_codex_config(&path, "https://example.com", false).unwrap_err();
-        assert!(
-            format!("{err}").contains("features"),
-            "error should mention features, got: {err}",
-        );
-    }
-
-    #[test]
-    fn ws_off_rejects_inline_features_table_same_as_ws_on() {
-        // Both `merge_codex_features` and the existing `merge_codex_saiai_provider`
-        // guard accept only standard tables (`is_table`), not inline tables
-        // (`features = { ... }`). Codex itself always writes standard tables, so
-        // an inline-table value indicates user-edited unusual state — we refuse
-        // and let the user resolve via the on-disk backup. This test pins that
-        // contract and matches the symmetric ws=true behavior.
-        let (_dir, path) = temp_config();
-        write_str(&path, "features = { responses_websockets_v2 = true }\n");
-        let err = merge_codex_config(&path, "https://example.com", false).unwrap_err();
-        assert!(
-            format!("{err}").contains("features"),
-            "error should mention features, got: {err}",
-        );
-    }
-
-    #[test]
-    fn merge_codex_auth_unaffected_by_ws_flag() {
-        let (_dir_cfg, cfg_path) = temp_config();
-        let auth_dir = TempDir::new().unwrap();
-        let auth_path = auth_dir.path().join("auth.json");
-
-        write_str(
-            &auth_path,
-            r#"{"auth_mode":"chatgptAuthTokens","tokens":{"access_token":"stale"},"account_id":"stale","OPENAI_API_KEY":"old"}"#,
-        );
-        merge_codex_auth(&auth_path, "sk-test").unwrap();
-        let auth_after_first = fs::read(&auth_path).unwrap();
-        assert_eq!(
-            load_json_object(&auth_path).unwrap(),
-            Map::from_iter([(
-                "OPENAI_API_KEY".to_string(),
-                Value::String("sk-test".to_string())
-            )])
-        );
-
-        // Toggle ws on then off through the config path; auth.json must not
-        // change.
-        merge_codex_config(&cfg_path, "https://example.com", true).unwrap();
-        merge_codex_config(&cfg_path, "https://example.com", false).unwrap();
-
-        merge_codex_auth(&auth_path, "sk-test").unwrap();
-        let auth_after_second = fs::read(&auth_path).unwrap();
-        assert_eq!(auth_after_first, auth_after_second);
     }
 }

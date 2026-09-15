@@ -1,6 +1,6 @@
-# Windows 使用指南（SAIAI 1.1.19）
+# Windows 使用指南（SAIAI 1.1.20）
 
-SAIAI `1.1.19` 为 Claude Code 和 VSCode 提供用户级本地代理，不要求管理员权限。
+SAIAI `1.1.20` 为 Claude Code 和 VSCode 提供用户级本地代理，不要求管理员权限。
 
 ## 一键配置 Claude Code
 
@@ -59,26 +59,19 @@ irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai init-codex 'ht
 ```
 
 该命令包含当前 Gateway 和 API Key，会写入 `%USERPROFILE%\\.codex`，或
-`CODEX_HOME` 指定的目录。该命令保留旧直连配置，同时在 `%USERPROFILE%\.saiai`
-准备本地代理配置和独立安装 CA；不会修改 Claude 配置，并会启动或刷新受管本地代理。
-随后运行 `saiai codex` 即进入 OAuth/local-proxy 模式，并且代理环境只注入
-Codex 子进程。旧直连配置保留命令中的 `/v1`，本地代理配置会移除末尾 `/v1`，
-避免代理转发时产生 `/v1/v1/*`。若旧初始化刚写入的 API Key 与 SAIAI 配置 Key
-完全一致，launcher
-会将该状态升级为仅供本地代理使用的 OAuth 占位；真实 OAuth 和不匹配的 API Key
-不会被覆盖。`saiai codex` 会清除旧第三方 provider，并保留一个固定指向
-`https://api.openai.com/v1` 的 `model_providers.OpenAI` 兼容别名，使旧线程能够
-恢复而不重新直连 Gateway。`model_providers.OpenAI.requires_openai_auth` 始终为 `true`；
-SAIAI 不会新增、覆盖或删除根 `model`、`review_model`、推理强度或模型上下文预算。
-占位状态使用 Codex 的 `chatgptAuthTokens` 外部 token 模式，避免 Codex
-把合成 refresh token 发往 OpenAI。`saiai codex` 支持 PATH 中的原生 `codex.exe`，
-也支持 npm 安装生成的 `codex.cmd`；npm 布局会由 SAIAI 解析后直接通过 `node.exe`
-运行官方 launcher。Codex VSCode 扩展先执行
-一次 `saiai vscode`；该命令只写 Codex 专属 `.env` 和配置文件，并将
+`CODEX_HOME` 指定的目录；它在 `%USERPROFILE%\.saiai` 准备本地代理配置和独立
+安装 CA，并将当前随机 loopback 端口、`SSL_CERT_FILE` 和 `NO_PROXY` 同步到
+`CODEX_HOME/.env`。不会修改 Claude 配置，并会启动或刷新受管本地代理。
+它会备份后清理旧直连 provider/base URL 与 API-key-only auth，将根 provider 设为
+内置 `openai`，不保留 `model_providers.OpenAI` 历史兼容别名。占位状态使用 Codex
+的 `chatgptAuthTokens` 外部 token 模式，避免 Codex 把合成 refresh token 发往
+OpenAI；已有真实 ChatGPT OAuth 会保留。SAIAI 不会新增、覆盖或删除根 `model`、
+`review_model`、推理强度或模型上下文预算。`saiai codex` 支持 PATH 中的原生
+`codex.exe`，也支持 npm 安装生成的 `codex.cmd`；npm 布局会由 SAIAI 解析后直接
+通过 `node.exe` 运行官方 launcher。`saiai vscode` 仍可用于不重新传入 Gateway/Key
+的配置修复；它会重新写入 Codex 专属 `.env`，并将
 `features.respect_system_proxy` 设为 `false`，避免 WinHTTP 的 `DIRECT` 决策覆盖
-`.env` 中的 loopback 代理；它不修改 Windows
-系统环境变量。完成后重启 VSCode。Windows 的 VSCode/CA 路径仍须在发布 runner 上
-完成验证后才能作为正式支持声明。
+`.env` 中的 loopback 代理；它不修改 Windows 系统环境变量。完成后重启 VSCode。
 
 ## 更新与回退
 

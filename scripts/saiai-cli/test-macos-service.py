@@ -229,6 +229,38 @@ Path(os.environ["SAIAI_DESKTOP_CAPTURE"]).write_text(
         global LISTEN_PORT
         LISTEN_PORT = listen.port
 
+        # init-codex is the WebUI entrypoint. It must immediately configure
+        # the external app-server environment with the random current port;
+        # waiting for a later `saiai vscode` would leave a stale 19908 route.
+        (codex_dir / ".env").write_text(
+            "USER_SETTING=keep\nHTTP_PROXY=http://127.0.0.1:19908\n",
+            encoding="utf-8",
+        )
+        codex_init = run_checked(
+            [
+                str(binary),
+                "init-codex",
+                "https://codex-gateway.example.test/v1",
+                "TEST_ONLY_MACOS_CODEX_KEY",
+            ],
+            environment,
+        )
+        if "local-proxy OAuth mode" not in codex_init.stdout:
+            raise AssertionError(
+                f"init-codex did not report OAuth local-proxy mode:\n{codex_init.stdout}"
+            )
+        codex_config = (codex_dir / "config.toml").read_text(encoding="utf-8")
+        if 'model_provider = "openai"' not in codex_config:
+            raise AssertionError("init-codex did not select the built-in OpenAI provider")
+        if "[model_providers" in codex_config or "legacy.example" in codex_config:
+            raise AssertionError("init-codex retained a direct-provider compatibility route")
+        codex_env = (codex_dir / ".env").read_text(encoding="utf-8")
+        expected_proxy = f'HTTP_PROXY="http://{LISTEN_HOST}:{LISTEN_PORT}"'
+        if expected_proxy not in codex_env:
+            raise AssertionError("init-codex did not synchronize CODEX_HOME/.env to config listen")
+        if "USER_SETTING=keep" not in codex_env:
+            raise AssertionError("init-codex removed an unrelated CODEX_HOME/.env value")
+
         plist = home / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
         try:
             if not plist.is_file():
