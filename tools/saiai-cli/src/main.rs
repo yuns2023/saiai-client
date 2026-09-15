@@ -6056,51 +6056,74 @@ fn start_windows_background_proxy() -> Result<u32> {
 
 #[cfg(target_os = "windows")]
 fn stop_windows_background_proxy() -> Result<()> {
-    let Some(pid) = windows_background_pid()? else {
-        let _ = fs::remove_file(windows_pid_path()?);
-        return Ok(());
-    };
-    if windows_pid_is_running(pid).unwrap_or(false) {
-        let status = ProcessCommand::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .status()
-            .context("failed to run taskkill")?;
-        if !status.success() {
-            // Detached/background workers can reject taskkill's tree walk even
-            // when the owning user can still terminate the exact process.
-            // Retry narrowly through PowerShell before surfacing an error.
-            let fallback = ProcessCommand::new("powershell")
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    "& { param($pid) Stop-Process -Id $pid -Force -ErrorAction Stop }",
-                    &pid.to_string(),
-                ])
-                .status();
-            if fallback
-                .as_ref()
-                .map(|value| !value.success())
-                .unwrap_or(true)
-                && windows_pid_is_running(pid).unwrap_or(false)
-            {
-                bail!(
-                    "could not stop SAIAI background process {pid}; taskkill exited with {status} and the exact-process fallback was rejected. Run PowerShell as the same user or Administrator and retry."
-                );
-            }
-        }
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
-            if !windows_pid_is_running(pid).unwrap_or(false) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+    if let Some(pid) = windows_background_pid()? {
         if windows_pid_is_running(pid).unwrap_or(false) {
-            bail!("SAIAI background process {pid} did not exit after forced termination");
+            let status = ProcessCommand::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .status()
+                .context("failed to run taskkill")?;
+            if !status.success() {
+                // Detached/background workers can reject taskkill's tree walk even
+                // when the owning user can still terminate the exact process.
+                // Retry narrowly through PowerShell before surfacing an error.
+                let fallback = ProcessCommand::new("powershell")
+                    .args([
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        "& { param($pid) Stop-Process -Id $pid -Force -ErrorAction Stop }",
+                        &pid.to_string(),
+                    ])
+                    .status();
+                if fallback
+                    .as_ref()
+                    .map(|value| !value.success())
+                    .unwrap_or(true)
+                    && windows_pid_is_running(pid).unwrap_or(false)
+                {
+                    bail!(
+                        "could not stop SAIAI background process {pid}; taskkill exited with {status} and the exact-process fallback was rejected. Run PowerShell as the same user or Administrator and retry."
+                    );
+                }
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if !windows_pid_is_running(pid).unwrap_or(false) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if windows_pid_is_running(pid).unwrap_or(false) {
+                bail!("SAIAI background process {pid} did not exit after forced termination");
+            }
         }
     }
+    stop_windows_exact_path_stragglers()?;
     let _ = fs::remove_file(windows_pid_path()?);
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn stop_windows_exact_path_stragglers() -> Result<()> {
+    let executable = env::current_exe().context("failed to resolve the SAIAI executable path")?;
+    let executable = executable.display().to_string();
+    let self_pid = std::process::id().to_string();
+    let status = ProcessCommand::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "& { param($path, $selfPid) Get-CimInstance Win32_Process -Filter \"Name = 'saiai.exe'\" | Where-Object { $_.ProcessId -ne [uint32]$selfPid -and $_.ExecutablePath -and [string]::Equals([IO.Path]::GetFullPath($_.ExecutablePath), $path, [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } }",
+            &executable,
+            &self_pid,
+        ])
+        .status()
+        .context("failed to inspect same-path SAIAI processes")?;
+    if !status.success() {
+        bail!(
+            "could not terminate an exact-path SAIAI process; run PowerShell as the same user or Administrator and retry"
+        );
+    }
     Ok(())
 }
 
