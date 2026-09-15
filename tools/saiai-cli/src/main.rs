@@ -6801,12 +6801,10 @@ fn merge_codex_openai_provider(
     // wire_api must remain "responses": the saiai backend dropped the
     // /v1/chat/completions compatibility layer (see backend changelog).
     openai.insert("wire_api", value("responses"));
-    // Legacy `init-codex` is API-key mode. Setting this to true makes Codex
-    // interpret the custom provider as OAuth-backed and direct requests then
-    // reach the SAIAI Gateway with the wrong credential shape. OAuth/local-
-    // proxy mode uses the built-in lowercase `openai` provider in its isolated
-    // runtime and does not depend on this legacy provider flag.
-    openai.insert("requires_openai_auth", value(false));
+    // Keep every managed OpenAI provider OAuth-shaped. Historical Codex
+    // groups require this flag even when their configuration originated from
+    // the legacy init-codex command.
+    openai.insert("requires_openai_auth", value(true));
     // Drop any `env_key` written by older SAIAI helper builds. Setting it to
     // `OPENAI_API_KEY` made Codex prefer the shell env over the api_key
     // SAIAI writes into ~/.codex/auth.json — a footgun whenever the user
@@ -6959,7 +6957,7 @@ mod tests {
         assert_eq!(openai["name"].as_str(), Some("OpenAI"));
         assert_eq!(openai["base_url"].as_str(), Some(base_url));
         assert_eq!(openai["wire_api"].as_str(), Some("responses"));
-        assert_eq!(openai["requires_openai_auth"].as_bool(), Some(false));
+        assert_eq!(openai["requires_openai_auth"].as_bool(), Some(true));
         assert!(
             openai.get("env_key").is_none(),
             "env_key must not be set; Codex would otherwise prefer shell env over auth.json",
