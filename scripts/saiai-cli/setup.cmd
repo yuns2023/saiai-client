@@ -70,6 +70,7 @@ if exist "%INSTALL_PATH%\" (
 )
 
 set "INSTALLED_MATCHES=0"
+set "SAIAI_BINARY_UPDATED=0"
 if exist "%INSTALL_PATH%" (
   powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ^
     "$ErrorActionPreference='Stop'; $item=Get-Item -LiteralPath $env:INSTALL_PATH -Force; if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Refusing to use a reparse-point install path' }; $hash=(Get-FileHash -LiteralPath $env:INSTALL_PATH -Algorithm SHA256).Hash.ToLowerInvariant(); [IO.File]::WriteAllText($env:INSTALLED_HASH,$hash)"
@@ -94,6 +95,7 @@ if errorlevel 1 goto failed
 move /Y "%STAGED_PATH%" "%INSTALL_PATH%" >nul
 if errorlevel 1 goto failed
 echo Installed SAIAI %RELEASE_VERSION% at %INSTALL_PATH%.
+set "SAIAI_BINARY_UPDATED=1"
 
 :configure
 if /I "%~1"=="init-codex" goto configure_codex

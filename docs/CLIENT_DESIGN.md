@@ -71,6 +71,13 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
 无论初始化前服务是否存活，都不会留下已停止的旧代理。自动化测试或明确需要只配置
 不启动时可设置 `SAIAI_SKIP_START=1`。一键 wrapper 只调用原生命令，避免额外的第二次
 服务重启。
+
+重复运行且本次未替换 CLI 二进制时，初始化会比较最终代理运行时配置（Gateway、Key、
+监听地址、CA 和 provider 路由）。若配置未变化、受管服务仍存活且当前 loopback
+监听可连接，则保留原进程，不中断已建立的代理连接；只继续更新 Claude/Codex 的用户
+配置。配置变化、wrapper 替换二进制、服务缺失或监听不可达时才刷新服务。该判断在
+Linux、macOS 与 Windows 共用；各平台只在真正需要刷新时调用其 systemd/LaunchAgent/
+后台进程实现。
 发布前在 Intel 和 Apple Silicon macOS runner 上分别验证
 `start/status/logs/restart/stop` 的真实 LaunchAgent 生命周期；两个 Linux 静态
 资产也必须在强制 `systemctl --user` 失败的环境中完成同一套 fallback 生命周期。

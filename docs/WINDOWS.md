@@ -79,5 +79,9 @@ OpenAI；已有真实 ChatGPT OAuth 会保留。SAIAI 不会新增、覆盖或�
 `saiai-previous.exe`。如需人工回退，应先执行 `saiai stop`，再恢复备份并重新
 启动；用户配置文件自身也会留下带时间戳的备份。
 
+重复执行同一初始化命令且二进制、Gateway/Key/监听地址/CA 均未变化时，会保留健康的
+后台代理进程，不会为配置文件的幂等重写而中断已有连接。安装新二进制、更新代理运行
+时配置或发现代理不健康时，才会停止并启动新的 Windows 后台进程。
+
 WebUI 只提供 Codex CLI，不提供 WebSocket 专用页签。由于命令包含 API Key，Key 会出现在
 剪贴板、PowerShell 历史和进程参数中；SAIAI 程序自身不会打印 Key。

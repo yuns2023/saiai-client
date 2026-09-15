@@ -62,6 +62,9 @@ def verify_cli() -> None:
         "saiai codex [-- <codex arguments>]",
         "initialize_codex_local_proxy",
         "start_managed_service_after_initialization",
+        "initialization_requires_proxy_refresh",
+        '"SAIAI_BINARY_UPDATED"',
+        "binary and runtime configuration are unchanged",
         '"SAIAI_SKIP_START"',
         "SAIAI configured Codex for local-proxy OAuth mode.",
         "configure_codex_oauth_local_proxy",
@@ -148,6 +151,7 @@ def verify_cli() -> None:
         "Codex local-proxy launcher is missing",
         "Codex initialization did not create local-proxy OAuth auth",
         "Codex initialization did not synchronize the local proxy port",
+        "Unchanged Codex initialization interrupted the managed proxy",
         "SAIAI_WINDOWS_NPM_CODEX",
         "features.apps=false",
         "otel.metrics_exporter=",
@@ -209,6 +213,10 @@ def verify_manifest_and_wrappers() -> None:
         "Unix wrapper duplicates the native local-proxy start",
     )
     require("installed_matches=1" in shell, "Unix wrapper cannot skip the binary download")
+    require(
+        'SAIAI_BINARY_UPDATED="${binary_updated}"' in shell,
+        "Unix wrapper does not tell native setup whether it replaced the binary",
+    )
     powershell = (SCRIPT_DIR / "setup.ps1").read_text(encoding="utf-8")
     require(
         "Stop-SaiaiForReplacement" in powershell,
@@ -237,6 +245,16 @@ def verify_manifest_and_wrappers() -> None:
         and "$startInfo.Arguments =" in powershell
         and ".ArgumentList" not in powershell,
         "PowerShell wrapper is not compatible with Windows PowerShell 5.1 argument passing",
+    )
+    require(
+        '$env:SAIAI_BINARY_UPDATED = if ($binaryUpdated) { "1" } else { "0" }' in powershell,
+        "PowerShell wrapper does not tell native setup whether it replaced the binary",
+    )
+    command = (SCRIPT_DIR / "setup.cmd").read_text(encoding="utf-8")
+    require(
+        'set "SAIAI_BINARY_UPDATED=0"' in command
+        and 'set "SAIAI_BINARY_UPDATED=1"' in command,
+        "CMD wrapper does not tell native setup whether it replaced the binary",
     )
     windows_release = text("scripts/saiai-cli/test-windows-release.ps1")
     require(
@@ -300,6 +318,10 @@ def verify_workflows_and_docs() -> None:
         "start_time_ticks",
     ):
         require(required in linux_service, f"Linux service smoke is missing {required!r}")
+    require(
+        "unchanged initialization did not preserve the managed proxy" in linux_service,
+        "Linux service smoke does not prove unchanged setup preserves the proxy",
+    )
     macos_service = text("scripts/saiai-cli/test-macos-service.py")
     for required in (
         '"init-codex"',

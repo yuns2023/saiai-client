@@ -156,6 +156,9 @@ try {
     $codexInitialStatus = Invoke-SaiaiProcess -Path $binary -Arguments @("status")
     Assert-Saiai ($codexInitialStatus.ExitCode -eq 0) "SAIAI status failed after Codex initialization: $($codexInitialStatus.Output)"
     Assert-Saiai ($codexInitialStatus.Output.Contains("service active: yes")) "Codex initialization did not refresh the managed proxy: $($codexInitialStatus.Output)"
+    $unchangedCodex = Invoke-SaiaiProcess -Path $binary -Arguments @("init-codex", "https://codex.example.test/v1", $codexKey)
+    Assert-Saiai ($unchangedCodex.ExitCode -eq 0) "Unchanged Codex initialization failed: $($unchangedCodex.Output)"
+    Assert-Saiai ($unchangedCodex.Output.Contains("left running; binary and runtime configuration are unchanged")) "Unchanged Codex initialization interrupted the managed proxy: $($unchangedCodex.Output)"
     # `vscode` may start the detached proxy. Do not attach it to a PowerShell
     # output pipeline: the child can inherit the pipeline handle and keep
     # Out-String waiting for EOF after the command itself exits.

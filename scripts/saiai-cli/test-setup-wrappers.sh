@@ -18,6 +18,7 @@ mkdir -p "${fixtures}" "${fake_bin}" "${home}" "${install_dir}"
 asset="${fixtures}/saiai-linux-x86_64"
 cat >"${asset}" <<'SH'
 #!/usr/bin/env bash
+printf 'UPDATED=%s\n' "${SAIAI_BINARY_UPDATED:-}" >>"${SAIAI_TEST_BINARY_INVOKED:?}"
 printf 'CALL\n' >>"${SAIAI_TEST_BINARY_INVOKED:?}"
 printf '%s\n' "$@" >>"${SAIAI_TEST_BINARY_INVOKED:?}"
 SH
@@ -76,11 +77,12 @@ run_setup "https://gateway.example.test" "${first_key}"
 test -x "${install_dir}/saiai"
 cmp -s "${asset}" "${install_dir}/saiai"
 mapfile -t first_invocation <"${invoked}"
-test "${first_invocation[0]}" = "CALL"
-test "${first_invocation[1]}" = "init"
-test "${first_invocation[2]}" = "https://gateway.example.test"
-test "${first_invocation[3]}" = "${first_key}"
-test "${#first_invocation[@]}" -eq 4
+test "${first_invocation[0]}" = "UPDATED=1"
+test "${first_invocation[1]}" = "CALL"
+test "${first_invocation[2]}" = "init"
+test "${first_invocation[3]}" = "https://gateway.example.test"
+test "${first_invocation[4]}" = "${first_key}"
+test "${#first_invocation[@]}" -eq 5
 test "$(grep -Fc '/manifest.json' "${curl_log}")" -eq 1
 test "$(grep -Fc '/saiai-linux-x86_64' "${curl_log}")" -eq 1
 if grep -Fq "${first_key}" "${output}"; then
@@ -91,23 +93,25 @@ fi
 second_key="TEST_ONLY_REPLACEMENT_KEY"
 run_setup "https://new-gateway.example.test" "${second_key}"
 mapfile -t second_invocation <"${invoked}"
-test "${second_invocation[0]}" = "CALL"
-test "${second_invocation[1]}" = "init"
-test "${second_invocation[2]}" = "https://new-gateway.example.test"
-test "${second_invocation[3]}" = "${second_key}"
-test "${#second_invocation[@]}" -eq 4
+test "${second_invocation[0]}" = "UPDATED=0"
+test "${second_invocation[1]}" = "CALL"
+test "${second_invocation[2]}" = "init"
+test "${second_invocation[3]}" = "https://new-gateway.example.test"
+test "${second_invocation[4]}" = "${second_key}"
+test "${#second_invocation[@]}" -eq 5
 test "$(grep -Fc '/manifest.json' "${curl_log}")" -eq 2
 test "$(grep -Fc '/saiai-linux-x86_64' "${curl_log}")" -eq 1
 grep -Fq 'binary download skipped' "${output}"
 
 run_setup init-codex "https://gateway.example.test/v1" "TEST_ONLY_CODEX_KEY" --websockets
 mapfile -t codex_invocation <"${invoked}"
-test "${codex_invocation[0]}" = "CALL"
-test "${codex_invocation[1]}" = "init-codex"
-test "${codex_invocation[2]}" = "https://gateway.example.test/v1"
-test "${codex_invocation[3]}" = "TEST_ONLY_CODEX_KEY"
-test "${codex_invocation[4]}" = "--websockets"
-test "${#codex_invocation[@]}" -eq 5
+test "${codex_invocation[0]}" = "UPDATED=0"
+test "${codex_invocation[1]}" = "CALL"
+test "${codex_invocation[2]}" = "init-codex"
+test "${codex_invocation[3]}" = "https://gateway.example.test/v1"
+test "${codex_invocation[4]}" = "TEST_ONLY_CODEX_KEY"
+test "${codex_invocation[5]}" = "--websockets"
+test "${#codex_invocation[@]}" -eq 6
 test "$(grep -Fc '/manifest.json' "${curl_log}")" -eq 3
 test "$(grep -Fc '/saiai-linux-x86_64' "${curl_log}")" -eq 1
 
@@ -115,11 +119,12 @@ mkdir -p "${home}/.saiai"
 printf '%s\n' '{"base_url":"https://reuse.example.test","api_key":"TEST_ONLY_REUSED_CODEX_KEY"}' >"${home}/.saiai/config.json"
 run_setup init-codex
 mapfile -t reused_invocation <"${invoked}"
-test "${reused_invocation[0]}" = "CALL"
-test "${reused_invocation[1]}" = "init-codex"
-test "${reused_invocation[2]}" = "https://reuse.example.test"
-test "${reused_invocation[3]}" = "TEST_ONLY_REUSED_CODEX_KEY"
-test "${#reused_invocation[@]}" -eq 4
+test "${reused_invocation[0]}" = "UPDATED=0"
+test "${reused_invocation[1]}" = "CALL"
+test "${reused_invocation[2]}" = "init-codex"
+test "${reused_invocation[3]}" = "https://reuse.example.test"
+test "${reused_invocation[4]}" = "TEST_ONLY_REUSED_CODEX_KEY"
+test "${#reused_invocation[@]}" -eq 5
 test "$(grep -Fc '/manifest.json' "${curl_log}")" -eq 4
 test "$(grep -Fc '/saiai-linux-x86_64' "${curl_log}")" -eq 1
 
