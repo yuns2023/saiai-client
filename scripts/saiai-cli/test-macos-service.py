@@ -228,16 +228,22 @@ Path(os.environ["SAIAI_DESKTOP_CAPTURE"]).write_text(
             raise AssertionError("SAIAI initialization wrote an invalid listen address")
         global LISTEN_PORT
         LISTEN_PORT = listen.port
-        if port_is_open():
-            raise AssertionError(f"test port {LISTEN_HOST}:{LISTEN_PORT} is already in use")
 
         plist = home / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
         try:
+            if not plist.is_file():
+                raise AssertionError(f"initialization did not write LaunchAgent plist: {plist}")
+            wait_for_port(True)
+            initialized_status = run_checked([str(binary), "status"], environment)
+            if "service active: yes" not in initialized_status.stdout:
+                raise AssertionError(
+                    "initialization did not start the LaunchAgent:\n"
+                    f"{initialized_status.stdout}"
+                )
+
             start = run_checked([str(binary), "start"], environment)
             if "SAIAI LaunchAgent started." not in start.stdout:
-                raise AssertionError("start did not report a successful LaunchAgent")
-            if not plist.is_file():
-                raise AssertionError(f"LaunchAgent plist was not written: {plist}")
+                raise AssertionError("start did not refresh the LaunchAgent")
             wait_for_port(True)
 
             status = run_checked([str(binary), "status"], environment)

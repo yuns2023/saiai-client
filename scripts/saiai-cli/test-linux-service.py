@@ -197,6 +197,8 @@ def main() -> int:
         environment.pop("DBUS_SESSION_BUS_ADDRESS", None)
         environment.pop("XDG_RUNTIME_DIR", None)
 
+        initialization_environment = environment.copy()
+        initialization_environment["SAIAI_SKIP_START"] = "1"
         run_checked(
             [
                 str(binary),
@@ -204,7 +206,7 @@ def main() -> int:
                 gateway_url,
                 TEST_KEY,
             ],
-            environment,
+            initialization_environment,
         )
         config_path = saiai_home / "config.json"
         config = json.loads(config_path.read_text(encoding="utf-8"))
