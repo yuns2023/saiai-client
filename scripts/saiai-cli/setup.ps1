@@ -134,6 +134,48 @@ function Move-SaiaiCandidate {
     throw "Could not replace existing SAIAI binary at $Destination after $maximumAttempts attempts: $($lastError.Exception.Message)"
 }
 
+function ConvertTo-WindowsCommandLineArgument {
+    param([AllowNull()][AllowEmptyString()][string]$Value)
+
+    # The per-argument ProcessStartInfo collection is only available on modern
+    # .NET. The public wrapper must also run from inbox Windows PowerShell 5.1,
+    # whose .NET Framework ProcessStartInfo exposes only the string Arguments API.
+    # Quote with the CommandLineToArgvW/MSVC rules so the native CLI receives
+    # precisely the original URL, Key, and optional flags.
+    if ($null -eq $Value -or $Value.Length -eq 0) {
+        return '""'
+    }
+    if ($Value -notmatch '[\s"]') {
+        return $Value
+    }
+
+    $builder = [System.Text.StringBuilder]::new()
+    $null = $builder.Append('"')
+    $backslashCount = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq [char]'\') {
+            $backslashCount++
+            continue
+        }
+        if ($character -eq [char]'"') {
+            $null = $builder.Append((('\' * (($backslashCount * 2) + 1)) -join ''))
+            $null = $builder.Append('"')
+            $backslashCount = 0
+            continue
+        }
+        if ($backslashCount -gt 0) {
+            $null = $builder.Append((('\' * $backslashCount) -join ''))
+            $backslashCount = 0
+        }
+        $null = $builder.Append($character)
+    }
+    if ($backslashCount -gt 0) {
+        $null = $builder.Append((('\' * ($backslashCount * 2)) -join ''))
+    }
+    $null = $builder.Append('"')
+    return $builder.ToString()
+}
+
 function Invoke-SaiaiNative {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -147,9 +189,11 @@ function Invoke-SaiaiNative {
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $Path
     $startInfo.UseShellExecute = $false
+    $encodedArguments = @()
     foreach ($argument in $Arguments) {
-        $null = $startInfo.ArgumentList.Add($argument)
+        $encodedArguments += ConvertTo-WindowsCommandLineArgument -Value $argument
     }
+    $startInfo.Arguments = [string]::Join(" ", [string[]]$encodedArguments)
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
     try {

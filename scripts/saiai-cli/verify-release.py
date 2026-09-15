@@ -43,7 +43,7 @@ def load_generator():
 
 def verify_cli() -> None:
     cargo = text("tools/saiai-cli/Cargo.toml")
-    require('version = "1.1.18"' in cargo, "CLI version is not 1.1.18")
+    require('version = "1.1.19"' in cargo, "CLI version is not 1.1.19")
     require("saiai-core" not in cargo, "local-proxy client still links the V2 runtime core")
     for dependency in ("reqwest", "tokio", "tokio-tungstenite", "rustls", "rcgen", "zeroize", "libc"):
         require(dependency in cargo, f"local-proxy dependency is missing: {dependency}")
@@ -169,7 +169,7 @@ def verify_manifest_and_wrappers() -> None:
         wrappers.mkdir()
         for name in WRAPPERS:
             (wrappers / name).write_bytes((name + "\n").encode())
-        manifest = generator.build_manifest(root, "1.1.18", ASSETS, wrappers)
+        manifest = generator.build_manifest(root, "1.1.19", ASSETS, wrappers)
         require(manifest.get("manifest_schema") == 1, "generated manifest schema differs")
         require(manifest.get("client_mode") == "local-proxy", "generated client mode differs")
         require(
@@ -219,6 +219,12 @@ def verify_manifest_and_wrappers() -> None:
         and "& $installPath @provided | Out-Host" not in powershell,
         "PowerShell wrapper does not delegate proxy start to the native initializer",
     )
+    require(
+        "ConvertTo-WindowsCommandLineArgument" in powershell
+        and "$startInfo.Arguments =" in powershell
+        and ".ArgumentList" not in powershell,
+        "PowerShell wrapper is not compatible with Windows PowerShell 5.1 argument passing",
+    )
     windows_release = text("scripts/saiai-cli/test-windows-release.ps1")
     require(
         "Running-client upgrade did not install the release binary" in windows_release,
@@ -227,6 +233,11 @@ def verify_manifest_and_wrappers() -> None:
     require(
         "Codex initialization did not start the background proxy" in windows_release,
         "Windows release smoke does not cover native Codex initialization start",
+    )
+    require(
+        "Windows PowerShell 5.1 setup wrapper smoke failed" in windows_release
+        and "TEST_ONLY_WINDOWS_PS51_CODEX_KEY WITH SPACE" in windows_release,
+        "Windows release smoke does not cover Windows PowerShell 5.1 wrapper arguments",
     )
 
 
@@ -260,6 +271,11 @@ def verify_workflows_and_docs() -> None:
             and 'codex-prefix "$prefix/bin"' in workflow,
             "macOS workflows do not capture the official Apple Silicon Codex client",
         )
+    require(
+        "Smoke-test Windows PowerShell 5.1 setup wrapper" in ci
+        and "test-windows-release.ps1" in ci,
+        "source CI does not execute the Windows PowerShell 5.1 setup-wrapper smoke",
+    )
     linux_service = text("scripts/saiai-cli/test-linux-service.py")
     for required in (
         "test-forced headless mode",

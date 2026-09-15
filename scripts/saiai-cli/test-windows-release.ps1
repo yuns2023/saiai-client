@@ -179,6 +179,30 @@ exit 0
     $codexStatus = Invoke-SaiaiProcess -Path $installed -Arguments @("status")
     Assert-Saiai ($codexStatus.ExitCode -eq 0) "Codex-initialized client status failed: $($codexStatus.Output)"
     Assert-Saiai ($codexStatus.Output.Contains("service active: yes")) "Codex initialization did not start the background proxy: $($codexStatus.Output)"
+
+    # GitHub's default pwsh shell is PowerShell 7, while many installed
+    # Windows systems still use inbox Windows PowerShell 5.1. Run the public
+    # wrapper in that exact host so a modern-.NET-only ProcessStartInfo API
+    # cannot regress either initialization entrypoint unnoticed.
+    $legacyPowerShell = Join-Path $env:WINDIR "System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+    Assert-Saiai (Test-Path -LiteralPath $legacyPowerShell -PathType Leaf) "Windows PowerShell 5.1 is unavailable on this runner"
+    $legacySetup = $setupPowerShell.Replace("'", "''")
+    $legacyScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$legacySetup'
+`$claudeResult = Invoke-Saiai 'https://powershell51-claude.example.test' 'TEST_ONLY_WINDOWS_PS51_CLAUDE_KEY WITH SPACE'
+if (`$claudeResult -ne 0) { exit `$claudeResult }
+`$codexResult = Invoke-Saiai init-codex 'https://powershell51-codex.example.test/v1' 'TEST_ONLY_WINDOWS_PS51_CODEX_KEY WITH SPACE'
+if (`$codexResult -ne 0) { exit `$codexResult }
+exit 0
+"@
+    $legacy = Invoke-SaiaiProcess -Path $legacyPowerShell -Arguments @("-NoProfile", "-NonInteractive", "-Command", $legacyScript) -CaptureOutput $false -TimeoutMilliseconds 60000
+    Assert-Saiai ($legacy.ExitCode -eq 0) "Windows PowerShell 5.1 setup wrapper smoke failed"
+    $legacyConfig = Get-Content -LiteralPath (Join-Path $env:SAIAI_HOME "config.json") -Raw | ConvertFrom-Json
+    Assert-Saiai ([string]$legacyConfig.api_key -ceq "TEST_ONLY_WINDOWS_PS51_CODEX_KEY WITH SPACE") "Windows PowerShell 5.1 wrapper did not preserve the Codex Key argument"
+    $legacyStatus = Invoke-SaiaiProcess -Path $installed -Arguments @("status")
+    Assert-Saiai ($legacyStatus.ExitCode -eq 0) "Windows PowerShell 5.1 initialized client status failed: $($legacyStatus.Output)"
+    Assert-Saiai ($legacyStatus.Output.Contains("service active: yes")) "Windows PowerShell 5.1 initialization did not start the background proxy: $($legacyStatus.Output)"
 }
 finally {
     $installedForCleanup = Join-Path $install "saiai.exe"

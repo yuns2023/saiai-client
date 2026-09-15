@@ -126,6 +126,24 @@ jobs:
           & "$PWD/scripts/saiai-cli/test-windows-runtime.ps1" `
             -BinaryPath "$PWD/tools/saiai-cli/target/debug/saiai.exe"
 
+      - name: Smoke-test Windows PowerShell 5.1 setup wrapper
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item "$PWD/tools/saiai-cli/target/debug/saiai.exe" "$PWD/dist/saiai-windows-x86_64.exe"
+          Copy-Item "$PWD/scripts/saiai-cli/setup.sh", "$PWD/scripts/saiai-cli/setup.ps1", "$PWD/scripts/saiai-cli/setup.cmd" "$PWD/dist/"
+          python scripts/saiai-cli/generate-manifest.py `
+            --dist dist `
+            --cargo-toml tools/saiai-cli/Cargo.toml `
+            --asset saiai-windows-x86_64.exe `
+            --wrappers-dir dist `
+            --output dist/manifest.json
+          & "$PWD/scripts/saiai-cli/test-windows-release.ps1" `
+            -BundleDir dist `
+            -SetupPs1 dist/setup.ps1 `
+            -SetupCmd dist/setup.cmd `
+            -AssetName saiai-windows-x86_64.exe
+
       - name: Capture official Windows Codex through local proxy
         shell: pwsh
         run: |
