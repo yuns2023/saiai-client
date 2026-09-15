@@ -297,11 +297,15 @@ Path(os.environ["SAIAI_DESKTOP_CAPTURE"]).write_text(
                 raise AssertionError(f"status did not find the LaunchAgent:\n{status.stdout}")
 
             desktop = run_checked(
-                [str(binary), "chatgpt", "--", "--smoke-argument"], environment
+                [str(binary), "desktop", "codex", "--", "--smoke-argument"], environment
             )
             if "Starting ChatGPT Desktop through the SAIAI local proxy." not in desktop.stdout:
                 raise AssertionError(
                     f"desktop launcher did not report startup:\n{desktop.stdout}"
+                )
+            if "SAIAI Desktop scope: Codex only" not in desktop.stdout or "product=Codex" not in desktop.stdout:
+                raise AssertionError(
+                    f"desktop launcher did not declare Codex-only scope:\n{desktop.stdout}"
                 )
             captured = json.loads(desktop_capture.read_text(encoding="utf-8"))
             desktop_root = saiai_home / "desktop"
