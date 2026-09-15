@@ -35,6 +35,11 @@ use zeroize::Zeroizing;
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
 const OPENAI_HOST: &str = "api.openai.com";
 const CHATGPT_HOST: &str = "chatgpt.com";
+// Packaged Windows Desktop 26.908.4834.0 also uses this authenticated
+// control-plane alias. Treat it exactly like chatgpt.com: falling through to
+// a direct CONNECT bypasses the local sidecars and fails on networks which
+// require SAIAI routing.
+const CHAT_OPENAI_HOST: &str = "chat.openai.com";
 // The packaged Desktop currently uses this host for authenticated Web/Wham
 // control-plane calls. It must receive the same local MITM/sidecar treatment
 // as chatgpt.com; otherwise CONNECT falls through to the real provider with
@@ -348,7 +353,7 @@ impl State {
         let host = canonical_host(host);
         match host.as_str() {
             ANTHROPIC_HOST => self.claude_route.as_ref().unwrap_or(&self.default_route),
-            OPENAI_HOST | CHATGPT_HOST | CHATGPT_AUX_HOST => {
+            OPENAI_HOST | CHATGPT_HOST | CHAT_OPENAI_HOST | CHATGPT_AUX_HOST => {
                 self.codex_route.as_ref().unwrap_or(&self.default_route)
             }
             _ => &self.default_route,
@@ -603,7 +608,7 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
     let tls_stream = acceptor
         .accept(stream)
         .await
-        .context("client TLS handshake failed")?;
+        .with_context(|| format!("client TLS handshake failed for {host}"))?;
     let mut reader = BufReader::new(tls_stream);
     let mut handled_requests = 0usize;
 
@@ -665,7 +670,11 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                     forward_to_saiai(&state, reader.get_mut(), request, close_after, false).await?;
                 }
             }
-        } else if host == OPENAI_HOST || host == CHATGPT_HOST || host == CHATGPT_AUX_HOST {
+        } else if host == OPENAI_HOST
+            || host == CHATGPT_HOST
+            || host == CHAT_OPENAI_HOST
+            || host == CHATGPT_AUX_HOST
+        {
             state.trace_openai_request(
                 if is_websocket_upgrade(&request) {
                     "handshake"
@@ -675,7 +684,7 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                 "to_gateway",
                 &request,
             );
-            let is_chatgpt = host == CHATGPT_HOST || host == CHATGPT_AUX_HOST;
+            let is_chatgpt = matches!(host, CHATGPT_HOST | CHAT_OPENAI_HOST | CHATGPT_AUX_HOST);
             if is_chatgpt {
                 match normalize_chatgpt_gateway_target(&request.target) {
                     Ok(target) => request.target = target,
@@ -1646,6 +1655,7 @@ fn is_managed_host(host: &str) -> bool {
     host == ANTHROPIC_HOST
         || host == OPENAI_HOST
         || host == CHATGPT_HOST
+        || host == CHAT_OPENAI_HOST
         || host == CHATGPT_AUX_HOST
 }
 
@@ -1942,6 +1952,7 @@ mod tests {
         );
         assert!(normalize_chatgpt_gateway_target("/backend-api/conversations").is_err());
         assert!(is_managed_host(CHATGPT_HOST));
+        assert!(is_managed_host(CHAT_OPENAI_HOST));
         assert!(is_managed_host(CHATGPT_AUX_HOST));
     }
 
@@ -2221,6 +2232,10 @@ mod tests {
         );
         assert_eq!(
             state.route_for_host(CHATGPT_HOST).api_key.as_str(),
+            "codex-key"
+        );
+        assert_eq!(
+            state.route_for_host(CHAT_OPENAI_HOST).api_key.as_str(),
             "codex-key"
         );
         assert_eq!(

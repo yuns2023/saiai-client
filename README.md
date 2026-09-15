@@ -98,9 +98,7 @@ OAuth/local-proxy 模式（第一阶段）使用：
 saiai codex
 saiai codex -- app-server --stdio
 saiai vscode
-saiai desktop
-# alias:
-saiai chatgpt
+saiai desktop codex
 ```
 
 `saiai codex` 只在 Codex 子进程中设置 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和
@@ -152,7 +150,7 @@ Linux 为 `true`，Windows/macOS 为 `false`。它不会
 VSCode（或 reload window），继续正常使用官方 Codex 扩展。若用户显式配置了 VSCode
 的 `http.proxy`，该值可能优先于 Codex `.env`，需要移除冲突值。
 
-`saiai desktop` 使用现有 ChatGPT OAuth `auth.json` 的副本启动隔离的 Desktop
+`saiai desktop codex` 使用现有 ChatGPT OAuth `auth.json` 的副本启动隔离的 Desktop
 `CODEX_HOME`，不会修改原始 Codex 目录。Linux 下还会在 SAIAI 管理目录创建独立
 NSS 数据库并导入本地 CA，避免修改系统信任库；首次使用需要系统已有
 `certutil`（`libnss3-tools`）。Desktop 的 OAuth/CA/代理环境由 launcher 注入，
@@ -171,30 +169,17 @@ App 从 Dock、Finder 或 `open -a` 直接启动时不能继承 launcher 的叶�
 信任 SAIAI 本地 CA，必须由当前用户通过 macOS 的授权交互把该 CA 设为登录 Keychain 的信任根。
 这不是可由 `init-codex` 静默完成的操作。未完成该用户授权时，使用无 Keychain、无系统代理修改的
 `saiai desktop codex`；它只对本次 Desktop 进程传入当前 SAIAI 叶证书的 SPKI pin，而不会放宽
-其他证书校验。`saiai doctor codex` 会明确报告这个 direct App 前置条件。
+其他证书校验。Windows 的 AppX broker 则不能继承该进程级 pin：`saiai desktop codex`
+会在官方 App 存活期间暂时设置当前用户的 loopback 系统代理和 SAIAI 根证书；重复启动以
+generation lease 交接，旧 watcher 不会清理新会话的 CA。退出后恢复启动前的代理并清理仅由
+SAIAI 加入的根证书。`saiai doctor codex` 会明确报告 direct App 的前置条件。
 
-桌面入口按产品 target 组织：`saiai desktop codex` 和
-`saiai desktop chatgpt` 使用当前 OpenAI Desktop adapter；`saiai desktop claude`
-与 `saiai desktop gemini` 已预留为独立 adapter 入口，当前会明确提示尚未实现。
-未来产品接入只需增加各自的 executable/config/auth/proxy/model/readiness adapter，
-共享 local-proxy、CA、profile、日志和进程生命周期管理。
-
-普通 ChatGPT Chat 默认使用固定的美国太平洋时区。也可以按次启动覆盖：
-
-```bash
-SAIAI_CHATGPT_TIMEZONE=America/Los_Angeles saiai chatgpt
-```
-
-该变量只作用于 Desktop 子进程，必须是本机存在的 IANA zoneinfo 名称；未设置时
-默认使用 `America/Los_Angeles`。如果需要恢复系统时区，可设置
-`SAIAI_CHATGPT_TIMEZONE=system`。它不会改变 Codex CLI/VSCode 的 Responses 请求，
-也不会修改系统环境或 Gateway 请求体。
-
-`saiai chatgpt` 默认转发普通 ChatGPT Chat 的明确 allowlist（包括
-`/backend-api/files/download/{file_id}` 与 `/backend-api/estuary/content` 图片/文件资产解析）到 Gateway 的独立
-`/chatgpt/backend-api/*` ingress，不做 Responses 协议转换。紧急排障时可仅对代理
-进程设置 `SAIAI_CHATGPT_CHAT_PASSTHROUGH=0` 关闭该路径；Gateway 端仍需显式启用
-普通 Chat，并在计费不可用时默认拒绝最终模型请求。
+官方应用的可执行文件和壳层仍显示为“ChatGPT”，但 SAIAI Desktop 当前只支持 Codex。
+`saiai desktop chatgpt`、Claude 与 Gemini target 都会明确拒绝。不要把官方应用左栏的
+普通 ChatGPT 会话、语言、设置或插件界面当作 SAIAI 已支持的功能：这些控制面没有
+历史/偏好持久化合同，也不是 Codex Responses 验证的一部分。`saiai desktop codex`
+通过 `codex://threads/new` 激活 Codex；如果用户在官方 UI 中手动切回 ChatGPT，结果
+不受支持。
 
 `init-codex` 不再提供 API-key 直连 Gateway 模式：输入的 Key 只保存在
 `SAIAI_HOME/config.json`，由 loopback proxy 在 Gateway 边界使用。它会备份后清理

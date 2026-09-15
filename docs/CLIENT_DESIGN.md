@@ -113,7 +113,7 @@ URL 可以带或不带末尾 `/v1`；本地代理配置只记录 Gateway root，
 初始化会备份后清理旧的 `config.toml` `base_url`、自定义 provider 与 API-key-only
 auth；根 provider 固定为内置 `openai`，不保留 `model_providers.OpenAI` 历史线程
 兼容别名。SAIAI 不管理根 `model`、`review_model`、`model_reasoning_effort` 或模型
-上下文预算。有效的用户 CA、监听地址和普通 Chat 开关会复用，只替换 Gateway 与 Key；
+上下文预算。有效的用户 CA、监听地址和既有兼容字段会复用，只替换 Gateway 与 Key；
 已有真实 ChatGPT OAuth 原样保留，API-key-only auth 会迁移为本地代理 OAuth 占位。
 
 在已安装 Codex、但尚未生成 OAuth `auth.json` 的环境中，`saiai codex` 会在目标
@@ -147,8 +147,8 @@ WebSocket 帧、User-Agent、`originator`、session/thread/request id 等头保�
 只有代理发往 Gateway 时的 `Authorization` 使用 SAIAI Key。代理仍只监听 loopback，
 用户 shell 和系统环境不变。
 
-Desktop 可能使用 `chatgpt.com/backend-api/codex/*` 而不是
-`api.openai.com/v1/*`。代理现在识别这类 managed host，并将 Responses/models
+Desktop 可能使用 `chatgpt.com`、`chat.openai.com` 或 `ab.chatgpt.com` 的
+`/backend-api/codex/*`，而不是 `api.openai.com/v1/*`。代理将这些 managed host 的 Responses/models
 路径映射到 Gateway 的 `/v1/*` ingress；业务 body 和客户端身份 header 仍保持。
 Desktop/app-server 的 CA 信任必须独立验证，不能仅凭 CLI 的
 `CODEX_CA_CERTIFICATE` child 环境变量推断。Linux ChatGPT Desktop 26.901.51231 /
@@ -161,26 +161,30 @@ Gateway 的 OpenAI `/v1/initialize` 契约，也不是模型流量。当前本�
 
 当前 launcher 只覆盖由它直接启动的 Codex CLI 子进程。Codex Desktop 和 VSCode
 扩展不是该子进程，不能因为共享 `CODEX_HOME` 就推断它们已继承代理/CA 环境。
-Linux、macOS 和 Windows Desktop 现在有独立的 `saiai desktop`（`saiai chatgpt`
-别名）启动路径。Linux、macOS 和显式 `SAIAI_DESKTOP_BIN` 的普通可执行文件使用隔离的
+Linux、macOS 和 Windows Desktop 现在有独立的 `saiai desktop codex` 启动路径。
+Linux、macOS 和显式 `SAIAI_DESKTOP_BIN` 的普通可执行文件使用隔离的
 `CODEX_HOME`/user-data 和进程级代理/CA。对于官方 macOS `com.openai.codex` bundle，
 launcher 先以隔离 home、loopback 代理和当前 SAIAI 叶证书的 SPKI pin 启动 bundle
 executable，再用 `codex://threads/new` 激活窗口；pin 仅适用于该子进程，不会修改
 Keychain、系统代理或系统环境。Windows `OpenAI.Codex_*!App` 仍由 AppX broker 按
 `codex://threads/new` 协议激活，使用正常 Codex home 的受管 `.env`、OAuth 占位和
-`respect_system_proxy=false`，与 VSCode 路径共享无系统环境修改的代理合同。
+`respect_system_proxy=false`。由于 AppX broker 不能继承 launcher 子进程环境，启动器会
+在应用存活期间暂时设置当前用户的 loopback 系统代理并安装当前 SAIAI CA；带 generation
+的 lease 让旧 watcher 在重启/重复启动后不能删除新 AppX lease 的 CA。应用退出后只恢复
+启动前的代理并删除本次 SAIAI 安装的根证书，既有的用户根证书不触碰。
 Linux 隔离启动器改写子进程 `HOME` 以避免复用正常 Codex state。若当前 X11 会话未
 导出 `XAUTHORITY`，它仅把调用用户现有且可读的 `~/.Xauthority` 路径传给该子进程；
 不会复制、修改或写入该文件。这样 Electron 仍可连接已有 X server，而隔离 home、
 Codex state 和 user-data 保持独立。
 
-Desktop 启动入口按产品 target 解析：`saiai desktop codex`、
-`saiai desktop chatgpt`、`saiai desktop claude` 和 `saiai desktop gemini`。
-当前 Codex/ChatGPT target 复用已验证的 OpenAI Desktop adapter；Claude/Gemini
-target 先返回明确的 adapter 未实现错误。后续产品接入应实现独立 adapter，描述
-可执行文件发现、认证/配置目录、profile/onboarding、TLS/代理继承、模型目录和
-UI readiness；这些差异不应继续堆进一个 OpenAI 专用 launcher 分支。代理进程、
-CA、profile 生命周期、日志和 doctor 检查属于共享 Desktop runtime。
+Desktop 当前只接受 `saiai desktop codex`。官方应用的壳层仍可能显示“ChatGPT”以及
+其左栏，但普通 ChatGPT 会话、历史、语言、设置、插件和图片/文件 UI 不属于 SAIAI
+Desktop 合同；`saiai desktop chatgpt`、Claude 和 Gemini target 都会明确拒绝。Codex
+启动器一律用 `codex://threads/new` 激活，并把模型目录、Responses HTTP/WS 与登录
+控制面作为独立验证面。后续产品接入必须实现独立 adapter，描述可执行文件发现、认证/
+配置目录、profile/onboarding、TLS/代理继承、模型目录和 UI readiness；这些差异不应
+继续堆进一个 OpenAI 专用 launcher 分支。代理进程、CA、profile 生命周期、日志和
+doctor 检查属于共享 Desktop runtime。
 
 macOS 会校验 bundle identifier、OpenAI Team ID `2DC432GLL2` 和 codesign，并在
 激活前先请求应用正常退出，必要时才终止该 bundle 内的旧进程；进程退出后等待
@@ -201,27 +205,10 @@ Keychain 行为，也不会静默安装用户信任根：2026-09-15 在 macOS 15
 否则支持的无弹窗路径是 `saiai desktop codex`。没有可用 OAuth/占位 `auth.json` 时 launcher
 会明确报错。
 
-普通 ChatGPT Chat 的固定时区是 Desktop 子进程设置，不是全局请求改写。默认值为
-`America/Los_Angeles`，也可以设置 `SAIAI_CHATGPT_TIMEZONE` 覆盖；launcher 会校验
-对应的 IANA zoneinfo 文件，
-只向该 Electron 子进程设置 `TZ`，并移除控制变量本身；父 shell、系统环境和
-原始 `CODEX_HOME` 均不变。Desktop 会据此生成 `timezone` 与
-`timezone_offset_min`。设置 `SAIAI_CHATGPT_TIMEZONE=system` 可恢复系统真实时区。
-该选项目前仅影响 ChatGPT Desktop 普通 Chat，不向 Codex Responses body 强行添加
-未知字段，也不用于绕过服务端客户端策略。
-
-普通 Chat 协议的 Gateway 转发仍处于实验阶段，但客户端 allowlist 默认开启：
-本地代理会把经过 allowlist 的
-`/backend-api/f/conversation`、`conversation/init`、`f/conversation/prepare`、
-`sentinel/chat-requirements/prepare`、`files/download/{file_id}` 和
-`estuary/content` 路径转成带有 `/chatgpt/` 命名空间的 Gateway 路径。图片/文件
-指针解析依赖 `files/download/{file_id}` 返回官方的
-`download_url`/`retry`/`error` JSON，再通过 `estuary/content` 获取图片字节；这两类
-control-plane/asset 请求不应被当作 Responses 或模型请求计费。`SAIAI_CHATGPT_CHAT_PASSTHROUGH=0`
-仅作为当前代理进程的紧急关闭开关。
-该路径不会把请求转换为 Responses；Gateway 仍以独立 feature flag 和计费保护决定
-是否允许最终 Chat 模型请求。旧 Gateway 上普通 Chat 仍不可用，但现有 Desktop
-Codex、CLI 和 VSCode 路径不受影响。
+普通 Chat 协议的现有 allowlist 只保留为未发布研究代码，不能当作 Desktop 产品支持。
+它没有会话历史或语言偏好持久化合同，也不能因 Codex 的模型目录通过就推断可用。
+支持入口拒绝 `saiai desktop chatgpt`，普通 Chat 后续若恢复必须独立完成账户、历史、
+偏好、模型、资产、计费和多账户亲和性验证，不能与 Codex Desktop 共用“已支持”结论。
 
 `init-codex` 已完成 VSCode 所需配置，之后用户正常启动 VSCode 和官方 Codex 扩展。
 `saiai vscode` 保留为无需再次传入 Gateway/Key 的修复与刷新入口。两者复用 OAuth
