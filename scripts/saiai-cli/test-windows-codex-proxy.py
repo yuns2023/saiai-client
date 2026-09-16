@@ -195,6 +195,15 @@ def main() -> int:
             if init.returncode != 0:
                 raise RuntimeError("SAIAI init-codex failed in the capture fixture")
 
+            desktop_state = json.loads(
+                (root / "codex" / ".codex-global-state.json").read_text(encoding="utf-8")
+            )
+            persisted_atoms = desktop_state.get("electron-persisted-atom-state", {})
+            if persisted_atoms.get("composer-permission-mode-visibility") is not True:
+                raise AssertionError(
+                    "init-codex did not expose the Desktop permission selector"
+                )
+
             config = json.loads((root / "saiai" / "config.json").read_text())
             listen = urllib.parse.urlsplit("//" + config["listen"])
             proxy_port = listen.port

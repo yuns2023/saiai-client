@@ -612,6 +612,8 @@ fn init_codex(args: InitArgs) -> Result<()> {
 
     let proxy_init = initialize_codex_local_proxy(&args, &timestamp)?;
     let oauth_init = configure_codex_oauth_local_proxy(&codex_dir, &proxy_init)?;
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    prepare_desktop_onboarding_state(&codex_dir)?;
     #[cfg(target_os = "linux")]
     ensure_direct_linux_desktop_trust(&proxy_init.ca_cert_path);
 
@@ -620,6 +622,7 @@ fn init_codex(args: InitArgs) -> Result<()> {
     println!("  {}", config_path.display());
     println!("  {}", oauth_init.auth_path.display());
     println!("  {}", oauth_init.env_path.display());
+    println!("  {}", codex_dir.join(".codex-global-state.json").display());
     println!("  {}", proxy_init.config_path.display());
     println!("  {}", proxy_init.ca_cert_path.display());
     println!("  {}", proxy_init.ca_key_path.display());
@@ -1234,12 +1237,12 @@ fn is_codex_placeholder_access_token(token: &str) -> bool {
 fn run_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
     if !product.has_adapter() {
         bail!(
-            "SAIAI Desktop currently supports Codex only; ordinary ChatGPT history, settings, and language are not supported. Use `saiai desktop codex`."
+            "SAIAI Desktop currently supports Codex only; ordinary ChatGPT history and settings are not supported. Use `saiai desktop codex`."
         );
     }
 
     println!(
-        "SAIAI Desktop scope: Codex only; the official ChatGPT sidebar, ordinary Chat history, settings, and language are not supported."
+        "SAIAI Desktop scope: Codex only; the official ChatGPT sidebar, ordinary Chat history, and settings are not supported."
     );
 
     #[cfg(target_os = "linux")]
@@ -2619,12 +2622,19 @@ fn check_direct_macos_desktop_trust(report: &mut DoctorReport) {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn prepare_desktop_onboarding_state(codex_home: &Path) -> Result<()> {
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    prepare_desktop_onboarding_state_at(codex_home, &timestamp)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn prepare_desktop_onboarding_state_at(codex_home: &Path, timestamp: &str) -> Result<()> {
     let path = codex_home.join(".codex-global-state.json");
     let mut root = if path.exists() {
         Value::Object(load_json_object(&path)?)
     } else {
         Value::Object(Map::new())
     };
+    let original = root.clone();
     let object = root
         .as_object_mut()
         .context("Desktop global state must contain a JSON object")?;
@@ -2642,12 +2652,70 @@ fn prepare_desktop_onboarding_state(codex_home: &Path) -> Result<()> {
         "electron:onboarding-hide-first-new-thread-promos".to_string(),
         Value::Bool(true),
     );
+    // This Desktop-owned persisted atom controls whether the permission
+    // selector exposes every available profile. It does not select a profile,
+    // change approval policy, or grant Full Access. Some Windows profiles can
+    // retain a stale false value even when app-server reports all profiles as
+    // allowed, leaving the composer control disabled.
+    atom_state.insert(
+        "composer-permission-mode-visibility".to_string(),
+        Value::Bool(true),
+    );
+    if root == original {
+        return Ok(());
+    }
+    backup_if_exists(&path, timestamp)?;
     write_json_object(&path, root).with_context(|| {
         format!(
             "failed to prepare Desktop onboarding state {}",
             path.display()
         )
     })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn check_desktop_permission_visibility(report: &mut DoctorReport) {
+    let codex_dir = match codex_config_dir() {
+        Ok(path) => path,
+        Err(err) => {
+            report.warn("Desktop permission selector", err.to_string());
+            return;
+        }
+    };
+    let path = codex_dir.join(".codex-global-state.json");
+    if !path.is_file() {
+        report.warn(
+            "Desktop permission selector",
+            "Desktop state is absent; run `saiai init-codex` before launching Desktop",
+        );
+        return;
+    }
+    let state = match load_json_object(&path) {
+        Ok(state) => state,
+        Err(err) => {
+            report.warn("Desktop permission selector", err.to_string());
+            return;
+        }
+    };
+    let visible = state
+        .get("electron-persisted-atom-state")
+        .and_then(Value::as_object)
+        .and_then(|state| state.get("composer-permission-mode-visibility"))
+        .and_then(Value::as_bool);
+    match visible {
+        Some(true) => report.ok(
+            "Desktop permission selector",
+            "all available permission profiles are visible",
+        ),
+        Some(false) => report.warn(
+            "Desktop permission selector",
+            "permission profile visibility is disabled; rerun `saiai init-codex` or use `saiai desktop codex`",
+        ),
+        None => report.warn(
+            "Desktop permission selector",
+            "visibility state is missing or invalid; rerun `saiai init-codex` or use `saiai desktop codex`",
+        ),
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -3910,6 +3978,8 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
             cfg.as_ref(),
             matches!(target, DoctorTarget::Codex),
         );
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        check_desktop_permission_visibility(&mut report);
         #[cfg(target_os = "linux")]
         check_direct_linux_desktop_trust(&mut report);
         #[cfg(target_os = "macos")]
@@ -7093,6 +7163,54 @@ mod tests {
 
     fn parse(path: &Path) -> DocumentMut {
         read_str(path).parse::<DocumentMut>().unwrap()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn prepares_desktop_permission_visibility_without_selecting_a_mode() {
+        let codex = TempDir::new().unwrap();
+        let state_path = codex.path().join(".codex-global-state.json");
+        write_str(
+            &state_path,
+            r#"{
+  "electron-persisted-atom-state": {
+    "composer-permission-mode-visibility": false,
+    "agent-mode-by-host-id": {"local": "granular"}
+  },
+  "unrelated": "keep"
+}"#,
+        );
+
+        prepare_desktop_onboarding_state_at(codex.path(), "test-first").unwrap();
+
+        let state = load_json_object(&state_path).unwrap();
+        let atoms = state["electron-persisted-atom-state"].as_object().unwrap();
+        assert_eq!(
+            atoms["composer-permission-mode-visibility"],
+            Value::Bool(true)
+        );
+        assert_eq!(atoms["agent-mode-by-host-id"]["local"], "granular");
+        assert_eq!(state["unrelated"], "keep");
+        assert_eq!(
+            atoms["electron:onboarding-projectless-completed"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            atoms["electron:onboarding-hide-first-new-thread-promos"],
+            Value::Bool(true)
+        );
+
+        let backup_path = PathBuf::from(format!("{}.bak-test-first", state_path.display()));
+        let backup = load_json_object(&backup_path).unwrap();
+        assert_eq!(
+            backup["electron-persisted-atom-state"]["composer-permission-mode-visibility"],
+            Value::Bool(false)
+        );
+
+        let prepared = read_str(&state_path);
+        prepare_desktop_onboarding_state_at(codex.path(), "test-second").unwrap();
+        assert_eq!(read_str(&state_path), prepared);
+        assert!(!PathBuf::from(format!("{}.bak-test-second", state_path.display())).exists());
     }
 
     #[test]

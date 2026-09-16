@@ -154,17 +154,19 @@ VSCode（或 reload window），继续正常使用官方 Codex 扩展。若用�
 `CODEX_HOME`，不会修改原始 Codex 目录。Linux 下还会在 SAIAI 管理目录创建独立
 NSS 数据库并导入本地 CA，避免修改系统信任库；首次使用需要系统已有
 `certutil`（`libnss3-tools`）。Desktop 的 OAuth/CA/代理环境由 launcher 注入，
-不会写入系统环境变量。隔离的 Desktop 全局状态会预置“已完成首次项目引导”，
-因此不会每次启动都要求选择职业/个性化设置；这只影响 SAIAI 管理的 Desktop
-profile，不会改写原始 Codex 配置。
+不会写入系统环境变量。隔离的 Desktop 全局状态会预置“已完成首次项目引导”并确保
+所有可用权限模式在 composer 中可见；后者只控制 selector 可见性，不会选择模式、
+修改 approval/sandbox 或授予 Full Access。`init-codex` 也会对正常 `CODEX_HOME`
+应用同一幂等修复，修改既有状态前先备份并保留其他字段。
 
 在 Linux，`saiai init-codex` 还会把安装 CA 更新到当前用户的
 `~/.pki/nssdb` 中唯一的 `saiai-local-proxy` 条目，帮助直接启动的官方 Desktop
 建立 CA 信任。它不改系统信任库，也没有系统弹窗；但会影响该用户共享此 NSS
 数据库的应用，命令会明确说明该操作。没有 `certutil` 时，CLI/VSCode 仍可使用，
 Desktop 请使用 `saiai desktop codex`。`saiai doctor codex` 会报告该条目是否存在。
-目前 Linux Desktop 的账户控制面已验证，但 `/v1/initialize` 仍待按独立控制面契约
-闭环；在完成前，`saiai desktop codex` 是受支持的隔离回退。macOS 不会写入 Keychain：官方
+Desktop 的 Statsig `/v1/initialize` 和登录后 bootstrap 由本地 sidecar 以同一最小
+payload 闭环，只启用 Codex 内置翻译消息所需的 i18n layer；它们不发送到 Gateway 或
+Statsig，也不携带 SAIAI Key、合成账户、Cookie 或请求体。macOS 不会写入 Keychain：官方
 App 从 Dock、Finder 或 `open -a` 直接启动时不能继承 launcher 的叶证书 SPKI pin，若要让它
 信任 SAIAI 本地 CA，必须由当前用户通过 macOS 的授权交互把该 CA 设为登录 Keychain 的信任根。
 这不是可由 `init-codex` 静默完成的操作。未完成该用户授权时，使用无 Keychain、无系统代理修改的
