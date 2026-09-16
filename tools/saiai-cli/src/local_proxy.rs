@@ -48,6 +48,12 @@ const CHATGPT_AUX_HOST: &str = "ab.chatgpt.com";
 const CERTIFICATE_CONTROL_HOST: &str = "certificate.saiai.local";
 const CERTIFICATE_SPKI_HEADER: &str = "x-saiai-leaf-spki-sha256";
 const CHATGPT_CHAT_PASSTHROUGH_ENV: &str = "SAIAI_CHATGPT_CHAT_PASSTHROUGH";
+const DESKTOP_STATSIG_MAX_REQUEST_BYTES: usize = 1024 * 1024;
+// Codex Desktop 26.908.4834.0 / Statsig JS 3.33.4 gates bundled locale
+// messages behind layer 72216192. Keep this local bootstrap deliberately
+// narrow: it enables only i18n and does not opt the synthetic SAIAI identity
+// into unrelated hosted experiments or send it to the Statsig control plane.
+const DESKTOP_STATSIG_I18N_PAYLOAD: &str = r#"{"feature_gates":{},"dynamic_configs":{},"layer_configs":{"72216192":{"name":"72216192","value":{"enable_i18n":true},"rule_id":"saiai-local-i18n","secondary_exposures":[],"is_user_in_experiment":false,"is_experiment_active":false,"allocated_experiment_name":"","explicit_parameters":["enable_i18n"],"undelegated_secondary_exposures":[]}},"has_updates":true,"time":0,"user":{"userID":"saiai-local-proxy-user","customIDs":{"stableID":"saiai-local-proxy"}}}"#;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HEADER_LINE: usize = 32 * 1024;
 const MAX_HEADER_BYTES: usize = 256 * 1024;
@@ -1452,6 +1458,26 @@ fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
 fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse> {
     let path = request_path(&request.target).ok()?;
     match path.as_str() {
+        "/v1/initialize" if !request.method.eq_ignore_ascii_case("POST") => Some(StaticResponse {
+            status: StatusCode::METHOD_NOT_ALLOWED,
+            content_type: "application/json",
+            body: br#"{"error":"method_not_allowed"}"#,
+            reason: "desktop_statsig_method_not_allowed",
+        }),
+        "/v1/initialize" if request.body.len() > DESKTOP_STATSIG_MAX_REQUEST_BYTES => {
+            Some(StaticResponse {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                content_type: "application/json",
+                body: br#"{"error":"payload_too_large"}"#,
+                reason: "desktop_statsig_payload_too_large",
+            })
+        }
+        "/v1/initialize" => Some(StaticResponse {
+            status: StatusCode::OK,
+            content_type: "application/json",
+            body: DESKTOP_STATSIG_I18N_PAYLOAD.as_bytes(),
+            reason: "desktop_statsig_i18n_bootstrap",
+        }),
         "/ces/v1/rgstr" => Some(StaticResponse {
             status: StatusCode::NO_CONTENT,
             content_type: "text/plain",
@@ -1568,7 +1594,7 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         // can be interpreted as a non-standard access state and hide Astra.
         "/backend-api/accounts/verified_access" | "/accounts/verified_access" => Value::Null,
         "/backend-api/wham/statsig/bootstrap" => json!({
-            "statsigPayload": "{\"feature_gates\":{},\"dynamic_configs\":{},\"layer_configs\":{},\"has_updates\":true,\"time\":0,\"user\":{\"userID\":\"saiai-local-proxy-user\",\"customIDs\":{\"stableID\":\"saiai-local-proxy\"}}}"
+            "statsigPayload": DESKTOP_STATSIG_I18N_PAYLOAD
         }),
         "/backend-api/conversations" => json!({
             "items": [],
@@ -2097,6 +2123,14 @@ mod tests {
             serde_json::from_str(body["statsigPayload"].as_str().unwrap()).unwrap();
         assert_eq!(payload["has_updates"], true);
         assert_eq!(payload["user"]["userID"], "saiai-local-proxy-user");
+        assert_eq!(
+            payload["layer_configs"]["72216192"]["value"]["enable_i18n"],
+            true
+        );
+        assert_eq!(
+            payload["layer_configs"]["72216192"]["explicit_parameters"],
+            json!(["enable_i18n"])
+        );
 
         let profile = IncomingRequest {
             method: "GET".to_string(),
@@ -2166,6 +2200,39 @@ mod tests {
         assert!(headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("set-cookie") && value.starts_with("_devicecheck=")
         }));
+    }
+
+    #[test]
+    fn serves_only_bounded_post_statsig_initialize_requests_locally() {
+        let request = IncomingRequest {
+            method: "POST".to_string(),
+            target: "/v1/initialize?k=client-test".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: vec![("Authorization".to_string(), "Bearer ignored".to_string())],
+            body: br#"{"statsigMetadata":{"sdkType":"javascript-client"}}"#.to_vec(),
+        };
+        let response = chatgpt_sidecar_response(&request).unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.reason, "desktop_statsig_i18n_bootstrap");
+        let payload: Value = serde_json::from_slice(response.body).unwrap();
+        assert_eq!(
+            payload["layer_configs"]["72216192"]["value"]["enable_i18n"],
+            true
+        );
+
+        let get = IncomingRequest {
+            method: "GET".to_string(),
+            ..request.clone()
+        };
+        let response = chatgpt_sidecar_response(&get).unwrap();
+        assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
+
+        let oversized = IncomingRequest {
+            body: vec![0; DESKTOP_STATSIG_MAX_REQUEST_BYTES + 1],
+            ..request
+        };
+        let response = chatgpt_sidecar_response(&oversized).unwrap();
+        assert_eq!(response.status, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]

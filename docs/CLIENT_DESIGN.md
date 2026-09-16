@@ -154,8 +154,12 @@ Desktop/app-server 的 CA 信任必须独立验证，不能仅凭 CLI 的
 `CODEX_CA_CERTIFICATE` child 环境变量推断。Linux ChatGPT Desktop 26.901.51231 /
 Codex app-server 0.153.4 已实测：用户 NSS 导入后账户控制面从 CA 错误恢复。Desktop
 还会向 `ab.chatgpt.com/v1/initialize` 发送 Statsig beta-eligibility 请求；它不是
-Gateway 的 OpenAI `/v1/initialize` 契约，也不是模型流量。当前本地代理不会将它
-转发到 Gateway；该请求失败时账户状态和本地 app-server 仍可完成初始化。不得把
+Gateway 的 OpenAI `/v1/initialize` 契约，也不是模型流量。本地代理只对精确的
+`POST /v1/initialize` 返回版本化的本地 Statsig bootstrap，并在
+`/backend-api/wham/statsig/bootstrap` 返回同一 payload。该 payload 只启用 Codex
+已内置消息包所需的 `72216192.enable_i18n`，不启用其他 hosted experiment，不携带
+SAIAI Key，也不把合成账户、Cookie 或请求体发往 Statsig/Gateway；非 POST 和超过
+1 MiB 的请求会被拒绝。不得把
 成功的账户查询或目录加载宣称为完整 Desktop 模型支持；未做模型请求的验证前，
 `saiai desktop codex` 仍是受支持的隔离回退路径。
 
@@ -204,6 +208,11 @@ Keychain 行为，也不会静默安装用户信任根：2026-09-15 在 macOS 15
 官方 App 仅在用户已明确授权登录 Keychain 信任 SAIAI CA 时才可能成立，且仍需按版本现场验证；
 否则支持的无弹窗路径是 `saiai desktop codex`。没有可用 OAuth/占位 `auth.json` 时 launcher
 会明确报错。
+
+`init-codex` 和 `saiai desktop codex` 都会幂等设置 Desktop 私有状态
+`composer-permission-mode-visibility=true`，避免旧 Windows profile 隐藏可用权限模式；
+该状态只控制 selector 可见性，不选择模式、不修改 approval/sandbox，也不授予 Full
+Access。修改既有 Desktop state 前会备份，其他 atom 和用户状态保持不变。
 
 普通 Chat 协议的现有 allowlist 只保留为未发布研究代码，不能当作 Desktop 产品支持。
 它没有会话历史或语言偏好持久化合同，也不能因 Codex 的模型目录通过就推断可用。
