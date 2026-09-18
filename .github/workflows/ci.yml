@@ -46,6 +46,7 @@ jobs:
 
       - name: Verify public release contract
         run: |
+          python3 scripts/saiai-cli/test-installed-codex-desktop-probe.py
           bash scripts/saiai-cli/test-setup-wrappers.sh
           python3 scripts/saiai-cli/verify-release.py
 
