@@ -166,6 +166,13 @@ SAIAI Key，也不把合成账户、Cookie 或请求体发往 Statsig/Gateway；
 成功的账户查询或目录加载宣称为完整 Desktop 模型支持；未做模型请求的验证前，
 `saiai desktop codex` 仍是受支持的隔离回退路径。
 
+Client 候选包发布前可运行
+`scripts/saiai-cli/probe-installed-codex-desktop.py`。它在 Windows/macOS 测试机上
+复制已安装官方 Desktop 随附的 app-server 到临时目录，以隔离的
+`HOME`/`CODEX_HOME`/`SAIAI_HOME`、临时 CA、合成登录和 loopback Gateway 验证
+`initialize` 与 `account/read`。探针不启动 turn，不发送模型请求，也不改写用户现有
+Codex/SAIAI 配置；结果只保留版本、二进制哈希和脱敏控制面状态。
+
 当前 launcher 只覆盖由它直接启动的 Codex CLI 子进程。Codex Desktop 和 VSCode
 扩展不是该子进程，不能因为共享 `CODEX_HOME` 就推断它们已继承代理/CA 环境。
 Linux、macOS 和 Windows Desktop 现在有独立的 `saiai desktop codex` 启动路径。
