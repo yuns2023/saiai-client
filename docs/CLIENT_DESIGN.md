@@ -159,7 +159,10 @@ Gateway 的 OpenAI `/v1/initialize` 契约，也不是模型流量。本地代�
 `/backend-api/wham/statsig/bootstrap` 返回同一 payload。该 payload 只启用 Codex
 已内置消息包所需的 `72216192.enable_i18n`，不启用其他 hosted experiment，不携带
 SAIAI Key，也不把合成账户、Cookie 或请求体发往 Statsig/Gateway；非 POST 和超过
-1 MiB 的请求会被拒绝。不得把
+1 MiB 的请求会被拒绝。账户 sidecar 的 `accounts/check` 条目同时返回
+`workspace_backend_origin=NO_CONSTRAINT` 和
+`account_routing_override=NO_CONSTRAINT`，满足 Codex app-server 0.155+ 的工作区路由
+发现合同，同时保留当前有效 ChatGPT origin，不施加区域路由。不得把
 成功的账户查询或目录加载宣称为完整 Desktop 模型支持；未做模型请求的验证前，
 `saiai desktop codex` 仍是受支持的隔离回退路径。
 

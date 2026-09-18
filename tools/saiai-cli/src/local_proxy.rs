@@ -1577,6 +1577,12 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
                 "id": account_id,
                 "account_user_id": "saiai-local-proxy-user",
                 "account_user_role": "standard-user",
+                // Codex app-server 0.155+ uses these fields to resolve the
+                // selected workspace before `account/read` can report the
+                // local ChatGPT identity. `NO_CONSTRAINT` keeps the effective
+                // ChatGPT origin and adds no regional routing override.
+                "workspace_backend_origin": "NO_CONSTRAINT",
+                "account_routing_override": "NO_CONSTRAINT",
                 "structure": "personal",
                 "plan_type": "plus",
                 "is_zdr": false,
@@ -2097,7 +2103,30 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["default_account_id"], "account-test");
         assert_eq!(body["accounts"][0]["account_user_role"], "standard-user");
+        assert_eq!(
+            body["accounts"][0]["workspace_backend_origin"],
+            "NO_CONSTRAINT"
+        );
+        assert_eq!(
+            body["accounts"][0]["account_routing_override"],
+            "NO_CONSTRAINT"
+        );
         assert_eq!(body["accounts"][0]["is_zdr"], false);
+
+        let optimized_accounts = IncomingRequest {
+            target: "/backend-api/accounts/optimized/check".to_string(),
+            ..accounts
+        };
+        let (_, body, _, _) = chatgpt_account_sidecar_response(&optimized_accounts).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["accounts"][0]["workspace_backend_origin"],
+            "NO_CONSTRAINT"
+        );
+        assert_eq!(
+            body["accounts"][0]["account_routing_override"],
+            "NO_CONSTRAINT"
+        );
 
         let verified_access = IncomingRequest {
             method: "GET".to_string(),
