@@ -16,6 +16,7 @@ import os
 import platform
 import plistlib
 import queue
+import re
 import shutil
 import signal
 import socket
@@ -92,6 +93,14 @@ def sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def sanitized_version(output: str, prefix: str) -> str:
+    pattern = re.compile(rf"^{re.escape(prefix)} [0-9A-Za-z][0-9A-Za-z.+_-]*$")
+    matches = [line.strip() for line in output.splitlines() if pattern.fullmatch(line.strip())]
+    if len(matches) != 1:
+        raise ProbeError(f"could not parse {prefix} version output")
+    return matches[0]
 
 
 def run(
@@ -449,10 +458,14 @@ def probe(saiai: Path, app_server_override: Path | None) -> dict[str, Any]:
             )
             if model_requests:
                 raise ProbeError("field probe unexpectedly attempted a model request")
-            saiai_version = run([str(saiai), "--version"], env=env, cwd=root).stdout.strip()
-            app_server_version = run(
-                [str(copied_app_server), "--version"], env=env, cwd=root
-            ).stdout.strip()
+            saiai_version = sanitized_version(
+                run([str(saiai), "--version"], env=env, cwd=root).stdout,
+                "saiai",
+            )
+            app_server_version = sanitized_version(
+                run([str(copied_app_server), "--version"], env=env, cwd=root).stdout,
+                "codex-cli",
+            )
             return {
                 "schema_version": 1,
                 "result": "pass",

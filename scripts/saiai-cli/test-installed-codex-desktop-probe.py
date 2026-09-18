@@ -17,6 +17,16 @@ SPEC.loader.exec_module(PROBE)
 
 
 class InstalledCodexDesktopProbeTests(unittest.TestCase):
+    def test_version_output_discards_packaged_app_warnings(self) -> None:
+        output = (
+            'WARNING: Refusing helper path C:\\Users\\someone\\AppData\\Local\\Temp\\\n'
+            "codex-cli 0.155.0-alpha.9\n"
+        )
+        self.assertEqual(
+            PROBE.sanitized_version(output, "codex-cli"),
+            "codex-cli 0.155.0-alpha.9",
+        )
+
     def test_accepts_chatgpt_workspace_routing(self) -> None:
         result = PROBE.validate_account_response(
             {
