@@ -1821,12 +1821,59 @@ fn run_windows_packaged_desktop(
     write_desktop_account_id_with_fallback(&auth_path, &desktop_root, "saiai-local-proxy-user")?;
     prepare_desktop_onboarding_state(&codex_dir)?;
 
+    let proxy = format!("http://{}", cfg.listen);
+    let spki = local_proxy_chatgpt_spki(&cfg.listen)?;
+    let executable = windows_packaged_desktop_executable(package)?;
+    let user_home = home_dir().context("failed to resolve the Windows user home")?;
+
     let proxy_lease =
         windows_begin_packaged_proxy_lease(&cfg.listen, Path::new(&cfg.ca_cert_path))?;
     if let Err(error) = stop_windows_packaged_desktop(package) {
         proxy_lease.restore()?;
         return Err(error);
     }
+    let mut command = ProcessCommand::new(&executable);
+    command
+        .arg(format!("--proxy-server={proxy}"))
+        .arg(format!("--ignore-certificate-errors-spki-list={spki}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for name in CODEX_MANAGED_ENV {
+        command.env_remove(*name);
+    }
+    command
+        .env("HOME", &user_home)
+        .env("USERPROFILE", &user_home)
+        .env("CODEX_HOME", &codex_dir)
+        .env("CODEX_CA_CERTIFICATE", &cfg.ca_cert_path)
+        .env("SSL_CERT_FILE", &cfg.ca_cert_path)
+        .env("NODE_EXTRA_CA_CERTS", &cfg.ca_cert_path)
+        .env("HTTP_PROXY", &proxy)
+        .env("HTTPS_PROXY", &proxy)
+        .env("ALL_PROXY", &proxy)
+        .env("NO_PROXY", CODEX_LOCAL_PROXY_NO_PROXY)
+        .env("http_proxy", &proxy)
+        .env("https_proxy", &proxy)
+        .env("all_proxy", &proxy)
+        .env("no_proxy", CODEX_LOCAL_PROXY_NO_PROXY);
+    if let Err(error) = command.spawn() {
+        proxy_lease.restore()?;
+        return Err(error).with_context(|| format!("failed to start {}", executable.display()));
+    }
+
+    let process_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < process_deadline {
+        if windows_packaged_desktop_executable_running(&executable).unwrap_or(false) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if !windows_packaged_desktop_executable_running(&executable).unwrap_or(false) {
+        rollback_windows_packaged_desktop_launch(package, &proxy_lease)?;
+        bail!("packaged OpenAI Desktop executable exited before protocol activation");
+    }
+
     let workspace = env::current_dir().context("failed to resolve the Desktop workspace")?;
     let target = codex_new_thread_url(&workspace);
     let status = match ProcessCommand::new("powershell")
@@ -1841,33 +1888,34 @@ fn run_windows_packaged_desktop(
     {
         Ok(status) => status,
         Err(error) => {
-            proxy_lease.restore()?;
+            rollback_windows_packaged_desktop_launch(package, &proxy_lease)?;
             return Err(error).context("failed to activate packaged OpenAI Desktop");
         }
     };
     if !status.success() {
-        proxy_lease.restore()?;
+        rollback_windows_packaged_desktop_launch(package, &proxy_lease)?;
         bail!("packaged OpenAI Desktop activation exited with {status}");
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
-        if windows_packaged_desktop_running(package).unwrap_or(false) {
+        if windows_packaged_desktop_executable_running(&executable).unwrap_or(false) {
             println!("Starting packaged OpenAI Desktop through the SAIAI local proxy.");
             println!("  product={}", product.label());
             println!("  app_id={}", package.app_id);
+            println!("  application={}", executable.display());
             println!("  CODEX_HOME={}", codex_dir.display());
             println!("  environment={}", env_path.display());
             println!("  proxy=http://{}", cfg.listen);
             println!("  system-proxy=temporary lease (restored when Desktop exits)");
             if let Err(error) = proxy_lease.spawn_restore_watcher(&package.install_location) {
-                proxy_lease.restore()?;
+                rollback_windows_packaged_desktop_launch(package, &proxy_lease)?;
                 return Err(error);
             }
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    proxy_lease.restore()?;
+    rollback_windows_packaged_desktop_launch(package, &proxy_lease)?;
     bail!("packaged OpenAI Desktop activation returned without a running app process")
 }
 
@@ -1927,8 +1975,8 @@ $deadline = (Get-Date).AddSeconds(120)
 $seen = $false
 $goneSince = $null
 while ($true) {
-  $processes = @(Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue | Where-Object {
-    $_.Path -and $_.Path.StartsWith($state.root, [StringComparison]::OrdinalIgnoreCase)
+  $processes = @(Get-CimInstance Win32_Process | Where-Object {
+    $_.ExecutablePath -and $_.ExecutablePath.StartsWith($state.root, [StringComparison]::OrdinalIgnoreCase)
   })
   if ($processes.Count -gt 0) {
     $seen = $true
@@ -2326,6 +2374,24 @@ struct WindowsPackagedDesktop {
 }
 
 #[cfg(target_os = "windows")]
+fn windows_packaged_desktop_executable(package: &WindowsPackagedDesktop) -> Result<PathBuf> {
+    [
+        package.install_location.join("app/ChatGPT.exe"),
+        package.install_location.join("app/Codex.exe"),
+        package.install_location.join("ChatGPT.exe"),
+        package.install_location.join("Codex.exe"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .with_context(|| {
+        format!(
+            "OpenAI Codex AppX executable is unavailable under {}",
+            package.install_location.display()
+        )
+    })
+}
+
+#[cfg(target_os = "windows")]
 fn resolve_windows_packaged_desktop() -> Result<Option<WindowsPackagedDesktop>> {
     let app_id = command_output(
         "powershell",
@@ -2373,7 +2439,7 @@ fn stop_windows_packaged_desktop(package: &WindowsPackagedDesktop) -> Result<()>
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "& { param($root) Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) } | Stop-Process -Force }",
+            "& { param($root) $deadline=(Get-Date).AddSeconds(10); do { $processes=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) }); foreach($process in $processes){ & taskkill.exe /PID $process.ProcessId /T /F 2>$null | Out-Null }; if($processes.Count -eq 0){ return }; Start-Sleep -Milliseconds 200 } while((Get-Date) -lt $deadline); $remaining=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) }); if($remaining.Count -gt 0){ throw 'packaged OpenAI Desktop process tree did not exit' } }",
             &root,
         ],
     )?;
@@ -2381,19 +2447,38 @@ fn stop_windows_packaged_desktop(package: &WindowsPackagedDesktop) -> Result<()>
 }
 
 #[cfg(target_os = "windows")]
-fn windows_packaged_desktop_running(package: &WindowsPackagedDesktop) -> Result<bool> {
-    let root = package.install_location.display().to_string();
+fn windows_packaged_desktop_executable_running(executable: &Path) -> Result<bool> {
+    let executable = executable.display().to_string();
     let count = command_output(
         "powershell",
         &[
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "& { param($root) $process = Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1; if ($null -ne $process) { 'yes' } }",
-            &root,
+            "& { param($executable) $process = Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.Equals($executable, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1; if ($null -ne $process) { 'yes' } }",
+            &executable,
         ],
     )?;
     Ok(count.trim() == "yes")
+}
+
+#[cfg(target_os = "windows")]
+fn rollback_windows_packaged_desktop_launch(
+    package: &WindowsPackagedDesktop,
+    proxy_lease: &WindowsPackagedProxyLease,
+) -> Result<()> {
+    let stop_error = stop_windows_packaged_desktop(package).err();
+    let restore_error = proxy_lease.restore().err();
+    match (stop_error, restore_error) {
+        (None, None) => Ok(()),
+        (Some(error), None) => Err(error).context("failed to stop packaged OpenAI Desktop"),
+        (None, Some(error)) => {
+            Err(error).context("failed to restore the packaged Desktop proxy lease")
+        }
+        (Some(stop_error), Some(restore_error)) => bail!(
+            "failed to stop packaged OpenAI Desktop ({stop_error:#}) and restore its proxy lease ({restore_error:#})"
+        ),
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -3038,11 +3123,17 @@ fn local_proxy_chatgpt_spki(listen: &str) -> Result<String> {
     let spki = spki.context(
         "running SAIAI proxy does not expose a Desktop certificate pin; run `saiai restart` and retry",
     )?;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(&spki)
-        .context("SAIAI local proxy returned an invalid Desktop certificate pin")?;
-    if decoded.len() != 32 {
-        bail!("SAIAI local proxy returned an invalid Desktop certificate pin length");
+    let pins = spki.split(',').collect::<Vec<_>>();
+    if pins.is_empty() || pins.iter().any(|pin| pin.trim().is_empty()) {
+        bail!("SAIAI local proxy returned an empty Desktop certificate pin");
+    }
+    for pin in pins {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(pin.trim())
+            .context("SAIAI local proxy returned an invalid Desktop certificate pin")?;
+        if decoded.len() != 32 {
+            bail!("SAIAI local proxy returned an invalid Desktop certificate pin length");
+        }
     }
     Ok(spki)
 }

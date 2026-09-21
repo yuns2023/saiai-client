@@ -79,6 +79,11 @@ OpenAI；已有真实 ChatGPT OAuth 会保留。SAIAI 不会新增、覆盖或�
 approval/sandbox 或授予 Full Access。`saiai desktop codex` 启动前会对实际使用的
 `CODEX_HOME` 重复同一检查，`saiai doctor codex` 会报告异常状态。
 
+商店版 Desktop 会先直接启动包内主程序，并向 Chromium 传入本地代理为四个受管 OpenAI/
+ChatGPT 域名生成的完整 SPKI pin 列表，再通过 `codex://` 激活窗口；这避免 Desktop 更新后
+新增控制面域名因只收到单一 pin 而回到登录页。应用完整进程树退出后，临时系统代理和本次
+安装的用户根证书会按 lease 恢复。
+
 Codex Desktop 的中文等内置翻译由 `localeOverride`/系统语言选择，但消息加载还依赖
 Desktop 的 i18n Statsig layer。SAIAI 在 loopback sidecar 内对精确的 Statsig bootstrap
 返回只包含 `enable_i18n=true` 的最小版本化 payload；它不会把该请求、SAIAI Key、
