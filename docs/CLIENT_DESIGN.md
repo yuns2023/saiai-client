@@ -279,3 +279,17 @@ manifest contract 为：
 wrapper、manifest 和六个平台二进制构成不可变 release bundle。Linux 二进制使用
 静态 musl，避免旧发行版和树莓派上的 GLIBC 版本依赖。Gateway 只从当前激活目录
 提供这一完整 bundle，默认下载源由可信公开 origin 动态渲染。
+
+### Linux 随机数兼容性
+
+Linux musl 资产通过 `scripts/saiai-cli/build-linux.sh` 构建。构建机需安装
+`musl-tools` 和 `linux-libc-dev`；脚本只向 musl 暴露 Linux UAPI 头文件，
+不混入宿主 glibc 头文件。AWS-LC 必须选中支持 `getrandom` 返回 `ENOSYS`
+时回退到 `/dev/urandom` 的 Linux 实现。缺少 `linux/random.h` 会使其选择
+无此回退的 `getentropy` 实现，可能导致 TLS 握手期间进程直接终止。
+
+CI 和 release 对两种 Linux 架构运行 `test-linux-entropy.py`：仅在测试进程
+及其子进程中用 seccomp 将 `getrandom` 返回值设为 `ENOSYS`，验证初始化、
+后台代理、doctor 的本地 TLS 握手及服务生命周期。该测试不改变宿主策略，
+不发送模型请求，也不代表已验证旧内核的所有系统调用兼容性。系统随机数源
+必须正常可用；不得通过固定随机数、忽略失败或禁用 TLS 校验来规避错误。
