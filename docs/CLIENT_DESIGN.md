@@ -293,3 +293,7 @@ CI 和 release 对两种 Linux 架构运行 `test-linux-entropy.py`：仅在测�
 后台代理、doctor 的本地 TLS 握手及服务生命周期。该测试不改变宿主策略，
 不发送模型请求，也不代表已验证旧内核的所有系统调用兼容性。系统随机数源
 必须正常可用；不得通过固定随机数、忽略失败或禁用 TLS 校验来规避错误。
+
+Windows MSVC 的两种 release 目标使用 `/Brepro`，避免链接时间戳和调试标识
+导致相同源码的 preview/tag 构建产生不同字节。正式 Release 的完整 manifest
+必须与实机验证过的 preview 一致；哈希不同的构建不能复用验证凭据。
