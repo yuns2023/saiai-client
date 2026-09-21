@@ -186,11 +186,20 @@ def main() -> int:
         systemctl.chmod(0o755)
 
         environment = os.environ.copy()
+        for key in list(environment):
+            if key.startswith(("SAIAI_", "ANTHROPIC_", "OPENAI_", "CLAUDE_", "CODEX_")):
+                environment.pop(key)
+            elif key.lower() in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+                environment.pop(key)
         environment.update(
             {
                 "HOME": str(home),
                 "CLAUDE_CONFIG_DIR": str(claude_dir),
+                "CODEX_HOME": str(home / ".codex"),
                 "SAIAI_HOME": str(saiai_home),
+                "XDG_CONFIG_HOME": str(home / ".config"),
+                "XDG_DATA_HOME": str(home / ".local" / "share"),
+                "XDG_CACHE_HOME": str(home / ".cache"),
                 "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
             }
         )
@@ -268,6 +277,14 @@ def main() -> int:
                 raise AssertionError(
                     f"doctor did not recognize the fallback:\n{doctor.stdout}"
                 )
+            for expected in (
+                "OK   local proxy MITM:",
+                "returned 204 then 200",
+            ):
+                if expected not in doctor.stdout:
+                    raise AssertionError(
+                        f"doctor did not complete the local TLS check:\n{doctor.stdout}"
+                    )
 
             verify_logs_command(binary, environment)
 

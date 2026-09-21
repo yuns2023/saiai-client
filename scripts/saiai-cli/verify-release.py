@@ -292,6 +292,8 @@ def verify_workflows_and_docs() -> None:
         "CI workflow does not exercise the Linux headless service fallback",
     )
     for workflow in (ci, release):
+        for required in ("build-linux.sh", "linux-libc-dev", "test-linux-entropy.py"):
+            require(required in workflow, f"Linux entropy contract is missing {required!r}")
         require(
             "test-windows-codex-proxy.py" in workflow
             and '"0.146.0", "0.153.4"' in workflow,
