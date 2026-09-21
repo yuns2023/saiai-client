@@ -341,6 +341,19 @@ impl State {
         Ok(self.certificate_for_host(host)?.spki_sha256)
     }
 
+    fn desktop_tls_spki_list(&self) -> Result<String> {
+        [
+            OPENAI_HOST,
+            CHATGPT_HOST,
+            CHAT_OPENAI_HOST,
+            CHATGPT_AUX_HOST,
+        ]
+        .into_iter()
+        .map(|host| self.tls_spki_for_host(host))
+        .collect::<Result<Vec<_>>>()
+        .map(|pins| pins.join(","))
+    }
+
     fn certificate_for_host(&self, host: &str) -> Result<ManagedCertificate> {
         let host = canonical_host(host);
         {
@@ -517,7 +530,7 @@ async fn handle_client(
 
     let mut stream = reader.into_inner();
     if connect.host == CERTIFICATE_CONTROL_HOST && connect.port == 443 {
-        let spki = state.tls_spki_for_host(CHATGPT_HOST)?;
+        let spki = state.desktop_tls_spki_list()?;
         stream
             .write_all(
                 format!(
@@ -1570,7 +1583,10 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         ));
     }
     let response = match path.as_str() {
-        "/backend-api/accounts/optimized/check" | "/backend-api/wham/accounts/check" => json!({
+        "/backend-api/accounts/optimized/check"
+        | "/accounts/optimized/check"
+        | "/backend-api/wham/accounts/check"
+        | "/wham/accounts/check" => json!({
             "account_ordering": [account_id],
             "default_account_id": account_id,
             "accounts": [{
@@ -1599,7 +1615,7 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         // means no special access program is present; an object such as `{}`
         // can be interpreted as a non-standard access state and hide Astra.
         "/backend-api/accounts/verified_access" | "/accounts/verified_access" => Value::Null,
-        "/backend-api/wham/statsig/bootstrap" => json!({
+        "/backend-api/wham/statsig/bootstrap" | "/wham/statsig/bootstrap" => json!({
             "statsigPayload": DESKTOP_STATSIG_I18N_PAYLOAD
         }),
         "/backend-api/conversations" => json!({
@@ -2128,6 +2144,19 @@ mod tests {
             "NO_CONSTRAINT"
         );
 
+        let unprefixed_optimized_accounts = IncomingRequest {
+            target: "/accounts/optimized/check".to_string(),
+            ..optimized_accounts
+        };
+        let (_, body, _, _) =
+            chatgpt_account_sidecar_response(&unprefixed_optimized_accounts).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["default_account_id"], "account-test");
+        assert_eq!(
+            body["accounts"][0]["workspace_backend_origin"],
+            "NO_CONSTRAINT"
+        );
+
         let verified_access = IncomingRequest {
             method: "GET".to_string(),
             target: "/backend-api/accounts/verified_access".to_string(),
@@ -2160,6 +2189,14 @@ mod tests {
             payload["layer_configs"]["72216192"]["explicit_parameters"],
             json!(["enable_i18n"])
         );
+
+        let unprefixed_statsig = IncomingRequest {
+            target: "/wham/statsig/bootstrap".to_string(),
+            ..statsig
+        };
+        let (_, body, _, _) = chatgpt_account_sidecar_response(&unprefixed_statsig).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["statsigPayload"].is_string());
 
         let profile = IncomingRequest {
             method: "GET".to_string(),
@@ -2313,6 +2350,24 @@ mod tests {
                 .unwrap()
                 .len(),
             32
+        );
+        let desktop_pins = state.desktop_tls_spki_list().unwrap();
+        let decoded_pins = desktop_pins
+            .split(',')
+            .map(|pin| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(pin)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decoded_pins.len(), 4);
+        assert!(decoded_pins.iter().all(|pin| pin.len() == 32));
+        assert_eq!(
+            decoded_pins
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            4
         );
         assert_eq!(
             state.route_for_host(ANTHROPIC_HOST).base_url,

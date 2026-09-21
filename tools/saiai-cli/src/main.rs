@@ -1827,6 +1827,7 @@ fn run_windows_packaged_desktop(
         proxy_lease.restore()?;
         return Err(error);
     }
+
     let workspace = env::current_dir().context("failed to resolve the Desktop workspace")?;
     let target = codex_new_thread_url(&workspace);
     let status = match ProcessCommand::new("powershell")
@@ -1927,8 +1928,8 @@ $deadline = (Get-Date).AddSeconds(120)
 $seen = $false
 $goneSince = $null
 while ($true) {
-  $processes = @(Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue | Where-Object {
-    $_.Path -and $_.Path.StartsWith($state.root, [StringComparison]::OrdinalIgnoreCase)
+  $processes = @(Get-CimInstance Win32_Process | Where-Object {
+    $_.ExecutablePath -and $_.ExecutablePath.StartsWith($state.root, [StringComparison]::OrdinalIgnoreCase)
   })
   if ($processes.Count -gt 0) {
     $seen = $true
@@ -2367,6 +2368,9 @@ fn resolve_windows_packaged_desktop() -> Result<Option<WindowsPackagedDesktop>> 
 #[cfg(target_os = "windows")]
 fn stop_windows_packaged_desktop(package: &WindowsPackagedDesktop) -> Result<()> {
     let root = package.install_location.display().to_string();
+    // Limit termination to the packaged app's named top-level process. Do not
+    // walk or force-kill its process tree: AppX child processes can share the
+    // host GPU/session and a broad tree kill can terminate unrelated software.
     command_output(
         "powershell",
         &[
@@ -3038,11 +3042,17 @@ fn local_proxy_chatgpt_spki(listen: &str) -> Result<String> {
     let spki = spki.context(
         "running SAIAI proxy does not expose a Desktop certificate pin; run `saiai restart` and retry",
     )?;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(&spki)
-        .context("SAIAI local proxy returned an invalid Desktop certificate pin")?;
-    if decoded.len() != 32 {
-        bail!("SAIAI local proxy returned an invalid Desktop certificate pin length");
+    let pins = spki.split(',').collect::<Vec<_>>();
+    if pins.is_empty() || pins.iter().any(|pin| pin.trim().is_empty()) {
+        bail!("SAIAI local proxy returned an empty Desktop certificate pin");
+    }
+    for pin in pins {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(pin.trim())
+            .context("SAIAI local proxy returned an invalid Desktop certificate pin")?;
+        if decoded.len() != 32 {
+            bail!("SAIAI local proxy returned an invalid Desktop certificate pin length");
+        }
     }
     Ok(spki)
 }
