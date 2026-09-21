@@ -126,15 +126,6 @@ jobs:
           cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml
           cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml
 
-      - name: Upload Windows candidate for the 1.199 test host
-        if: github.head_ref == 'fix/windows-desktop-ca-20260921'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: saiai-windows-candidate-${{ github.sha }}
-          path: tools/saiai-cli/target/debug/saiai.exe
-          if-no-files-found: error
-          retention-days: 3
-
       - name: Smoke-test Windows configuration
         shell: pwsh
         run: |
