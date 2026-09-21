@@ -3,3 +3,10 @@ linker = "cc"
 
 [target.aarch64-unknown-linux-musl]
 linker = "cc"
+
+# Keep PE timestamps and debug identifiers identical across preview/tag builds.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/Brepro"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/Brepro"]

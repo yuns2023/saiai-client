@@ -132,6 +132,9 @@ jobs:
           & "$PWD/scripts/saiai-cli/test-windows-runtime.ps1" `
             -BinaryPath "$PWD/tools/saiai-cli/target/debug/saiai.exe"
 
+      - name: Verify reproducible Windows image
+        run: python scripts/saiai-cli/verify-windows-reproducibility.py tools/saiai-cli/target/debug/saiai.exe
+
       - name: Smoke-test Windows PowerShell 5.1 setup wrapper
         shell: pwsh
         run: |

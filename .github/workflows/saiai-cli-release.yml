@@ -103,6 +103,10 @@ jobs:
         if: runner.os != 'Linux'
         run: cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml --release --target ${{ matrix.target }}
 
+      - name: Verify reproducible Windows image
+        if: runner.os == 'Windows'
+        run: python scripts/saiai-cli/verify-windows-reproducibility.py tools/saiai-cli/target/${{ matrix.target }}/release/saiai.exe
+
       - name: Smoke-test native macOS LaunchAgent lifecycle
         if: runner.os == 'macOS'
         run: >-
