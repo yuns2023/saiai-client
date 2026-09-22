@@ -2530,7 +2530,10 @@ fn copy_real_codex_oauth_auth(source: &Path, target: &Path) -> Result<bool> {
     // API-key-only legacy auth is a valid source for Desktop local-proxy
     // mode. It has no OAuth token to copy; the caller will create an isolated
     // SAIAI placeholder instead of requiring `saiai codex` first.
-    if access_token.trim().is_empty() || is_codex_placeholder_access_token(access_token) {
+    if access_token.trim().is_empty()
+        || is_codex_placeholder_access_token(access_token)
+        || codex_access_token_is_expired(access_token, Utc::now().timestamp())
+    {
         return Ok(false);
     }
     validate_codex_oauth_auth(source)?;
@@ -2539,6 +2542,23 @@ fn copy_real_codex_oauth_auth(source: &Path, target: &Path) -> Result<bool> {
     write_bytes_atomic(target, &bytes, 0o600)
         .with_context(|| format!("failed to copy OAuth auth file to {}", target.display()))?;
     Ok(true)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn codex_access_token_is_expired(token: &str, now_epoch_seconds: i64) -> bool {
+    let Some(payload) = token.split('.').nth(1) else {
+        return false;
+    };
+    let Ok(decoded) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
+        return false;
+    };
+    let Ok(claims) = serde_json::from_slice::<Value>(&decoded) else {
+        return false;
+    };
+    claims
+        .get("exp")
+        .and_then(Value::as_i64)
+        .is_some_and(|expires_at| expires_at <= now_epoch_seconds.saturating_add(60))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -7273,6 +7293,32 @@ HTTPS_PROXY="http://127.0.0.1:1111"
 
         assert!(!copy_real_codex_oauth_auth(&source, &target).unwrap());
         assert!(!target.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn detects_expired_parseable_codex_access_tokens() {
+        let expired = "e30.eyJleHAiOjEwMH0.signature";
+        let unexpired = "e30.eyJleHAiOjIwMH0.signature";
+        assert!(codex_access_token_is_expired(expired, 100));
+        assert!(!codex_access_token_is_expired(unexpired, 100));
+        assert!(!codex_access_token_is_expired("opaque-token", 100));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn treats_expired_real_oauth_as_desktop_placeholder_source() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("auth.json");
+        let target = dir.path().join("desktop-auth.json");
+        write_str(
+            &source,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"e30.eyJleHAiOjEwMH0.signature","refresh_token":"revoked","account_id":"expired-account"}}"#,
+        );
+
+        assert!(!copy_real_codex_oauth_auth(&source, &target).unwrap());
+        assert!(!target.exists());
+        assert!(source.exists(), "the normal profile must remain untouched");
     }
 
     fn json_str<'a>(map: &'a Map<String, Value>, key: &str) -> &'a str {

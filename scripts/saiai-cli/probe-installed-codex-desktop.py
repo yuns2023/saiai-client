@@ -3,7 +3,8 @@
 
 The probe uses an isolated temporary HOME/CODEX_HOME/SAIAI_HOME, synthetic
 credentials, and a loopback-only mock Gateway.  It exercises only app-server
-initialization and ``account/read``; it never starts a model turn.
+initialization, ``getAuthStatus``, and ``account/read``; it never starts a model
+turn.
 """
 
 from __future__ import annotations
@@ -287,6 +288,19 @@ def validate_account_response(response: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def validate_auth_status_response(response: dict[str, Any]) -> str:
+    if "error" in response:
+        message = response.get("error", {}).get("message", "unknown getAuthStatus error")
+        raise ProbeError(f"getAuthStatus failed: {message}")
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise ProbeError("getAuthStatus returned no result object")
+    auth_method = result.get("authMethod")
+    if auth_method != "chatgptAuthTokens":
+        raise ProbeError("getAuthStatus did not report external ChatGPT token mode")
+    return auth_method
+
+
 def probe(saiai: Path, app_server_override: Path | None) -> dict[str, Any]:
     saiai = saiai.resolve(strict=True)
     if not saiai.is_file():
@@ -439,11 +453,21 @@ def probe(saiai: Path, app_server_override: Path | None) -> dict[str, Any]:
                 send(
                     {
                         "id": 2,
+                        "method": "getAuthStatus",
+                        "params": {"includeToken": False, "refreshToken": False},
+                    }
+                )
+                auth_method = validate_auth_status_response(
+                    read_response(messages, 2, 30)
+                )
+                send(
+                    {
+                        "id": 3,
                         "method": "account/read",
                         "params": {"refreshToken": False},
                     }
                 )
-                account = validate_account_response(read_response(messages, 2, 30))
+                account = validate_account_response(read_response(messages, 3, 30))
 
             assert app_server is not None and proxy is not None
             terminate_process_tree(app_server)
@@ -482,8 +506,10 @@ def probe(saiai: Path, app_server_override: Path | None) -> dict[str, Any]:
                 },
                 "control_plane": {
                     "initialize": "pass",
+                    "get_auth_status": "pass",
                     "account_read": "pass",
                     "auth_mode": account["auth_mode"],
+                    "auth_method": auth_method,
                     "backend_origin": account["backend_origin"],
                     "account_routing_override": account[
                         "account_routing_override"

@@ -172,7 +172,7 @@ Client 候选包发布前可运行
 `scripts/saiai-cli/probe-installed-codex-desktop.py`。它在 Windows/macOS 测试机上
 复制已安装官方 Desktop 随附的 app-server 到临时目录，以隔离的
 `HOME`/`CODEX_HOME`/`SAIAI_HOME`、临时 CA、合成登录和 loopback Gateway 验证
-`initialize` 与 `account/read`。探针不启动 turn，不发送模型请求，也不改写用户现有
+`initialize`、`getAuthStatus` 与 `account/read`。探针不启动 turn，不发送模型请求，也不改写用户现有
 Codex/SAIAI 配置；结果只保留版本、二进制哈希和脱敏控制面状态。
 
 当前 launcher 只覆盖由它直接启动的 Codex CLI 子进程。Codex Desktop 和 VSCode
@@ -185,6 +185,9 @@ executable，再用 `codex://threads/new` 激活窗口；pin 仅适用于该子�
 Keychain、系统代理或系统环境。Windows `OpenAI.Codex_*!App` 不再通过 AppX broker
 启动第二套无法继承环境的进程；launcher 直接运行包内主程序，把当前 workspace 的
 `codex://threads/new` URL 作为该子进程参数，并使用隔离的 `CODEX_HOME` 与 user-data。
+从普通 Codex profile 复制真实 OAuth 前会在本地检查可解析 JWT 的 `exp`；已经过期的
+access token 不会复制，也不会触发 refresh，而由 Desktop 隔离 profile 使用外部
+`chatgptAuthTokens` 占位状态。普通 profile 的原始凭据文件保持不变。
 loopback proxy、标准 TLS 环境和四个受管 OpenAI/ChatGPT 叶证书的 SPKI pin 只注入该
 Desktop 进程树。正常启动不修改 HKCU 系统代理、Windows 系统环境或
 `CurrentUser\Root`；若检测到旧版本遗留的 proxy lease，只按 marker 所有权恢复旧值、

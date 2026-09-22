@@ -84,6 +84,9 @@ approval/sandbox 或授予 Full Access。`saiai desktop codex` 启动前会对�
 OpenAI/ChatGPT 域名生成的 SPKI pin 列表只传给该 Desktop 进程树；不会修改 HKCU
 系统代理、Windows 系统环境或 `CurrentUser\Root`。升级时若发现旧版本遗留的 proxy
 lease，启动器只执行一次有所有权校验的恢复和清理。
+启动器只复制尚未过期的真实 Codex OAuth access token。若普通 profile 中可解析的 JWT
+已经过期，它不会尝试 refresh，也不会改写原文件，而会在 Desktop 隔离 profile 中使用
+SAIAI 外部 token 状态完成免登录引导。
 
 Codex Desktop 的中文等内置翻译由 `localeOverride`/系统语言选择，但消息加载还依赖
 Desktop 的 i18n Statsig layer。SAIAI 在 loopback sidecar 内对精确的 Statsig bootstrap

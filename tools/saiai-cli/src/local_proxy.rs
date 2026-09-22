@@ -1491,7 +1491,7 @@ fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse>
             body: DESKTOP_STATSIG_I18N_PAYLOAD.as_bytes(),
             reason: "desktop_statsig_i18n_bootstrap",
         }),
-        "/ces/v1/rgstr" => Some(StaticResponse {
+        "/ces/v1/rgstr" | "/ces/v1/telemetry/intake" => Some(StaticResponse {
             status: StatusCode::NO_CONTENT,
             content_type: "text/plain",
             body: b"",
@@ -1583,10 +1583,24 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         ));
     }
     let response = match path.as_str() {
-        "/backend-api/accounts/optimized/check"
-        | "/accounts/optimized/check"
-        | "/backend-api/wham/accounts/check"
-        | "/wham/accounts/check" => json!({
+        // The Desktop renderer uses the optimized account endpoint for seat
+        // access.  It is not the same wire shape as the app-server's
+        // `/wham/accounts/check` workspace-discovery endpoint: the renderer
+        // dereferences `account_user.seat_type` directly during startup.
+        "/backend-api/accounts/optimized/check" | "/accounts/optimized/check" => json!({
+            "account": {
+                "id": account_id,
+                "is_fedramp_compliant_workspace": false
+            },
+            "account_user": {
+                "account_id": account_id,
+                "user_id": "saiai-local-proxy-user",
+                "seat_type": "default",
+                "trial_expires_at": null,
+                "pending_seat_upgrade_request": false
+            }
+        }),
+        "/backend-api/wham/accounts/check" | "/wham/accounts/check" => json!({
             "account_ordering": [account_id],
             "default_account_id": account_id,
             "accounts": [{
@@ -2082,6 +2096,14 @@ mod tests {
         let response = chatgpt_sidecar_response(&telemetry).expect("telemetry sidecar response");
         assert_eq!(response.status, StatusCode::NO_CONTENT);
 
+        let telemetry_intake = IncomingRequest {
+            target: "/ces/v1/telemetry/intake".to_string(),
+            ..telemetry
+        };
+        let response =
+            chatgpt_sidecar_response(&telemetry_intake).expect("telemetry intake sidecar response");
+        assert_eq!(response.status, StatusCode::NO_CONTENT);
+
         let recommended_plugins = IncomingRequest {
             method: "GET".to_string(),
             target: "/backend-api/ps/plugins/suggested/codex?scope=GLOBAL".to_string(),
@@ -2135,14 +2157,8 @@ mod tests {
         };
         let (_, body, _, _) = chatgpt_account_sidecar_response(&optimized_accounts).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            body["accounts"][0]["workspace_backend_origin"],
-            "NO_CONSTRAINT"
-        );
-        assert_eq!(
-            body["accounts"][0]["account_routing_override"],
-            "NO_CONSTRAINT"
-        );
+        assert_eq!(body["account_user"]["seat_type"], "default");
+        assert_eq!(body["account"]["is_fedramp_compliant_workspace"], false);
 
         let unprefixed_optimized_accounts = IncomingRequest {
             target: "/accounts/optimized/check".to_string(),
@@ -2151,11 +2167,8 @@ mod tests {
         let (_, body, _, _) =
             chatgpt_account_sidecar_response(&unprefixed_optimized_accounts).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["default_account_id"], "account-test");
-        assert_eq!(
-            body["accounts"][0]["workspace_backend_origin"],
-            "NO_CONSTRAINT"
-        );
+        assert_eq!(body["account_user"]["account_id"], "account-test");
+        assert_eq!(body["account_user"]["seat_type"], "default");
 
         let verified_access = IncomingRequest {
             method: "GET".to_string(),
