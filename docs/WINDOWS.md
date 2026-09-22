@@ -1,6 +1,6 @@
-# Windows 使用指南（SAIAI 1.1.25）
+# Windows 使用指南（SAIAI 1.1.26）
 
-SAIAI `1.1.25` 为 Claude Code 和 VSCode 提供用户级本地代理，不要求管理员权限。
+SAIAI `1.1.26` 为 Claude Code 和 VSCode 提供用户级本地代理，不要求管理员权限。
 
 ## 一键配置 Claude Code
 
@@ -78,6 +78,15 @@ OpenAI；已有真实 ChatGPT OAuth 会保留。SAIAI 不会新增、覆盖或�
 旧 Desktop profile 隐藏权限模式。该字段只控制选择器可见性，不会选择权限模式、修改
 approval/sandbox 或授予 Full Access。`saiai desktop codex` 启动前会对实际使用的
 `CODEX_HOME` 重复同一检查，`saiai doctor codex` 会报告异常状态。
+
+商店版 Codex Desktop 由 `saiai desktop codex` 直接启动包内主程序，使用 SAIAI
+隔离的 `CODEX_HOME` 和 user-data。loopback proxy、TLS 环境以及为四个受管
+OpenAI/ChatGPT 域名生成的 SPKI pin 列表只传给该 Desktop 进程树；不会修改 HKCU
+系统代理、Windows 系统环境或 `CurrentUser\Root`。升级时若发现旧版本遗留的 proxy
+lease，启动器只执行一次有所有权校验的恢复和清理。
+启动器只复制尚未过期的真实 Codex OAuth access token。若普通 profile 中可解析的 JWT
+已经过期，它不会尝试 refresh，也不会改写原文件，而会在 Desktop 隔离 profile 中使用
+SAIAI 外部 token 状态完成免登录引导。
 
 Codex Desktop 的中文等内置翻译由 `localeOverride`/系统语言选择，但消息加载还依赖
 Desktop 的 i18n Statsig layer。SAIAI 在 loopback sidecar 内对精确的 Statsig bootstrap

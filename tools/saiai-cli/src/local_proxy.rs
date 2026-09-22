@@ -48,6 +48,7 @@ const CHATGPT_AUX_HOST: &str = "ab.chatgpt.com";
 const CERTIFICATE_CONTROL_HOST: &str = "certificate.saiai.local";
 const CERTIFICATE_SPKI_HEADER: &str = "x-saiai-leaf-spki-sha256";
 const CHATGPT_CHAT_PASSTHROUGH_ENV: &str = "SAIAI_CHATGPT_CHAT_PASSTHROUGH";
+const SAIAI_DESKTOP_EMAIL: &str = "saiai-local-proxy@example.invalid";
 const DESKTOP_STATSIG_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 // Codex Desktop 26.908.4834.0 / Statsig JS 3.33.4 gates bundled locale
 // messages behind layer 72216192. Keep this local bootstrap deliberately
@@ -341,6 +342,19 @@ impl State {
         Ok(self.certificate_for_host(host)?.spki_sha256)
     }
 
+    fn desktop_tls_spki_list(&self) -> Result<String> {
+        [
+            OPENAI_HOST,
+            CHATGPT_HOST,
+            CHAT_OPENAI_HOST,
+            CHATGPT_AUX_HOST,
+        ]
+        .into_iter()
+        .map(|host| self.tls_spki_for_host(host))
+        .collect::<Result<Vec<_>>>()
+        .map(|pins| pins.join(","))
+    }
+
     fn certificate_for_host(&self, host: &str) -> Result<ManagedCertificate> {
         let host = canonical_host(host);
         {
@@ -517,7 +531,7 @@ async fn handle_client(
 
     let mut stream = reader.into_inner();
     if connect.host == CERTIFICATE_CONTROL_HOST && connect.port == 443 {
-        let spki = state.tls_spki_for_host(CHATGPT_HOST)?;
+        let spki = state.desktop_tls_spki_list()?;
         stream
             .write_all(
                 format!(
@@ -1063,11 +1077,6 @@ where
             "forward request method={} target={} upstream={} bytes={} close_after={}",
             request_method, request_target, upstream_url, request_bytes, close_after
         );
-    } else {
-        eprintln!(
-            "forward request method={} target={} bytes={}",
-            request_method, request_target, request_bytes
-        );
     }
     let started = Instant::now();
     let response = builder.body(request.body).send().await.with_context(|| {
@@ -1478,7 +1487,7 @@ fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse>
             body: DESKTOP_STATSIG_I18N_PAYLOAD.as_bytes(),
             reason: "desktop_statsig_i18n_bootstrap",
         }),
-        "/ces/v1/rgstr" => Some(StaticResponse {
+        "/ces/v1/rgstr" | "/ces/v1/telemetry/intake" => Some(StaticResponse {
             status: StatusCode::NO_CONTENT,
             content_type: "text/plain",
             body: b"",
@@ -1570,7 +1579,24 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         ));
     }
     let response = match path.as_str() {
-        "/backend-api/accounts/optimized/check" | "/backend-api/wham/accounts/check" => json!({
+        // The Desktop renderer uses the optimized account endpoint for seat
+        // access.  It is not the same wire shape as the app-server's
+        // `/wham/accounts/check` workspace-discovery endpoint: the renderer
+        // dereferences `account_user.seat_type` directly during startup.
+        "/backend-api/accounts/optimized/check" | "/accounts/optimized/check" => json!({
+            "account": {
+                "id": account_id,
+                "is_fedramp_compliant_workspace": false
+            },
+            "account_user": {
+                "account_id": account_id,
+                "user_id": "saiai-local-proxy-user",
+                "seat_type": "default",
+                "trial_expires_at": null,
+                "pending_seat_upgrade_request": false
+            }
+        }),
+        "/backend-api/wham/accounts/check" | "/wham/accounts/check" => json!({
             "account_ordering": [account_id],
             "default_account_id": account_id,
             "accounts": [{
@@ -1599,7 +1625,7 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         // means no special access program is present; an object such as `{}`
         // can be interpreted as a non-standard access state and hide Astra.
         "/backend-api/accounts/verified_access" | "/accounts/verified_access" => Value::Null,
-        "/backend-api/wham/statsig/bootstrap" => json!({
+        "/backend-api/wham/statsig/bootstrap" | "/wham/statsig/bootstrap" => json!({
             "statsigPayload": DESKTOP_STATSIG_I18N_PAYLOAD
         }),
         "/backend-api/conversations" => json!({
@@ -1624,7 +1650,7 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         "/backend-api/me" => json!({
             "id": account_id,
             "account_id": account_id,
-            "email": "staging@example.invalid"
+            "email": SAIAI_DESKTOP_EMAIL
         }),
         // The Desktop rate-limit/sidebar code dereferences this array even
         // when no checkout flow is enabled. Returning an empty collection is
@@ -2066,6 +2092,14 @@ mod tests {
         let response = chatgpt_sidecar_response(&telemetry).expect("telemetry sidecar response");
         assert_eq!(response.status, StatusCode::NO_CONTENT);
 
+        let telemetry_intake = IncomingRequest {
+            target: "/ces/v1/telemetry/intake".to_string(),
+            ..telemetry
+        };
+        let response =
+            chatgpt_sidecar_response(&telemetry_intake).expect("telemetry intake sidecar response");
+        assert_eq!(response.status, StatusCode::NO_CONTENT);
+
         let recommended_plugins = IncomingRequest {
             method: "GET".to_string(),
             target: "/backend-api/ps/plugins/suggested/codex?scope=GLOBAL".to_string(),
@@ -2093,6 +2127,14 @@ mod tests {
         assert_eq!(body["items"], json!([]));
         assert_eq!(body["total"], 0);
 
+        let me = IncomingRequest {
+            target: "/backend-api/me".to_string(),
+            ..conversations.clone()
+        };
+        let (_, body, _, _) = chatgpt_account_sidecar_response(&me).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["email"], SAIAI_DESKTOP_EMAIL);
+
         let accounts = IncomingRequest {
             method: "GET".to_string(),
             target: "/backend-api/wham/accounts/check".to_string(),
@@ -2119,14 +2161,18 @@ mod tests {
         };
         let (_, body, _, _) = chatgpt_account_sidecar_response(&optimized_accounts).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            body["accounts"][0]["workspace_backend_origin"],
-            "NO_CONSTRAINT"
-        );
-        assert_eq!(
-            body["accounts"][0]["account_routing_override"],
-            "NO_CONSTRAINT"
-        );
+        assert_eq!(body["account_user"]["seat_type"], "default");
+        assert_eq!(body["account"]["is_fedramp_compliant_workspace"], false);
+
+        let unprefixed_optimized_accounts = IncomingRequest {
+            target: "/accounts/optimized/check".to_string(),
+            ..optimized_accounts
+        };
+        let (_, body, _, _) =
+            chatgpt_account_sidecar_response(&unprefixed_optimized_accounts).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["account_user"]["account_id"], "account-test");
+        assert_eq!(body["account_user"]["seat_type"], "default");
 
         let verified_access = IncomingRequest {
             method: "GET".to_string(),
@@ -2160,6 +2206,14 @@ mod tests {
             payload["layer_configs"]["72216192"]["explicit_parameters"],
             json!(["enable_i18n"])
         );
+
+        let unprefixed_statsig = IncomingRequest {
+            target: "/wham/statsig/bootstrap".to_string(),
+            ..statsig
+        };
+        let (_, body, _, _) = chatgpt_account_sidecar_response(&unprefixed_statsig).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["statsigPayload"].is_string());
 
         let profile = IncomingRequest {
             method: "GET".to_string(),
@@ -2313,6 +2367,24 @@ mod tests {
                 .unwrap()
                 .len(),
             32
+        );
+        let desktop_pins = state.desktop_tls_spki_list().unwrap();
+        let decoded_pins = desktop_pins
+            .split(',')
+            .map(|pin| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(pin)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decoded_pins.len(), 4);
+        assert!(decoded_pins.iter().all(|pin| pin.len() == 32));
+        assert_eq!(
+            decoded_pins
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            4
         );
         assert_eq!(
             state.route_for_host(ANTHROPIC_HOST).base_url,

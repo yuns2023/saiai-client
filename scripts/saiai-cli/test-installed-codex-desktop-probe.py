@@ -44,6 +44,18 @@ class InstalledCodexDesktopProbeTests(unittest.TestCase):
         self.assertEqual(result["backend_origin"], "https://chatgpt.com")
         self.assertNotIn("chatgptAccountId", result)
 
+    def test_accepts_external_chatgpt_token_auth_status(self) -> None:
+        self.assertEqual(
+            PROBE.validate_auth_status_response(
+                {"result": {"authMethod": "chatgptAuthTokens"}}
+            ),
+            "chatgptAuthTokens",
+        )
+
+    def test_rejects_missing_external_chatgpt_token_auth_status(self) -> None:
+        with self.assertRaisesRegex(PROBE.ProbeError, "external ChatGPT token mode"):
+            PROBE.validate_auth_status_response({"result": {"authMethod": None}})
+
     def test_rejects_failed_workspace_discovery(self) -> None:
         with self.assertRaisesRegex(PROBE.ProbeError, "workspace routing discovery"):
             PROBE.validate_account_response(
