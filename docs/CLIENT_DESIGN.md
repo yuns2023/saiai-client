@@ -126,7 +126,8 @@ auth；根 provider 固定为内置 `openai`，不保留 `model_providers.OpenAI
 固定 SAIAI 虚拟声明的 ID token，使 VSCode app-server 的
 `account/read` 能返回本地登录态；它不能通过 OpenAI 签名校验，也不能在绕过本地代理
 时作为 provider 凭证。占位 refresh token 为空，`last_refresh` 仅用于保持 Codex
-token 数据结构完整；禁止刷新由 auth mode 本身保证。
+token 数据结构完整；禁止刷新由 auth mode 本身保证。Desktop 显示的账户邮箱是
+ `saiai-local-proxy@example.invalid`，仅表示本地代理身份，不是用户的真实邮箱。
 
 启动前会先完成只读预检，然后备份并清理主 `config.toml` 及 profile 配置中的
 第三方 `base_url`、provider 覆盖，将根 provider 设置为内置 `openai`。不再保留

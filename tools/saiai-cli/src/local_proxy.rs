@@ -48,6 +48,7 @@ const CHATGPT_AUX_HOST: &str = "ab.chatgpt.com";
 const CERTIFICATE_CONTROL_HOST: &str = "certificate.saiai.local";
 const CERTIFICATE_SPKI_HEADER: &str = "x-saiai-leaf-spki-sha256";
 const CHATGPT_CHAT_PASSTHROUGH_ENV: &str = "SAIAI_CHATGPT_CHAT_PASSTHROUGH";
+const SAIAI_DESKTOP_EMAIL: &str = "saiai-local-proxy@example.invalid";
 const DESKTOP_STATSIG_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 // Codex Desktop 26.908.4834.0 / Statsig JS 3.33.4 gates bundled locale
 // messages behind layer 72216192. Keep this local bootstrap deliberately
@@ -1076,11 +1077,6 @@ where
             "forward request method={} target={} upstream={} bytes={} close_after={}",
             request_method, request_target, upstream_url, request_bytes, close_after
         );
-    } else {
-        eprintln!(
-            "forward request method={} target={} bytes={}",
-            request_method, request_target, request_bytes
-        );
     }
     let started = Instant::now();
     let response = builder.body(request.body).send().await.with_context(|| {
@@ -1654,7 +1650,7 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         "/backend-api/me" => json!({
             "id": account_id,
             "account_id": account_id,
-            "email": "staging@example.invalid"
+            "email": SAIAI_DESKTOP_EMAIL
         }),
         // The Desktop rate-limit/sidebar code dereferences this array even
         // when no checkout flow is enabled. Returning an empty collection is
@@ -2130,6 +2126,14 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["items"], json!([]));
         assert_eq!(body["total"], 0);
+
+        let me = IncomingRequest {
+            target: "/backend-api/me".to_string(),
+            ..conversations.clone()
+        };
+        let (_, body, _, _) = chatgpt_account_sidecar_response(&me).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["email"], SAIAI_DESKTOP_EMAIL);
 
         let accounts = IncomingRequest {
             method: "GET".to_string(),
