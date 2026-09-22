@@ -95,7 +95,7 @@ const CODEX_IDE_ENV_END: &str = "# END SAIAI CODEX IDE (managed)";
 const CODEX_CERTIFICATE_CONTROL_HOST: &str = "certificate.saiai.local";
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const CODEX_CERTIFICATE_SPKI_HEADER: &str = "x-saiai-leaf-spki-sha256";
-const CODEX_PLACEHOLDER_ACCOUNT_ID: &str = "saiai-local-proxy-placeholder-account";
+const CODEX_PLACEHOLDER_ACCOUNT_ID: &str = "saiai-local-proxy-account";
 // Structurally valid but unsigned and therefore unusable against OpenAI. The
 // local proxy replaces request authentication at the Gateway boundary; these
 // claims only let Codex's local app-server expose an authenticated UI state.
@@ -1808,275 +1808,136 @@ fn run_windows_packaged_desktop(
     if !args.is_empty() {
         bail!("packaged Windows Desktop does not accept passthrough arguments");
     }
-    let codex_dir = codex_config_dir()?;
-    fs::create_dir_all(&codex_dir)
-        .with_context(|| format!("failed to create {}", codex_dir.display()))?;
-    let auth_path = codex_dir.join("auth.json");
-    prepare_codex_oauth_files(&codex_dir, true)?;
-    ensure_codex_local_proxy_auth(&auth_path)?;
-    validate_codex_oauth_auth(&auth_path)?;
-    let env_path = codex_dir.join(".env");
-    write_codex_ide_env(&env_path, &cfg.listen, &cfg.ca_cert_path)?;
     let desktop_root = saiai_config_dir()?.join("desktop");
-    write_desktop_account_id_with_fallback(&auth_path, &desktop_root, "saiai-local-proxy-user")?;
-    prepare_desktop_onboarding_state(&codex_dir)?;
-
-    let proxy_lease =
-        windows_begin_packaged_proxy_lease(&cfg.listen, Path::new(&cfg.ca_cert_path))?;
-    if let Err(error) = stop_windows_packaged_desktop(package) {
-        proxy_lease.restore()?;
-        return Err(error);
+    let desktop_home = desktop_root.join("home");
+    let desktop_codex = desktop_root.join("codex");
+    let desktop_user_data = desktop_root.join("user-data");
+    let desktop_roaming_app_data = desktop_home.join("AppData/Roaming");
+    let desktop_local_app_data = desktop_home.join("AppData/Local");
+    for directory in [
+        &desktop_home,
+        &desktop_codex,
+        &desktop_user_data,
+        &desktop_roaming_app_data,
+        &desktop_local_app_data,
+    ] {
+        fs::create_dir_all(directory)
+            .with_context(|| format!("failed to create {}", directory.display()))?;
     }
+    prepare_isolated_desktop_state(&desktop_root, &desktop_codex)?;
+    let env_path = desktop_codex.join(".env");
+    write_codex_ide_env(&env_path, &cfg.listen, &cfg.ca_cert_path)?;
+
+    let executable = windows_packaged_desktop_executable(package)?;
+    let proxy = format!("http://{}", cfg.listen);
+    let spki = local_proxy_chatgpt_spki(&cfg.listen)?;
+    let fixed_timezone = resolve_chatgpt_timezone()?;
+    stop_windows_packaged_desktop(package)?;
+    restore_legacy_windows_packaged_proxy_lease()?;
+
     let workspace = env::current_dir().context("failed to resolve the Desktop workspace")?;
     let target = codex_new_thread_url(&workspace);
-    let status = match ProcessCommand::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "& { param($target) Start-Process -FilePath $target }",
-        ])
-        .arg(&target)
-        .status()
-    {
-        Ok(status) => status,
-        Err(error) => {
-            proxy_lease.restore()?;
-            return Err(error).context("failed to activate packaged OpenAI Desktop");
-        }
-    };
-    if !status.success() {
-        proxy_lease.restore()?;
-        bail!("packaged OpenAI Desktop activation exited with {status}");
+    let mut command = ProcessCommand::new(&executable);
+    command
+        .arg(format!("--user-data-dir={}", desktop_user_data.display()))
+        .arg(format!("--proxy-server={proxy}"))
+        .arg(format!("--ignore-certificate-errors-spki-list={spki}"))
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for name in CODEX_MANAGED_ENV {
+        command.env_remove(*name);
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV);
+    command
+        .env("HOME", &desktop_home)
+        .env("USERPROFILE", &desktop_home)
+        .env("APPDATA", &desktop_roaming_app_data)
+        .env("LOCALAPPDATA", &desktop_local_app_data)
+        .env("CODEX_HOME", &desktop_codex)
+        .env("CODEX_ELECTRON_USER_DATA_PATH", &desktop_user_data)
+        .env("CODEX_CA_CERTIFICATE", &cfg.ca_cert_path)
+        .env("SSL_CERT_FILE", &cfg.ca_cert_path)
+        .env("NODE_EXTRA_CA_CERTS", &cfg.ca_cert_path)
+        .env("HTTP_PROXY", &proxy)
+        .env("HTTPS_PROXY", &proxy)
+        .env("ALL_PROXY", &proxy)
+        .env("NO_PROXY", CODEX_LOCAL_PROXY_NO_PROXY)
+        .env("http_proxy", &proxy)
+        .env("https_proxy", &proxy)
+        .env("all_proxy", &proxy)
+        .env("no_proxy", CODEX_LOCAL_PROXY_NO_PROXY);
+    if let Some(timezone) = &fixed_timezone {
+        command.env("TZ", timezone);
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to start {}", executable.display()))?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if windows_packaged_desktop_running(package).unwrap_or(false) {
-            println!("Starting packaged OpenAI Desktop through the SAIAI local proxy.");
-            println!("  product={}", product.label());
-            println!("  app_id={}", package.app_id);
-            println!("  CODEX_HOME={}", codex_dir.display());
-            println!("  environment={}", env_path.display());
-            println!("  proxy=http://{}", cfg.listen);
-            println!("  system-proxy=temporary lease (restored when Desktop exits)");
-            if let Err(error) = proxy_lease.spawn_restore_watcher(&package.install_location) {
-                proxy_lease.restore()?;
-                return Err(error);
-            }
-            return Ok(());
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to inspect packaged OpenAI Desktop")?
+        {
+            bail!("packaged OpenAI Desktop exited during startup with {status}");
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    proxy_lease.restore()?;
-    bail!("packaged OpenAI Desktop activation returned without a running app process")
+    println!("Starting packaged OpenAI Desktop through the SAIAI local proxy.");
+    println!("  product={}", product.label());
+    println!("  app_id={}", package.app_id);
+    println!("  application={}", executable.display());
+    println!("  CODEX_HOME={}", desktop_codex.display());
+    println!("  user-data-dir={}", desktop_user_data.display());
+    println!("  environment={}", env_path.display());
+    println!("  proxy={proxy} (Desktop process tree only)");
+    println!("  certificate-trust=process-scoped SPKI pins");
+    println!("  Windows system proxy=unchanged");
+    if let Some(timezone) = &fixed_timezone {
+        println!("  timezone={timezone} (Desktop child only)");
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WindowsInternetProxySettings {
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyWindowsInternetProxySettings {
     proxy_enable: Option<i32>,
     proxy_server: Option<String>,
     auto_config_url: Option<String>,
 }
 
 #[cfg(target_os = "windows")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WindowsPackagedProxyLeaseMarker {
-    generation: String,
-    previous: WindowsInternetProxySettings,
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyWindowsPackagedProxyLeaseMarker {
+    previous: LegacyWindowsInternetProxySettings,
     managed_server: String,
-    // Only certificates this client installed are listed here. A pre-existing
-    // user trust root must never be removed when the final Desktop lease ends.
+    #[serde(default)]
     added_ca_thumbprints: Vec<String>,
 }
 
 #[cfg(target_os = "windows")]
-struct WindowsPackagedProxyLease {
-    marker_path: PathBuf,
-    marker: WindowsPackagedProxyLeaseMarker,
-}
-
-#[cfg(target_os = "windows")]
-impl WindowsPackagedProxyLease {
-    fn restore(&self) -> Result<()> {
-        let Some(marker) = read_windows_packaged_proxy_lease_marker(&self.marker_path)? else {
-            return Ok(());
-        };
-        // A newer launcher owns the active lease. An older launcher must not
-        // restore its proxy snapshot or remove the CA the newer AppX process
-        // is actively using.
-        if marker.generation != self.marker.generation {
-            return Ok(());
-        }
-        restore_windows_packaged_proxy_lease_marker(&marker)?;
-        remove_windows_packaged_proxy_lease_marker(&self.marker_path)
-    }
-
-    fn spawn_restore_watcher(&self, package_root: &Path) -> Result<()> {
-        let state = serde_json::json!({
-            "root": package_root.display().to_string(),
-            "lease_path": self.marker_path.display().to_string(),
-            "generation": self.marker.generation,
-        });
-        let state_b64 =
-            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&state)?);
-        let script = r#"
-$raw = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{STATE_B64}'))
-$state = $raw | ConvertFrom-Json
-$deadline = (Get-Date).AddSeconds(120)
-$seen = $false
-$goneSince = $null
-while ($true) {
-  $processes = @(Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue | Where-Object {
-    $_.Path -and $_.Path.StartsWith($state.root, [StringComparison]::OrdinalIgnoreCase)
-  })
-  if ($processes.Count -gt 0) {
-    $seen = $true
-    $goneSince = $null
-  } elseif ($seen) {
-    if ($null -eq $goneSince) { $goneSince = Get-Date }
-    if (((Get-Date) - $goneSince).TotalSeconds -ge 15) { break }
-  } elseif ((Get-Date) -ge $deadline) {
-    break
-  }
-  Start-Sleep -Seconds 2
-}
-$lease = $null
-try {
-  if (Test-Path -LiteralPath $state.lease_path) {
-    $lease = Get-Content -LiteralPath $state.lease_path -Raw | ConvertFrom-Json
-  }
-} catch {
-  exit 0
-}
-if ($null -eq $lease -or [string]$lease.generation -ne [string]$state.generation) {
-  exit 0
-}
-$path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
-$current = Get-ItemProperty $path
-$server = [string]$current.ProxyServer
-$auto = [string]$current.AutoConfigURL
-if ([int]$current.ProxyEnable -eq 1 -and $server -eq [string]$lease.managed_server -and [string]::IsNullOrEmpty($auto)) {
-  $previous = $lease.previous
-  if ($null -eq $previous.proxy_enable) { Remove-ItemProperty $path -Name ProxyEnable -ErrorAction SilentlyContinue } else { Set-ItemProperty $path -Name ProxyEnable -Type DWord -Value ([int]$previous.proxy_enable) }
-  if ($null -eq $previous.proxy_server) { Remove-ItemProperty $path -Name ProxyServer -ErrorAction SilentlyContinue } else { Set-ItemProperty $path -Name ProxyServer -Type String -Value ([string]$previous.proxy_server) }
-  if ($null -eq $previous.auto_config_url) { Remove-ItemProperty $path -Name AutoConfigURL -ErrorAction SilentlyContinue } else { Set-ItemProperty $path -Name AutoConfigURL -Type String -Value ([string]$previous.auto_config_url) }
-}
-foreach ($thumb in @($lease.added_ca_thumbprints)) {
-  if (-not [string]::IsNullOrEmpty([string]$thumb)) {
-    Remove-Item -LiteralPath ("Cert:\CurrentUser\Root\" + [string]$thumb) -ErrorAction SilentlyContinue
-  }
-}
-try {
-  $latest = Get-Content -LiteralPath $state.lease_path -Raw | ConvertFrom-Json
-  if ([string]$latest.generation -eq [string]$state.generation) {
-    Remove-Item -LiteralPath $state.lease_path -ErrorAction SilentlyContinue
-  }
-} catch {}
-"#
-        .replace("{STATE_B64}", &state_b64);
-        let encoded = base64::engine::general_purpose::STANDARD.encode(
-            script
-                .encode_utf16()
-                .flat_map(u16::to_le_bytes)
-                .collect::<Vec<_>>(),
-        );
-        ProcessCommand::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-WindowStyle",
-                "Hidden",
-                "-EncodedCommand",
-                &encoded,
-            ])
-            .spawn()
-            .context("failed to start the Desktop proxy restore watcher")?;
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn windows_begin_packaged_proxy_lease(
-    listen: &str,
-    ca_cert_path: &Path,
-) -> Result<WindowsPackagedProxyLease> {
+fn restore_legacy_windows_packaged_proxy_lease() -> Result<()> {
     let marker_path = windows_packaged_proxy_lease_marker_path()?;
+    let Some(marker) = read_legacy_windows_packaged_proxy_lease_marker(&marker_path)? else {
+        return Ok(());
+    };
+
     let current = windows_read_internet_proxy()?;
-    let prior_marker = read_windows_packaged_proxy_lease_marker(&marker_path)?;
-    let managed_server = listen.to_string();
-    let prior_owns_current_proxy = prior_marker
-        .as_ref()
-        .is_some_and(|marker| windows_proxy_matches_managed(&current, &marker.managed_server));
-    if windows_proxy_conflicts(&current, &managed_server) && !prior_owns_current_proxy {
-        bail!(
-            "Windows system proxy or PAC is already configured outside SAIAI; refusing to override it for packaged Desktop. Disable the conflicting proxy or use the direct Desktop override."
+    if windows_proxy_matches_managed(&current, &marker.managed_server) {
+        windows_write_internet_proxy(&marker.previous)?;
+        println!("Restored the Windows proxy left by a legacy SAIAI Desktop lease.");
+    } else {
+        eprintln!(
+            "warning: legacy SAIAI Desktop lease found, but the current Windows proxy was changed externally; preserving the current proxy"
         );
     }
-
-    // Transfer ownership from a still-active SAIAI lease before stopping its
-    // AppX process. Its watcher observes the new generation and becomes a
-    // no-op instead of deleting the current CA underneath the replacement.
-    let previous = prior_marker
-        .as_ref()
-        .filter(|_| prior_owns_current_proxy)
-        .map(|marker| marker.previous.clone())
-        .unwrap_or_else(|| current.clone());
-    let mut marker = WindowsPackagedProxyLeaseMarker {
-        generation: Uuid::new_v4().to_string(),
-        previous,
-        managed_server: managed_server.clone(),
-        added_ca_thumbprints: prior_marker
-            .as_ref()
-            .filter(|_| prior_owns_current_proxy)
-            .map(|marker| marker.added_ca_thumbprints.clone())
-            .unwrap_or_default(),
-    };
-    write_windows_packaged_proxy_lease_marker(&marker_path, &marker)?;
-
-    let added_ca_thumbprint = match windows_install_user_ca(ca_cert_path) {
-        Ok(value) => value,
-        Err(error) => {
-            rollback_windows_packaged_proxy_lease_marker(
-                &marker_path,
-                &marker.generation,
-                prior_marker.as_ref().filter(|_| prior_owns_current_proxy),
-            )?;
-            return Err(error);
-        }
-    };
-    if let Some(thumbprint) = &added_ca_thumbprint
-        && !marker.added_ca_thumbprints.contains(thumbprint)
-    {
-        marker.added_ca_thumbprints.push(thumbprint.clone());
-        if let Err(error) = write_windows_packaged_proxy_lease_marker(&marker_path, &marker) {
-            marker.added_ca_thumbprints.pop();
-            windows_remove_user_ca(added_ca_thumbprint.as_deref())?;
-            rollback_windows_packaged_proxy_lease_marker(
-                &marker_path,
-                &marker.generation,
-                prior_marker.as_ref().filter(|_| prior_owns_current_proxy),
-            )?;
-            return Err(error);
-        }
+    for thumbprint in &marker.added_ca_thumbprints {
+        windows_remove_user_ca(Some(thumbprint))?;
     }
-    if let Err(error) = windows_write_internet_proxy(&WindowsInternetProxySettings {
-        proxy_enable: Some(1),
-        proxy_server: Some(managed_server.clone()),
-        auto_config_url: None,
-    }) {
-        windows_remove_user_ca(added_ca_thumbprint.as_deref())?;
-        rollback_windows_packaged_proxy_lease_marker(
-            &marker_path,
-            &marker.generation,
-            prior_marker.as_ref().filter(|_| prior_owns_current_proxy),
-        )?;
-        return Err(error);
-    }
-    Ok(WindowsPackagedProxyLease {
-        marker_path,
-        marker,
-    })
+    remove_windows_packaged_proxy_lease_marker(&marker_path)
 }
 
 #[cfg(target_os = "windows")]
@@ -2087,9 +1948,9 @@ fn windows_packaged_proxy_lease_marker_path() -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
-fn read_windows_packaged_proxy_lease_marker(
+fn read_legacy_windows_packaged_proxy_lease_marker(
     path: &Path,
-) -> Result<Option<WindowsPackagedProxyLeaseMarker>> {
+) -> Result<Option<LegacyWindowsPackagedProxyLeaseMarker>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -2103,77 +1964,11 @@ fn read_windows_packaged_proxy_lease_marker(
 }
 
 #[cfg(target_os = "windows")]
-fn write_windows_packaged_proxy_lease_marker(
-    path: &Path,
-    marker: &WindowsPackagedProxyLeaseMarker,
-) -> Result<()> {
-    let mut bytes = serde_json::to_vec_pretty(marker)
-        .context("failed to serialize Windows Desktop proxy lease")?;
-    bytes.push(b'\n');
-    write_bytes_atomic(path, &bytes, 0o600)
-}
-
-#[cfg(target_os = "windows")]
 fn remove_windows_packaged_proxy_lease_marker(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn rollback_windows_packaged_proxy_lease_marker(
-    path: &Path,
-    generation: &str,
-    prior: Option<&WindowsPackagedProxyLeaseMarker>,
-) -> Result<()> {
-    let Some(current) = read_windows_packaged_proxy_lease_marker(path)? else {
-        return Ok(());
-    };
-    if current.generation != generation {
-        return Ok(());
-    }
-    match prior {
-        Some(marker) => write_windows_packaged_proxy_lease_marker(path, marker),
-        None => remove_windows_packaged_proxy_lease_marker(path),
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn restore_windows_packaged_proxy_lease_marker(
-    marker: &WindowsPackagedProxyLeaseMarker,
-) -> Result<()> {
-    let current = windows_read_internet_proxy()?;
-    if windows_proxy_matches_managed(&current, &marker.managed_server) {
-        windows_write_internet_proxy(&marker.previous)?;
-    }
-    for thumbprint in &marker.added_ca_thumbprints {
-        windows_remove_user_ca(Some(thumbprint))?;
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn windows_install_user_ca(path: &Path) -> Result<Option<String>> {
-    let file = path.to_string_lossy().to_string();
-    let output = command_output(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "& { param($file) $cert=Get-PfxCertificate -FilePath $file; $thumb=$cert.Thumbprint; $existing=Get-ChildItem Cert:\\CurrentUser\\Root | Where-Object { $_.Thumbprint -eq $thumb }; if($existing){ 'EXISTING:' + $thumb } else { Import-Certificate -FilePath $file -CertStoreLocation Cert:\\CurrentUser\\Root | Out-Null; 'ADDED:' + $thumb } }",
-            &file,
-        ],
-    )?;
-    let value = output.trim();
-    if let Some(thumbprint) = value.strip_prefix("ADDED:") {
-        Ok(Some(thumbprint.trim().to_string()))
-    } else if value.starts_with("EXISTING:") {
-        Ok(None)
-    } else {
-        bail!("failed to install the SAIAI Desktop CA in the user trust store")
     }
 }
 
@@ -2196,7 +1991,7 @@ fn windows_remove_user_ca(thumbprint: Option<&str>) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn windows_read_internet_proxy() -> Result<WindowsInternetProxySettings> {
+fn windows_read_internet_proxy() -> Result<LegacyWindowsInternetProxySettings> {
     let output = command_output(
         "powershell",
         &[
@@ -2210,28 +2005,11 @@ fn windows_read_internet_proxy() -> Result<WindowsInternetProxySettings> {
 }
 
 #[cfg(target_os = "windows")]
-fn windows_proxy_conflicts(settings: &WindowsInternetProxySettings, managed: &str) -> bool {
-    if settings
-        .auto_config_url
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        return true;
-    }
-    if settings.proxy_enable != Some(1) {
-        return false;
-    }
-    !windows_proxy_matches_managed(settings, managed)
-}
-
-#[cfg(target_os = "windows")]
-fn windows_proxy_matches_managed(settings: &WindowsInternetProxySettings, managed: &str) -> bool {
-    if settings.proxy_enable != Some(1)
-        || settings
-            .auto_config_url
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-    {
+fn windows_proxy_matches_managed(
+    settings: &LegacyWindowsInternetProxySettings,
+    managed: &str,
+) -> bool {
+    if settings.proxy_enable != Some(1) || settings.auto_config_url.is_some() {
         return false;
     }
     let current = settings
@@ -2249,7 +2027,7 @@ fn windows_proxy_matches_managed(settings: &WindowsInternetProxySettings, manage
 }
 
 #[cfg(target_os = "windows")]
-fn windows_write_internet_proxy(settings: &WindowsInternetProxySettings) -> Result<()> {
+fn windows_write_internet_proxy(settings: &LegacyWindowsInternetProxySettings) -> Result<()> {
     let enable = settings
         .proxy_enable
         .map(|value| value.to_string())
@@ -2278,7 +2056,6 @@ fn windows_write_internet_proxy(settings: &WindowsInternetProxySettings) -> Resu
     )?;
     Ok(())
 }
-
 #[cfg(target_os = "windows")]
 fn resolve_windows_desktop_override() -> Result<Option<PathBuf>> {
     for variable in ["SAIAI_DESKTOP_BIN", "SAIAI_CHATGPT_BIN"] {
@@ -2323,6 +2100,24 @@ fn resolve_windows_desktop_executable() -> Result<PathBuf> {
 struct WindowsPackagedDesktop {
     app_id: String,
     install_location: PathBuf,
+}
+
+#[cfg(target_os = "windows")]
+fn windows_packaged_desktop_executable(package: &WindowsPackagedDesktop) -> Result<PathBuf> {
+    [
+        package.install_location.join("app/ChatGPT.exe"),
+        package.install_location.join("app/Codex.exe"),
+        package.install_location.join("ChatGPT.exe"),
+        package.install_location.join("Codex.exe"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .with_context(|| {
+        format!(
+            "OpenAI Codex AppX executable is unavailable under {}",
+            package.install_location.display()
+        )
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -2373,27 +2168,11 @@ fn stop_windows_packaged_desktop(package: &WindowsPackagedDesktop) -> Result<()>
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "& { param($root) Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) } | Stop-Process -Force }",
+            "& { param($root) $deadline=(Get-Date).AddSeconds(10); do { $processes=@(Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) }); $processes | Stop-Process -Force; if($processes.Count -eq 0){ return }; Start-Sleep -Milliseconds 200 } while((Get-Date) -lt $deadline); $remaining=@(Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) }); if($remaining.Count -gt 0){ throw 'packaged OpenAI Desktop top-level process did not exit' } }",
             &root,
         ],
     )?;
     Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn windows_packaged_desktop_running(package: &WindowsPackagedDesktop) -> Result<bool> {
-    let root = package.install_location.display().to_string();
-    let count = command_output(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "& { param($root) $process = Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1; if ($null -ne $process) { 'yes' } }",
-            &root,
-        ],
-    )?;
-    Ok(count.trim() == "yes")
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -2803,32 +2582,6 @@ fn write_desktop_account_id(auth_path: &Path, desktop_root: &Path) -> Result<()>
     })
 }
 
-#[cfg(target_os = "windows")]
-fn write_desktop_account_id_with_fallback(
-    auth_path: &Path,
-    desktop_root: &Path,
-    fallback: &str,
-) -> Result<()> {
-    let account_id = load_json_object(auth_path)
-        .ok()
-        .and_then(|auth| {
-            auth.get("tokens")
-                .and_then(Value::as_object)
-                .and_then(|tokens| tokens.get("account_id"))
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| fallback.to_string());
-    let path = desktop_root.join("account-id");
-    write_bytes_atomic(&path, account_id.as_bytes(), 0o600).with_context(|| {
-        format!(
-            "failed to write Desktop account identity {}",
-            path.display()
-        )
-    })
-}
-
 fn validate_codex_oauth_auth(path: &Path) -> Result<()> {
     let auth = load_json_object(path)
         .with_context(|| format!("failed to load OAuth auth file {}", path.display()))?;
@@ -3038,11 +2791,17 @@ fn local_proxy_chatgpt_spki(listen: &str) -> Result<String> {
     let spki = spki.context(
         "running SAIAI proxy does not expose a Desktop certificate pin; run `saiai restart` and retry",
     )?;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(&spki)
-        .context("SAIAI local proxy returned an invalid Desktop certificate pin")?;
-    if decoded.len() != 32 {
-        bail!("SAIAI local proxy returned an invalid Desktop certificate pin length");
+    let pins = spki.split(',').collect::<Vec<_>>();
+    if pins.is_empty() || pins.iter().any(|pin| pin.trim().is_empty()) {
+        bail!("SAIAI local proxy returned an empty Desktop certificate pin");
+    }
+    for pin in pins {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(pin.trim())
+            .context("SAIAI local proxy returned an invalid Desktop certificate pin")?;
+        if decoded.len() != 32 {
+            bail!("SAIAI local proxy returned an invalid Desktop certificate pin length");
+        }
     }
     Ok(spki)
 }
@@ -7421,6 +7180,26 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         );
         assert_eq!(created_tokens["refresh_token"].as_str(), Some(""));
         assert_eq!(
+            created_tokens["account_id"].as_str(),
+            Some("saiai-local-proxy-account")
+        );
+        let token_payload = created_tokens["id_token"]
+            .as_str()
+            .unwrap()
+            .split('.')
+            .nth(1)
+            .unwrap();
+        let claims: Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(token_payload)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            claims["https://api.openai.com/auth"]["chatgpt_account_id"],
+            created_tokens["account_id"]
+        );
+        assert_eq!(
             created_tokens["id_token"]
                 .as_str()
                 .unwrap()
@@ -8135,19 +7914,18 @@ HTTPS_PROXY="http://127.0.0.1:1111"
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_packaged_proxy_lease_marker_keeps_the_original_proxy_and_ca_ownership() {
-        let original = WindowsInternetProxySettings {
+    fn recognizes_a_legacy_packaged_proxy_lease_for_cleanup() {
+        let original = LegacyWindowsInternetProxySettings {
             proxy_enable: Some(0),
             proxy_server: None,
             auto_config_url: None,
         };
-        let marker = WindowsPackagedProxyLeaseMarker {
-            generation: "test-generation".to_string(),
+        let marker = LegacyWindowsPackagedProxyLeaseMarker {
             previous: original.clone(),
             managed_server: "127.0.0.1:64196".to_string(),
             added_ca_thumbprints: vec!["TEST-CA".to_string()],
         };
-        let active = WindowsInternetProxySettings {
+        let active = LegacyWindowsInternetProxySettings {
             proxy_enable: Some(1),
             proxy_server: Some("http://127.0.0.1:64196/".to_string()),
             auto_config_url: None,
@@ -8157,7 +7935,6 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             &active,
             &marker.managed_server
         ));
-        assert!(!windows_proxy_conflicts(&active, &marker.managed_server));
         assert_eq!(marker.previous.proxy_enable, Some(0));
         assert_eq!(marker.added_ca_thumbprints, vec!["TEST-CA"]);
     }

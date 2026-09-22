@@ -159,7 +159,9 @@ Gateway 的 OpenAI `/v1/initialize` 契约，也不是模型流量。本地代�
 `/backend-api/wham/statsig/bootstrap` 返回同一 payload。该 payload 只启用 Codex
 已内置消息包所需的 `72216192.enable_i18n`，不启用其他 hosted experiment，不携带
 SAIAI Key，也不把合成账户、Cookie 或请求体发往 Statsig/Gateway；非 POST 和超过
-1 MiB 的请求会被拒绝。账户 sidecar 的 `accounts/check` 条目同时返回
+1 MiB 的请求会被拒绝。账户 sidecar 同时覆盖带 `/backend-api` 前缀和新版 Electron
+直接请求的 `/accounts/optimized/check`、`/wham/accounts/check` 与
+`/wham/statsig/bootstrap`；账户条目返回
 `workspace_backend_origin=NO_CONSTRAINT` 和
 `account_routing_override=NO_CONSTRAINT`，满足 Codex app-server 0.155+ 的工作区路由
 发现合同，同时保留当前有效 ChatGPT origin，不施加区域路由。不得把
@@ -180,12 +182,13 @@ Linux、macOS 和显式 `SAIAI_DESKTOP_BIN` 的普通可执行文件使用隔离
 `CODEX_HOME`/user-data 和进程级代理/CA。对于官方 macOS `com.openai.codex` bundle，
 launcher 先以隔离 home、loopback 代理和当前 SAIAI 叶证书的 SPKI pin 启动 bundle
 executable，再用 `codex://threads/new` 激活窗口；pin 仅适用于该子进程，不会修改
-Keychain、系统代理或系统环境。Windows `OpenAI.Codex_*!App` 仍由 AppX broker 按
-`codex://threads/new` 协议激活，使用正常 Codex home 的受管 `.env`、OAuth 占位和
-`respect_system_proxy=false`。由于 AppX broker 不能继承 launcher 子进程环境，启动器会
-在应用存活期间暂时设置当前用户的 loopback 系统代理并安装当前 SAIAI CA；带 generation
-的 lease 让旧 watcher 在重启/重复启动后不能删除新 AppX lease 的 CA。应用退出后只恢复
-启动前的代理并删除本次 SAIAI 安装的根证书，既有的用户根证书不触碰。
+Keychain、系统代理或系统环境。Windows `OpenAI.Codex_*!App` 不再通过 AppX broker
+启动第二套无法继承环境的进程；launcher 直接运行包内主程序，把当前 workspace 的
+`codex://threads/new` URL 作为该子进程参数，并使用隔离的 `CODEX_HOME` 与 user-data。
+loopback proxy、标准 TLS 环境和四个受管 OpenAI/ChatGPT 叶证书的 SPKI pin 只注入该
+Desktop 进程树。正常启动不修改 HKCU 系统代理、Windows 系统环境或
+`CurrentUser\Root`；若检测到旧版本遗留的 proxy lease，只按 marker 所有权恢复旧值、
+删除该 lease 安装的证书并移除 marker。
 Linux 隔离启动器改写子进程 `HOME` 以避免复用正常 Codex state。若当前 X11 会话未
 导出 `XAUTHORITY`，它仅把调用用户现有且可读的 `~/.Xauthority` 路径传给该子进程；
 不会复制、修改或写入该文件。这样 Electron 仍可连接已有 X server，而隔离 home、
@@ -203,10 +206,11 @@ doctor 检查属于共享 Desktop runtime。
 macOS 会校验 bundle identifier、OpenAI Team ID `2DC432GLL2` 和 codesign，并在
 激活前先请求应用正常退出，必要时才终止该 bundle 内的旧进程；进程退出后等待
 LaunchServices 稳定，并用 `open -n -a` 有界重试，避免紧接退出发生 `-600`。
-Windows 通过稳定的 StartApps AppID 和 AppX
-InstallLocation 识别包，只停止该安装目录中的 `ChatGPT`/`Codex` 进程。两者随后
-通过 `codex://` 打开当前 workspace，并确认包进程实际出现，不能再把内部 launcher
-stub 的零退出码当作 UI 启动成功。它们不修改系统代理、Keychain 或系统环境。
+Windows 通过稳定的 StartApps AppID 和 AppX InstallLocation 识别包，只停止该安装
+目录中的 `ChatGPT`/`Codex` 顶层进程；不会递归终止可能共享系统宿主的包内辅助进程。
+macOS 经 LaunchServices、Windows 经直接子进程参数打开当前 workspace，并确认主程序
+实际出现，不能把内部 launcher stub 的零退出码当作 UI 启动成功。它们不修改系统代理、
+Keychain、Windows 用户根证书或系统环境。
 
 `saiai desktop` 的 Linux/macOS/普通可执行文件会把现有 OAuth `auth.json` 复制到 SAIAI
 管理的隔离 `CODEX_HOME`，为 Electron/NSS 创建独立 CA 数据库（Linux），并在隔离的
