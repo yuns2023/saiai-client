@@ -99,6 +99,10 @@ Desktop 的 i18n Statsig layer。SAIAI 在 loopback sidecar 内对精确的 Stat
 `saiai-previous.exe`。如需人工回退，应先执行 `saiai stop`，再恢复备份并重新
 启动；用户配置文件自身也会留下带时间戳的备份。
 
+`saiai update` 对正在运行的自身使用自动 helper：原命令退出后它会完成替换，用户
+无需、也不应手动运行 `.saiai-update-*.exe` 临时文件。随后执行 `saiai --version`
+确认新版本；若代理原本运行，helper 会自动安排刷新。
+
 重复执行同一初始化命令且二进制、Gateway/Key/监听地址/CA 均未变化时，会保留健康的
 后台代理进程，不会为配置文件的幂等重写而中断已有连接。安装新二进制、更新代理运行
 时配置或发现代理不健康时，才会停止并启动新的 Windows 后台进程。

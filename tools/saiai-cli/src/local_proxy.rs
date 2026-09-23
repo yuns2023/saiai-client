@@ -154,6 +154,11 @@ struct ParsedConnect {
     port: u16,
 }
 
+enum InitialProxyRequest {
+    Connect(ParsedConnect),
+    Http(IncomingRequest),
+}
+
 #[derive(Debug, Clone)]
 struct IncomingRequest {
     method: String,
@@ -521,12 +526,20 @@ async fn handle_client(
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| remote_addr.to_string());
     let mut reader = BufReader::new(stream);
-    let connect = match read_connect_request(&mut reader).await {
-        Ok(connect) => connect,
+    let request = match read_initial_proxy_request(&mut reader).await {
+        Ok(request) => request,
         Err(err) => {
-            let _ = write_plain_error(reader.get_mut(), StatusCode::METHOD_NOT_ALLOWED).await;
+            let _ = write_plain_error(reader.get_mut(), StatusCode::BAD_REQUEST).await;
             return Err(err);
         }
+    };
+
+    if let InitialProxyRequest::Http(request) = request {
+        let stream = reader.into_inner();
+        return serve_http_proxy_request(state, stream, request, &peer).await;
+    }
+    let InitialProxyRequest::Connect(connect) = request else {
+        unreachable!("HTTP requests returned above");
     };
 
     let mut stream = reader.into_inner();
@@ -561,36 +574,108 @@ async fn handle_client(
     }
 }
 
-async fn read_connect_request<R>(reader: &mut R) -> Result<ParsedConnect>
+async fn read_initial_proxy_request<R>(reader: &mut R) -> Result<InitialProxyRequest>
 where
     R: AsyncBufRead + Unpin,
 {
-    let request_line = read_line_limited(reader).await?;
-    let parts = request_line.split_whitespace().collect::<Vec<_>>();
-    if parts.len() != 3 || !parts[2].starts_with("HTTP/") {
-        bail!("invalid proxy request line");
+    let request = read_http_request(reader).await?;
+    if request.method.eq_ignore_ascii_case("CONNECT") {
+        let (host, port) = split_host_port(&request.target)?;
+        return Ok(InitialProxyRequest::Connect(ParsedConnect {
+            host: canonical_host(&host),
+            port,
+        }));
     }
-    if !parts[0].eq_ignore_ascii_case("CONNECT") {
-        bail!("only CONNECT proxy requests are supported");
-    }
-    let (host, port) = split_host_port(parts[1])?;
+    // Chromium/Electron sends absolute-form requests for ordinary HTTP URLs
+    // when a --proxy-server HTTP proxy is configured.  Rejecting those before
+    // their startup connectivity check makes Desktop report a generic offline
+    // error even though its HTTPS CONNECT path is otherwise healthy.
+    parse_http_proxy_target(&request)?;
+    Ok(InitialProxyRequest::Http(request))
+}
 
-    let mut header_bytes = request_line.len();
-    loop {
-        let line = read_line_limited(reader).await?;
-        header_bytes += line.len();
-        if header_bytes > MAX_HEADER_BYTES {
-            bail!("CONNECT headers are too large");
+fn parse_http_proxy_target(request: &IncomingRequest) -> Result<Url> {
+    if request.method.eq_ignore_ascii_case("CONNECT") {
+        bail!("CONNECT is not an HTTP proxy request");
+    }
+    let target =
+        Url::parse(&request.target).context("HTTP proxy target must be an absolute URL")?;
+    if target.scheme() != "http" {
+        bail!(
+            "HTTP proxy request must use the http scheme, got {}",
+            target.scheme()
+        );
+    }
+    if target.host_str().is_none() {
+        bail!("HTTP proxy target host is required");
+    }
+    if !target.username().is_empty() || target.password().is_some() {
+        bail!("HTTP proxy target must not contain userinfo");
+    }
+    Ok(target)
+}
+
+async fn serve_http_proxy_request(
+    state: Arc<State>,
+    mut stream: TcpStream,
+    request: IncomingRequest,
+    peer: &str,
+) -> Result<()> {
+    let target = match parse_http_proxy_target(&request) {
+        Ok(target) => target,
+        Err(err) => {
+            let _ = write_plain_error(&mut stream, StatusCode::BAD_REQUEST).await;
+            return Err(err).context("rejected HTTP proxy request");
         }
-        if is_blank_line(&line) {
-            break;
+    };
+    let method = match Method::from_bytes(request.method.as_bytes()) {
+        Ok(method) => method,
+        Err(err) => {
+            let _ = write_plain_error(&mut stream, StatusCode::METHOD_NOT_ALLOWED).await;
+            return Err(err)
+                .with_context(|| format!("unsupported HTTP proxy method {}", request.method));
+        }
+    };
+    let host = canonical_host(target.host_str().unwrap_or_default());
+    let port = target.port_or_known_default().unwrap_or(80);
+    if state.verbose {
+        eprintln!(
+            "http proxy accepted method={} scheme=http host={}:{} remote={} bytes={}",
+            request.method,
+            host,
+            port,
+            peer,
+            request.body.len(),
+        );
+    }
+    let mut builder = state.client.request(method, target);
+    for (name, value) in &request.headers {
+        if should_forward_http_proxy_header(name) {
+            builder = builder.header(name.as_str(), value.as_str());
         }
     }
-
-    Ok(ParsedConnect {
-        host: canonical_host(&host),
-        port,
-    })
+    let response = builder.body(request.body).send().await.with_context(|| {
+        format!(
+            "HTTP proxy request failed method={} host={}:{}",
+            request.method, host, port
+        )
+    });
+    let response = match response {
+        Ok(response) => response,
+        Err(err) => {
+            let _ = write_plain_error(&mut stream, StatusCode::BAD_GATEWAY).await;
+            return Err(err);
+        }
+    };
+    write_upstream_response(&mut stream, response, true)
+        .await
+        .with_context(|| {
+            format!(
+                "HTTP proxy response failed method={} host={}:{}",
+                request.method, host, port
+            )
+        })?;
+    Ok(())
 }
 
 async fn serve_direct_tunnel(
@@ -1750,6 +1835,15 @@ fn should_forward_request_header_to_gateway(name: &str, replace_authorization: b
             && (name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("cookie")))
 }
 
+// Plain HTTP proxy requests are not a credential-bearing transport.  Desktop
+// uses them for connectivity/bootstrap checks; never disclose OAuth headers or
+// cookies if an unexpected request is made to an arbitrary cleartext origin.
+fn should_forward_http_proxy_header(name: &str) -> bool {
+    should_forward_request_header(name)
+        && !name.eq_ignore_ascii_case("authorization")
+        && !name.eq_ignore_ascii_case("cookie")
+}
+
 fn should_forward_response_header(name: &str) -> bool {
     !is_hop_by_hop_header(name)
         && !name.eq_ignore_ascii_case("content-length")
@@ -2465,6 +2559,125 @@ mod tests {
             split_host_port("git.example.test:22").unwrap(),
             ("git.example.test".to_string(), 22)
         );
+    }
+
+    #[test]
+    fn accepts_absolute_form_http_proxy_requests() {
+        let request = IncomingRequest {
+            method: "GET".to_string(),
+            target: "http://connectivity-check.example.test/generate_204?source=desktop"
+                .to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let target = parse_http_proxy_target(&request).unwrap();
+        assert_eq!(target.scheme(), "http");
+        assert_eq!(target.host_str(), Some("connectivity-check.example.test"));
+        assert_eq!(target.path(), "/generate_204");
+    }
+
+    #[test]
+    fn rejects_unsafe_or_ambiguous_http_proxy_targets() {
+        let request = IncomingRequest {
+            method: "GET".to_string(),
+            target: "https://chatgpt.com/backend-api/wham/accounts/check".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        assert!(
+            parse_http_proxy_target(&request)
+                .unwrap_err()
+                .to_string()
+                .contains("http scheme")
+        );
+
+        let relative = IncomingRequest {
+            target: "/generate_204".to_string(),
+            ..request.clone()
+        };
+        assert!(parse_http_proxy_target(&relative).is_err());
+
+        let credentialed = IncomingRequest {
+            target: "http://user:password@example.test/".to_string(),
+            ..request
+        };
+        assert!(
+            parse_http_proxy_target(&credentialed)
+                .unwrap_err()
+                .to_string()
+                .contains("userinfo")
+        );
+    }
+
+    #[tokio::test]
+    async fn forwards_absolute_form_http_proxy_requests() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("GET /generate_204 HTTP/1.1\r\n"));
+            assert!(!request.to_ascii_lowercase().contains("authorization:"));
+            assert!(!request.to_ascii_lowercase().contains("cookie:"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let (ca_cert_pem, ca_key_pem) = test_ca();
+        let state = Arc::new(
+            State::new(Config {
+                listen: "127.0.0.1:0".to_string(),
+                base_url: "https://gateway.example.test".to_string(),
+                api_key: "test-key".to_string(),
+                claude: None,
+                codex: None,
+                ca_cert_pem,
+                ca_key_pem,
+                verbose: false,
+                chatgpt_chat_passthrough: false,
+            })
+            .unwrap(),
+        );
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = TcpStream::connect(proxy_addr);
+        let server = proxy.accept();
+        let (client, server) = tokio::join!(client, server);
+        let mut client = client.unwrap();
+        let (server, _) = server.unwrap();
+        let request = IncomingRequest {
+            method: "GET".to_string(),
+            target: format!("http://127.0.0.1:{upstream_port}/generate_204"),
+            http_version: "HTTP/1.1".to_string(),
+            headers: vec![
+                ("Proxy-Connection".to_string(), "keep-alive".to_string()),
+                (
+                    "Authorization".to_string(),
+                    "Bearer must-not-forward".to_string(),
+                ),
+                ("Cookie".to_string(), "must-not-forward=1".to_string()),
+            ],
+            body: Vec::new(),
+        };
+        let proxy_task = tokio::spawn(serve_http_proxy_request(
+            state,
+            server,
+            request,
+            "127.0.0.1:test",
+        ));
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        proxy_task.await.unwrap().unwrap();
+        upstream_task.await.unwrap();
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 204"));
     }
 
     #[test]
