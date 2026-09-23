@@ -274,6 +274,11 @@ installed hash != manifest hash
   -> 下载并校验 -> 原子替换二进制 -> 初始化并启动服务
 ```
 
+Windows 上正在运行的 `saiai.exe` 不能覆盖自身。`saiai update` 因此启动独立
+helper，在原进程退出后自动替换、保留带时间戳的备份并按需刷新服务；用户不应运行
+`.saiai-update-*.exe` 临时文件。命令只报告 `staged`，下一次 `saiai --version` 才是
+替换完成的确认。
+
 manifest contract 为：
 
 ```json

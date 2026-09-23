@@ -3668,6 +3668,12 @@ fn run_update() -> Result<()> {
         service_was_active,
     )?;
 
+    #[cfg(target_os = "windows")]
+    println!(
+        "Update staged: {}. Replacement completes automatically after this command exits; run `saiai --version` to confirm.",
+        candidate_version.trim()
+    );
+    #[cfg(not(target_os = "windows"))]
     println!("Updated: {}", candidate_version.trim());
     println!("Backup: {}", backup_path.display());
     if service_was_active {
@@ -5526,8 +5532,7 @@ fn finalize_update(
         .spawn()
         .context("failed to start Windows update helper")?;
     println!(
-        "Windows update staged; replacement will finish after this process exits. If needed, run {} manually.",
-        candidate_path.display()
+        "Windows update helper started; replacement will finish automatically after this process exits."
     );
     Ok(())
 }
