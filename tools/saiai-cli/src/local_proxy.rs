@@ -323,6 +323,10 @@ impl State {
             Some("1") => true,
             _ => cfg.chatgpt_chat_passthrough,
         };
+        // This is an opt-in operator diagnostic for a single inherited service
+        // process. It never enables body tracing; verbose records remain
+        // limited to request metadata and response outcomes.
+        let verbose = cfg.verbose || env::var("SAIAI_PROXY_VERBOSE").ok().as_deref() == Some("1");
 
         Ok(Self {
             listen: cfg.listen,
@@ -331,7 +335,7 @@ impl State {
             codex_route,
             ca_cert_pem: cfg.ca_cert_pem,
             ca_key_pem: Zeroizing::new(cfg.ca_key_pem),
-            verbose: cfg.verbose,
+            verbose,
             chatgpt_chat_passthrough,
             client,
             certs: Mutex::new(HashMap::new()),
