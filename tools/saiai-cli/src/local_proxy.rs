@@ -714,6 +714,15 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
         .accept(stream)
         .await
         .with_context(|| format!("client TLS handshake failed for {host}"))?;
+    // Do not log request contents here.  The Desktop compatibility boundary is
+    // negotiated before HTTP begins, so the host and ALPN alone identify a
+    // browser transport change without exposing credentials or prompts.
+    let alpn = tls_stream
+        .get_ref()
+        .1
+        .alpn_protocol()
+        .map(|value| String::from_utf8_lossy(value).into_owned())
+        .unwrap_or_else(|| "none".to_string());
     let mut reader = BufReader::new(tls_stream);
     let mut handled_requests = 0usize;
 
@@ -732,7 +741,11 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                     true,
                 )
                 .await;
-                return Err(err);
+                return Err(err).with_context(|| {
+                    format!(
+                        "managed TLS stream ended host={host} alpn={alpn} requests_handled={handled_requests}"
+                    )
+                });
             }
         };
         handled_requests += 1;
