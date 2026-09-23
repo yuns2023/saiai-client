@@ -52,7 +52,8 @@ Claude 路径解析遵守 `CLAUDE_CONFIG_DIR`。未设置时使用：
 本地代理终止 `api.anthropic.com` 和 Codex 使用的 `api.openai.com` 本机 TLS，
 分别把允许的请求转发到配置的 Gateway；其他 `CONNECT` 请求作为任意目标和任意
 TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出站规则接管实际流量。
-它不提供 UDP 转发，也不处理明文 HTTP 的 absolute-form 请求。由于该接口不认证且
+它不提供 UDP 转发；对普通目标的明文 HTTP absolute-form 请求按直接代理处理，
+不得误送入 OpenAI/Anthropic 的 TLS MITM 路由。由于该接口不认证且
 可访问任意目标，代理核心必须强制只监听 loopback，不能仅依赖初始化器生成的默认
 地址。Gateway Key 由代理从私有配置读取，程序不会把 Key 打印到输出或请求日志。
 
@@ -165,7 +166,10 @@ SAIAI Key，也不把合成账户、Cookie 或请求体发往 Statsig/Gateway；
 `/wham/statsig/bootstrap`；账户条目返回
 `workspace_backend_origin=NO_CONSTRAINT` 和
 `account_routing_override=NO_CONSTRAINT`，满足 Codex app-server 0.155+ 的工作区路由
-发现合同，同时保留当前有效 ChatGPT origin，不施加区域路由。不得把
+发现合同，同时保留当前有效 ChatGPT origin，不施加区域路由。新版 Desktop 的
+`/backend-api/accounts/check/v4-2023-04-27` 必须返回版本化账户集合，不能用
+HTTP 200 加空对象代替：Renderer 会读取 `account_ordering.map`，形状错误时仍会
+出现 “ChatGPT hit a snag”。不得把
 成功的账户查询或目录加载宣称为完整 Desktop 模型支持；未做模型请求的验证前，
 `saiai desktop codex` 仍是受支持的隔离回退路径。
 
@@ -174,7 +178,12 @@ Client 候选包发布前可运行
 复制已安装官方 Desktop 随附的 app-server 到临时目录，以隔离的
 `HOME`/`CODEX_HOME`/`SAIAI_HOME`、临时 CA、合成登录和 loopback Gateway 验证
 `initialize`、`getAuthStatus` 与 `account/read`。探针不启动 turn，不发送模型请求，也不改写用户现有
-Codex/SAIAI 配置；结果只保留版本、二进制哈希和脱敏控制面状态。
+Codex/SAIAI 配置；结果只保留版本、二进制哈希和脱敏控制面状态。它不运行
+Electron Renderer，不能证明主窗口正常。候选包还须在目标 Windows 用户的交互式
+会话中启动已安装的官方 Desktop，确认主窗口加载、无 Renderer 异常；同时记录实际
+AppX 包版本、候选二进制哈希和脱敏结果。不要用 SSH Session 0 截图、成功的
+`/v1/models` 或 `account/read` 代替这一步。系统升级可能直接删除旧 AppX 包，
+先确认可恢复路径，不要假设本机仍能回退旧版。
 
 当前 launcher 只覆盖由它直接启动的 Codex CLI 子进程。Codex Desktop 和 VSCode
 扩展不是该子进程，不能因为共享 `CODEX_HOME` 就推断它们已继承代理/CA 环境。
