@@ -1722,6 +1722,37 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
                 "profile_picture_url": null
             }]
         }),
+        // Codex Desktop 26.917 reads the versioned full-account endpoint in
+        // addition to the older wham and optimized endpoints. Its renderer
+        // expects an ordered map of account records, not the wham array. A
+        // generic `{}` fallback makes `account_ordering.map(...)` throw and
+        // displays "ChatGPT hit a snag" despite an HTTP 200 response.
+        _ if path.starts_with("/accounts/check/")
+            || path.starts_with("/backend-api/accounts/check/") =>
+        {
+            let mut accounts = serde_json::Map::new();
+            accounts.insert(
+                account_id.clone(),
+                json!({
+                    "account": {
+                        "account_id": account_id,
+                        "account_user_id": "saiai-local-proxy-user",
+                        "structure": "personal",
+                        "plan_type": "plus",
+                        "is_deactivated": false,
+                        "is_fedramp_compliant_workspace": false,
+                        "is_hipaa_compliant_workspace": false,
+                        "ekm_config": null
+                    },
+                    "features": [],
+                    "can_access_with_session": true
+                }),
+            );
+            json!({
+                "account_ordering": [account_id],
+                "accounts": accounts
+            })
+        }
         // Codex Desktop's model picker treats this authenticated control-plane
         // response as the source of optional Daybreak access. A null root
         // means no special access program is present; an object such as `{}`
@@ -2284,6 +2315,28 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["account_user"]["account_id"], "account-test");
         assert_eq!(body["account_user"]["seat_type"], "default");
+
+        for target in [
+            "/accounts/check/v4-2023-04-27",
+            "/backend-api/accounts/check/v4-2023-04-27",
+        ] {
+            let versioned_accounts = IncomingRequest {
+                target: target.to_string(),
+                ..conversations.clone()
+            };
+            let (_, body, _, _) = chatgpt_account_sidecar_response(&versioned_accounts).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["account_ordering"], json!(["account-test"]));
+            assert!(body["accounts"].is_object());
+            assert_eq!(
+                body["accounts"]["account-test"]["account"]["account_id"],
+                "account-test"
+            );
+            assert_eq!(
+                body["accounts"]["account-test"]["can_access_with_session"],
+                true
+            );
+        }
 
         let verified_access = IncomingRequest {
             method: "GET".to_string(),
