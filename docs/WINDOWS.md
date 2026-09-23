@@ -1,6 +1,6 @@
-# Windows 使用指南（SAIAI 1.1.26）
+# Windows 使用指南（SAIAI 1.1.27）
 
-SAIAI `1.1.26` 为 Claude Code 和 VSCode 提供用户级本地代理，不要求管理员权限。
+SAIAI `1.1.27` 为 Claude Code 和 VSCode 提供用户级本地代理，不要求管理员权限。
 
 ## 一键配置 Claude Code
 
@@ -92,6 +92,14 @@ Codex Desktop 的中文等内置翻译由 `localeOverride`/系统语言选择，
 Desktop 的 i18n Statsig layer。SAIAI 在 loopback sidecar 内对精确的 Statsig bootstrap
 返回只包含 `enable_i18n=true` 的最小版本化 payload；它不会把该请求、SAIAI Key、
 合成账户或 Cookie 发往 Gateway/Statsig，也不会启用其他 hosted experiment。
+
+如果主窗口显示 “ChatGPT hit a snag”，先记录 `saiai --version`、当前用户实际
+安装的 `OpenAI.Codex` AppX 包版本和 `saiai logs` 的相关时间段，再检查 Desktop
+Renderer 异常。代理返回 200、模型目录加载或 app-server 的 `account/read` 成功，
+都不能单独证明界面可用；某些版本会读取版本化账户响应中的
+`account_ordering`。日志中 URL 的 query 可能含敏感信息，分享前必须脱敏。
+远程 SSH 会话不是交互式桌面会话，不能用其截图判断用户界面。升级 AppX 前确认
+可恢复路径，因为 Windows 可能移除旧包。
 
 ## 更新与回退
 
