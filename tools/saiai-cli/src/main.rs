@@ -6483,23 +6483,62 @@ fn stop_windows_background_proxy() -> Result<()> {
 #[cfg(target_os = "windows")]
 fn stop_windows_exact_path_stragglers() -> Result<()> {
     let executable = env::current_exe().context("failed to resolve the SAIAI executable path")?;
-    let executable = executable.display().to_string();
-    let self_pid = std::process::id().to_string();
-    let status = ProcessCommand::new("powershell")
+    let executable = fs::canonicalize(&executable)
+        .with_context(|| format!("failed to canonicalize {}", executable.display()))?;
+    let output = ProcessCommand::new("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "& { param($path, $selfPid) Get-CimInstance Win32_Process -Filter \"Name = 'saiai.exe'\" | Where-Object { $_.ProcessId -ne [uint32]$selfPid -and $_.ExecutablePath -and [string]::Equals([IO.Path]::GetFullPath($_.ExecutablePath), $path, [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } }",
-            &executable,
-            &self_pid,
+            "$items = @(Get-CimInstance Win32_Process -Filter \"Name = 'saiai.exe'\" | Where-Object { $_.ExecutablePath } | ForEach-Object { @{ pid = $_.ProcessId; path = $_.ExecutablePath } }); ConvertTo-Json -InputObject $items -Compress",
         ])
-        .status()
+        .output()
         .context("failed to inspect same-path SAIAI processes")?;
-    if !status.success() {
+    if !output.status.success() {
         bail!(
-            "could not terminate an exact-path SAIAI process; run PowerShell as the same user or Administrator and retry"
+            "could not inspect same-path SAIAI processes: {}",
+            output.status
         );
+    }
+    let processes: Vec<Value> = serde_json::from_slice(&output.stdout)
+        .context("failed to parse same-path SAIAI process inventory")?;
+    for process in processes {
+        let Some(pid) = process
+            .get("pid")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        let Some(path) = process.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(process_path) = fs::canonicalize(path) else {
+            continue;
+        };
+        if !process_path
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&executable.to_string_lossy())
+        {
+            continue;
+        }
+        let status = ProcessCommand::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .status()
+            .with_context(|| format!("failed to terminate same-path SAIAI process {pid}"))?;
+        if !status.success() && windows_pid_is_running(pid).unwrap_or(false) {
+            bail!("could not terminate same-path SAIAI process {pid}: {status}");
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while windows_pid_is_running(pid).unwrap_or(false) {
+            if std::time::Instant::now() >= deadline {
+                bail!("same-path SAIAI process {pid} did not exit after termination");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
     Ok(())
 }
