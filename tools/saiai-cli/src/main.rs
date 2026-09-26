@@ -5630,11 +5630,14 @@ $expectedHash = '{expected_sha256}'\r\n\
 $restartService = ${}\r\n\
 $stopped = $false\r\n\
 try {{\r\n\
+    Set-Content -LiteralPath $statusPath -Value 'pending: waiting for updater' -Encoding UTF8\r\n\
     Wait-Process -Id {pid} -Timeout 30 -ErrorAction SilentlyContinue\r\n\
     if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ throw 'Updater process did not exit within 30 seconds' }}\r\n\
+    Set-Content -LiteralPath $statusPath -Value 'pending: stopping SAIAI processes' -Encoding UTF8\r\n\
     & $currentExe stop *> $null\r\n\
     if ($LASTEXITCODE -ne 0) {{ throw \"Could not stop SAIAI processes (exit $LASTEXITCODE)\" }}\r\n\
     $stopped = $true\r\n\
+    Set-Content -LiteralPath $statusPath -Value 'pending: replacing binary' -Encoding UTF8\r\n\
     $lastError = $null\r\n\
     foreach ($attempt in 1..120) {{\r\n\
         try {{\r\n\
@@ -5649,6 +5652,7 @@ try {{\r\n\
         }}\r\n\
     }}\r\n\
     if ($null -ne $lastError) {{ throw \"Could not replace SAIAI binary after 120 attempts: $($lastError.Exception.Message)\" }}\r\n\
+    Set-Content -LiteralPath $statusPath -Value 'pending: verifying binary' -Encoding UTF8\r\n\
     $stream = [IO.File]::OpenRead($currentExe)\r\n\
     try {{\r\n\
         $sha = [Security.Cryptography.SHA256]::Create()\r\n\
@@ -5657,6 +5661,7 @@ try {{\r\n\
     }} finally {{ $stream.Dispose() }}\r\n\
     if ($actualHash -cne $expectedHash) {{ throw \"Installed SAIAI binary hash mismatch: $actualHash\" }}\r\n\
     if ($restartService) {{\r\n\
+        Set-Content -LiteralPath $statusPath -Value 'pending: restarting proxy' -Encoding UTF8\r\n\
         & $currentExe restart *> $null\r\n\
         if ($LASTEXITCODE -ne 0) {{ throw \"Updated SAIAI binary could not restart the background proxy (exit $LASTEXITCODE)\" }}\r\n\
     }}\r\n\
@@ -5701,7 +5706,7 @@ fn warn_incomplete_windows_update() {
             "WARN Previous SAIAI update {status}. Details: {}",
             path.display()
         );
-    } else if status == "pending" {
+    } else if status.starts_with("pending") {
         eprintln!(
             "WARN Previous SAIAI update has not completed; check again shortly. Status: {}",
             path.display()

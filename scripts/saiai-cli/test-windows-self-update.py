@@ -99,6 +99,7 @@ def main() -> None:
             assert "not yet installed" in staged.stdout
             result_path = install / ".saiai-update-status.txt"
             deadline = time.monotonic() + 45
+            result = "missing status file"
             while time.monotonic() < deadline:
                 if result_path.exists():
                     result = result_path.read_text(encoding="utf-8-sig").strip()
@@ -108,7 +109,7 @@ def main() -> None:
                         break
                 time.sleep(0.1)
             else:
-                raise AssertionError("Windows update helper did not record completion")
+                raise AssertionError(f"Windows update helper did not record completion: {result}")
             assert result == f"updated: {release_hash}", result
             print("Windows self-update fixture: replacement completed", flush=True)
             assert sha256(installed) == release_hash, "installed binary does not match release"
