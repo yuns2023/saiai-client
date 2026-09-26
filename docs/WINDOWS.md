@@ -109,9 +109,11 @@ Renderer 异常。代理返回 200、模型目录加载或 app-server 的 `accou
 `saiai-previous.exe`。如需人工回退，应先执行 `saiai stop`，再恢复备份并重新
 启动；用户配置文件自身也会留下带时间戳的备份。
 
-`saiai update` 对正在运行的自身使用自动 helper：原命令退出后它会完成替换，用户
-无需、也不应手动运行 `.saiai-update-*.exe` 临时文件。随后执行 `saiai --version`
-确认新版本；若代理原本运行，helper 会自动安排刷新。
+`saiai update` 对正在运行的自身使用自动 helper：原命令退出后，helper 先停止
+后台代理和同路径进程，再替换并校验二进制；若代理原本运行，会自动重启。
+命令显示“已暂存”不代表安装已经成功。随后执行 `saiai --version` 确认新版本；
+若替换失败，该命令会显示警告，详细状态保存在安装目录的
+`.saiai-update-status.txt`。用户无需、也不应手动运行 `.saiai-update-*.exe` 临时文件。
 
 重复执行同一初始化命令且二进制、Gateway/Key/监听地址/CA 均未变化时，会保留健康的
 后台代理进程，不会为配置文件的幂等重写而中断已有连接。安装新二进制、更新代理运行

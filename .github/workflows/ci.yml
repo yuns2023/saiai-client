@@ -153,6 +153,10 @@ jobs:
             -SetupCmd dist/setup.cmd `
             -AssetName saiai-windows-x86_64.exe
 
+      - name: Smoke-test native Windows self-update with active proxy
+        shell: pwsh
+        run: python scripts/saiai-cli/test-windows-self-update.py --binary dist/saiai-windows-x86_64.exe
+
       - name: Capture official Windows Codex through local proxy
         shell: pwsh
         run: |
