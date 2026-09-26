@@ -21,9 +21,20 @@ def sha256(path: Path) -> str:
 
 
 def run(exe: Path, env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        [str(exe), *args], env=env, text=True, capture_output=True, timeout=45, check=False
-    )
+    # The initialized proxy is detached, but Windows descendants can still
+    # inherit a pipe handle. Redirect to files so communicate() cannot wait
+    # forever for EOF after the command itself has exited.
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stdout:
+        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr:
+            completed = subprocess.run(
+                [str(exe), *args], env=env, stdout=stdout, stderr=stderr,
+                timeout=45, check=False,
+            )
+            stdout.seek(0)
+            stderr.seek(0)
+            result = subprocess.CompletedProcess(
+                completed.args, completed.returncode, stdout.read(), stderr.read()
+            )
     if result.returncode:
         raise AssertionError(f"{args!r} exited {result.returncode}: {result.stdout}\n{result.stderr}")
     return result
