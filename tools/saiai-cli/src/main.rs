@@ -5638,7 +5638,7 @@ try {{\r\n\
     $lastError = $null\r\n\
     foreach ($attempt in 1..120) {{\r\n\
         try {{\r\n\
-            $replacementBackup = Join-Path (Split-Path -Parent $currentExe) ('.saiai.replace.' + [guid]::NewGuid().ToString('N') + '.bak')\r\n\
+            $replacementBackup = $currentExe + '.replace.' + [guid]::NewGuid().ToString('N') + '.bak'\r\n\
             try {{ [IO.File]::Replace($candidate, $currentExe, $replacementBackup, $true) }}\r\n\
             finally {{ Remove-Item -LiteralPath $replacementBackup -Force -ErrorAction SilentlyContinue }}\r\n\
             $lastError = $null\r\n\
