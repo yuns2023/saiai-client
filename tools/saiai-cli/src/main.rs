@@ -1808,97 +1808,164 @@ fn run_windows_packaged_desktop(
     if !args.is_empty() {
         bail!("packaged Windows Desktop does not accept passthrough arguments");
     }
-    let desktop_root = saiai_config_dir()?.join("desktop");
-    let desktop_home = desktop_root.join("home");
-    let desktop_codex = desktop_root.join("codex");
-    let desktop_user_data = desktop_root.join("user-data");
-    let desktop_roaming_app_data = desktop_home.join("AppData/Roaming");
-    let desktop_local_app_data = desktop_home.join("AppData/Local");
-    for directory in [
-        &desktop_home,
-        &desktop_codex,
-        &desktop_user_data,
-        &desktop_roaming_app_data,
-        &desktop_local_app_data,
-    ] {
-        fs::create_dir_all(directory)
-            .with_context(|| format!("failed to create {}", directory.display()))?;
+    // AppX activation is brokered by Windows. Unlike CreateProcess, it cannot
+    // inherit a child-only CODEX_HOME or proxy environment from this launcher.
+    // Require the user's already-managed Codex profile before touching the
+    // running Desktop; never silently start against an unconfigured profile.
+    if env::var_os("CODEX_HOME").is_some() {
+        bail!(
+            "packaged Windows Desktop cannot inherit CODEX_HOME; use the standard Windows Codex profile or a non-packaged Desktop override"
+        );
     }
-    prepare_isolated_desktop_state(&desktop_root, &desktop_codex)?;
-    let env_path = desktop_codex.join(".env");
-    write_codex_ide_env(&env_path, &cfg.listen, &cfg.ca_cert_path)?;
+    if env::var_os(SAIAI_CHATGPT_TIMEZONE_ENV).is_some() {
+        bail!("packaged Windows Desktop cannot inherit a child-only timezone override");
+    }
+    let codex_home = codex_config_dir()?;
+    let env_path = codex_home.join(".env");
+    let current_env = fs::read_to_string(&env_path).with_context(|| {
+        format!(
+            "failed to read {}; run `saiai init-codex` first",
+            env_path.display()
+        )
+    })?;
+    if !current_env.contains(CODEX_IDE_ENV_BEGIN)
+        || current_env != merge_codex_ide_env(&current_env, &cfg.listen, &cfg.ca_cert_path)
+    {
+        bail!(
+            "packaged Windows Desktop needs the current SAIAI Codex profile; run `saiai vscode` or `saiai init-codex` and retry"
+        );
+    }
+    validate_codex_oauth_auth(&codex_home.join("auth.json")).context(
+        "packaged Windows Desktop needs a configured Codex account; run `saiai init-codex` first",
+    )?;
+    let session_id = command_output(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-Process -Id $PID).SessionId",
+        ],
+    )?;
+    if session_id.trim() == "0" {
+        bail!(
+            "packaged Windows Desktop must be started from the signed-in desktop session, not SSH or a Windows service session"
+        );
+    }
+    let desktop_user_data = saiai_config_dir()?.join("desktop/user-data");
+    fs::create_dir_all(&desktop_user_data)
+        .with_context(|| format!("failed to create {}", desktop_user_data.display()))?;
 
-    let executable = windows_packaged_desktop_executable(package)?;
     let proxy = format!("http://{}", cfg.listen);
     let spki = local_proxy_chatgpt_spki(&cfg.listen)?;
-    let fixed_timezone = resolve_chatgpt_timezone()?;
     stop_windows_packaged_desktop(package)?;
     restore_legacy_windows_packaged_proxy_lease()?;
 
     let workspace = env::current_dir().context("failed to resolve the Desktop workspace")?;
     let target = codex_new_thread_url(&workspace);
-    let mut command = ProcessCommand::new(&executable);
-    command
-        .arg(format!("--user-data-dir={}", desktop_user_data.display()))
-        .arg(format!("--proxy-server={proxy}"))
-        .arg(format!("--ignore-certificate-errors-spki-list={spki}"))
-        .arg(target)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    for name in CODEX_MANAGED_ENV {
-        command.env_remove(*name);
-    }
-    command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV);
-    command
-        .env("HOME", &desktop_home)
-        .env("USERPROFILE", &desktop_home)
-        .env("APPDATA", &desktop_roaming_app_data)
-        .env("LOCALAPPDATA", &desktop_local_app_data)
-        .env("CODEX_HOME", &desktop_codex)
-        .env("CODEX_ELECTRON_USER_DATA_PATH", &desktop_user_data)
-        .env("CODEX_CA_CERTIFICATE", &cfg.ca_cert_path)
-        .env("SSL_CERT_FILE", &cfg.ca_cert_path)
-        .env("NODE_EXTRA_CA_CERTS", &cfg.ca_cert_path)
-        .env("HTTP_PROXY", &proxy)
-        .env("HTTPS_PROXY", &proxy)
-        .env("ALL_PROXY", &proxy)
-        .env("NO_PROXY", CODEX_LOCAL_PROXY_NO_PROXY)
-        .env("http_proxy", &proxy)
-        .env("https_proxy", &proxy)
-        .env("all_proxy", &proxy)
-        .env("no_proxy", CODEX_LOCAL_PROXY_NO_PROXY);
-    if let Some(timezone) = &fixed_timezone {
-        command.env("TZ", timezone);
-    }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to start {}", executable.display()))?;
+    let activation_args = [
+        format!("--user-data-dir={}", desktop_user_data.display()),
+        format!("--proxy-server={proxy}"),
+        format!("--ignore-certificate-errors-spki-list={spki}"),
+        target,
+    ]
+    .iter()
+    .map(|arg| windows_quote_activation_arg(arg))
+    .collect::<Vec<_>>()
+    .join(" ");
+    let pid = activate_windows_packaged_desktop(&package.app_id, &activation_args)?;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if let Some(status) = child
-            .try_wait()
-            .context("failed to inspect packaged OpenAI Desktop")?
-        {
-            bail!("packaged OpenAI Desktop exited during startup with {status}");
+        if !windows_pid_is_running(pid)? {
+            bail!("packaged OpenAI Desktop exited during startup (pid {pid})");
         }
         std::thread::sleep(Duration::from_millis(200));
     }
     println!("Starting packaged OpenAI Desktop through the SAIAI local proxy.");
     println!("  product={}", product.label());
     println!("  app_id={}", package.app_id);
-    println!("  application={}", executable.display());
-    println!("  CODEX_HOME={}", desktop_codex.display());
+    println!("  pid={pid}");
+    println!("  CODEX_HOME={} (standard profile)", codex_home.display());
     println!("  user-data-dir={}", desktop_user_data.display());
     println!("  environment={}", env_path.display());
-    println!("  proxy={proxy} (Desktop process tree only)");
+    println!("  proxy={proxy} (Desktop activation arguments only)");
     println!("  certificate-trust=process-scoped SPKI pins");
     println!("  Windows system proxy=unchanged");
-    if let Some(timezone) = &fixed_timezone {
-        println!("  timezone={timezone} (Desktop child only)");
-    }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_quote_activation_arg(arg: &str) -> String {
+    // Windows command-line quoting: escape a backslash only when it precedes
+    // a quote or the final quote. Paths may contain spaces and trailing slashes.
+    let mut quoted = String::from("\"");
+    let mut slashes = 0;
+    for character in arg.chars() {
+        match character {
+            '\\' => slashes += 1,
+            '"' => {
+                quoted.push_str(&"\\".repeat(slashes * 2 + 1));
+                quoted.push('"');
+                slashes = 0;
+            }
+            _ => {
+                quoted.push_str(&"\\".repeat(slashes));
+                quoted.push(character);
+                slashes = 0;
+            }
+        }
+    }
+    quoted.push_str(&"\\".repeat(slashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+#[cfg(target_os = "windows")]
+fn activate_windows_packaged_desktop(app_id: &str, arguments: &str) -> Result<u32> {
+    // The Store package must be activated by AppUserModelID. Starting its
+    // WindowsApps executable directly creates an unpackaged process and the
+    // official app then fails with "The process has no package identity".
+    // Pass only non-secret Chromium arguments through the broker.
+    const SCRIPT: &str = r#"
+$ErrorActionPreference='Stop'
+$source=@'
+using System;
+using System.Runtime.InteropServices;
+[ComImport, Guid("2e941141-7f97-4756-ba1d-9decde894a3d"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IApplicationActivationManager {
+    void ActivateApplication([MarshalAs(UnmanagedType.LPWStr)] string appUserModelId,
+        [MarshalAs(UnmanagedType.LPWStr)] string arguments, uint options, out uint processId);
+}
+public static class SaiaiPackageActivation {
+    public static uint Activate(string appId, string arguments) {
+        var clsid = new Guid("45BA127D-10A8-46EA-8AB7-56EA9078943C");
+        var manager = (IApplicationActivationManager)Activator.CreateInstance(Type.GetTypeFromCLSID(clsid));
+        uint pid;
+        manager.ActivateApplication(appId, arguments, 0, out pid);
+        return pid;
+    }
+}
+'@
+Add-Type -TypeDefinition $source
+[SaiaiPackageActivation]::Activate($env:SAIAI_DESKTOP_APP_ID,$env:SAIAI_DESKTOP_ACTIVATION_ARGS)
+"#;
+    let output = ProcessCommand::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .env("SAIAI_DESKTOP_APP_ID", app_id)
+        .env("SAIAI_DESKTOP_ACTIVATION_ARGS", arguments)
+        .output()
+        .context("failed to invoke Windows package activation")?;
+    if !output.status.success() {
+        bail!(
+            "Windows package activation failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .context("Windows package activation did not return a process ID")
 }
 
 #[cfg(target_os = "windows")]
@@ -2100,24 +2167,6 @@ fn resolve_windows_desktop_executable() -> Result<PathBuf> {
 struct WindowsPackagedDesktop {
     app_id: String,
     install_location: PathBuf,
-}
-
-#[cfg(target_os = "windows")]
-fn windows_packaged_desktop_executable(package: &WindowsPackagedDesktop) -> Result<PathBuf> {
-    [
-        package.install_location.join("app/ChatGPT.exe"),
-        package.install_location.join("app/Codex.exe"),
-        package.install_location.join("ChatGPT.exe"),
-        package.install_location.join("Codex.exe"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
-    .with_context(|| {
-        format!(
-            "OpenAI Codex AppX executable is unavailable under {}",
-            package.install_location.display()
-        )
-    })
 }
 
 #[cfg(target_os = "windows")]
@@ -7961,6 +8010,17 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             ])
             .is_err()
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn quotes_windows_package_activation_arguments() {
+        assert_eq!(
+            windows_quote_activation_arg(r"--user-data-dir=C:\Users\Test User\SAIAI"),
+            r#""--user-data-dir=C:\Users\Test User\SAIAI""#
+        );
+        assert_eq!(windows_quote_activation_arg("a\"b"), r#""a\"b""#);
+        assert_eq!(windows_quote_activation_arg("ends\\"), r#""ends\\""#);
     }
 
     #[cfg(target_os = "windows")]

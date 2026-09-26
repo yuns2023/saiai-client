@@ -76,17 +76,19 @@ OpenAI；已有真实 ChatGPT OAuth 会保留。SAIAI 不会新增、覆盖或�
 `init-codex` 还会备份并幂等修复 `%USERPROFILE%\.codex\.codex-global-state.json`：
 将 `electron-persisted-atom-state.composer-permission-mode-visibility` 设为 `true`，避免
 旧 Desktop profile 隐藏权限模式。该字段只控制选择器可见性，不会选择权限模式、修改
-approval/sandbox 或授予 Full Access。`saiai desktop codex` 启动前会对实际使用的
-`CODEX_HOME` 重复同一检查，`saiai doctor codex` 会报告异常状态。
+approval/sandbox 或授予 Full Access。商店版 `saiai desktop codex` 使用已配置的标准
+Codex profile，不在启动时改写该 profile；`saiai doctor codex` 会报告异常状态。
 
-商店版 Codex Desktop 由 `saiai desktop codex` 直接启动包内主程序，使用 SAIAI
-隔离的 `CODEX_HOME` 和 user-data。loopback proxy、TLS 环境以及为四个受管
-OpenAI/ChatGPT 域名生成的 SPKI pin 列表只传给该 Desktop 进程树；不会修改 HKCU
-系统代理、Windows 系统环境或 `CurrentUser\Root`。升级时若发现旧版本遗留的 proxy
-lease，启动器只执行一次有所有权校验的恢复和清理。
-启动器只复制尚未过期的真实 Codex OAuth access token。若普通 profile 中可解析的 JWT
-已经过期，它不会尝试 refresh，也不会改写原文件，而会在 Desktop 隔离 profile 中使用
-SAIAI 外部 token 状态完成免登录引导。
+商店版 Codex Desktop 必须由 Windows 按包 AppID 激活；直接运行 WindowsApps 下的
+`ChatGPT.exe` 会失去包身份，导致 “The process has no package identity”。
+`saiai desktop codex` 通过包激活传入独立的 Electron user-data、loopback proxy 和
+受管域名 SPKI pin。包激活不会继承启动器的子进程环境变量，因此它使用当前用户的
+标准 `%USERPROFILE%\.codex` profile；启动前要求该 profile 的 `.env` 已有与当前
+SAIAI 代理和 CA 一致的受管配置。未配置时先运行 `saiai init-codex`，配置过期时运行
+`saiai vscode`。不要从 SSH 或服务会话启动需要交互窗口的商店版 Desktop，也不要设置
+自定义 `CODEX_HOME` 或仅供子进程使用的时区覆盖。启动器不会修改 HKCU 系统代理、
+Windows 系统环境或 `CurrentUser\Root`；升级时如发现旧版本遗留的 proxy lease，
+只执行一次有所有权校验的恢复和清理。
 
 Codex Desktop 的中文等内置翻译由 `localeOverride`/系统语言选择，但消息加载还依赖
 Desktop 的 i18n Statsig layer。SAIAI 在 loopback sidecar 内对精确的 Statsig bootstrap
