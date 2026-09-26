@@ -30,7 +30,7 @@ def run(exe: Path, env: dict[str, str], *args: str) -> subprocess.CompletedProce
 
 
 def main() -> None:
-    faulthandler.dump_traceback_later(90, repeat=True)
+    faulthandler.dump_traceback_later(90, exit=True)
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True, type=Path)
     args = parser.parse_args()
