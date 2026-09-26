@@ -224,9 +224,15 @@ fn is_managed_claude_env(key: &str) -> bool {
 
 fn main() -> Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
+    let command = parse_command(&args)?;
     #[cfg(target_os = "windows")]
-    warn_incomplete_windows_update();
-    match parse_command(&args)? {
+    if matches!(
+        &command,
+        Command::Version | Command::Status | Command::Update | Command::Doctor(_)
+    ) {
+        warn_incomplete_windows_update();
+    }
+    match command {
         Command::Help => {
             println!("{USAGE}");
             Ok(())
