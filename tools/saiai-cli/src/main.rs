@@ -224,6 +224,8 @@ fn is_managed_claude_env(key: &str) -> bool {
 
 fn main() -> Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
+    #[cfg(target_os = "windows")]
+    warn_incomplete_windows_update();
     match parse_command(&args)? {
         Command::Help => {
             println!("{USAGE}");
@@ -3715,11 +3717,12 @@ fn run_update() -> Result<()> {
         &candidate_path,
         &backup_path,
         service_was_active,
+        &sha256_hex(&bytes),
     )?;
 
     #[cfg(target_os = "windows")]
     println!(
-        "Update staged: {}. Replacement completes automatically after this command exits; run `saiai --version` to confirm.",
+        "Update staged (not yet installed): {}. After this command exits, run `saiai --version` to confirm; a failed replacement is reported there.",
         candidate_version.trim()
     );
     #[cfg(not(target_os = "windows"))]
@@ -5526,6 +5529,7 @@ fn finalize_update(
     candidate_path: &Path,
     backup_path: &Path,
     _restart_service: bool,
+    _expected_sha256: &str,
 ) -> Result<()> {
     fs::copy(current_exe, backup_path).with_context(|| {
         format!(
@@ -5550,6 +5554,7 @@ fn finalize_update(
     candidate_path: &Path,
     backup_path: &Path,
     restart_service: bool,
+    expected_sha256: &str,
 ) -> Result<()> {
     fs::copy(current_exe, backup_path).with_context(|| {
         format!(
@@ -5559,17 +5564,21 @@ fn finalize_update(
         )
     })?;
     let script_path = candidate_path.with_extension("ps1");
+    let status_path = windows_update_status_path(current_exe)?;
+    fs::write(&status_path, "pending\n")
+        .with_context(|| format!("failed to write {}", status_path.display()))?;
     let script = render_windows_update_script(
         std::process::id(),
         current_exe,
         candidate_path,
-        backup_path,
         &script_path,
+        &status_path,
         restart_service,
+        expected_sha256,
     )?;
     fs::write(&script_path, script)
         .with_context(|| format!("failed to write {}", script_path.display()))?;
-    ProcessCommand::new("powershell")
+    if let Err(err) = ProcessCommand::new("powershell")
         .arg("-NoProfile")
         .arg("-ExecutionPolicy")
         .arg("Bypass")
@@ -5579,9 +5588,16 @@ fn finalize_update(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context("failed to start Windows update helper")?;
+    {
+        let _ = fs::write(
+            &status_path,
+            format!("failed: could not start update helper: {err}\n"),
+        );
+        return Err(err).context("failed to start Windows update helper");
+    }
     println!(
-        "Windows update helper started; replacement will finish automatically after this process exits."
+        "Windows update helper started; replacement result: {}",
+        status_path.display()
     );
     Ok(())
 }
@@ -5591,33 +5607,95 @@ fn render_windows_update_script(
     pid: u32,
     current_exe: &Path,
     candidate_path: &Path,
-    backup_path: &Path,
     script_path: &Path,
+    status_path: &Path,
     restart_service: bool,
+    expected_sha256: &str,
 ) -> Result<String> {
-    let restart = if restart_service {
-        format!(
-            "Start-Process -FilePath {} -ArgumentList 'restart' -WindowStyle Hidden\r\n",
-            powershell_quote_path(current_exe)?
-        )
-    } else {
-        String::new()
-    };
+    if expected_sha256.len() != 64 || !expected_sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("invalid expected Windows update sha256");
+    }
     Ok(format!(
         "$ErrorActionPreference = 'Stop'\r\n\
-try {{ Wait-Process -Id {pid} -Timeout 30 -ErrorAction SilentlyContinue }} catch {{}}\r\n\
-Start-Sleep -Milliseconds 300\r\n\
-Copy-Item -LiteralPath {} -Destination {} -Force\r\n\
-Move-Item -LiteralPath {} -Destination {} -Force\r\n\
-Remove-Item -LiteralPath {} -Force -ErrorAction SilentlyContinue\r\n\
-{}",
+$currentExe = {}\r\n\
+$candidate = {}\r\n\
+$statusPath = {}\r\n\
+$expectedHash = '{expected_sha256}'\r\n\
+$restartService = ${}\r\n\
+$stopped = $false\r\n\
+try {{\r\n\
+    Wait-Process -Id {pid} -Timeout 30 -ErrorAction SilentlyContinue\r\n\
+    if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ throw 'Updater process did not exit within 30 seconds' }}\r\n\
+    & $currentExe stop *> $null\r\n\
+    if ($LASTEXITCODE -ne 0) {{ throw \"Could not stop SAIAI processes (exit $LASTEXITCODE)\" }}\r\n\
+    $stopped = $true\r\n\
+    $lastError = $null\r\n\
+    foreach ($attempt in 1..120) {{\r\n\
+        try {{\r\n\
+            $replacementBackup = Join-Path (Split-Path -Parent $currentExe) ('.saiai.replace.' + [guid]::NewGuid().ToString('N') + '.bak')\r\n\
+            try {{ [IO.File]::Replace($candidate, $currentExe, $replacementBackup, $true) }}\r\n\
+            finally {{ Remove-Item -LiteralPath $replacementBackup -Force -ErrorAction SilentlyContinue }}\r\n\
+            $lastError = $null\r\n\
+            break\r\n\
+        }} catch {{\r\n\
+            $lastError = $_\r\n\
+            if ($attempt -lt 120) {{ Start-Sleep -Milliseconds 250 }}\r\n\
+        }}\r\n\
+    }}\r\n\
+    if ($null -ne $lastError) {{ throw \"Could not replace SAIAI binary after 120 attempts: $($lastError.Exception.Message)\" }}\r\n\
+    $actualHash = (Get-FileHash -LiteralPath $currentExe -Algorithm SHA256).Hash.ToLowerInvariant()\r\n\
+    if ($actualHash -cne $expectedHash) {{ throw \"Installed SAIAI binary hash mismatch: $actualHash\" }}\r\n\
+    if ($restartService) {{\r\n\
+        & $currentExe restart *> $null\r\n\
+        if ($LASTEXITCODE -ne 0) {{ throw \"Updated SAIAI binary could not restart the background proxy (exit $LASTEXITCODE)\" }}\r\n\
+    }}\r\n\
+    Set-Content -LiteralPath $statusPath -Value \"updated: $actualHash\" -Encoding UTF8\r\n\
+    Remove-Item -LiteralPath {} -Force -ErrorAction SilentlyContinue\r\n\
+}} catch {{\r\n\
+    $failure = $_.Exception.Message\r\n\
+    Set-Content -LiteralPath $statusPath -Value \"failed: $failure\" -Encoding UTF8\r\n\
+    if ($stopped -and $restartService -and (Test-Path -LiteralPath $currentExe -PathType Leaf)) {{\r\n\
+        try {{ & $currentExe start *> $null }} catch {{}}\r\n\
+    }}\r\n\
+    exit 1\r\n\
+}}",
         powershell_quote_path(current_exe)?,
-        powershell_quote_path(backup_path)?,
         powershell_quote_path(candidate_path)?,
-        powershell_quote_path(current_exe)?,
+        powershell_quote_path(status_path)?,
+        if restart_service { "true" } else { "false" },
         powershell_quote_path(script_path)?,
-        restart,
     ))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_update_status_path(current_exe: &Path) -> Result<PathBuf> {
+    Ok(current_exe
+        .parent()
+        .context("failed to resolve SAIAI executable directory")?
+        .join(".saiai-update-status.txt"))
+}
+
+#[cfg(target_os = "windows")]
+fn warn_incomplete_windows_update() {
+    let Ok(exe) = env::current_exe() else { return };
+    let Ok(path) = windows_update_status_path(&exe) else {
+        return;
+    };
+    let Ok(status) = fs::read_to_string(&path) else {
+        return;
+    };
+    let status = status.trim_start_matches('\u{feff}').trim();
+    if status.starts_with("failed:") {
+        eprintln!(
+            "WARN Previous SAIAI update {status}. Details: {}",
+            path.display()
+        );
+    } else if status == "pending" {
+        eprintln!(
+            "WARN Previous SAIAI update has not completed; check again shortly. Status: {}",
+            path.display()
+        );
+    }
 }
 
 #[cfg(target_os = "windows")]

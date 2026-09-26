@@ -270,6 +270,12 @@ def verify_manifest_and_wrappers() -> None:
         and "TEST_ONLY_WINDOWS_PS51_CODEX_KEY WITH SPACE" in windows_release,
         "Windows release smoke does not cover Windows PowerShell 5.1 wrapper arguments",
     )
+    self_update = text("scripts/saiai-cli/test-windows-self-update.py")
+    require(
+        "same-path log follower exited before update" in self_update
+        and "installed binary does not match release" in self_update,
+        "Windows self-update smoke does not cover a running same-path client",
+    )
 
 
 def verify_workflows_and_docs() -> None:
@@ -308,6 +314,10 @@ def verify_workflows_and_docs() -> None:
         "Smoke-test Windows PowerShell 5.1 setup wrapper" in ci
         and "test-windows-release.ps1" in ci,
         "source CI does not execute the Windows PowerShell 5.1 setup-wrapper smoke",
+    )
+    require(
+        "test-windows-self-update.py" in ci and "test-windows-self-update.py" in release,
+        "Windows self-update smoke must run in source CI and release workflow",
     )
     linux_service = text("scripts/saiai-cli/test-linux-service.py")
     for required in (

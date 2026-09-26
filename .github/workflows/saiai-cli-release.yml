@@ -207,6 +207,11 @@ jobs:
             -SetupCmd dist/setup.cmd `
             -AssetName "${{ matrix.asset }}"
 
+      - name: Smoke-test native Windows self-update with active proxy
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: python scripts/saiai-cli/test-windows-self-update.py --binary dist/${{ matrix.asset }}
+
       - name: Upload target binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
