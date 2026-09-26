@@ -192,14 +192,16 @@ Linux、macOS 和显式 `SAIAI_DESKTOP_BIN` 的普通可执行文件使用隔离
 `CODEX_HOME`/user-data 和进程级代理/CA。对于官方 macOS `com.openai.codex` bundle，
 launcher 先以隔离 home、loopback 代理和当前 SAIAI 叶证书的 SPKI pin 启动 bundle
 executable，再用 `codex://threads/new` 激活窗口；pin 仅适用于该子进程，不会修改
-Keychain、系统代理或系统环境。Windows `OpenAI.Codex_*!App` 不再通过 AppX broker
-启动第二套无法继承环境的进程；launcher 直接运行包内主程序，把当前 workspace 的
-`codex://threads/new` URL 作为该子进程参数，并使用隔离的 `CODEX_HOME` 与 user-data。
-从普通 Codex profile 复制真实 OAuth 前会在本地检查可解析 JWT 的 `exp`；已经过期的
-access token 不会复制，也不会触发 refresh，而由 Desktop 隔离 profile 使用外部
-`chatgptAuthTokens` 占位状态。普通 profile 的原始凭据文件保持不变。
-loopback proxy、标准 TLS 环境和四个受管 OpenAI/ChatGPT 叶证书的 SPKI pin 只注入该
-Desktop 进程树。正常启动不修改 HKCU 系统代理、Windows 系统环境或
+Keychain、系统代理或系统环境。Windows `OpenAI.Codex_*!App` 必须通过 AppX broker
+激活，直接运行 WindowsApps 中的主程序会失去包身份。Windows launcher 将当前
+workspace 的 `codex://threads/new` URL、隔离 Electron user-data、loopback proxy
+以及 SPKI pin 作为激活参数传入。broker 不继承 launcher 的子进程环境，因此 Windows
+商店版使用当前用户的标准 Codex profile；启动前要求该 profile 的受管 `.env` 与当前
+代理和 CA 一致，不能保证自定义 `CODEX_HOME` 或子进程时区覆盖。Linux、macOS 与
+普通可执行文件仍使用隔离 Codex profile：从普通 profile 复制真实 OAuth 前检查
+可解析 JWT 的 `exp`；已过期的 access token 不复制，也不触发 refresh，而在隔离
+profile 中使用外部 `chatgptAuthTokens` 占位状态。普通 profile 的原始凭据文件保持不变。
+Windows 正常启动不修改 HKCU 系统代理、Windows 系统环境或
 `CurrentUser\Root`；若检测到旧版本遗留的 proxy lease，只按 marker 所有权恢复旧值、
 删除该 lease 安装的证书并移除 marker。
 Linux 隔离启动器改写子进程 `HOME` 以避免复用正常 Codex state。若当前 X11 会话未
@@ -221,7 +223,7 @@ macOS 会校验 bundle identifier、OpenAI Team ID `2DC432GLL2` 和 codesign，�
 LaunchServices 稳定，并用 `open -n -a` 有界重试，避免紧接退出发生 `-600`。
 Windows 通过稳定的 StartApps AppID 和 AppX InstallLocation 识别包，只停止该安装
 目录中的 `ChatGPT`/`Codex` 顶层进程；不会递归终止可能共享系统宿主的包内辅助进程。
-macOS 经 LaunchServices、Windows 经直接子进程参数打开当前 workspace，并确认主程序
+macOS 经 LaunchServices、Windows 经包 AppID 激活打开当前 workspace，并确认主程序
 实际出现，不能把内部 launcher stub 的零退出码当作 UI 启动成功。它们不修改系统代理、
 Keychain、Windows 用户根证书或系统环境。
 
