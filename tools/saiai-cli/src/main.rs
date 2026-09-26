@@ -5649,7 +5649,12 @@ try {{\r\n\
         }}\r\n\
     }}\r\n\
     if ($null -ne $lastError) {{ throw \"Could not replace SAIAI binary after 120 attempts: $($lastError.Exception.Message)\" }}\r\n\
-    $actualHash = (Get-FileHash -LiteralPath $currentExe -Algorithm SHA256).Hash.ToLowerInvariant()\r\n\
+    $stream = [IO.File]::OpenRead($currentExe)\r\n\
+    try {{\r\n\
+        $sha = [Security.Cryptography.SHA256]::Create()\r\n\
+        try {{ $actualHash = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }}\r\n\
+        finally {{ $sha.Dispose() }}\r\n\
+    }} finally {{ $stream.Dispose() }}\r\n\
     if ($actualHash -cne $expectedHash) {{ throw \"Installed SAIAI binary hash mismatch: $actualHash\" }}\r\n\
     if ($restartService) {{\r\n\
         & $currentExe restart *> $null\r\n\
