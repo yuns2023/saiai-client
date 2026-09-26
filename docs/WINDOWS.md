@@ -1,6 +1,6 @@
-# Windows 使用指南（SAIAI 1.1.28）
+# Windows 使用指南（SAIAI 1.1.29）
 
-SAIAI `1.1.28` 为 Claude Code 和 VSCode 提供用户级本地代理，不要求管理员权限。
+SAIAI `1.1.29` 为 Claude Code 和 VSCode 提供用户级本地代理，不要求管理员权限。
 
 ## 一键配置 Claude Code
 
@@ -114,6 +114,8 @@ Renderer 异常。代理返回 200、模型目录加载或 app-server 的 `accou
 命令显示“已暂存”不代表安装已经成功。随后执行 `saiai --version` 确认新版本；
 若替换失败，该命令会显示警告，详细状态保存在安装目录的
 `.saiai-update-status.txt`。用户无需、也不应手动运行 `.saiai-update-*.exe` 临时文件。
+从 `1.1.28` 升级到 `1.1.29` 时，旧版 `saiai update` 尚未包含此修复；请重新运行
+WebUI 提供的一键配置命令，以便安装器先停止旧代理并完成替换。
 
 重复执行同一初始化命令且二进制、Gateway/Key/监听地址/CA 均未变化时，会保留健康的
 后台代理进程，不会为配置文件的幂等重写而中断已有连接。安装新二进制、更新代理运行
