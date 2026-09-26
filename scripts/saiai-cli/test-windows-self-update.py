@@ -2,6 +2,7 @@
 """Exercise native Windows self-update with an active same-path proxy and log follower."""
 
 import argparse
+import faulthandler
 import functools
 import hashlib
 import http.server
@@ -29,6 +30,7 @@ def run(exe: Path, env: dict[str, str], *args: str) -> subprocess.CompletedProce
 
 
 def main() -> None:
+    faulthandler.dump_traceback_later(90, repeat=True)
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True, type=Path)
     args = parser.parse_args()
@@ -71,6 +73,7 @@ def main() -> None:
         straggler = None
         try:
             base_url = f"http://127.0.0.1:{server.server_port}"
+            print("Windows self-update fixture: initializing isolated client", flush=True)
             run(installed, env, "init", base_url, "TEST_ONLY_WINDOWS_UPDATE_KEY")
             assert "service active: yes" in run(installed, env, "status").stdout
             straggler = subprocess.Popen(
@@ -80,6 +83,7 @@ def main() -> None:
             time.sleep(0.5)
             assert straggler.poll() is None, "same-path log follower exited before update"
 
+            print("Windows self-update fixture: running native update", flush=True)
             staged = run(installed, env, "update")
             assert "not yet installed" in staged.stdout
             result_path = install / ".saiai-update-status.txt"
@@ -95,10 +99,12 @@ def main() -> None:
             else:
                 raise AssertionError("Windows update helper did not record completion")
             assert result == f"updated: {release_hash}", result
+            print("Windows self-update fixture: replacement completed", flush=True)
             assert sha256(installed) == release_hash, "installed binary does not match release"
             assert straggler.wait(timeout=5) is not None
             assert "service active: yes" in run(installed, env, "status").stdout
         finally:
+            print("Windows self-update fixture: cleaning up", flush=True)
             if installed.exists() and (home / ".saiai").exists():
                 subprocess.run([str(installed), "stop"], env=env, capture_output=True, timeout=20)
             if straggler and straggler.poll() is None:
