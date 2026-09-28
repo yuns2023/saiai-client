@@ -211,7 +211,11 @@ Codex state 和 user-data 保持独立。
 
 Desktop 当前只接受 `saiai desktop codex`。官方应用的壳层仍可能显示“ChatGPT”以及
 其左栏，但普通 ChatGPT 会话、历史、语言、设置、插件和图片/文件 UI 不属于 SAIAI
-Desktop 合同；`saiai desktop chatgpt`、Claude 和 Gemini target 都会明确拒绝。Codex
+Desktop 合同。Desktop 26.924 的通知页会对 `/notifications/settings` 的返回值直接调用
+`settings.map()`；通用 `200 {}` 会使 Renderer 显示“ChatGPT hit a snag”，HTTP 501
+则令页面持续加载重试。本地代理对该精确路径（含 `/backend-api` 前缀）的 GET 返回
+`{"settings":[]}`，表示本地身份没有托管 ChatGPT 通知类别；修改请求仍返回 501，
+不会伪造或接受通知偏好。`saiai desktop chatgpt`、Claude 和 Gemini target 都会明确拒绝。Codex
 启动器一律用 `codex://threads/new` 激活，并把模型目录、Responses HTTP/WS 与登录
 控制面作为独立验证面。后续产品接入必须实现独立 adapter，描述可执行文件发现、认证/
 配置目录、profile/onboarding、TLS/代理继承、模型目录和 UI readiness；这些差异不应
