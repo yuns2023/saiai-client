@@ -1860,27 +1860,17 @@ fn run_windows_packaged_desktop(
             "packaged Windows Desktop must be started from the signed-in desktop session, not SSH or a Windows service session"
         );
     }
-    let desktop_user_data = saiai_config_dir()?.join("desktop/user-data");
-    fs::create_dir_all(&desktop_user_data)
-        .with_context(|| format!("failed to create {}", desktop_user_data.display()))?;
-
     let proxy = format!("http://{}", cfg.listen);
     let spki = local_proxy_chatgpt_spki(&cfg.listen)?;
     stop_windows_packaged_desktop(package)?;
     restore_legacy_windows_packaged_proxy_lease()?;
 
+    // Toast replies and other shell activations carry no launcher arguments.
+    // Use the package's default Electron profile so those activations join
+    // this proxy-bound instance instead of opening an unproxied second one.
     let workspace = env::current_dir().context("failed to resolve the Desktop workspace")?;
     let target = codex_new_thread_url(&workspace);
-    let activation_args = [
-        format!("--user-data-dir={}", desktop_user_data.display()),
-        format!("--proxy-server={proxy}"),
-        format!("--ignore-certificate-errors-spki-list={spki}"),
-        target,
-    ]
-    .iter()
-    .map(|arg| windows_quote_activation_arg(arg))
-    .collect::<Vec<_>>()
-    .join(" ");
+    let activation_args = windows_packaged_desktop_activation_args(&proxy, &spki, &target);
     let pid = activate_windows_packaged_desktop(&package.app_id, &activation_args)?;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -1895,12 +1885,25 @@ fn run_windows_packaged_desktop(
     println!("  app_id={}", package.app_id);
     println!("  pid={pid}");
     println!("  CODEX_HOME={} (standard profile)", codex_home.display());
-    println!("  user-data-dir={}", desktop_user_data.display());
+    println!("  user-data-dir=packaged Desktop default (shared with notification activation)");
     println!("  environment={}", env_path.display());
     println!("  proxy={proxy} (Desktop activation arguments only)");
     println!("  certificate-trust=process-scoped SPKI pins");
     println!("  Windows system proxy=unchanged");
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_packaged_desktop_activation_args(proxy: &str, spki: &str, target: &str) -> String {
+    [
+        format!("--proxy-server={proxy}"),
+        format!("--ignore-certificate-errors-spki-list={spki}"),
+        target.to_string(),
+    ]
+    .iter()
+    .map(|arg| windows_quote_activation_arg(arg))
+    .collect::<Vec<_>>()
+    .join(" ")
 }
 
 #[cfg(target_os = "windows")]
@@ -8167,6 +8170,15 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         );
         assert_eq!(windows_quote_activation_arg("a\"b"), r#""a\"b""#);
         assert_eq!(windows_quote_activation_arg("ends\\"), r#""ends\\""#);
+        let args = windows_packaged_desktop_activation_args(
+            "http://127.0.0.1:19908",
+            "test-pin",
+            "codex://threads/new?path=C%3A%5Cwork",
+        );
+        assert!(args.contains("--proxy-server=http://127.0.0.1:19908"));
+        assert!(args.contains("--ignore-certificate-errors-spki-list=test-pin"));
+        assert!(args.contains("codex://threads/new?path=C%3A%5Cwork"));
+        assert!(!args.contains("--user-data-dir"));
     }
 
     #[cfg(target_os = "windows")]
