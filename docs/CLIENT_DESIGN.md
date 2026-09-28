@@ -194,8 +194,10 @@ launcher 先以隔离 home、loopback 代理和当前 SAIAI 叶证书的 SPKI pi
 executable，再用 `codex://threads/new` 激活窗口；pin 仅适用于该子进程，不会修改
 Keychain、系统代理或系统环境。Windows `OpenAI.Codex_*!App` 必须通过 AppX broker
 激活，直接运行 WindowsApps 中的主程序会失去包身份。Windows launcher 将当前
-workspace 的 `codex://threads/new` URL、隔离 Electron user-data、loopback proxy
-以及 SPKI pin 作为激活参数传入。broker 不继承 launcher 的子进程环境，因此 Windows
+workspace 的 `codex://threads/new` URL、loopback proxy 以及 SPKI pin 作为激活参数
+传入。Windows 商店版使用包默认 Electron user-data；通知回复等系统再次激活不会携带
+SAIAI 的启动参数，必须复用同一数据目录和已有的代理进程，否则会另起未代理的窗口并
+把本地占位令牌送到 ChatGPT，得到 401。broker 不继承 launcher 的子进程环境，因此 Windows
 商店版使用当前用户的标准 Codex profile；启动前要求该 profile 的受管 `.env` 与当前
 代理和 CA 一致，不能保证自定义 `CODEX_HOME` 或子进程时区覆盖。Linux、macOS 与
 普通可执行文件仍使用隔离 Codex profile：从普通 profile 复制真实 OAuth 前检查
