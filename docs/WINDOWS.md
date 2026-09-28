@@ -1,6 +1,6 @@
-# Windows 使用指南（SAIAI 1.1.29）
+# Windows 使用指南（SAIAI 1.1.30）
 
-SAIAI `1.1.29` 为 Claude Code 和 VSCode 提供用户级本地代理，不要求管理员权限。
+SAIAI `1.1.30` 为 Claude Code 和 VSCode 提供用户级本地代理，不要求管理员权限。
 
 ## 一键配置 Claude Code
 
@@ -81,14 +81,19 @@ Codex profile，不在启动时改写该 profile；`saiai doctor codex` 会报�
 
 商店版 Codex Desktop 必须由 Windows 按包 AppID 激活；直接运行 WindowsApps 下的
 `ChatGPT.exe` 会失去包身份，导致 “The process has no package identity”。
-`saiai desktop codex` 通过包激活传入独立的 Electron user-data、loopback proxy 和
-受管域名 SPKI pin。包激活不会继承启动器的子进程环境变量，因此它使用当前用户的
+`saiai desktop codex` 通过包激活传入 loopback proxy 和受管域名 SPKI pin，
+并复用应用默认的 Electron user-data，使 Windows 通知激活回到同一主进程。
+包激活不会继承启动器的子进程环境变量，因此它使用当前用户的
 标准 `%USERPROFILE%\.codex` profile；启动前要求该 profile 的 `.env` 已有与当前
 SAIAI 代理和 CA 一致的受管配置。未配置时先运行 `saiai init-codex`，配置过期时运行
 `saiai vscode`。不要从 SSH 或服务会话启动需要交互窗口的商店版 Desktop，也不要设置
 自定义 `CODEX_HOME` 或仅供子进程使用的时区覆盖。启动器不会修改 HKCU 系统代理、
 Windows 系统环境或 `CurrentUser\Root`；升级时如发现旧版本遗留的 proxy lease，
 只执行一次有所有权校验的恢复和清理。
+
+Desktop 通知设置的只读查询返回空设置列表；修改通知设置会明确报告不支持。
+从 Windows 通知气泡回复后，消息会进入原会话；若主窗口未即时刷新，可在历史列表
+重新打开该会话查看消息和回复。
 
 Codex Desktop 的中文等内置翻译由 `localeOverride`/系统语言选择，但消息加载还依赖
 Desktop 的 i18n Statsig layer。SAIAI 在 loopback sidecar 内对精确的 Statsig bootstrap
