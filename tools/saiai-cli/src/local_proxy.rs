@@ -1613,6 +1613,25 @@ fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse>
             body: br#"{"plugins":[],"pagination":{"total":0,"limit":200,"offset":0}}"#,
             reason: "desktop_plugins_empty",
         }),
+        // Desktop 26.924 renders notification settings with `data.settings.map(...)`.
+        // A generic 200/{} crashes the renderer, while a 501 keeps the page
+        // loading and retrying. The local account has no hosted categories.
+        "/backend-api/notifications/settings" | "/notifications/settings"
+            if request.method.eq_ignore_ascii_case("GET") =>
+        {
+            Some(StaticResponse {
+                status: StatusCode::OK,
+                content_type: "application/json",
+                body: br#"{"settings":[]}"#,
+                reason: "desktop_notification_settings_empty",
+            })
+        }
+        "/backend-api/notifications/settings" | "/notifications/settings" => Some(StaticResponse {
+                status: StatusCode::NOT_IMPLEMENTED,
+                content_type: "application/json",
+                body: br#"{"error":{"type":"desktop_notification_settings_unsupported","message":"Notification settings are unavailable through SAIAI Desktop."}}"#,
+                reason: "desktop_notification_settings_unsupported",
+            }),
         _ if path.starts_with("/backend-api/wham/")
             || path.starts_with("/backend-api/")
             || path.starts_with("/wham/")
@@ -2212,6 +2231,43 @@ mod tests {
             })
             .is_some()
         );
+    }
+
+    #[test]
+    fn serves_empty_notification_settings_without_accepting_updates() {
+        let request = IncomingRequest {
+            method: "GET".to_string(),
+            target: "/backend-api/notifications/settings".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        for target in [
+            "/backend-api/notifications/settings",
+            "/notifications/settings",
+        ] {
+            for method in ["GET", "PATCH"] {
+                let response = chatgpt_sidecar_response(&IncomingRequest {
+                    method: method.to_string(),
+                    target: target.to_string(),
+                    ..request.clone()
+                })
+                .expect("notification settings response");
+                let body: Value = serde_json::from_slice(response.body).unwrap();
+                if method == "GET" {
+                    assert_eq!(response.status, StatusCode::OK);
+                    assert_eq!(response.reason, "desktop_notification_settings_empty");
+                    assert_eq!(body["settings"], json!([]));
+                } else {
+                    assert_eq!(response.status, StatusCode::NOT_IMPLEMENTED);
+                    assert_eq!(response.reason, "desktop_notification_settings_unsupported");
+                    assert_eq!(
+                        body["error"]["type"],
+                        "desktop_notification_settings_unsupported"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
