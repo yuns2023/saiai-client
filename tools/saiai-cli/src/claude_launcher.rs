@@ -339,13 +339,11 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        drop(replacement);
-        assert!(
-            ensure_local_proxy_running_with_start(&address.to_string(), || {
-                bail!("synthetic start failure")
-            })
-            .is_err()
-        );
+        let failure = ensure_local_proxy_running_with_start("127.0.0.1:0", || {
+            bail!("synthetic start failure")
+        })
+        .unwrap_err();
+        assert!(format!("{failure:#}").contains("synthetic start failure"));
     }
 
     #[test]
