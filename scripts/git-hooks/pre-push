@@ -19,5 +19,6 @@ CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" \
   cargo test --locked --manifest-path "$repo_root/tools/saiai-cli/Cargo.toml"
 
 echo "[pre-push] client: release contract"
+(cd "$repo_root" && python3 scripts/saiai-cli/test-release-contract.py)
 (cd "$repo_root" && bash scripts/saiai-cli/test-setup-wrappers.sh)
 (cd "$repo_root" && python3 scripts/saiai-cli/verify-release.py)

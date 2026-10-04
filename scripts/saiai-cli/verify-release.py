@@ -21,6 +21,15 @@ ASSETS = (
     "saiai-windows-aarch64.exe",
 )
 WRAPPERS = ("setup.sh", "setup.ps1", "setup.cmd")
+WITHDRAWN_V2_MARKERS = (
+    "mod v2",
+    "mod claude_proxy",
+    "saiai setup [claude|codex]",
+    "saiai revoke --all",
+    "client/bootstrap",
+    "run_claude",
+    'include_str!("../../piproxy/internal/certs/assets/piproxy-ca.key")',
+)
 
 
 def require(condition: bool, message: str) -> None:
@@ -39,6 +48,114 @@ def load_generator():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def verify_claude_launcher(main: str) -> None:
+    for required in (
+        "mod claude_launcher;",
+        "saiai claude [-- <claude arguments>]",
+        "Command::Claude(args) => claude_launcher::run(&args)",
+        '"init" => return Ok(Command::Init(',
+        "Command::Init(init) => init_claude(init)",
+        "Command::VSCode => configure_vscode()",
+    ):
+        require(required in main, f"optional Claude dispatch is missing {required!r}")
+    require(
+        main.count("claude_launcher::run(") == 1,
+        "optional Claude launcher must not become an initialization or default entrypoint",
+    )
+    source = text("tools/saiai-cli/src/claude_launcher.rs")
+    production, separator, tests = source.partition("#[cfg(test)]\nmod tests")
+    require(bool(separator), "optional Claude launcher has no regression tests")
+    tests, test_end, trailing = tests.partition("\n}")
+    require(bool(test_end) and not trailing.strip(), "Claude test module must be the final source item")
+    compact = re.sub(r"\s+", "", production).replace(",)", ")")
+    conflict_list = re.search(r"const CONFLICTING_ENV:.*?=\s*&\[(.*?)\];", production, re.DOTALL)
+    require(conflict_list is not None, "Claude conflicting environment list is missing")
+    conflicts = set(re.findall(r'"([^"\n]+)"', conflict_list.group(1)))
+    no_proxy = re.search(r'const LOCAL_NO_PROXY:\s*&str\s*=\s*"([^"\n]+)";', production)
+    require(
+        no_proxy is not None and no_proxy.group(1) == "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local",
+        "Claude NO_PROXY must remain limited to local/private ranges",
+    )
+    for required in (
+        "pub(crate) fn run(args: &[String])",
+        "let mut command = process_command()?",
+        "read_saiai_config()",
+        "let token = claude_token(&config)?",
+        "validate_listen(&config.listen)?",
+        "read_runtime_ca(&config)",
+        "ensure_local_proxy_running_with_start(&config.listen",
+        "apply_environment(&mut command, &config, token)",
+        "command.args(args)",
+        "command.exec()",
+        "command.status()",
+        "status.code().unwrap_or(1)",
+        "config.providers.claude.as_ref()",
+        "config.providers.is_empty()",
+        "address.ip().is_loopback()",
+        "address.port() == 0",
+        "for name in CONFLICTING_ENV",
+        "command.env_remove(name)",
+        'starts_with("VERTEX_REGION_CLAUDE_")',
+        '.env("ANTHROPIC_BASE_URL", "https://api.anthropic.com")',
+        '.env("CLAUDE_CODE_OAUTH_TOKEN", token)',
+        '.env("NODE_EXTRA_CA_CERTS", &config.ca_cert_path)',
+        '.env("CLAUDE_STREAM_IDLE_TIMEOUT_MS", CLAUDE_STREAM_IDLE_TIMEOUT_MS)',
+    ):
+        require(
+            re.sub(r"\s+", "", required) in compact,
+            f"optional Claude launcher contract is missing {required!r}",
+        )
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        require(f'.env("{name}",&proxy)' in compact, f"Claude child proxy is missing {name}")
+    for name in ("NO_PROXY", "no_proxy"):
+        require(f'.env("{name}",LOCAL_NO_PROXY)' in compact, f"Claude child proxy is missing {name}")
+    for name in (
+        "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY", "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+        "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "ANTHROPIC_CUSTOM_HEADERS",
+        "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+        "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "NODE_TLS_REJECT_UNAUTHORIZED",
+        "SSL_CERT_FILE", "SSL_CERT_DIR", "CLAUDE_CODE_CLIENT_CERT",
+        "CLAUDE_CODE_CLIENT_KEY", "CLAUDE_CODE_CLIENT_KEY_PASSPHRASE",
+    ):
+        require(name in conflicts, f"Claude conflicting environment is missing {name}")
+    for forbidden in WITHDRAWN_V2_MARKERS + (
+        "env::set_var", "env::remove_var", "set_current_dir", ".current_dir(", "init_claude(",
+        "write_json", "fs::write", "File::create", "OpenOptions", "create_dir",
+        "remove_file", "rename(", "--settings", "--setting-sources", "apiKeyHelper",
+        "settings.json", ".credentials.json", "reqwest::", "TcpStream::", "/v1/messages",
+    ):
+        require(forbidden not in production, f"optional Claude launcher contains forbidden behavior: {forbidden}")
+    for name in (
+        "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "CLAUDE_CONFIG_DIR",
+        "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "NODE_TLS_REJECT_UNAUTHORIZED",
+    ):
+        require(f'.env("{name}",' not in compact, f"Claude launcher must not override {name}")
+    for name in (
+        "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "CLAUDE_CONFIG_DIR",
+        "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    ):
+        require(name not in conflicts, f"Claude launcher must not remove {name}")
+        require(f'.env_remove("{name}")' not in compact, f"Claude launcher must not remove {name}")
+    for invocation in re.findall(r"\b(?:e?print(?:ln)?|dbg)!\s*\((.*?)\)\s*;", production, re.DOTALL):
+        require(
+            re.fullmatch(r'\s*"(?:[^"\\{}]|\\.)*"\s*,?\s*', invocation) is not None,
+            "optional Claude diagnostics must not interpolate credentials or configuration",
+        )
+    require(re.search(r"\bprint(?:ln)?!\s*\(", production) is None, "Claude diagnostics must not use stdout")
+    for required in (
+        "claude_launcher_replaces_only_child_routing_environment",
+        "claude_launcher_reuses_reachable_proxy_without_starting_service",
+        "claude_launcher_selects_claude_route_and_rejects_codex_only_config",
+        "claude_launcher_requires_loopback_listener",
+        "claude_launcher_child_process_preserves_profile_and_parent_environment",
+    ):
+        require(required in tests, f"optional Claude regression is missing {required!r}")
 
 
 def verify_cli() -> None:
@@ -103,17 +220,9 @@ def verify_cli() -> None:
         "run_windows_background_proxy_worker",
     ):
         require(required in main, f"CLI contract is missing {required!r}")
-    for withdrawn in (
-        "mod v2",
-        "mod claude_proxy",
-        "saiai setup [claude|codex]",
-        "saiai claude [--",
-        "saiai revoke --all",
-        "client/bootstrap",
-        "run_claude",
-        "include_str!(\"../../piproxy/internal/certs/assets/piproxy-ca.key\")",
-    ):
+    for withdrawn in WITHDRAWN_V2_MARKERS:
         require(withdrawn not in main, f"CLI still exposes withdrawn V2 behavior: {withdrawn}")
+    verify_claude_launcher(main)
     for forced_model_default in (
         'doc["model"] = value(',
         'doc["review_model"] = value(',
@@ -281,6 +390,11 @@ def verify_manifest_and_wrappers() -> None:
 def verify_workflows_and_docs() -> None:
     release = text(".github/workflows/saiai-cli-release.yml")
     ci = text(".github/workflows/ci.yml")
+    for path in (".github/workflows/ci.yml", ".github/workflows/saiai-cli-release.yml", "scripts/git-hooks/pre-push"):
+        require(
+            "python3 scripts/saiai-cli/test-release-contract.py" in text(path),
+            f"{path} does not run the optional Claude contract regressions",
+        )
     for asset in ASSETS:
         require(asset in release, f"release workflow omits {asset}")
     for required in (

@@ -30,8 +30,11 @@ use toml_edit::{DocumentMut, Item, Table, value};
 use url::Url;
 use uuid::Uuid;
 
+mod claude_launcher;
 mod desktop_product;
 mod local_proxy;
+#[cfg(any(windows, test))]
+mod windows_desktop_runtime;
 
 use desktop_product::DesktopProduct;
 
@@ -52,6 +55,7 @@ Usage:
   saiai --version                                                 # print version
   saiai init <base_url> <api_key>                                 # initialize Claude Code
   saiai init-codex <base_url> <api_key> [--websockets]            # initialize Codex CLI
+  saiai claude [-- <claude arguments>]                            # launch Claude with a child-only SAIAI environment
   saiai codex [-- <codex arguments>]                              # launch Codex through SAIAI local proxy
   saiai vscode                                                    # configure the Codex VSCode extension for SAIAI
   saiai desktop [codex] [-- <Desktop arguments>]                # launch Codex Desktop through SAIAI
@@ -248,6 +252,7 @@ fn main() -> Result<()> {
         Command::Version => print_version(),
         Command::Init(init) => init_claude(init),
         Command::InitCodex(init) => init_codex(init),
+        Command::Claude(args) => claude_launcher::run(&args),
         Command::Codex(args) => run_codex(&args),
         Command::VSCode => configure_vscode(),
         Command::Desktop { product, args } => run_desktop(product, &args),
@@ -274,6 +279,7 @@ enum Command {
     Version,
     Init(InitArgs),
     InitCodex(InitArgs),
+    Claude(Vec<String>),
     Codex(Vec<String>),
     VSCode,
     Desktop {
@@ -333,6 +339,13 @@ fn parse_command(args: &[String]) -> Result<Command> {
                 "init-codex",
                 &args[1..],
             )?));
+        }
+        "claude" => {
+            let mut claude_args = args[1..].to_vec();
+            if claude_args.first().is_some_and(|arg| arg == "--") {
+                claude_args.remove(0);
+            }
+            return Ok(Command::Claude(claude_args));
         }
         "codex" => {
             let mut codex_args = args[1..].to_vec();
@@ -1718,13 +1731,12 @@ fn run_windows_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
     let cfg = read_saiai_config().context("SAIAI local proxy is not configured")?;
     let _runtime_ca = read_runtime_ca(&cfg)
         .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
-    ensure_local_proxy_running(&cfg.listen)?;
-
     if resolve_windows_desktop_override()?.is_none()
         && let Some(package) = resolve_windows_packaged_desktop()?
     {
         return run_windows_packaged_desktop(product, args, &cfg, &package);
     }
+    ensure_local_proxy_running(&cfg.listen)?;
 
     let desktop_root = saiai_config_dir()?.join("desktop");
     let desktop_home = desktop_root.join("home");
@@ -1860,30 +1872,116 @@ fn run_windows_packaged_desktop(
             "packaged Windows Desktop must be started from the signed-in desktop session, not SSH or a Windows service session"
         );
     }
-    let proxy = format!("http://{}", cfg.listen);
-    let spki = local_proxy_chatgpt_spki(&cfg.listen)?;
-    stop_windows_packaged_desktop(package)?;
-    restore_legacy_windows_packaged_proxy_lease()?;
+    let profile = windows_packaged_profile(cfg, &codex_home)?;
+    let initial = windows_desktop_runtime::inspect(&package.app_id, &package.install_location)?;
+    let directory = PathBuf::from(&initial.runtime_directory);
+    let receipt_path = directory.join("instance.json");
+    let receipt = if initial.actor_count == 0 {
+        None
+    } else {
+        windows_desktop_runtime::read_receipt(&receipt_path)?
+    };
+    windows_desktop_runtime::decide(&initial, &profile, receipt.as_ref())?;
+    windows_desktop_runtime::protect_directory(&directory)?;
+    let _launch_lock = windows_desktop_runtime::lock(&directory)?;
+    let snapshot = windows_desktop_runtime::inspect(&package.app_id, &package.install_location)?;
+    if snapshot.runtime_directory != initial.runtime_directory {
+        bail!("Windows Desktop runtime directory changed during startup");
+    }
+    let receipt = if snapshot.actor_count == 0 {
+        None
+    } else {
+        windows_desktop_runtime::read_receipt(&receipt_path)?
+    };
+    let decision = windows_desktop_runtime::decide(&snapshot, &profile, receipt.as_ref())?;
+    if matches!(decision, windows_desktop_runtime::Decision::Cold) {
+        ensure_local_proxy_running(&cfg.listen)?;
+    }
+    let proxy = &profile.proxy;
+    let spki = local_proxy_chatgpt_spki(&cfg.listen).context(
+        "Desktop proxy is unavailable; a running Desktop is never silently rebound or restarted",
+    )?;
+    if let windows_desktop_runtime::Decision::Reuse(prior) = &decision
+        && prior.window.spki.as_deref() != Some(spki.as_str())
+    {
+        bail!("Desktop certificate binding changed; use normal File > Quit and retry");
+    }
+    if matches!(decision, windows_desktop_runtime::Decision::Cold) {
+        restore_legacy_windows_packaged_proxy_lease()?;
+    }
 
     // Toast replies and other shell activations carry no launcher arguments.
     // Use the package's default Electron profile so those activations join
     // this proxy-bound instance instead of opening an unproxied second one.
-    let workspace = env::current_dir().context("failed to resolve the Desktop workspace")?;
-    let target = codex_new_thread_url(&workspace);
-    let activation_args = windows_packaged_desktop_activation_args(&proxy, &spki, &target);
-    let pid = activate_windows_packaged_desktop(&package.app_id, &activation_args)?;
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if !windows_pid_is_running(pid)? {
-            bail!("packaged OpenAI Desktop exited during startup (pid {pid})");
-        }
-        std::thread::sleep(Duration::from_millis(200));
+    let target = if matches!(decision, windows_desktop_runtime::Decision::Cold) {
+        let workspace = env::current_dir().context("failed to resolve the Desktop workspace")?;
+        Some(codex_new_thread_url(&workspace))
+    } else {
+        None
+    };
+    let activation_args =
+        windows_packaged_desktop_activation_args(&proxy, &spki, target.as_deref());
+    let before = windows_desktop_runtime::inspect(&package.app_id, &package.install_location)?;
+    if before.identity != snapshot.identity
+        || windows_packaged_profile(cfg, &codex_home)? != profile
+        || windows_desktop_runtime::decide(&before, &profile, receipt.as_ref())? != decision
+        || local_proxy_chatgpt_spki(&cfg.listen)? != spki
+    {
+        bail!("Desktop context changed; use normal File > Quit and retry");
     }
+    let not_before = u64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() / 100 + 116_444_736_000_000_000,
+    )?;
+    let _broker_pid = activate_windows_packaged_desktop(&package.app_id, &activation_args)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let observed = loop {
+        if std::time::Instant::now() >= deadline {
+            bail!("Signed Windows Desktop window was not observed before the startup deadline");
+        }
+        let current = windows_desktop_runtime::inspect(&package.app_id, &package.install_location)?;
+        if let Some(observed) = windows_desktop_runtime::accept_window(
+            &current,
+            &snapshot.identity,
+            &profile,
+            &spki,
+            &decision,
+            not_before,
+        )? {
+            break observed;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    let stable = windows_desktop_runtime::inspect(&package.app_id, &package.install_location)?;
+    if windows_desktop_runtime::accept_window(
+        &stable,
+        &snapshot.identity,
+        &profile,
+        &spki,
+        &decision,
+        not_before,
+    )? != Some(observed.clone())
+        || windows_packaged_profile(cfg, &codex_home)? != profile
+        || local_proxy_chatgpt_spki(&cfg.listen)? != spki
+    {
+        bail!("Desktop window or proxy binding changed during startup; no instance was adopted");
+    }
+    if matches!(decision, windows_desktop_runtime::Decision::Cold) {
+        windows_desktop_runtime::write_receipt(&directory, &observed)?;
+    }
+    let pid = observed.window.process_id;
     println!("Starting packaged OpenAI Desktop through the SAIAI local proxy.");
     println!("  product={}", product.label());
     println!("  app_id={}", package.app_id);
     println!("  pid={pid}");
+    println!(
+        "  existing-instance={}",
+        if matches!(decision, windows_desktop_runtime::Decision::Reuse(_)) {
+            "reused"
+        } else {
+            "cold launch"
+        }
+    );
     println!("  CODEX_HOME={} (standard profile)", codex_home.display());
     println!("  user-data-dir=packaged Desktop default (shared with notification activation)");
     println!("  environment={}", env_path.display());
@@ -1894,19 +1992,59 @@ fn run_windows_packaged_desktop(
 }
 
 #[cfg(target_os = "windows")]
-fn windows_packaged_desktop_activation_args(proxy: &str, spki: &str, target: &str) -> String {
-    [
-        format!("--proxy-server={proxy}"),
-        format!("--ignore-certificate-errors-spki-list={spki}"),
-        target.to_string(),
-    ]
-    .iter()
-    .map(|arg| windows_quote_activation_arg(arg))
-    .collect::<Vec<_>>()
-    .join(" ")
+fn windows_packaged_profile(
+    cfg: &SaiaiConfig,
+    codex_home: &Path,
+) -> Result<windows_desktop_runtime::Profile> {
+    use std::io::Read;
+    let current_env = fs::read_to_string(codex_home.join(".env"))?;
+    if !current_env.contains(CODEX_IDE_ENV_BEGIN)
+        || current_env != merge_codex_ide_env(&current_env, &cfg.listen, &cfg.ca_cert_path)
+    {
+        bail!(
+            "Desktop managed profile changed; run `saiai init-codex` and retry after normal Quit"
+        );
+    }
+    validate_codex_oauth_auth(&codex_home.join("auth.json"))?;
+    let mut certificate = Vec::new();
+    fs::File::open(&cfg.ca_cert_path)?
+        .take(65537)
+        .read_to_end(&mut certificate)?;
+    if certificate.is_empty() || certificate.len() > 65536 {
+        bail!("Desktop CA certificate exceeds its supported bounds");
+    }
+    Ok(windows_desktop_runtime::Profile {
+        codex_home: codex_home
+            .canonicalize()?
+            .to_str()
+            .context("Windows Codex home is not valid Unicode")?
+            .to_string(),
+        proxy: format!("http://{}", cfg.listen),
+        ca_sha256: sha256_hex(&certificate),
+    })
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(windows, test))]
+fn windows_packaged_desktop_activation_args(
+    proxy: &str,
+    spki: &str,
+    target: Option<&str>,
+) -> String {
+    let mut arguments = vec![
+        format!("--proxy-server={proxy}"),
+        format!("--ignore-certificate-errors-spki-list={spki}"),
+    ];
+    if let Some(target) = target {
+        arguments.push(target.to_string());
+    }
+    arguments
+        .iter()
+        .map(|argument| windows_quote_activation_arg(argument))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(any(windows, test))]
 fn windows_quote_activation_arg(arg: &str) -> String {
     // Windows command-line quoting: escape a backslash only when it precedes
     // a quote or the final quote. Paths may contain spaces and trailing slashes.
@@ -1961,19 +2099,14 @@ public static class SaiaiPackageActivation {
 Add-Type -TypeDefinition $source
 [SaiaiPackageActivation]::Activate($env:SAIAI_DESKTOP_APP_ID,$env:SAIAI_DESKTOP_ACTIVATION_ARGS)
 "#;
-    let output = ProcessCommand::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
-        .env("SAIAI_DESKTOP_APP_ID", app_id)
-        .env("SAIAI_DESKTOP_ACTIVATION_ARGS", arguments)
-        .output()
-        .context("failed to invoke Windows package activation")?;
-    if !output.status.success() {
-        bail!(
-            "Windows package activation failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    String::from_utf8_lossy(&output.stdout)
+    let output = windows_desktop_runtime::powershell(
+        SCRIPT,
+        &[
+            ("SAIAI_DESKTOP_APP_ID", OsStr::new(app_id)),
+            ("SAIAI_DESKTOP_ACTIVATION_ARGS", OsStr::new(arguments)),
+        ],
+    )?;
+    output
         .trim()
         .parse::<u32>()
         .context("Windows package activation did not return a process ID")
@@ -2217,22 +2350,6 @@ fn resolve_windows_packaged_desktop() -> Result<Option<WindowsPackagedDesktop>> 
         app_id: app_id.trim().to_string(),
         install_location,
     }))
-}
-
-#[cfg(target_os = "windows")]
-fn stop_windows_packaged_desktop(package: &WindowsPackagedDesktop) -> Result<()> {
-    let root = package.install_location.display().to_string();
-    command_output(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "& { param($root) $deadline=(Get-Date).AddSeconds(10); do { $processes=@(Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) }); $processes | Stop-Process -Force; if($processes.Count -eq 0){ return }; Start-Sleep -Milliseconds 200 } while((Get-Date) -lt $deadline); $remaining=@(Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) }); if($remaining.Count -gt 0){ throw 'packaged OpenAI Desktop top-level process did not exit' } }",
-            &root,
-        ],
-    )?;
-    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -2808,13 +2925,20 @@ fn clean_codex_oauth_document(document: &mut DocumentMut) {
 }
 
 fn ensure_local_proxy_running(listen: &str) -> Result<()> {
+    ensure_local_proxy_running_with_start(listen, run_service_start)
+}
+
+fn ensure_local_proxy_running_with_start(
+    listen: &str,
+    start: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     let addr = listen
         .parse::<SocketAddr>()
         .with_context(|| format!("invalid local proxy listen address {listen}"))?;
     if TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
         return Ok(());
     }
-    run_service_start().context("failed to start the SAIAI local proxy")?;
+    start().context("failed to start the SAIAI local proxy")?;
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
         if TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
@@ -7613,6 +7737,35 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     }
 
     #[test]
+    fn parses_claude_launcher_arguments_without_consuming_them() {
+        for separator in [false, true] {
+            let mut args = vec!["claude".to_string()];
+            if separator {
+                args.push("--".to_string());
+            }
+            args.extend([
+                "-p".to_string(),
+                "fixture with spaces".to_string(),
+                "--help".to_string(),
+            ]);
+            match parse_command(&args).unwrap() {
+                Command::Claude(claude_args) => assert_eq!(
+                    claude_args,
+                    vec![
+                        "-p".to_string(),
+                        "fixture with spaces".to_string(),
+                        "--help".to_string()
+                    ]
+                ),
+                _ => panic!("expected claude launcher command"),
+            }
+        }
+        assert!(
+            matches!(parse_command(&["claude".to_string()]).unwrap(), Command::Claude(args) if args.is_empty())
+        );
+    }
+
+    #[test]
     fn parses_codex_launcher_arguments_without_consuming_them() {
         let args = [
             "codex".to_string(),
@@ -8161,7 +8314,6 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         );
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn quotes_windows_package_activation_arguments() {
         assert_eq!(
@@ -8173,12 +8325,39 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         let args = windows_packaged_desktop_activation_args(
             "http://127.0.0.1:19908",
             "test-pin",
-            "codex://threads/new?path=C%3A%5Cwork",
+            Some("codex://threads/new?path=C%3A%5Cwork"),
         );
         assert!(args.contains("--proxy-server=http://127.0.0.1:19908"));
         assert!(args.contains("--ignore-certificate-errors-spki-list=test-pin"));
         assert!(args.contains("codex://threads/new?path=C%3A%5Cwork"));
         assert!(!args.contains("--user-data-dir"));
+    }
+
+    #[test]
+    fn windows_reuse_activation_preserves_transport_without_a_new_thread_target() {
+        let arguments =
+            windows_packaged_desktop_activation_args("http://127.0.0.1:19908", "test-pin", None);
+        assert_eq!(
+            arguments,
+            "\"--proxy-server=http://127.0.0.1:19908\" \"--ignore-certificate-errors-spki-list=test-pin\""
+        );
+        assert!(!arguments.contains("codex://"));
+        assert!(!arguments.contains("--user-data-dir"));
+    }
+
+    #[test]
+    fn windows_workspace_target_is_resolved_only_for_guarded_cold_launch() {
+        let source = include_str!("main.rs");
+        let branch = source
+            .split("let target = if matches!(decision, windows_desktop_runtime::Decision::Cold) {")
+            .nth(1)
+            .unwrap()
+            .split("let before = windows_desktop_runtime::inspect")
+            .next()
+            .unwrap();
+        assert!(branch.contains("Some(codex_new_thread_url(&workspace))"));
+        assert!(branch.contains("} else {\n        None\n    }"));
+        assert!(branch.contains("target.as_deref()"));
     }
 
     #[cfg(target_os = "windows")]
