@@ -4,6 +4,19 @@ SAIAI Client `1.1.26` 使用托管本地代理模式。Claude Code 和 VSCode �
 级 `saiai` 代理访问 Gateway；`init-codex`、Codex CLI、Codex VSCode 扩展和
 Desktop 使用同一套 OAuth/local-proxy 配置。客户端不创建隔离 home 或 generation。
 
+## 本分支的开发预览
+
+本分支用于生成测试站专用的 Actions 预览包，不代表当前正式版本已提供这些改动：
+
+- 新增可选的 `saiai claude`，仅替换子进程的连接环境；正常 Claude/VSCode 用法不变。
+- Windows 商店版 Desktop 仅复用身份、代理和证书绑定均匹配的受管实例；未知实例
+  要求用户正常 `File > Quit`，不强制关闭，也不静默改写其配置。
+- Desktop 仍属于实验功能。完整旧对话保全、MCP 就绪和普通 Chat 兼容性尚未完成验收；
+  合成数据测试通过不等于真实用户历史兼容，测试前应备份自己的 Codex 配置和历史。
+
+预览和正式包可能显示相同版本号，必须按源码提交、Actions run 和 manifest/文件哈希
+区分。预览包不得自动替换正式站客户端，也不能复用旧开发二进制的验收结果。
+
 ## 一键配置
 
 Codex WebUI 会生成包含当前 Gateway 地址和 API Key 的一行短命令。macOS / Linux
@@ -67,6 +80,11 @@ credentials 和 CA 文件全部跟随该目录。代理配置和 Key 独立保�
 `~/.saiai/config.json`；可用 `SAIAI_HOME` 改变其目录，且不受
 `CLAUDE_CONFIG_DIR` 影响。配置完成后直接运行 `claude`，VSCode 中的 Claude
 Code 也读取同一份配置。
+
+如果 shell 或系统继承了不兼容的 Base URL、认证或代理变量，可选择使用
+`saiai claude`（或 `saiai claude -- <Claude 参数>`）。它仅覆盖官方 Claude
+子进程的连接环境，不改写用户配置、credentials 或历史，不清除用户显式设置的
+`apiKeyHelper`。正常 `claude` 和 VSCode 用法保持不变；配置文件中的显式覆盖仍生效。
 
 常用管理命令：
 

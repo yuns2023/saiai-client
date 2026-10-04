@@ -17,6 +17,17 @@
 - 无关用户配置和机器身份值必须保留。
 - 每个用户使用独立生成的 CA；release 中不得包含 CA 私钥。
 
+## 本次开发预览边界
+
+新增 Claude 启动器和 Windows Desktop 实例复用改动仅在专用预览分支生成测试包，
+保持 `local-proxy`、manifest schema 1 和 configuration schema 1，不改变 Gateway
+接口、正常 Claude/VSCode 初始化方式或正式站发布坐标。完整包必须来自同一源码的
+成功 Actions run，包含六个平台二进制、三种 wrapper 和 manifest；不混入手工开发资产。
+
+Desktop 的完整历史保全、MCP 就绪和普通 Chat 兼容性仍是未关闭的验收项，预览不承诺
+这些能力已完成。测试站激活前须记录精确 manifest/文件哈希及完整旧包回滚路径；
+不打正式版本标签、不合并 main，也不将本次测试视为正式站发布授权。
+
 ## Claude 配置
 
 Claude 路径解析遵守 `CLAUDE_CONFIG_DIR`。未设置时使用：
@@ -56,6 +67,39 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
 不得误送入 OpenAI/Anthropic 的 TLS MITM 路由。由于该接口不认证且
 可访问任意目标，代理核心必须强制只监听 loopback，不能仅依赖初始化器生成的默认
 地址。Gateway Key 由代理从私有配置读取，程序不会把 Key 打印到输出或请求日志。
+
+### 可选的 Claude 环境恢复启动器
+
+`saiai claude [-- <claude arguments>]` 用于用户 shell 或系统继承环境存在旧
+Base URL、认证或 proxy/CA 配置时启动官方 Claude Code。它不是新的默认入口：正常
+`claude`、初始化、一键 wrapper、用户服务与 VSCode 流程保留原样。
+
+启动器先解析官方 Claude 可执行文件、读取已有 SAIAI Claude 路由并校验本地 CA，
+确保 loopback 代理运行；然后只在 Claude 子进程中替换环境：
+
+- Base URL 固定为官方 `https://api.anthropic.com`，流量经现有本地代理转到
+  SAIAI Gateway，不直接把 Gateway URL 写入 Claude。
+- `CLAUDE_CODE_OAUTH_TOKEN` 使用已配置的 Claude 路由 Key；移除继承的
+  `ANTHROPIC_AUTH_TOKEN`、API-key/descriptor、云 provider 等冲突来源。
+- 设置大小写 HTTP/HTTPS/ALL proxy 和本地 NO_PROXY、`NODE_EXTRA_CA_CERTS`、
+  `CLAUDE_STREAM_IDLE_TIMEOUT_MS=600000`，移除继承的旧 CA、mTLS 与跳过证书校验值。
+- 保留原 `HOME`、`CLAUDE_CONFIG_DIR`、工作目录、模型选择及其他无关环境。
+
+不调用初始化，不改写 settings、state 或 credentials，不创建隔离目录，不修改
+父进程/系统环境，也不设置 `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1`、注入
+`--settings` 或禁用 `apiKeyHelper`。用户/项目/managed settings 仍按官方规则生效；
+若它们显式指定另一条路由或认证来源，本入口不会强制接管。
+已有代理会复用；未运行时可以按现有服务逻辑启动，但不能用模型请求做预检。
+
+Unix 使用进程替换以保留交互、退出码和信号行为；Windows 等待官方子进程并返回
+其退出码。启动提示写入 stderr，避免污染 `-p --output-format json` 的 stdout。
+Windows npm 安装通过 Node 直接运行已安装的官方 `cli.js`，不拼接用户参数到 shell。
+
+发布校验按实际入口与行为区分此可选启动器和已撤回的 V2：仍禁止 V2 runtime、
+bootstrap、旧 setup/revoke 等路径，同时要求现有 local-proxy/OAuth、子进程环境
+隔离、原 profile/模型保留、参数透传及无凭据诊断输出。负向测试、子进程回归与
+原初始化/服务测试共同约束该入口，不用放宽 manifest 或配置 schema 来绕过检查。
+这些是开发候选的校验规则，不表示新增入口已发布或 Desktop 原生验收已完成。
 
 ## 用户服务
 
@@ -227,9 +271,26 @@ doctor 检查属于共享 Desktop runtime。
 macOS 会校验 bundle identifier、OpenAI Team ID `2DC432GLL2` 和 codesign，并在
 激活前先请求应用正常退出，必要时才终止该 bundle 内的旧进程；进程退出后等待
 LaunchServices 稳定，并用 `open -n -a` 有界重试，避免紧接退出发生 `-600`。
-Windows 通过稳定的 StartApps AppID 和 AppX InstallLocation 识别包，只停止该安装
-目录中的 `ChatGPT`/`Codex` 顶层进程；不会递归终止可能共享系统宿主的包内辅助进程。
-macOS 经 LaunchServices、Windows 经包 AppID 激活打开当前 workspace，并确认主程序
+Windows 通过稳定的 StartApps AppID、AppX InstallLocation、Store 发布者及实际
+签名识别包。开发中的 packaged 启动路径不再强制停止现有 Desktop：先检查同一
+用户/交互会话的真实窗口、PID/启动时间、签名包版本、标准 `.codex`、本地代理、
+CA 摘要和进程启动 SPKI 参数，再与受管启动记录及运行代理的公开 SPKI 绑定核对。
+匹配则复用；未知、隐藏、旧版本、证书变化或记录不完整的实例要求用户正常
+`File > Quit` 后重试，不静默重启、收养或改写其配置。正在运行但代理不可用时
+也不会自动重启代理来重新绑定该窗口。
+锁和不含 Key/OAuth 凭据的 schema-1 实例记录位于 Windows Known Folder 的
+`LocalAppData/SAIAI/desktop-runtime`，对当前用户限制 ACL，所有 `SAIAI_HOME`
+共用此锁。缺失的 runtime 目录在创建时显式指定当前用户 SID 和不继承的私有 ACL，
+避免管理员令牌的默认组所有者导致冷启动误拒绝；既有外来所有者和 reparse point
+仍拒绝，不能把管理员组成员资格当成实例所有权。只在确认冷启动窗口后写入记录；
+复用不重写记录或用户历史。冷启动仍通过 `codex://threads/new` 打开当前 workspace；
+已验证的实例复用只发送相同的 proxy/SPKI 激活参数，不再次发送新建对话链接，以保留
+当前页面并避免重复排队的文件夹信任弹窗。不自动信任文件夹，用户仍自行取消或确认。
+Windows
+激活返回的临时 broker PID 不作为成功依据，成功要求真实签名窗口及其启动身份
+保持一致。该改动尚未发布，替代激活实验通过不等于新客户端已完成原生验收；
+仍需新候选的冷启动/复用/未知实例无副作用、实际通知/协议路由与原历史回归。
+macOS 经 LaunchServices、Windows 冷启动经包 AppID 激活打开当前 workspace，并确认主程序
 实际出现，不能把内部 launcher stub 的零退出码当作 UI 启动成功。它们不修改系统代理、
 Keychain、Windows 用户根证书或系统环境。
 
