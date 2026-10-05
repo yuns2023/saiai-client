@@ -279,6 +279,22 @@ pub(crate) fn write_receipt(directory: &Path, receipt: &Receipt) -> Result<()> {
 
 #[cfg(windows)]
 pub(crate) fn powershell(script: &str, variables: &[(&str, &std::ffi::OsStr)]) -> Result<String> {
+    powershell_with_failure(script, variables, refuse)
+}
+
+#[cfg(windows)]
+fn runtime_directory_failure() -> anyhow::Error {
+    anyhow::anyhow!(
+        "Could not apply private Windows Desktop runtime directory permissions. No Desktop process was stopped."
+    )
+}
+
+#[cfg(windows)]
+fn powershell_with_failure(
+    script: &str,
+    variables: &[(&str, &std::ffi::OsStr)],
+    failure: fn() -> anyhow::Error,
+) -> Result<String> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
     let mut command = Command::new("powershell");
@@ -312,7 +328,7 @@ pub(crate) fn powershell(script: &str, variables: &[(&str, &std::ffi::OsStr)]) -
         }
         if let Some(status) = status {
             if !status.success() {
-                return Err(refuse());
+                return Err(failure());
             }
             if let Ok(result) = receiver.try_recv() {
                 let bytes = result?;
@@ -336,9 +352,10 @@ pub(crate) fn powershell(script: &str, variables: &[(&str, &std::ffi::OsStr)]) -
 #[cfg(windows)]
 pub(crate) fn protect_directory(directory: &Path) -> Result<()> {
     reject_link(directory)?;
-    powershell(
-        r#"$ErrorActionPreference='Stop';$path=$env:SAIAI_RUNTIME_DIRECTORY;$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;$private=[Security.AccessControl.DirectorySecurity]::new();$private.SetOwner($sid);$private.SetAccessRuleProtection($true,$false);$rule=[Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow');$private.AddAccessRule($rule);[IO.Directory]::CreateDirectory($path,$private)|Out-Null;$item=Get-Item -LiteralPath $path;if($item.Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'runtime_reparse_point_refused'};$acl=Get-Acl -LiteralPath $path;if($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){throw 'foreign_runtime_owner'};Set-Acl -LiteralPath $path -AclObject $private;'ok'"#,
+    powershell_with_failure(
+        r#"$ErrorActionPreference='Stop';$path=$env:SAIAI_RUNTIME_DIRECTORY;$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;$private=[Security.AccessControl.DirectorySecurity]::new();$private.SetOwner($sid);$private.SetAccessRuleProtection($true,$false);$rule=[Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow');$private.AddAccessRule($rule);[IO.Directory]::CreateDirectory($path,$private)|Out-Null;$item=Get-Item -LiteralPath $path;if($item.Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'runtime_reparse_point_refused'};$acl=Get-Acl -LiteralPath $path;if($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){throw 'foreign_runtime_owner'};[IO.Directory]::SetAccessControl($path,$private);'ok'"#,
         &[("SAIAI_RUNTIME_DIRECTORY", directory.as_os_str())],
+        runtime_directory_failure,
     )
     .context("Could not initialize the private Windows Desktop runtime directory")?;
     Ok(())
@@ -688,9 +705,24 @@ mod tests {
         );
         assert!(
             initialization.find("foreign_runtime_owner").unwrap()
-                < initialization.find("Set-Acl").unwrap()
+                < initialization
+                    .find("SetAccessControl($path,$private)")
+                    .unwrap()
         );
+        assert!(!initialization.contains("Set-Acl"));
         assert!(initialization.contains("runtime_reparse_point_refused"));
+        assert!(initialization.contains("powershell_with_failure("));
+        assert!(initialization.contains("runtime_directory_failure"));
+    }
+
+    #[cfg(windows)]
+    fn assert_native_private_runtime(directory: &Path) {
+        let verified = powershell(
+            r#"$ErrorActionPreference='Stop';$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;$acl=Get-Acl -LiteralPath $env:SAIAI_RUNTIME_DIRECTORY;$rules=@($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]));if($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value -or -not $acl.AreAccessRulesProtected -or $rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $sid.Value -or [string]$rules[0].AccessControlType -ne 'Allow' -or [string]$rules[0].FileSystemRights -ne 'FullControl'){throw 'private_current_user_runtime_required'};'verified'"#,
+            &[("SAIAI_RUNTIME_DIRECTORY", directory.as_os_str())],
+        )
+        .unwrap();
+        assert_eq!(verified.trim(), "verified");
     }
 
     #[cfg(windows)]
@@ -704,12 +736,49 @@ mod tests {
         fs::write(&marker, b"owned-runtime-fixture").unwrap();
         protect_directory(&directory).unwrap();
         assert_eq!(fs::read(&marker).unwrap(), b"owned-runtime-fixture");
-        let verified = powershell(
-            r#"$ErrorActionPreference='Stop';$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;$acl=Get-Acl -LiteralPath $env:SAIAI_RUNTIME_DIRECTORY;$rules=@($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]));if($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value -or -not $acl.AreAccessRulesProtected -or $rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $sid.Value -or [string]$rules[0].AccessControlType -ne 'Allow' -or [string]$rules[0].FileSystemRights -ne 'FullControl'){throw 'private_current_user_runtime_required'};'verified'"#,
+        assert_native_private_runtime(&directory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_runtime_protection_removes_inherited_access_without_changing_files() {
+        let parent = tempfile::tempdir().unwrap();
+        let directory = parent.path().join("inherited-runtime");
+        powershell(
+            r#"$ErrorActionPreference='Stop';$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;$security=[Security.AccessControl.DirectorySecurity]::new();$security.SetOwner($sid);$security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'));[IO.Directory]::CreateDirectory($env:SAIAI_RUNTIME_DIRECTORY,$security)|Out-Null;$acl=Get-Acl -LiteralPath $env:SAIAI_RUNTIME_DIRECTORY;if($acl.AreAccessRulesProtected){throw 'inherited_fixture_required'};'created'"#,
             &[("SAIAI_RUNTIME_DIRECTORY", directory.as_os_str())],
         )
         .unwrap();
-        assert_eq!(verified.trim(), "verified");
+        let marker = directory.join("unchanged-fixture");
+        fs::write(&marker, b"owned-inherited-runtime-fixture").unwrap();
+        protect_directory(&directory).unwrap();
+        assert_native_private_runtime(&directory);
+        assert_eq!(
+            fs::read(&marker).unwrap(),
+            b"owned-inherited-runtime-fixture"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runtime_permission_failure_is_not_a_desktop_reuse_error_or_raw_output() {
+        let error = powershell_with_failure(
+            "'TEST_ONLY_PRIVATE_STDOUT'; [Console]::Error.WriteLine('TEST_ONLY_PRIVATE_STDERR'); exit 7",
+            &[],
+            runtime_directory_failure,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("runtime directory permissions"));
+        for forbidden in ["Cannot safely reuse", "File > Quit", "TEST_ONLY_PRIVATE"] {
+            assert!(!error.contains(forbidden));
+        }
+        assert!(
+            powershell("exit 7", &[])
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot safely reuse")
+        );
     }
 
     #[cfg(unix)]

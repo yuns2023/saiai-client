@@ -282,7 +282,11 @@ CA 摘要和进程启动 SPKI 参数，再与受管启动记录及运行代理�
 `LocalAppData/SAIAI/desktop-runtime`，对当前用户限制 ACL，所有 `SAIAI_HOME`
 共用此锁。缺失的 runtime 目录在创建时显式指定当前用户 SID 和不继承的私有 ACL，
 避免管理员令牌的默认组所有者导致冷启动误拒绝；既有外来所有者和 reparse point
-仍拒绝，不能把管理员组成员资格当成实例所有权。只在确认冷启动窗口后写入记录；
+仍拒绝，不能把管理员组成员资格当成实例所有权。ACL 写入使用 .NET 的
+`Directory.SetAccessControl`，只更新受管所有者和访问规则，不使用会要求
+`SeSecurityPrivilege` 的 PowerShell `Set-Acl`；普通权限终端不需要提权。
+目录权限初始化失败独立报告，不再误报为运行中 Desktop 的实例复用拒绝。
+只在确认冷启动窗口后写入记录；
 复用不重写记录或用户历史。冷启动仍通过 `codex://threads/new` 打开当前 workspace；
 已验证的实例复用只发送相同的 proxy/SPKI 激活参数，不再次发送新建对话链接，以保留
 当前页面并避免重复排队的文件夹信任弹窗。不自动信任文件夹，用户仍自行取消或确认。
