@@ -7,6 +7,92 @@ use std::path::Path;
 
 const RECEIPT_LIMIT: u64 = 16384;
 
+#[cfg(any(windows, test))]
+const HELPER_FAILURE_PREFIX: &str = "SAIAI_DESKTOP_HELPER_FAILURE:";
+
+#[cfg(any(windows, test))]
+const HELPER_FAILURE_REASONS: &[&str] = &[
+    "interactive_session_required",
+    "single_official_package_required",
+    "official_package_identity_required",
+    "signed_entrypoint_required",
+    "bounded_actor_inventory_required",
+    "unknown_or_foreign_actor",
+    "live_actor_inspection_required",
+    "same_user_actor_required",
+    "bounded_command_arguments_required",
+    "actor_changed_during_inspection",
+    "runtime_reparse_point_refused",
+    "foreign_runtime_owner",
+    "unclassified_powershell_failure",
+];
+
+#[cfg(any(windows, test))]
+const HELPER_FAILURE_CATEGORIES: &[&str] = &[
+    "NotSpecified",
+    "ObjectNotFound",
+    "InvalidOperation",
+    "PermissionDenied",
+    "ParserError",
+    "ResourceUnavailable",
+    "InvalidArgument",
+    "SecurityError",
+    "OperationStopped",
+    "OpenError",
+    "ReadError",
+    "WriteError",
+];
+
+#[cfg(any(windows, test))]
+fn helper_script(script: &str) -> String {
+    let reasons = HELPER_FAILURE_REASONS
+        .iter()
+        .map(|reason| format!("'{reason}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let categories = HELPER_FAILURE_CATEGORIES
+        .iter()
+        .map(|category| format!("'{category}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "try {{\n& {{\n{script}\n}}\n}} catch {{\n\
+         $reason='unclassified_powershell_failure';\n\
+         if($_.Exception.Message -cin @({reasons})){{$reason=$_.Exception.Message}};\n\
+         $category=[string]$_.CategoryInfo.Category;\n\
+         if($category -cnotin @({categories})){{$category='NotSpecified'}};\n\
+         [Console]::Out.WriteLine('{HELPER_FAILURE_PREFIX}'+(@{{reason=$reason;category=$category}}|ConvertTo-Json -Compress));\n\
+         exit 1\n}}"
+    )
+}
+
+#[cfg(any(windows, test))]
+fn helper_failure_diagnostic(output: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Failure {
+        reason: String,
+        category: String,
+    }
+    if output.len() as u64 > RECEIPT_LIMIT {
+        return None;
+    }
+    let encoded = std::str::from_utf8(output)
+        .ok()?
+        .trim()
+        .strip_prefix(HELPER_FAILURE_PREFIX)?;
+    let failure: Failure = serde_json::from_str(encoded).ok()?;
+    if !HELPER_FAILURE_REASONS.contains(&failure.reason.as_str())
+        || !HELPER_FAILURE_CATEGORIES.contains(&failure.category.as_str())
+    {
+        return None;
+    }
+    Some(format!(
+        "Windows Desktop helper diagnostic: reason={}, category={}",
+        failure.reason, failure.category
+    ))
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Identity {
@@ -279,7 +365,12 @@ pub(crate) fn write_receipt(directory: &Path, receipt: &Receipt) -> Result<()> {
 
 #[cfg(windows)]
 pub(crate) fn powershell(script: &str, variables: &[(&str, &std::ffi::OsStr)]) -> Result<String> {
-    powershell_with_failure(script, variables, refuse)
+    powershell_with_failure(script, variables, helper_failure)
+}
+
+#[cfg(windows)]
+fn helper_failure() -> anyhow::Error {
+    anyhow::anyhow!("Windows Desktop helper failed. No Desktop process was stopped.")
 }
 
 #[cfg(windows)]
@@ -297,9 +388,10 @@ fn powershell_with_failure(
 ) -> Result<String> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+    let script = helper_script(script);
     let mut command = Command::new("powershell");
     command
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .envs(variables.iter().copied())
         .env_remove("PSModulePath")
         .stdin(Stdio::null())
@@ -328,11 +420,15 @@ fn powershell_with_failure(
             status = child.try_wait()?;
         }
         if let Some(status) = status {
-            if !status.success() {
-                return Err(failure());
-            }
             if let Ok(result) = receiver.try_recv() {
                 let bytes = result?;
+                if !status.success() {
+                    let error = failure();
+                    return Err(match helper_failure_diagnostic(&bytes) {
+                        Some(diagnostic) => error.context(diagnostic),
+                        None => error,
+                    });
+                }
                 if bytes.len() as u64 > RECEIPT_LIMIT {
                     bail!("Desktop observer output exceeded its limit");
                 }
@@ -371,7 +467,11 @@ pub(crate) fn inspect(app_id: &str, install_location: &Path) -> Result<Snapshot>
             ("SAIAI_RUNTIME_PACKAGE_ROOT", install_location.as_os_str()),
         ],
     )?;
-    let mut snapshot: Snapshot = serde_json::from_str(output.trim()).map_err(|_| refuse())?;
+    let mut snapshot: Snapshot = serde_json::from_str(output.trim()).map_err(|_| {
+        anyhow::anyhow!(
+            "Windows Desktop observer returned an invalid snapshot. No Desktop process was stopped."
+        )
+    })?;
     snapshot.codex_home = Path::new(&snapshot.codex_home)
         .canonicalize()?
         .to_str()
@@ -383,6 +483,44 @@ pub(crate) fn inspect(app_id: &str, install_location: &Path) -> Result<Snapshot>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_diagnostics_accept_only_bounded_known_fields() {
+        for reason in HELPER_FAILURE_REASONS {
+            let encoded = format!(
+                "{HELPER_FAILURE_PREFIX}{{\"reason\":\"{reason}\",\"category\":\"ObjectNotFound\"}}"
+            );
+            let diagnostic = helper_failure_diagnostic(encoded.as_bytes()).unwrap();
+            assert!(diagnostic.contains(reason));
+            assert!(diagnostic.contains("ObjectNotFound"));
+        }
+        for encoded in [
+            "TEST_ONLY_PRIVATE_STDOUT",
+            "{\"reason\":\"live_actor_inspection_required\",\"category\":\"ObjectNotFound\"}",
+            "SAIAI_DESKTOP_HELPER_FAILURE:{\"reason\":\"TEST_ONLY_PRIVATE\",\"category\":\"ObjectNotFound\"}",
+            "SAIAI_DESKTOP_HELPER_FAILURE:{\"reason\":\"live_actor_inspection_required\",\"category\":\"TEST_ONLY_PRIVATE\"}",
+            "SAIAI_DESKTOP_HELPER_FAILURE:{\"reason\":\"live_actor_inspection_required\",\"category\":\"ObjectNotFound\",\"secret\":\"TEST_ONLY_PRIVATE\"}",
+            "SAIAI_DESKTOP_HELPER_FAILURE:{\"reason\":\"live_actor_inspection_required\"}",
+            "SAIAI_DESKTOP_HELPER_FAILURE:not-json",
+            "SAIAI_DESKTOP_HELPER_FAILURE:{\"reason\":\"live_actor_inspection_required\",\"category\":\"ObjectNotFound\"}\nTEST_ONLY_PRIVATE_STDOUT",
+        ] {
+            assert!(helper_failure_diagnostic(encoded.as_bytes()).is_none());
+        }
+        assert!(helper_failure_diagnostic(&vec![b' '; RECEIPT_LIMIT as usize + 1]).is_none());
+        assert!(helper_failure_diagnostic(&[0xff]).is_none());
+    }
+
+    #[test]
+    fn helper_script_preserves_source_and_does_not_print_raw_exceptions() {
+        let source = include_str!("windows_desktop_inspect.ps1");
+        let script = helper_script(source);
+        assert!(script.contains(source));
+        assert!(script.contains("[Console]::Out.WriteLine('SAIAI_DESKTOP_HELPER_FAILURE:'"));
+        assert!(script.contains("exit 1"));
+        for forbidden in ["Write-Error", "$_ |", "$_.ToString()", "Stop-Process"] {
+            assert!(!script.contains(forbidden));
+        }
+    }
 
     fn fixture() -> (Snapshot, Profile, Receipt) {
         let profile = Profile {
@@ -790,7 +928,25 @@ mod tests {
             powershell("exit 7", &[])
                 .unwrap_err()
                 .to_string()
-                .contains("Cannot safely reuse")
+                .contains("Windows Desktop helper failed")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_helper_failures_report_only_safe_reason_and_category() {
+        let known = powershell("throw 'live_actor_inspection_required'", &[]).unwrap_err();
+        let known_chain = format!("{known:#}");
+        assert!(known_chain.contains("reason=live_actor_inspection_required"));
+        assert!(!known_chain.contains("Cannot safely reuse"));
+        assert!(!known_chain.contains("File > Quit"));
+        let unknown = powershell("throw 'TEST_ONLY_PRIVATE_EXCEPTION'", &[]).unwrap_err();
+        let unknown_chain = format!("{unknown:#}");
+        assert!(unknown_chain.contains("reason=unclassified_powershell_failure"));
+        assert!(!unknown_chain.contains("TEST_ONLY_PRIVATE"));
+        assert_eq!(
+            powershell("'unchanged-success'", &[]).unwrap().trim(),
+            "unchanged-success"
         );
     }
 
