@@ -745,11 +745,12 @@ mod tests {
     fn native_runtime_protection_removes_inherited_access_without_changing_files() {
         let parent = tempfile::tempdir().unwrap();
         let directory = parent.path().join("inherited-runtime");
-        powershell(
-            r#"$ErrorActionPreference='Stop';$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;$security=[Security.AccessControl.DirectorySecurity]::new();$security.SetOwner($sid);$security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'));[IO.Directory]::CreateDirectory($env:SAIAI_RUNTIME_DIRECTORY,$security)|Out-Null;$acl=Get-Acl -LiteralPath $env:SAIAI_RUNTIME_DIRECTORY;if($acl.AreAccessRulesProtected){throw 'inherited_fixture_required'};'created'"#,
+        let created = powershell(
+            r#"$ErrorActionPreference='Stop';try{$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;$security=[Security.AccessControl.DirectorySecurity]::new();$security.SetOwner($sid);$security.SetAccessRuleProtection($false,$true);$security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'));[IO.Directory]::CreateDirectory($env:SAIAI_RUNTIME_DIRECTORY,$security)|Out-Null;[IO.Directory]::SetAccessControl($env:SAIAI_RUNTIME_DIRECTORY,$security);$acl=Get-Acl -LiteralPath $env:SAIAI_RUNTIME_DIRECTORY;if($acl.AreAccessRulesProtected){throw 'inherited_fixture_required'};'created'}catch{'fixture_failed:'+ $_.FullyQualifiedErrorId}"#,
             &[("SAIAI_RUNTIME_DIRECTORY", directory.as_os_str())],
         )
         .unwrap();
+        assert_eq!(created.trim(), "created");
         let marker = directory.join("unchanged-fixture");
         fs::write(&marker, b"owned-inherited-runtime-fixture").unwrap();
         protect_directory(&directory).unwrap();
