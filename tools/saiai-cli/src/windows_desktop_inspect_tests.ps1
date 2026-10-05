@@ -7,7 +7,11 @@ $cases = @(
     'gone_then_valid', 'gone_then_empty', 'gone_then_foreign_owner',
     'live_missing', 'exit_proof_denied', 'long_command', 'foreign_owner',
     'owner_query_failed', 'foreign_session', 'foreign_path', 'pid_reused',
-    'inventory_limit', 'cim_query_failed', 'never_settles'
+    'inventory_limit', 'cim_query_failed', 'never_settles',
+    'package_root_changed', 'package_app_id_changed', 'package_publisher_changed',
+    'package_not_store_signed', 'package_not_ready', 'entrypoint_not_signed',
+    'changed_root_not_signed', 'changed_root_foreign_publisher', 'multiple_packages',
+    'refresh_empty', 'refresh_live_actor', 'refresh_unrelated_codex'
 )
 $options = [Diagnostics.ProcessStartInfo]::new()
 $options.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -35,6 +39,7 @@ $reports = @(@{name='native_exit_proof';passed=$true})
 foreach ($case in $cases) {
     $reports += & {
         $state = @{name=$case;reads=0;pauses=0}
+        $env:SAIAI_RUNTIME_REQUIRE_NO_ACTORS = if ($case -like 'refresh_*') { '1' } else { '0' }
         $entrypoint = Join-Path $root 'app\ChatGPT.exe'
         $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         $started = [DateTime]::Parse('2026-01-01T00:00:00Z').ToUniversalTime()
@@ -55,6 +60,13 @@ foreach ($case in $cases) {
             if ($Id -eq $PID) { return [pscustomobject]@{SessionId=1} }
             if ($Name) {
                 $state.reads++
+                if ($state.name -eq 'refresh_empty') { return @() }
+                if ($state.name -eq 'refresh_unrelated_codex') {
+                    $actor = New-FixtureActor 201 $false
+                    $actor.ProcessName = 'Codex'
+                    $actor.Path = 'C:\SAIAI-TEST-ONLY-CLI\codex.exe'
+                    return $actor
+                }
                 if ($state.name -eq 'inventory_limit') {
                     return @(1..65 | ForEach-Object { New-FixtureActor (100 + $_) $false })
                 }
@@ -75,15 +87,23 @@ foreach ($case in $cases) {
         function Get-AppxPackage {
             [CmdletBinding()]
             param([string]$Name)
-            return [pscustomobject]@{
+            $package = [pscustomobject]@{
                 PackageFamilyName='OpenAI.Codex_TEST_ONLY';InstallLocation=$root
                 Publisher='CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B';SignatureKind='Store';Status='Ok';Version='1.0.0.0'
             }
+            if ($state.name -in @('package_root_changed','changed_root_not_signed','changed_root_foreign_publisher')) { $package.InstallLocation='C:\SAIAI-TEST-ONLY-UPDATED' }
+            if ($state.name -eq 'package_app_id_changed') { $package.PackageFamilyName='OpenAI.Codex_FOREIGN_TEST_ONLY' }
+            if ($state.name -in @('package_publisher_changed','changed_root_foreign_publisher')) { $package.Publisher='TEST_ONLY_FOREIGN_PUBLISHER' }
+            if ($state.name -eq 'package_not_store_signed') { $package.SignatureKind='Developer' }
+            if ($state.name -eq 'package_not_ready') { $package.Status='Modified' }
+            if ($state.name -eq 'multiple_packages') { return @($package,$package) }
+            return $package
         }
         function Get-AuthenticodeSignature {
             [CmdletBinding()]
             param([string]$LiteralPath)
-            return [pscustomobject]@{Status='Valid'}
+            $status = if ($state.name -in @('entrypoint_not_signed','changed_root_not_signed')) { 'NotSigned' } else { 'Valid' }
+            return [pscustomobject]@{Status=$status}
         }
         function Get-FileHash {
             [CmdletBinding()]
@@ -129,6 +149,17 @@ foreach ($case in $cases) {
             'inventory_limit' { 'bounded_actor_inventory_required' }
             'cim_query_failed' { 'TEST_ONLY_PRIVATE_CIM_FAILURE' }
             'never_settles' { 'actor_inventory_did_not_settle' }
+            'package_root_changed' { 'official_package_root_changed' }
+            'package_app_id_changed' { 'official_package_app_id_required' }
+            'package_publisher_changed' { 'official_package_publisher_required' }
+            'package_not_store_signed' { 'official_package_store_signature_required' }
+            'package_not_ready' { 'official_package_not_ready' }
+            'entrypoint_not_signed' { 'signed_entrypoint_required' }
+            'changed_root_not_signed' { 'signed_entrypoint_required' }
+            'changed_root_foreign_publisher' { 'official_package_publisher_required' }
+            'multiple_packages' { 'single_official_package_required' }
+            'refresh_live_actor' { 'package_refresh_requires_no_actors' }
+            'refresh_unrelated_codex' { 'package_refresh_requires_no_actors' }
             default { $null }
         }
         $failure = $null
@@ -138,13 +169,14 @@ foreach ($case in $cases) {
         if ($state.name -eq 'exit_proof_denied') {
             if ($null -eq $failure) { throw 'observer_fixture_exit_proof_accepted' }
         } elseif ($failure -cne $expected) { throw 'observer_fixture_outcome_failed' }
-        $reads = if ($state.name -eq 'never_settles') { 3 } elseif ($state.name -like 'gone_then_*') { 2 } else { 1 }
-        if ($state.reads -ne $reads -or $state.pauses -ne ($reads - 1)) { throw 'observer_fixture_retry_bound_failed' }
+        $reads = if ($state.name -eq 'never_settles') { 3 } elseif ($state.name -like 'gone_then_*') { 2 } elseif ($state.name -like 'package_*' -or $state.name -like 'changed_root_*' -or $state.name -in @('entrypoint_not_signed','multiple_packages')) { 0 } else { 1 }
+        if ($state.reads -ne $reads -or $state.pauses -ne [Math]::Max(0,($reads - 1))) { throw 'observer_fixture_retry_bound_failed' }
         if ($state.name -eq 'gone_then_valid') {
             if ($snapshot.actor_count -ne 1 -or @($snapshot.windows).Count -ne 1 -or $snapshot.windows[0].process_id -ne 201) { throw 'observer_fixture_partial_snapshot_reused' }
             if ($snapshot.windows[0].proxy -ne 'http://127.0.0.1:19908' -or -not $snapshot.windows[0].spki) { throw 'observer_fixture_binding_lost' }
         }
         if ($state.name -eq 'gone_then_empty' -and ($snapshot.actor_count -ne 0 -or @($snapshot.windows).Count -ne 0)) { throw 'observer_fixture_stale_actor_count' }
+        if ($state.name -eq 'refresh_empty' -and ($snapshot.actor_count -ne 0 -or @($snapshot.windows).Count -ne 0)) { throw 'observer_fixture_refresh_actor_count' }
         return @{name=$state.name;passed=$true;inventory_reads=$state.reads;pauses=$state.pauses}
     }
 }

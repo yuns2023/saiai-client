@@ -3,7 +3,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const RECEIPT_LIMIT: u64 = 16384;
 
@@ -15,6 +15,12 @@ const HELPER_FAILURE_REASONS: &[&str] = &[
     "interactive_session_required",
     "single_official_package_required",
     "official_package_identity_required",
+    "official_package_app_id_required",
+    "official_package_publisher_required",
+    "official_package_store_signature_required",
+    "official_package_not_ready",
+    "official_package_root_changed",
+    "package_refresh_requires_no_actors",
     "signed_entrypoint_required",
     "bounded_actor_inventory_required",
     "unknown_or_foreign_actor",
@@ -69,13 +75,27 @@ fn helper_script(script: &str) -> String {
 }
 
 #[cfg(any(windows, test))]
-fn helper_failure_diagnostic(output: &[u8]) -> Option<String> {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Failure {
-        reason: String,
-        category: String,
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HelperFailure {
+    reason: String,
+    category: String,
+}
+
+impl std::fmt::Display for HelperFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Windows Desktop helper diagnostic: reason={}, category={}",
+            self.reason, self.category
+        )
     }
+}
+
+impl std::error::Error for HelperFailure {}
+
+#[cfg(any(windows, test))]
+fn helper_failure_diagnostic(output: &[u8]) -> Option<HelperFailure> {
     if output.len() as u64 > RECEIPT_LIMIT {
         return None;
     }
@@ -83,16 +103,173 @@ fn helper_failure_diagnostic(output: &[u8]) -> Option<String> {
         .ok()?
         .trim()
         .strip_prefix(HELPER_FAILURE_PREFIX)?;
-    let failure: Failure = serde_json::from_str(encoded).ok()?;
+    let failure: HelperFailure = serde_json::from_str(encoded).ok()?;
     if !HELPER_FAILURE_REASONS.contains(&failure.reason.as_str())
         || !HELPER_FAILURE_CATEGORIES.contains(&failure.category.as_str())
     {
         return None;
     }
-    Some(format!(
-        "Windows Desktop helper diagnostic: reason={}, category={}",
-        failure.reason, failure.category
-    ))
+    Some(failure)
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Package {
+    pub app_id: String,
+    pub install_location: PathBuf,
+    pub package_version: String,
+}
+
+fn package_version(value: &str) -> Option<[u16; 4]> {
+    let parts: Vec<_> = value.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let mut version = [0; 4];
+    for (index, part) in parts.into_iter().enumerate() {
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        version[index] = part.parse().ok()?;
+    }
+    Some(version)
+}
+
+fn parse_package(output: &str) -> Result<Option<Package>> {
+    let invalid =
+        || anyhow::anyhow!("Windows Desktop resolver returned an invalid package identity");
+    if output.len() as u64 > RECEIPT_LIMIT {
+        return Err(invalid());
+    }
+    let package: Option<Package> = serde_json::from_str(output.trim()).map_err(|_| invalid())?;
+    if let Some(package) = &package
+        && (!package.app_id.starts_with("OpenAI.Codex_")
+            || !package.app_id.ends_with("!App")
+            || package.app_id.len() > 256
+            || package.install_location.as_os_str().is_empty()
+            || package.install_location.as_os_str().len() > 4096
+            || package_version(&package.package_version).is_none())
+    {
+        return Err(invalid());
+    }
+    Ok(package)
+}
+
+fn package_update_refused() -> anyhow::Error {
+    anyhow::anyhow!(
+        "Official Codex package changed or is not ready. Wait for its update to finish, then retry `saiai desktop codex`; if Desktop is open, use normal File > Quit first. No Desktop process was stopped or adopted."
+    )
+}
+
+pub(crate) struct PackageObserver {
+    package: Package,
+    binding: Option<Snapshot>,
+    actors_observed: bool,
+    refresh_used: bool,
+}
+
+impl PackageObserver {
+    pub(crate) fn new(package: Package) -> Self {
+        Self {
+            package,
+            binding: None,
+            actors_observed: false,
+            refresh_used: false,
+        }
+    }
+
+    pub(crate) fn identity(&self) -> Result<&Identity> {
+        self.binding
+            .as_ref()
+            .map(|snapshot| &snapshot.identity)
+            .context("Windows Desktop package identity has not been observed")
+    }
+
+    fn observe_with(
+        &mut self,
+        mut reader: impl FnMut(&Package, bool) -> Result<Snapshot>,
+        mut resolver: impl FnMut() -> Result<Option<Package>>,
+    ) -> Result<Snapshot> {
+        let snapshot = match reader(&self.package, false) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let reason = error
+                    .downcast_ref::<HelperFailure>()
+                    .map(|failure| failure.reason.as_str());
+                if reason != Some("official_package_root_changed") {
+                    return Err(if reason == Some("official_package_not_ready") {
+                        error.context(package_update_refused())
+                    } else {
+                        error
+                    });
+                }
+                if self.refresh_used || self.actors_observed {
+                    return Err(error.context(package_update_refused()));
+                }
+                self.refresh_used = true;
+                let package = resolver()?.ok_or_else(package_update_refused)?;
+                if package.app_id != self.package.app_id
+                    || package.install_location == self.package.install_location
+                    || package_version(&package.package_version).is_none()
+                    || package_version(&self.package.package_version).is_none()
+                    || package_version(&package.package_version)
+                        <= package_version(&self.package.package_version)
+                {
+                    return Err(package_update_refused());
+                }
+                let current = reader(&package, true)?;
+                if current.actor_count != 0
+                    || !current.windows.is_empty()
+                    || current.identity.app_id != package.app_id
+                    || current.identity.package_version != package.package_version
+                    || !valid_hash(&current.identity.entrypoint_sha256)
+                    || current.identity.session_id == 0
+                    || !current.identity.owner_sid.starts_with("S-")
+                    || current.identity.owner_sid.len() > 256
+                    || self.binding.as_ref().is_some_and(|prior| {
+                        prior.identity.app_id != current.identity.app_id
+                            || prior.identity.session_id != current.identity.session_id
+                            || prior.identity.owner_sid != current.identity.owner_sid
+                            || prior.codex_home != current.codex_home
+                            || prior.runtime_directory != current.runtime_directory
+                    })
+                {
+                    return Err(package_update_refused());
+                }
+                self.package = package;
+                self.binding = Some(current.clone());
+                current
+            }
+        };
+        if snapshot.identity.app_id != self.package.app_id
+            || snapshot.identity.package_version != self.package.package_version
+            || self.binding.as_ref().is_some_and(|prior| {
+                prior.identity != snapshot.identity
+                    || prior.codex_home != snapshot.codex_home
+                    || prior.runtime_directory != snapshot.runtime_directory
+            })
+        {
+            return Err(refuse());
+        }
+        self.actors_observed |= snapshot.actor_count != 0;
+        if self.binding.is_none() {
+            self.binding = Some(snapshot.clone());
+        }
+        Ok(snapshot)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn inspect(&mut self) -> Result<Snapshot> {
+        self.observe_with(inspect_package, resolve_package)
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn resolve_package() -> Result<Option<Package>> {
+    parse_package(&powershell(
+        include_str!("windows_desktop_resolve.ps1"),
+        &[],
+    )?)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -461,12 +638,22 @@ pub(crate) fn protect_directory(directory: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-pub(crate) fn inspect(app_id: &str, install_location: &Path) -> Result<Snapshot> {
+fn inspect_package(package: &Package, require_no_actors: bool) -> Result<Snapshot> {
     let output = powershell(
         include_str!("windows_desktop_inspect.ps1"),
         &[
-            ("SAIAI_RUNTIME_APP_ID", std::ffi::OsStr::new(app_id)),
-            ("SAIAI_RUNTIME_PACKAGE_ROOT", install_location.as_os_str()),
+            (
+                "SAIAI_RUNTIME_APP_ID",
+                std::ffi::OsStr::new(&package.app_id),
+            ),
+            (
+                "SAIAI_RUNTIME_PACKAGE_ROOT",
+                package.install_location.as_os_str(),
+            ),
+            (
+                "SAIAI_RUNTIME_REQUIRE_NO_ACTORS",
+                std::ffi::OsStr::new(if require_no_actors { "1" } else { "0" }),
+            ),
         ],
     )?;
     let mut snapshot: Snapshot = serde_json::from_str(output.trim()).map_err(|_| {
@@ -492,7 +679,9 @@ mod tests {
             let encoded = format!(
                 "{HELPER_FAILURE_PREFIX}{{\"reason\":\"{reason}\",\"category\":\"ObjectNotFound\"}}"
             );
-            let diagnostic = helper_failure_diagnostic(encoded.as_bytes()).unwrap();
+            let diagnostic = helper_failure_diagnostic(encoded.as_bytes())
+                .unwrap()
+                .to_string();
             assert!(diagnostic.contains(reason));
             assert!(diagnostic.contains("ObjectNotFound"));
         }
@@ -557,6 +746,373 @@ mod tests {
             window: snapshot.windows[0].clone(),
         };
         (snapshot, profile, receipt)
+    }
+
+    fn package_fixture() -> (Package, Snapshot, Package, Snapshot) {
+        let (mut initial, _, _) = fixture();
+        initial.actor_count = 0;
+        initial.windows.clear();
+        let previous = Package {
+            app_id: initial.identity.app_id.clone(),
+            install_location: PathBuf::from("C:/TEST_ONLY/previous"),
+            package_version: initial.identity.package_version.clone(),
+        };
+        let next = Package {
+            install_location: PathBuf::from("C:/TEST_ONLY/next"),
+            package_version: "26.930.4958.0".into(),
+            ..previous.clone()
+        };
+        let mut current = initial.clone();
+        current.identity.package_version = next.package_version.clone();
+        current.identity.entrypoint_sha256 = "c".repeat(64);
+        (previous, initial, next, current)
+    }
+
+    fn package_failure(reason: &str) -> anyhow::Error {
+        anyhow::anyhow!("Windows Desktop helper failed").context(HelperFailure {
+            reason: reason.into(),
+            category: "OperationStopped".into(),
+        })
+    }
+
+    #[test]
+    fn package_resolution_is_bounded_and_rejects_untrusted_shapes_without_raw_output() {
+        assert!(parse_package("null").unwrap().is_none());
+        let (package, _, _, _) = package_fixture();
+        let encoded = serde_json::json!({
+            "app_id":package.app_id,"install_location":package.install_location,
+            "package_version":package.package_version,
+        });
+        assert_eq!(parse_package(&encoded.to_string()).unwrap(), Some(package));
+        for (field, value) in [
+            ("app_id", "TEST_ONLY_PRIVATE"),
+            ("package_version", "26.930"),
+            ("package_version", "26.930.4958.65536"),
+            ("package_version", "26.930.-1.0"),
+            ("install_location", ""),
+            ("private", "TEST_ONLY_PRIVATE"),
+        ] {
+            let mut invalid = encoded.clone();
+            invalid[field] = value.into();
+            let error = parse_package(&invalid.to_string()).unwrap_err();
+            assert!(!format!("{error:#}").contains("TEST_ONLY_PRIVATE"));
+        }
+        assert!(parse_package(&"x".repeat(RECEIPT_LIMIT as usize + 1)).is_err());
+        assert!(parse_package("TEST_ONLY_PRIVATE").is_err());
+    }
+
+    #[test]
+    fn package_observer_refreshes_one_empty_context_and_preserves_window_guards() {
+        for has_initial_snapshot in [false, true] {
+            let (previous, initial, next, current) = package_fixture();
+            let mut observer = PackageObserver::new(previous.clone());
+            if has_initial_snapshot {
+                observer
+                    .observe_with(
+                        |_, strict| {
+                            assert!(!strict);
+                            Ok(initial.clone())
+                        },
+                        || panic!("unexpected resolution"),
+                    )
+                    .unwrap();
+            }
+            let mut reads = 0;
+            let result = observer
+                .observe_with(
+                    |package, strict| {
+                        reads += 1;
+                        if package == &previous {
+                            assert!(!strict);
+                            return Err(package_failure("official_package_root_changed"));
+                        }
+                        assert_eq!(package, &next);
+                        assert!(strict);
+                        Ok(current.clone())
+                    },
+                    || Ok(Some(next.clone())),
+                )
+                .unwrap();
+            assert_eq!(reads, 2);
+            assert_eq!(observer.identity().unwrap(), &current.identity);
+            assert_eq!(result.actor_count, 0);
+            assert!(observer.refresh_used);
+
+            let (_, profile, receipt) = fixture();
+            let mut launched = current.clone();
+            launched.actor_count = 1;
+            launched.windows = vec![receipt.window.clone()];
+            let observed = observer
+                .observe_with(
+                    |package, strict| {
+                        assert_eq!(package, &next);
+                        assert!(!strict);
+                        Ok(launched.clone())
+                    },
+                    || panic!("unexpected resolution"),
+                )
+                .unwrap();
+            let pins = receipt.window.spki.as_deref().unwrap();
+            assert!(
+                accept_window(
+                    &observed,
+                    observer.identity().unwrap(),
+                    &profile,
+                    pins,
+                    &Decision::Cold,
+                    1
+                )
+                .unwrap()
+                .is_some()
+            );
+            for field in ["proxy", "spki", "started_filetime", "unsafe_overrides"] {
+                let mut invalid = launched.clone();
+                match field {
+                    "proxy" => invalid.windows[0].proxy = Some("http://127.0.0.1:1".into()),
+                    "spki" => invalid.windows[0].spki = Some("bad-pin".into()),
+                    "started_filetime" => invalid.windows[0].started_filetime = "0".into(),
+                    _ => invalid.windows[0].unsafe_overrides = true,
+                }
+                assert!(
+                    accept_window(
+                        &invalid,
+                        observer.identity().unwrap(),
+                        &profile,
+                        pins,
+                        &Decision::Cold,
+                        1
+                    )
+                    .is_err()
+                );
+            }
+            assert!(
+                observer
+                    .observe_with(
+                        |_, _| Err(package_failure("official_package_root_changed")),
+                        || panic!("second refresh")
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn package_observer_never_retries_other_failures_or_forged_reason_text() {
+        for reason in HELPER_FAILURE_REASONS {
+            if *reason == "official_package_root_changed" {
+                continue;
+            }
+            let (previous, _, _, _) = package_fixture();
+            let mut observer = PackageObserver::new(previous);
+            let error = observer
+                .observe_with(
+                    |_, _| Err(package_failure(reason)),
+                    || panic!("unexpected resolution"),
+                )
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(reason));
+            assert!(!observer.refresh_used);
+        }
+        let (previous, _, _, _) = package_fixture();
+        let mut observer = PackageObserver::new(previous);
+        assert!(
+            observer
+                .observe_with(
+                    |_, _| Err(anyhow::anyhow!("official_package_root_changed")),
+                    || panic!("forged reason accepted")
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn package_observer_refuses_refresh_after_any_actor_even_if_it_later_exits() {
+        let (previous, mut initial, _, _) = package_fixture();
+        initial.actor_count = 1;
+        let mut observer = PackageObserver::new(previous);
+        observer
+            .observe_with(
+                |_, _| Ok(initial.clone()),
+                || panic!("unexpected resolution"),
+            )
+            .unwrap();
+        initial.actor_count = 0;
+        observer
+            .observe_with(
+                |_, _| Ok(initial.clone()),
+                || panic!("unexpected resolution"),
+            )
+            .unwrap();
+        assert!(
+            observer
+                .observe_with(
+                    |_, _| Err(package_failure("official_package_root_changed")),
+                    || panic!("live context refreshed")
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn package_observer_refresh_requires_same_identity_newer_version_and_zero_actors() {
+        for field in [
+            "actor_count",
+            "windows",
+            "app_id",
+            "session_id",
+            "owner_sid",
+            "codex_home",
+            "runtime_directory",
+            "package_version",
+            "entrypoint_sha256",
+        ] {
+            let (previous, initial, next, mut current) = package_fixture();
+            let (_, _, receipt) = fixture();
+            match field {
+                "actor_count" => current.actor_count = 1,
+                "windows" => current.windows = vec![receipt.window],
+                "app_id" => current.identity.app_id = "OpenAI.Codex_other!App".into(),
+                "session_id" => current.identity.session_id += 1,
+                "owner_sid" => current.identity.owner_sid = "S-1-5-9999".into(),
+                "codex_home" => current.codex_home = "other-home".into(),
+                "runtime_directory" => current.runtime_directory = "other-runtime".into(),
+                "package_version" => {
+                    current.identity.package_version = initial.identity.package_version.clone()
+                }
+                _ => current.identity.entrypoint_sha256 = "invalid".into(),
+            }
+            let mut observer = PackageObserver::new(previous.clone());
+            observer
+                .observe_with(
+                    |_, _| Ok(initial.clone()),
+                    || panic!("unexpected resolution"),
+                )
+                .unwrap();
+            assert!(
+                observer
+                    .observe_with(
+                        |package, _| {
+                            if package == &previous {
+                                Err(package_failure("official_package_root_changed"))
+                            } else {
+                                Ok(current.clone())
+                            }
+                        },
+                        || Ok(Some(next.clone()))
+                    )
+                    .is_err(),
+                "accepted {field}"
+            );
+            assert_eq!(observer.identity().unwrap(), &initial.identity);
+            assert_eq!(observer.package, previous);
+        }
+        for field in [
+            "same_path",
+            "same_version",
+            "downgrade",
+            "invalid_version",
+            "different_app",
+        ] {
+            let (previous, _, mut next, _) = package_fixture();
+            match field {
+                "same_path" => next.install_location = previous.install_location.clone(),
+                "same_version" => next.package_version = previous.package_version.clone(),
+                "downgrade" => next.package_version = "1.0.0.0".into(),
+                "invalid_version" => next.package_version = "invalid".into(),
+                _ => next.app_id = "OpenAI.Codex_other!App".into(),
+            }
+            let mut observer = PackageObserver::new(previous.clone());
+            assert!(
+                observer
+                    .observe_with(
+                        |package, _| {
+                            assert_eq!(package, &previous);
+                            Err(package_failure("official_package_root_changed"))
+                        },
+                        || Ok(Some(next.clone()))
+                    )
+                    .is_err(),
+                "accepted {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_observer_discards_failed_refresh_and_refuses_unannounced_identity_changes() {
+        let (previous, initial, next, current) = package_fixture();
+        let mut observer = PackageObserver::new(previous.clone());
+        observer
+            .observe_with(
+                |_, _| Ok(initial.clone()),
+                || panic!("unexpected resolution"),
+            )
+            .unwrap();
+        assert!(
+            observer
+                .observe_with(
+                    |_, _| Ok(current.clone()),
+                    || panic!("unexpected resolution")
+                )
+                .is_err()
+        );
+        assert_eq!(observer.identity().unwrap(), &initial.identity);
+        let error = observer
+            .observe_with(
+                |package, strict| {
+                    if package == &previous {
+                        return Err(package_failure("official_package_root_changed"));
+                    }
+                    assert!(strict);
+                    Err(package_failure("signed_entrypoint_required"))
+                },
+                || Ok(Some(next.clone())),
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("signed_entrypoint_required"));
+        assert_eq!(observer.package, previous);
+        assert_eq!(observer.identity().unwrap(), &initial.identity);
+        assert!(
+            observer
+                .observe_with(
+                    |_, _| Err(package_failure("official_package_root_changed")),
+                    || panic!("failed refresh retried")
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn package_resolution_and_observation_do_not_activate_or_mutate_desktop() {
+        let resolver = include_str!("windows_desktop_resolve.ps1");
+        assert_eq!(resolver.matches("Get-AppxPackage").count(), 1);
+        assert!(!resolver.contains("Get-StartApps"));
+        for source in [resolver, include_str!("windows_desktop_inspect.ps1")] {
+            for forbidden in [
+                "Stop-Process",
+                "Start-Process",
+                "ActivateApplication",
+                "Set-ItemProperty",
+                "Remove-AppxPackage",
+                "Add-AppxPackage",
+            ] {
+                assert!(!source.contains(forbidden));
+            }
+        }
+        let main = include_str!("main.rs");
+        let launcher = main
+            .split("fn run_windows_packaged_desktop(")
+            .nth(1)
+            .unwrap()
+            .split("fn windows_packaged_profile(")
+            .next()
+            .unwrap();
+        assert_eq!(
+            launcher
+                .matches("activate_windows_packaged_desktop(")
+                .count(),
+            1
+        );
+        assert_eq!(launcher.matches("observer.identity()?").count(), 2);
     }
 
     #[test]
@@ -834,7 +1390,7 @@ mod tests {
             .split("pub(crate) fn protect_directory(")
             .nth(1)
             .unwrap()
-            .split("pub(crate) fn inspect(")
+            .split("fn inspect_package(")
             .next()
             .unwrap();
         assert!(!initialization.contains("fs::create_dir_all"));
@@ -962,9 +1518,25 @@ mod tests {
         );
         let output = powershell(&script, &[]).unwrap();
         let cases: Vec<serde_json::Value> = serde_json::from_str(output.trim()).unwrap();
-        assert_eq!(cases.len(), 15);
+        assert_eq!(cases.len(), 27);
         for case in cases {
             assert_eq!(case["passed"], true, "observer fixture: {}", case["name"]);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_resolver_reads_one_trusted_package_without_separate_start_app_lookup() {
+        let script = include_str!("windows_desktop_resolve_tests.ps1").replace(
+            "__RESOLVER_SOURCE__",
+            &base64::engine::general_purpose::STANDARD
+                .encode(include_str!("windows_desktop_resolve.ps1")),
+        );
+        let output = powershell(&script, &[]).unwrap();
+        let cases: Vec<serde_json::Value> = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(cases.len(), 7);
+        for case in cases {
+            assert_eq!(case["passed"], true, "resolver fixture: {}", case["name"]);
         }
     }
 
