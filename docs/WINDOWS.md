@@ -109,6 +109,9 @@ Desktop 的 i18n Statsig layer。SAIAI 在 loopback sidecar 内对精确的 Stat
 Renderer 异常。代理返回 200、模型目录加载或 app-server 的 `account/read` 成功，
 都不能单独证明界面可用；某些版本会读取版本化账户响应中的
 `account_ordering`。日志中 URL 的 query 可能含敏感信息，分享前必须脱敏。
+Desktop 26.930 的插件首页还要求 `/ps/plugins/home` 返回 `sections` 数组；
+本地 sidecar 返回空分区，不启用 hosted 插件。插件列表的 `plugins` 数组不能代替
+此结构，否则 composer 可因 `sections.find(...)` 显示同一错误页。
 远程 SSH 会话不是交互式桌面会话，不能用其截图判断用户界面。升级 AppX 前确认
 可恢复路径，因为 Windows 可能移除旧包。
 

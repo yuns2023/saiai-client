@@ -1938,7 +1938,8 @@ fn run_windows_packaged_desktop(
         if std::time::Instant::now() >= deadline {
             bail!("Signed Windows Desktop window was not observed before the startup deadline");
         }
-        let current = windows_desktop_runtime::inspect(&package.app_id, &package.install_location)?;
+        let current = windows_desktop_runtime::inspect(&package.app_id, &package.install_location)
+            .context("Could not inspect the newly activated Windows Desktop")?;
         if let Some(observed) = windows_desktop_runtime::accept_window(
             &current,
             &snapshot.identity,
@@ -1946,13 +1947,16 @@ fn run_windows_packaged_desktop(
             &spki,
             &decision,
             not_before,
-        )? {
+        )
+        .context("Could not verify the newly activated Windows Desktop window")?
+        {
             break observed;
         }
         std::thread::sleep(Duration::from_millis(300));
     };
     std::thread::sleep(Duration::from_millis(300));
-    let stable = windows_desktop_runtime::inspect(&package.app_id, &package.install_location)?;
+    let stable = windows_desktop_runtime::inspect(&package.app_id, &package.install_location)
+        .context("Could not inspect Windows Desktop after activation settled")?;
     if windows_desktop_runtime::accept_window(
         &stable,
         &snapshot.identity,
@@ -1960,7 +1964,9 @@ fn run_windows_packaged_desktop(
         &spki,
         &decision,
         not_before,
-    )? != Some(observed.clone())
+    )
+    .context("Could not verify Windows Desktop after activation settled")?
+        != Some(observed.clone())
         || windows_packaged_profile(cfg, &codex_home)? != profile
         || local_proxy_chatgpt_spki(&cfg.listen)? != spki
     {

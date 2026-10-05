@@ -1601,6 +1601,12 @@ fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse>
             body: br#"{"plugins":[],"pagination":{"total":0,"limit":200,"offset":0}}"#,
             reason: "desktop_plugins_empty",
         }),
+        "/backend-api/ps/plugins/home" | "/ps/plugins/home" => Some(StaticResponse {
+            status: StatusCode::OK,
+            content_type: "application/json",
+            body: br#"{"sections":[]}"#,
+            reason: "desktop_plugin_home_empty",
+        }),
         "/backend-api/ps/plugins/suggested/codex" => Some(StaticResponse {
             status: StatusCode::OK,
             content_type: "application/json",
@@ -2309,6 +2315,41 @@ mod tests {
         let body: Value = serde_json::from_slice(response.body).unwrap();
         assert_eq!(body["plugins"], json!([]));
         assert_eq!(body["enabled"], false);
+    }
+
+    #[test]
+    fn desktop_plugin_home_has_sections_for_renderer_find_without_changing_plugin_lists() {
+        for target in [
+            "/backend-api/ps/plugins/home",
+            "/backend-api/ps/plugins/home?scope=GLOBAL",
+            "/ps/plugins/home",
+            "/ps/plugins/home?scope=GLOBAL",
+        ] {
+            let request = IncomingRequest {
+                method: "GET".to_string(),
+                target: target.to_string(),
+                http_version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            };
+            let response = chatgpt_sidecar_response(&request).unwrap();
+            assert_eq!(response.status, StatusCode::OK);
+            assert_eq!(response.reason, "desktop_plugin_home_empty");
+            let body: Value = serde_json::from_slice(response.body).unwrap();
+            assert_eq!(body, json!({ "sections": [] }));
+        }
+        let request = IncomingRequest {
+            method: "GET".to_string(),
+            target: "/backend-api/ps/plugins/list".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let response = chatgpt_sidecar_response(&request).unwrap();
+        assert_eq!(response.reason, "desktop_plugins_empty");
+        let body: Value = serde_json::from_slice(response.body).unwrap();
+        assert_eq!(body["plugins"], json!([]));
+        assert!(body.get("sections").is_none());
     }
 
     #[test]
