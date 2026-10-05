@@ -13,6 +13,7 @@ if ($appId -cne $env:SAIAI_RUNTIME_APP_ID -or [IO.Path]::GetFullPath($package.In
 $entrypoint = Join-Path $root 'app\ChatGPT.exe'
 if ([string](Get-AuthenticodeSignature -LiteralPath $entrypoint).Status -ne 'Valid') { throw 'signed_entrypoint_required' }
 $hash = (Get-FileHash -LiteralPath $entrypoint -Algorithm SHA256).Hash.ToLowerInvariant()
+function Read-ActorSnapshot {
 $processes = @(Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue)
 if ($processes.Count -gt 64) { throw 'bounded_actor_inventory_required' }
 $relevant = @()
@@ -24,6 +25,7 @@ foreach ($process in $processes) {
 }
 $windows = @()
 if ($relevant.Count) {
+    if (-not ('SaiaiRuntimeArguments' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -47,9 +49,14 @@ public static class SaiaiRuntimeArguments {
     }
 }
 '@
+    }
     foreach ($process in $relevant) {
         $native = Get-CimInstance Win32_Process -Filter ('ProcessId='+$process.Id) -OperationTimeoutSec 3
-        if (-not $native -or $native.CommandLine.Length -gt 8192) { throw 'live_actor_inspection_required' }
+        if (-not $native) {
+            if ($process.HasExited) { return $null }
+            throw 'live_actor_inspection_required'
+        }
+        if ($native.CommandLine.Length -gt 8192) { throw 'bounded_actor_command_line_required' }
         $owner = Invoke-CimMethod -InputObject $native -MethodName GetOwnerSid -OperationTimeoutSec 3
         if ($owner.ReturnValue -ne 0 -or $owner.Sid -ne $sid) { throw 'same_user_actor_required' }
         $arguments = @([SaiaiRuntimeArguments]::Split([string]$native.CommandLine))
@@ -88,10 +95,19 @@ public static class SaiaiRuntimeArguments {
         }
     }
 }
+return @{actor_count=$relevant.Count;windows=@($windows)}
+}
+$snapshot = $null
+for ($attempt = 0; $attempt -lt 3; $attempt++) {
+    $snapshot = Read-ActorSnapshot
+    if ($null -ne $snapshot) { break }
+    if ($attempt -lt 2) { Start-Sleep -Milliseconds 100 }
+}
+if ($null -eq $snapshot) { throw 'actor_inventory_did_not_settle' }
 @{
     identity=@{app_id=$appId;package_version=[string]$package.Version;entrypoint_sha256=$hash;session_id=$session;owner_sid=$sid}
     codex_home=Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex'
     runtime_directory=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'SAIAI\desktop-runtime'
-    actor_count=$relevant.Count
-    windows=@($windows)
+    actor_count=$snapshot.actor_count
+    windows=@($snapshot.windows)
 } | ConvertTo-Json -Depth 6 -Compress
