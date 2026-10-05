@@ -104,6 +104,11 @@ jobs:
         if: runner.os != 'Linux'
         run: cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml --release --target ${{ matrix.target }}
 
+      - name: Verify native Windows Desktop runtime
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml windows_desktop_runtime::tests -- --test-threads=1
+
       - name: Verify reproducible Windows image
         if: runner.os == 'Windows'
         run: python scripts/saiai-cli/verify-windows-reproducibility.py tools/saiai-cli/target/${{ matrix.target }}/release/saiai.exe
