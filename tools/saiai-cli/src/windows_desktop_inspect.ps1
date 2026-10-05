@@ -7,23 +7,43 @@ $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $packages = @(Get-AppxPackage -Name OpenAI.Codex)
 if ($packages.Count -ne 1) { throw 'single_official_package_required' }
 $package = $packages[0]
-$root = [IO.Path]::GetFullPath($env:SAIAI_RUNTIME_PACKAGE_ROOT)
+$root = [IO.Path]::GetFullPath($package.InstallLocation)
 $appId = $package.PackageFamilyName+'!App'
-if ($appId -cne $env:SAIAI_RUNTIME_APP_ID -or [IO.Path]::GetFullPath($package.InstallLocation) -ine $root -or $package.Publisher -ne 'CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B' -or [string]$package.SignatureKind -ne 'Store' -or [string]$package.Status -ne 'Ok') { throw 'official_package_identity_required' }
+if ($appId -cne $env:SAIAI_RUNTIME_APP_ID) { throw 'official_package_app_id_required' }
+if ($package.Publisher -ne 'CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B') { throw 'official_package_publisher_required' }
+if ([string]$package.SignatureKind -ne 'Store') { throw 'official_package_store_signature_required' }
+if ([string]$package.Status -ne 'Ok') { throw 'official_package_not_ready' }
 $entrypoint = Join-Path $root 'app\ChatGPT.exe'
 if ([string](Get-AuthenticodeSignature -LiteralPath $entrypoint).Status -ne 'Valid') { throw 'signed_entrypoint_required' }
+if ($root -ine [IO.Path]::GetFullPath($env:SAIAI_RUNTIME_PACKAGE_ROOT)) { throw 'official_package_root_changed' }
 $hash = (Get-FileHash -LiteralPath $entrypoint -Algorithm SHA256).Hash.ToLowerInvariant()
+function Read-ActorIdentity($process) {
+    try {
+        if ($process.HasExited) { return $null }
+        $identity = @{name=$process.ProcessName;path=$process.Path;session=$process.SessionId}
+        if ($process.HasExited) { return $null }
+        return $identity
+    } catch {
+        if ($process.HasExited) { return $null }
+        throw
+    }
+}
+function Read-ActorSnapshot {
 $processes = @(Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue)
 if ($processes.Count -gt 64) { throw 'bounded_actor_inventory_required' }
+if ($env:SAIAI_RUNTIME_REQUIRE_NO_ACTORS -ceq '1' -and $processes.Count) { throw 'package_refresh_requires_no_actors' }
 $relevant = @()
 foreach ($process in $processes) {
-    if ($process.ProcessName -eq 'ChatGPT' -or $process.Path -ieq (Join-Path $root 'app\Codex.exe')) {
-        if ($process.SessionId -ne $session -or $process.Path -notin @($entrypoint,(Join-Path $root 'app\Codex.exe'))) { throw 'unknown_or_foreign_actor' }
-        $relevant += $process
+    $identity = Read-ActorIdentity $process
+    if ($null -eq $identity) { return $null }
+    if ($identity.name -eq 'ChatGPT' -or $identity.path -ieq (Join-Path $root 'app\Codex.exe')) {
+        if ($identity.session -ne $session -or $identity.path -notin @($entrypoint,(Join-Path $root 'app\Codex.exe'))) { throw 'unknown_or_foreign_actor' }
+        $relevant += @{process=$process;identity=$identity}
     }
 }
 $windows = @()
 if ($relevant.Count) {
+    if (-not ('SaiaiRuntimeArguments' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -47,13 +67,19 @@ public static class SaiaiRuntimeArguments {
     }
 }
 '@
-    foreach ($process in $relevant) {
+    }
+    foreach ($actor in $relevant) {
+        $process = $actor.process
         $native = Get-CimInstance Win32_Process -Filter ('ProcessId='+$process.Id) -OperationTimeoutSec 3
-        if (-not $native -or $native.CommandLine.Length -gt 8192) { throw 'live_actor_inspection_required' }
+        if (-not $native) {
+            if ($process.HasExited) { return $null }
+            throw 'live_actor_inspection_required'
+        }
+        if ($native.CommandLine.Length -gt 8192) { throw 'bounded_actor_command_line_required' }
         $owner = Invoke-CimMethod -InputObject $native -MethodName GetOwnerSid -OperationTimeoutSec 3
         if ($owner.ReturnValue -ne 0 -or $owner.Sid -ne $sid) { throw 'same_user_actor_required' }
         $arguments = @([SaiaiRuntimeArguments]::Split([string]$native.CommandLine))
-        if ($process.Path -ine $entrypoint -or @($arguments | Where-Object {$_ -like '--type=*'}).Count) { continue }
+        if ($actor.identity.path -ine $entrypoint -or @($arguments | Where-Object {$_ -like '--type=*'}).Count) { continue }
         $proxy = @($arguments | Where-Object {$_.StartsWith('--proxy-server=',[StringComparison]::Ordinal)})
         $pins = @($arguments | Where-Object {$_.StartsWith('--ignore-certificate-errors-spki-list=',[StringComparison]::Ordinal)})
         $unsafe = @($arguments | Where-Object {
@@ -88,10 +114,19 @@ public static class SaiaiRuntimeArguments {
         }
     }
 }
+return @{actor_count=$relevant.Count;windows=@($windows)}
+}
+$snapshot = $null
+for ($attempt = 0; $attempt -lt 3; $attempt++) {
+    $snapshot = Read-ActorSnapshot
+    if ($null -ne $snapshot) { break }
+    if ($attempt -lt 2) { Start-Sleep -Milliseconds 100 }
+}
+if ($null -eq $snapshot) { throw 'actor_inventory_did_not_settle' }
 @{
     identity=@{app_id=$appId;package_version=[string]$package.Version;entrypoint_sha256=$hash;session_id=$session;owner_sid=$sid}
     codex_home=Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex'
     runtime_directory=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'SAIAI\desktop-runtime'
-    actor_count=$relevant.Count
-    windows=@($windows)
+    actor_count=$snapshot.actor_count
+    windows=@($snapshot.windows)
 } | ConvertTo-Json -Depth 6 -Compress

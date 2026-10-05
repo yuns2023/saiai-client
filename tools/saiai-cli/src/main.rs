@@ -1873,7 +1873,8 @@ fn run_windows_packaged_desktop(
         );
     }
     let profile = windows_packaged_profile(cfg, &codex_home)?;
-    let initial = windows_desktop_runtime::inspect(&package.app_id, &package.install_location)?;
+    let mut observer = windows_desktop_runtime::PackageObserver::new(package.clone());
+    let initial = observer.inspect()?;
     let directory = PathBuf::from(&initial.runtime_directory);
     let receipt_path = directory.join("instance.json");
     let receipt = if initial.actor_count == 0 {
@@ -1884,7 +1885,7 @@ fn run_windows_packaged_desktop(
     windows_desktop_runtime::decide(&initial, &profile, receipt.as_ref())?;
     windows_desktop_runtime::protect_directory(&directory)?;
     let _launch_lock = windows_desktop_runtime::lock(&directory)?;
-    let snapshot = windows_desktop_runtime::inspect(&package.app_id, &package.install_location)?;
+    let snapshot = observer.inspect()?;
     if snapshot.runtime_directory != initial.runtime_directory {
         bail!("Windows Desktop runtime directory changed during startup");
     }
@@ -1921,9 +1922,8 @@ fn run_windows_packaged_desktop(
     };
     let activation_args =
         windows_packaged_desktop_activation_args(&proxy, &spki, target.as_deref());
-    let before = windows_desktop_runtime::inspect(&package.app_id, &package.install_location)?;
-    if before.identity != snapshot.identity
-        || windows_packaged_profile(cfg, &codex_home)? != profile
+    let before = observer.inspect()?;
+    if windows_packaged_profile(cfg, &codex_home)? != profile
         || windows_desktop_runtime::decide(&before, &profile, receipt.as_ref())? != decision
         || local_proxy_chatgpt_spki(&cfg.listen)? != spki
     {
@@ -1938,29 +1938,37 @@ fn run_windows_packaged_desktop(
         if std::time::Instant::now() >= deadline {
             bail!("Signed Windows Desktop window was not observed before the startup deadline");
         }
-        let current = windows_desktop_runtime::inspect(&package.app_id, &package.install_location)?;
+        let current = observer
+            .inspect()
+            .context("Could not inspect the newly activated Windows Desktop")?;
         if let Some(observed) = windows_desktop_runtime::accept_window(
             &current,
-            &snapshot.identity,
+            observer.identity()?,
             &profile,
             &spki,
             &decision,
             not_before,
-        )? {
+        )
+        .context("Could not verify the newly activated Windows Desktop window")?
+        {
             break observed;
         }
         std::thread::sleep(Duration::from_millis(300));
     };
     std::thread::sleep(Duration::from_millis(300));
-    let stable = windows_desktop_runtime::inspect(&package.app_id, &package.install_location)?;
+    let stable = observer
+        .inspect()
+        .context("Could not inspect Windows Desktop after activation settled")?;
     if windows_desktop_runtime::accept_window(
         &stable,
-        &snapshot.identity,
+        observer.identity()?,
         &profile,
         &spki,
         &decision,
         not_before,
-    )? != Some(observed.clone())
+    )
+    .context("Could not verify Windows Desktop after activation settled")?
+        != Some(observed.clone())
         || windows_packaged_profile(cfg, &codex_home)? != profile
         || local_proxy_chatgpt_spki(&cfg.listen)? != spki
     {
@@ -2308,48 +2316,11 @@ fn resolve_windows_desktop_executable() -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
-struct WindowsPackagedDesktop {
-    app_id: String,
-    install_location: PathBuf,
-}
+type WindowsPackagedDesktop = windows_desktop_runtime::Package;
 
 #[cfg(target_os = "windows")]
 fn resolve_windows_packaged_desktop() -> Result<Option<WindowsPackagedDesktop>> {
-    let app_id = command_output(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Get-StartApps | Where-Object AppID -Like 'OpenAI.Codex_*!App' | Select-Object -First 1 -ExpandProperty AppID",
-        ],
-    )?;
-    if app_id.trim().is_empty() {
-        return Ok(None);
-    }
-    let install_location = command_output(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Get-AppxPackage -Name 'OpenAI.Codex' | Sort-Object Version -Descending | Select-Object -First 1 -ExpandProperty InstallLocation",
-        ],
-    )?;
-    if install_location.trim().is_empty() {
-        return Ok(None);
-    }
-    let install_location = PathBuf::from(install_location.trim());
-    if !install_location.is_dir() {
-        bail!(
-            "OpenAI.Codex AppX install location is unavailable: {}",
-            install_location.display()
-        );
-    }
-    Ok(Some(WindowsPackagedDesktop {
-        app_id: app_id.trim().to_string(),
-        install_location,
-    }))
+    windows_desktop_runtime::resolve_package()
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -8352,7 +8323,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             .split("let target = if matches!(decision, windows_desktop_runtime::Decision::Cold) {")
             .nth(1)
             .unwrap()
-            .split("let before = windows_desktop_runtime::inspect")
+            .split("let before = observer.inspect")
             .next()
             .unwrap();
         assert!(branch.contains("Some(codex_new_thread_url(&workspace))"));

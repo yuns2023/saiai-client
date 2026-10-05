@@ -122,7 +122,12 @@ jobs:
         with:
           workspaces: tools/saiai-cli -> target
 
+      - name: Verify native Windows Desktop runtime
+        shell: bash
+        run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml windows_desktop_runtime::tests -- --test-threads=1
+
       - name: Test and build native Windows client
+        shell: bash
         run: |
           cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml
           cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml
