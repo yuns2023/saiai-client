@@ -7,15 +7,20 @@ $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $packages = @(Get-AppxPackage -Name OpenAI.Codex)
 if ($packages.Count -ne 1) { throw 'single_official_package_required' }
 $package = $packages[0]
-$root = [IO.Path]::GetFullPath($env:SAIAI_RUNTIME_PACKAGE_ROOT)
+$root = [IO.Path]::GetFullPath($package.InstallLocation)
 $appId = $package.PackageFamilyName+'!App'
-if ($appId -cne $env:SAIAI_RUNTIME_APP_ID -or [IO.Path]::GetFullPath($package.InstallLocation) -ine $root -or $package.Publisher -ne 'CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B' -or [string]$package.SignatureKind -ne 'Store' -or [string]$package.Status -ne 'Ok') { throw 'official_package_identity_required' }
+if ($appId -cne $env:SAIAI_RUNTIME_APP_ID) { throw 'official_package_app_id_required' }
+if ($package.Publisher -ne 'CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B') { throw 'official_package_publisher_required' }
+if ([string]$package.SignatureKind -ne 'Store') { throw 'official_package_store_signature_required' }
+if ([string]$package.Status -ne 'Ok') { throw 'official_package_not_ready' }
 $entrypoint = Join-Path $root 'app\ChatGPT.exe'
 if ([string](Get-AuthenticodeSignature -LiteralPath $entrypoint).Status -ne 'Valid') { throw 'signed_entrypoint_required' }
+if ($root -ine [IO.Path]::GetFullPath($env:SAIAI_RUNTIME_PACKAGE_ROOT)) { throw 'official_package_root_changed' }
 $hash = (Get-FileHash -LiteralPath $entrypoint -Algorithm SHA256).Hash.ToLowerInvariant()
 function Read-ActorSnapshot {
 $processes = @(Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue)
 if ($processes.Count -gt 64) { throw 'bounded_actor_inventory_required' }
+if ($env:SAIAI_RUNTIME_REQUIRE_NO_ACTORS -ceq '1' -and $processes.Count) { throw 'package_refresh_requires_no_actors' }
 $relevant = @()
 foreach ($process in $processes) {
     if ($process.ProcessName -eq 'ChatGPT' -or $process.Path -ieq (Join-Path $root 'app\Codex.exe')) {
