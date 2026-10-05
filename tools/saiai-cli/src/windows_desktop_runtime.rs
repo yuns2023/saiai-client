@@ -19,6 +19,8 @@ const HELPER_FAILURE_REASONS: &[&str] = &[
     "bounded_actor_inventory_required",
     "unknown_or_foreign_actor",
     "live_actor_inspection_required",
+    "bounded_actor_command_line_required",
+    "actor_inventory_did_not_settle",
     "same_user_actor_required",
     "bounded_command_arguments_required",
     "actor_changed_during_inspection",
@@ -950,6 +952,22 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn native_observer_rebuilds_only_after_confirmed_actor_exit() {
+        let script = include_str!("windows_desktop_inspect_tests.ps1").replace(
+            "__OBSERVER_SOURCE__",
+            &base64::engine::general_purpose::STANDARD
+                .encode(include_str!("windows_desktop_inspect.ps1")),
+        );
+        let output = powershell(&script, &[]).unwrap();
+        let cases: Vec<serde_json::Value> = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(cases.len(), 15);
+        for case in cases {
+            assert_eq!(case["passed"], true, "observer fixture: {}", case["name"]);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn linked_runtime_paths_are_rejected_without_modifying_targets() {
@@ -989,6 +1007,39 @@ mod tests {
         ] {
             assert!(source.contains(required));
         }
+    }
+
+    #[test]
+    fn actor_observer_retry_is_bounded_and_discards_partial_snapshots() {
+        let source = include_str!("windows_desktop_inspect.ps1");
+        for required in [
+            "function Read-ActorSnapshot",
+            "if ($process.HasExited) { return $null }",
+            "throw 'live_actor_inspection_required'",
+            "throw 'bounded_actor_command_line_required'",
+            "$attempt -lt 3",
+            "$snapshot = Read-ActorSnapshot",
+            "Start-Sleep -Milliseconds 100",
+            "throw 'actor_inventory_did_not_settle'",
+            "actor_count=$snapshot.actor_count",
+            "windows=@($snapshot.windows)",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing observer guard: {required}"
+            );
+        }
+        let snapshot = source
+            .split("function Read-ActorSnapshot {")
+            .nth(1)
+            .unwrap();
+        assert!(
+            snapshot.find("$relevant = @()").unwrap()
+                < snapshot.find("$process.HasExited").unwrap()
+        );
+        assert!(
+            snapshot.find("$windows = @()").unwrap() < snapshot.find("$process.HasExited").unwrap()
+        );
     }
 
     #[test]
