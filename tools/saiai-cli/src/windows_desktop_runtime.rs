@@ -301,6 +301,7 @@ fn powershell_with_failure(
     command
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .envs(variables.iter().copied())
+        .env_remove("PSModulePath")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -757,6 +758,17 @@ mod tests {
             fs::read(&marker).unwrap(),
             b"owned-inherited-runtime-fixture"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_powershell_uses_its_own_module_path() {
+        let output = powershell(
+            "$ErrorActionPreference='Stop';if($env:PSModulePath -like '*TEST_ONLY_INVALID_MODULE_PATH*'){throw 'foreign_module_path_inherited'};Get-Command Get-Acl -ErrorAction Stop|Out-Null;'verified'",
+            &[("PSModulePath", std::ffi::OsStr::new("TEST_ONLY_INVALID_MODULE_PATH"))],
+        )
+        .unwrap();
+        assert_eq!(output.trim(), "verified");
     }
 
     #[cfg(windows)]
