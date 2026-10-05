@@ -33,6 +33,7 @@ use uuid::Uuid;
 mod claude_launcher;
 mod desktop_product;
 mod local_proxy;
+mod vscode;
 #[cfg(any(windows, test))]
 mod windows_desktop_runtime;
 
@@ -637,6 +638,12 @@ fn init_codex(args: InitArgs) -> Result<()> {
     prepare_desktop_onboarding_state(&codex_dir)?;
     #[cfg(target_os = "linux")]
     ensure_direct_linux_desktop_trust(&proxy_init.ca_cert_path);
+    if let Err(error) = configure_vscode_editor_proxy(&proxy_init.listen, &proxy_init.ca_cert_path)
+    {
+        eprintln!(
+            "WARN VSCode editor setup is incomplete: {error:#}; Codex CLI remains configured."
+        );
+    }
 
     println!("SAIAI configured Codex for local-proxy OAuth mode.");
     println!("Updated:");
@@ -658,7 +665,7 @@ fn init_codex(args: InitArgs) -> Result<()> {
         );
     }
     println!(
-        "SAIAI local-proxy OAuth configuration is ready; run `saiai codex` or restart VSCode."
+        "SAIAI local-proxy OAuth configuration is ready; run `saiai codex`. Fully quit and reopen VSCode after its editor setup succeeds."
     );
     warn_claude_settings_overrides();
     start_managed_service_after_initialization(proxy_init.config_changed)?;
@@ -975,10 +982,8 @@ fn find_windows_program(search_path: &OsStr, names: &[&str]) -> Option<PathBuf> 
     None
 }
 
-/// Configure Codex's application-local environment for the official VSCode
-/// extension. Unlike `saiai codex`, the extension is not our direct child, so
-/// the proxy variables must live in Codex's own `.env` file. This never
-/// changes the invoking shell or the operating-system environment.
+/// Configure both the Codex app-server environment and the VSCode editor's
+/// native HTTP route without changing shell or operating-system settings.
 fn configure_vscode() -> Result<()> {
     let codex_dir = codex_config_dir().context("failed to resolve Codex config directory")?;
     fs::create_dir_all(&codex_dir)
@@ -994,6 +999,7 @@ fn configure_vscode() -> Result<()> {
     validate_codex_oauth_auth(&auth_path)?;
     let env_path = codex_dir.join(".env");
     write_codex_ide_env(&env_path, &cfg.listen, &cfg.ca_cert_path)?;
+    configure_vscode_editor_proxy(&cfg.listen, Path::new(&cfg.ca_cert_path))?;
     ensure_local_proxy_running(&cfg.listen)?;
 
     println!("SAIAI configured the Codex VSCode extension for local proxy mode.");
@@ -1004,9 +1010,29 @@ fn configure_vscode() -> Result<()> {
         "  migrated {} Codex config file(s) with backups",
         files.len()
     );
-    println!("Restart VSCode (or reload its window) before starting a new Codex session.");
+    println!("Fully quit and reopen VSCode before starting a new Codex session.");
+    Ok(())
+}
+
+fn configure_vscode_editor_proxy(listen: &str, ca_cert: &Path) -> Result<()> {
+    let home = home_dir().context("failed to resolve VSCode's home directory")?;
+    let paths = vscode::settings_paths(&home);
+    if paths.is_empty() {
+        println!("No existing VSCode user settings directory was found; editor setup was skipped.");
+        return Ok(());
+    }
+    if !vscode::certificate_trust(&home, ca_cert)? {
+        bail!(
+            "VSCode's certificate loader does not trust the SAIAI CA; editor settings were preserved. Establish certificate trust before repeating initialization; TLS verification will not be disabled."
+        );
+    }
+    let changed = vscode::configure(&home, listen)?;
     println!(
-        "If VSCode has an explicit `http.proxy`, remove it when it overrides the SAIAI proxy."
+        "Configured VSCode's editor-wide HTTP proxy ({} settings file(s) updated with backups). Other extensions share this route; the system proxy is unchanged.",
+        changed.len()
+    );
+    println!(
+        "VSCode's certificate loader recognizes the SAIAI CA. TLS verification remains enabled; fully quit and reopen the editor to load the new route."
     );
     Ok(())
 }
@@ -3919,6 +3945,11 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
             cfg.as_ref(),
             matches!(target, DoctorTarget::Codex),
         );
+        if let Some(cfg) = &cfg
+            && (matches!(target, DoctorTarget::Codex) || cfg.providers.codex.is_some())
+        {
+            check_vscode_editor_config(&mut report, cfg);
+        }
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         check_desktop_permission_visibility(&mut report);
         #[cfg(target_os = "linux")]
@@ -3964,6 +3995,40 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
     }
 
     report.finish()
+}
+
+fn check_vscode_editor_config(report: &mut DoctorReport, cfg: &SaiaiConfig) {
+    let Some(home) = home_dir() else {
+        report.warn(
+            "VSCode settings",
+            "could not resolve the current user's home",
+        );
+        return;
+    };
+    let paths = vscode::settings_paths(&home);
+    if paths.is_empty() {
+        return;
+    }
+    for path in paths {
+        match fs::read_to_string(&path)
+            .context("could not read VSCode settings")
+            .and_then(|raw| vscode::validate_settings(&raw, &cfg.listen))
+        {
+            Ok(()) => report.ok("VSCode settings", path.display().to_string()),
+            Err(error) => report.warn(
+                "VSCode settings",
+                format!(
+                    "{}: {error}; repeat SAIAI initialization after resolving explicit conflicts",
+                    path.display()
+                ),
+            ),
+        }
+    }
+    match vscode::certificate_trust(&home, Path::new(&cfg.ca_cert_path)) {
+        Ok(true) => report.ok("VSCode certificate loader", "recognizes the current SAIAI CA; this is not a live UI or model-request test"),
+        Ok(false) => report.warn("VSCode certificate loader", "does not trust the SAIAI CA; Codex's SSL_CERT_FILE in .env does not establish editor-host trust"),
+        Err(error) => report.warn("VSCode certificate loader", error.to_string()),
+    }
 }
 
 struct DoctorReport {

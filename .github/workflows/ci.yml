@@ -46,6 +46,7 @@ jobs:
 
       - name: Verify public release contract
         run: |
+          node --test scripts/saiai-cli/test-vscode-certificates.js
           python3 scripts/saiai-cli/test-release-contract.py
           python3 scripts/saiai-cli/test-installed-codex-desktop-probe.py
           bash scripts/saiai-cli/test-setup-wrappers.sh
@@ -129,6 +130,7 @@ jobs:
       - name: Test and build native Windows client
         shell: bash
         run: |
+          node --test scripts/saiai-cli/test-vscode-certificates.js
           cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml
           cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml
 
@@ -204,6 +206,7 @@ jobs:
 
       - name: Test and build native macOS client
         run: |
+          node --test scripts/saiai-cli/test-vscode-certificates.js
           cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml
           cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml
 

@@ -75,8 +75,14 @@ $savedPath = $env:PATH
 $savedDesktopBin = $env:SAIAI_DESKTOP_BIN
 $savedChatgptTimezone = $env:SAIAI_CHATGPT_TIMEZONE
 $savedDesktopCapture = $env:SAIAI_DESKTOP_CAPTURE
+$savedAppData = $env:APPDATA
+$savedVSCodeAgent = $env:VSCODE_AGENT_FOLDER
+$savedVSCodePortable = $env:VSCODE_PORTABLE
 
 try {
+    $env:APPDATA = Join-Path $temporary "AppData\Roaming"
+    $env:VSCODE_AGENT_FOLDER = Join-Path $temporary ".vscode-server"
+    $env:VSCODE_PORTABLE = $null
     $null = New-Item -ItemType Directory -Path $claudeDir -Force
     [IO.File]::WriteAllText(
         $settingsPath,
@@ -269,6 +275,9 @@ finally {
     $env:SAIAI_DESKTOP_BIN = $savedDesktopBin
     $env:SAIAI_CHATGPT_TIMEZONE = $savedChatgptTimezone
     $env:SAIAI_DESKTOP_CAPTURE = $savedDesktopCapture
+    $env:APPDATA = $savedAppData
+    $env:VSCODE_AGENT_FOLDER = $savedVSCodeAgent
+    $env:VSCODE_PORTABLE = $savedVSCodePortable
     Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
 }
 
