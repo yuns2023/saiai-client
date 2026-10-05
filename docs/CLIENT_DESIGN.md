@@ -321,18 +321,55 @@ Access。修改既有 Desktop state 前会备份，其他 atom 和用户状态�
 支持入口拒绝 `saiai desktop chatgpt`，普通 Chat 后续若恢复必须独立完成账户、历史、
 偏好、模型、资产、计费和多账户亲和性验证，不能与 Codex Desktop 共用“已支持”结论。
 
-`init-codex` 已完成 VSCode 所需配置，之后用户正常启动 VSCode 和官方 Codex 扩展。
-`saiai vscode` 保留为无需再次传入 Gateway/Key 的修复与刷新入口。两者复用 OAuth
+`init-codex` 默认配置 VSCode，不新增 launcher、模式选择或隔离用户目录；之后用户
+仍正常启动 VSCode 和官方 Codex 扩展。已有 `saiai vscode` 仅保留为无需再次传入
+Gateway/Key 的修复与刷新入口，不是新增的必选操作。两者复用 OAuth
 占位、第三方 provider/base URL 清理和备份逻辑，在 `CODEX_HOME/.env` 中写入当前
 loopback HTTP(S) proxy、`NO_PROXY` 和
 `SSL_CERT_FILE`，并按同一平台规则在 Codex 配置中写入
 `features.respect_system_proxy`（Linux 为 `true`，Windows/macOS 为 `false`）；它不
 修改 shell 或系统环境变量，也不写第三方 `base_url`。官方扩展的 Codex app-server
-会读取 `.env` 中的标准代理和 `SSL_CERT_FILE`。实测 Codex 0.153.4 从 `.env` 读取
+会读取 `.env` 中的标准代理和 `SSL_CERT_FILE`，但扩展宿主自己的 Node HTTP 请求
+不会因此继承该文件。实测 Codex 0.153.4 从 `.env` 读取
 代理和 `SSL_CERT_FILE` 后，HTTP 与 WebSocket 均到达隔离本地代理；仅把
 `CODEX_CA_CERTIFICATE` 写入 `.env` 则不足以建立信任，因此 IDE 路径固定使用标准
-TLS 变量，CLI 子进程路径继续使用 `CODEX_CA_CERTIFICATE`。显式 VSCode
-`http.proxy` 可能覆盖扩展子进程的代理变量，命令输出会提示移除冲突设置。
+TLS 变量，CLI 子进程路径继续使用 `CODEX_CA_CERTIFICATE`。
+
+默认初始化还检查已有标准 VSCode、portable 与 VSCode Server 用户设置目录。
+Windows 运行时定位兼容传统安装目录及官方 `bin/code.cmd` 指向的版本化资源目录；
+读取的是当前 launcher 的版本，不猜测残留版本或执行该批处理文件。
+没有发现目录时不创建一个新的编辑器 profile，也不影响 Codex CLI 初始化。在写入
+编辑器配置前，用已安装编辑器的 Node runtime 和 `@vscode/proxy-agent` 检查当前
+SAIAI CA 是否被其证书加载器识别；该检查不启动 GUI、不改信任库、不读取 OAuth，
+也不发送网络或模型请求。检查失败时不改 VSCode 设置，并明确报告编辑器配置未完成；
+CLI 已完成的初始化保持可用。Linux NSS 的 Desktop 信任不能证明 Node 证书加载器
+已信任 CA，不能绕过这项检查。自定义安装路径、未知证书加载器和新版变化应失败关闭，
+不能通过 `http.proxyStrictSSL=false` 或 `NODE_TLS_REJECT_UNAUTHORIZED=0` 解决。
+
+检查通过后，在原有 `settings.json` 中设置 `http.proxy`、`http.proxySupport=override`、
+`http.fetchAdditionalSupport=true`、`http.systemCertificates=true`、
+`http.systemCertificatesNode=false` 和 `http.proxyStrictSSL=true`。
+缺失或空的 `http.noProxy` 会补为 localhost、本机 loopback 和 `.local`，避免扩展宿主
+继承全局 `NO_PROXY=*` 而绕过已配置的代理；已有非空且不排除 Codex 的列表保持不变。
+这使用编辑器原生机制覆盖扩展宿主控制面请求，不改官方扩展代码、shell 环境或系统代理。
+原有 JSONC 注释、尾逗号、其他设置和历史目录保持不变；变更先备份，重复初始化无变更
+时不重新写入。代理端口变化仅更新 SAIAI 注释标记仍与当前值一致的受管配置；已有不同的
+显式代理、用户改过的受管代理、禁用 TLS 校验、排除 ChatGPT 的 `http.noProxy`、重复键、
+无效 JSONC 和 symlink 设置均不被强行覆盖。多个配置文件在写入前统一预检。
+
+这是 **VSCode 整体**的代理设置，不是仅限 Codex 的扩展设置；其他扩展会共享该路由。
+SAIAI 现有非托管 HTTPS CONNECT 行为仍是直连隧道，不能据此宣称保留了用户原有上游
+代理或所有扩展的网络语义。初始化输出必须披露影响范围；不能静默替换另一个显式代理。
+初始化后要求完整退出并重新打开编辑器，窗口 reload 不能代替启动期环境与证书缓存刷新。
+`doctor codex` 只读检查编辑器配置和同一证书加载器，不把这些检查当作真实 UI、MCP、
+历史或模型请求的验收。
+
+VSCode 1.140.0 / Codex 扩展 26.5930.51102 / app-server 0.160.0 的 macOS 原生
+Node runtime 已验证本地控制面读取：加载器的传统模式识别安装 CA，经过本地代理的
+账户检查和任务列表返回 200。该环境的 Node system-certificates 模式没有识别同一 CA，
+因此固定使用已验证的传统加载器；不意味着更改系统信任，也不意味着所有版本完全兼容。
+这仍是网络机制验证，不是完整 VSCode Webview 对照；默认流程候选在原生界面、历史、
+MCP、其他扩展和 Linux/Windows 证书信任闭环完成前不得宣称全部验收或发布。
 
 当前验证覆盖 Linux 官方扩展/app-server 的进程、OAuth 文件、HTTP(S) proxy、CA
 信任和 WebSocket 握手路径。macOS runner 覆盖 LaunchAgent、Info.plist executable
