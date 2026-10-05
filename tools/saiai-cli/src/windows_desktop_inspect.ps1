@@ -17,15 +17,28 @@ $entrypoint = Join-Path $root 'app\ChatGPT.exe'
 if ([string](Get-AuthenticodeSignature -LiteralPath $entrypoint).Status -ne 'Valid') { throw 'signed_entrypoint_required' }
 if ($root -ine [IO.Path]::GetFullPath($env:SAIAI_RUNTIME_PACKAGE_ROOT)) { throw 'official_package_root_changed' }
 $hash = (Get-FileHash -LiteralPath $entrypoint -Algorithm SHA256).Hash.ToLowerInvariant()
+function Read-ActorIdentity($process) {
+    try {
+        if ($process.HasExited) { return $null }
+        $identity = @{name=$process.ProcessName;path=$process.Path;session=$process.SessionId}
+        if ($process.HasExited) { return $null }
+        return $identity
+    } catch {
+        if ($process.HasExited) { return $null }
+        throw
+    }
+}
 function Read-ActorSnapshot {
 $processes = @(Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue)
 if ($processes.Count -gt 64) { throw 'bounded_actor_inventory_required' }
 if ($env:SAIAI_RUNTIME_REQUIRE_NO_ACTORS -ceq '1' -and $processes.Count) { throw 'package_refresh_requires_no_actors' }
 $relevant = @()
 foreach ($process in $processes) {
-    if ($process.ProcessName -eq 'ChatGPT' -or $process.Path -ieq (Join-Path $root 'app\Codex.exe')) {
-        if ($process.SessionId -ne $session -or $process.Path -notin @($entrypoint,(Join-Path $root 'app\Codex.exe'))) { throw 'unknown_or_foreign_actor' }
-        $relevant += $process
+    $identity = Read-ActorIdentity $process
+    if ($null -eq $identity) { return $null }
+    if ($identity.name -eq 'ChatGPT' -or $identity.path -ieq (Join-Path $root 'app\Codex.exe')) {
+        if ($identity.session -ne $session -or $identity.path -notin @($entrypoint,(Join-Path $root 'app\Codex.exe'))) { throw 'unknown_or_foreign_actor' }
+        $relevant += @{process=$process;identity=$identity}
     }
 }
 $windows = @()
@@ -55,7 +68,8 @@ public static class SaiaiRuntimeArguments {
 }
 '@
     }
-    foreach ($process in $relevant) {
+    foreach ($actor in $relevant) {
+        $process = $actor.process
         $native = Get-CimInstance Win32_Process -Filter ('ProcessId='+$process.Id) -OperationTimeoutSec 3
         if (-not $native) {
             if ($process.HasExited) { return $null }
@@ -65,7 +79,7 @@ public static class SaiaiRuntimeArguments {
         $owner = Invoke-CimMethod -InputObject $native -MethodName GetOwnerSid -OperationTimeoutSec 3
         if ($owner.ReturnValue -ne 0 -or $owner.Sid -ne $sid) { throw 'same_user_actor_required' }
         $arguments = @([SaiaiRuntimeArguments]::Split([string]$native.CommandLine))
-        if ($process.Path -ine $entrypoint -or @($arguments | Where-Object {$_ -like '--type=*'}).Count) { continue }
+        if ($actor.identity.path -ine $entrypoint -or @($arguments | Where-Object {$_ -like '--type=*'}).Count) { continue }
         $proxy = @($arguments | Where-Object {$_.StartsWith('--proxy-server=',[StringComparison]::Ordinal)})
         $pins = @($arguments | Where-Object {$_.StartsWith('--ignore-certificate-errors-spki-list=',[StringComparison]::Ordinal)})
         $unsafe = @($arguments | Where-Object {

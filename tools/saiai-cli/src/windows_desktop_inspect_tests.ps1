@@ -5,6 +5,12 @@ $env:SAIAI_RUNTIME_APP_ID = 'OpenAI.Codex_TEST_ONLY!App'
 $env:SAIAI_RUNTIME_PACKAGE_ROOT = $root
 $cases = @(
     'gone_then_valid', 'gone_then_empty', 'gone_then_foreign_owner',
+    'gone_early_path_then_valid', 'gone_early_session_then_valid',
+    'gone_early_throw_then_valid', 'gone_before_metadata_then_valid',
+    'gone_early_path_then_empty', 'gone_early_path_then_foreign_path',
+    'gone_early_path_then_foreign_session', 'gone_early_path_then_pid_reused',
+    'live_path_unavailable', 'live_path_read_failed', 'early_exit_proof_denied',
+    'never_early_settles', 'unrelated_codex',
     'live_missing', 'exit_proof_denied', 'long_command', 'foreign_owner',
     'owner_query_failed', 'foreign_session', 'foreign_path', 'pid_reused',
     'inventory_limit', 'cim_query_failed', 'never_settles',
@@ -38,7 +44,7 @@ try {
 $reports = @(@{name='native_exit_proof';passed=$true})
 foreach ($case in $cases) {
     $reports += & {
-        $state = @{name=$case;reads=0;pauses=0}
+        $state = @{name=$case;reads=0;pauses=0;metadata_reads=0;actors=@{}}
         $env:SAIAI_RUNTIME_REQUIRE_NO_ACTORS = if ($case -like 'refresh_*') { '1' } else { '0' }
         $entrypoint = Join-Path $root 'app\ChatGPT.exe'
         $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -48,9 +54,30 @@ foreach ($case in $cases) {
                 Id=$identifier;ProcessName='ChatGPT';Path=$entrypoint;SessionId=1
                 StartTime=$started.AddSeconds($identifier);MainWindowHandle=[IntPtr]1;HasExited=$exited
             }
-            if ($state.name -eq 'exit_proof_denied') {
+            if ($state.name -in @('exit_proof_denied','early_exit_proof_denied')) {
                 $actor.PSObject.Properties.Remove('HasExited')
                 $actor | Add-Member ScriptProperty HasExited { throw 'TEST_ONLY_PRIVATE_EXIT_PROOF' }
+            }
+            $state.actors[$identifier] = $actor
+            return $actor
+        }
+        function New-EarlyExitActor {
+            $actor = New-FixtureActor 102 ($state.name -eq 'gone_before_metadata_then_valid')
+            if ($state.name -eq 'gone_early_session_then_valid') {
+                $actor.PSObject.Properties.Remove('SessionId')
+                $actor | Add-Member ScriptProperty SessionId {
+                    $state.metadata_reads++
+                    $this.HasExited = $true
+                    return 0
+                }
+            } else {
+                $actor.PSObject.Properties.Remove('Path')
+                $actor | Add-Member ScriptProperty Path {
+                    $state.metadata_reads++
+                    $this.HasExited = $true
+                    if ($state.name -in @('gone_early_throw_then_valid','gone_before_metadata_then_valid')) { throw 'TEST_ONLY_PRIVATE_EXIT_PATH' }
+                    return $null
+                }
             }
             return $actor
         }
@@ -61,7 +88,7 @@ foreach ($case in $cases) {
             if ($Name) {
                 $state.reads++
                 if ($state.name -eq 'refresh_empty') { return @() }
-                if ($state.name -eq 'refresh_unrelated_codex') {
+                if ($state.name -in @('refresh_unrelated_codex','unrelated_codex')) {
                     $actor = New-FixtureActor 201 $false
                     $actor.ProcessName = 'Codex'
                     $actor.Path = 'C:\SAIAI-TEST-ONLY-CLI\codex.exe'
@@ -70,18 +97,27 @@ foreach ($case in $cases) {
                 if ($state.name -eq 'inventory_limit') {
                     return @(1..65 | ForEach-Object { New-FixtureActor (100 + $_) $false })
                 }
-                if ($state.name -eq 'never_settles') { return New-FixtureActor 102 $true }
+                if ($state.name -eq 'never_early_settles') { return New-EarlyExitActor }
+                if ($state.name -eq 'never_settles') { return New-FixtureActor 102 $false }
                 if ($state.name -like 'gone_then_*' -and $state.reads -eq 1) {
-                    return @((New-FixtureActor 101 $false), (New-FixtureActor 102 $true))
+                    return @((New-FixtureActor 101 $false), (New-FixtureActor 102 $false))
                 }
-                if ($state.name -eq 'gone_then_empty') { return @() }
+                if (($state.name -like 'gone_early_*' -or $state.name -eq 'gone_before_metadata_then_valid') -and $state.reads -eq 1) {
+                    return @((New-FixtureActor 101 $false), (New-EarlyExitActor))
+                }
+                if ($state.name -in @('gone_then_empty','gone_early_path_then_empty')) { return @() }
                 $actor = New-FixtureActor 201 $false
-                if ($state.name -eq 'foreign_session') { $actor.SessionId=0 }
-                if ($state.name -eq 'foreign_path') { $actor.Path='C:\SAIAI-FOREIGN-TEST-ONLY\ChatGPT.exe' }
+                if ($state.name -in @('foreign_session','gone_early_path_then_foreign_session')) { $actor.SessionId=0 }
+                if ($state.name -in @('foreign_path','gone_early_path_then_foreign_path')) { $actor.Path='C:\SAIAI-FOREIGN-TEST-ONLY\ChatGPT.exe' }
+                if ($state.name -in @('live_path_unavailable','early_exit_proof_denied')) { $actor.Path=$null }
+                if ($state.name -eq 'live_path_read_failed') {
+                    $actor.PSObject.Properties.Remove('Path')
+                    $actor | Add-Member ScriptProperty Path { throw 'TEST_ONLY_PRIVATE_LIVE_PATH' }
+                }
                 return $actor
             }
             $actor = New-FixtureActor $Id $false
-            if ($state.name -eq 'pid_reused') { $actor.StartTime=$actor.StartTime.AddSeconds(1) }
+            if ($state.name -in @('pid_reused','gone_early_path_then_pid_reused')) { $actor.StartTime=$actor.StartTime.AddSeconds(1) }
             return $actor
         }
         function Get-AppxPackage {
@@ -115,7 +151,8 @@ foreach ($case in $cases) {
             param([string]$ClassName, [string]$Filter, [int]$OperationTimeoutSec)
             if ($state.name -eq 'cim_query_failed') { throw 'TEST_ONLY_PRIVATE_CIM_FAILURE' }
             $identifier = [int]$Filter.Substring('ProcessId='.Length)
-            if ($identifier -eq 102 -or $state.name -in @('live_missing','exit_proof_denied')) { return $null }
+            if ($identifier -eq 102) { $state.actors[$identifier].HasExited=$true; return $null }
+            if ($state.name -in @('live_missing','exit_proof_denied')) { return $null }
             $pins = [Convert]::ToBase64String([byte[]]::new(32))
             $command = '"'+$entrypoint+'" --proxy-server=http://127.0.0.1:19908 --ignore-certificate-errors-spki-list='+$pins
             if ($state.name -eq 'long_command') { $command='x' * 8193 }
@@ -145,10 +182,15 @@ foreach ($case in $cases) {
             'owner_query_failed' { 'same_user_actor_required' }
             'foreign_session' { 'unknown_or_foreign_actor' }
             'foreign_path' { 'unknown_or_foreign_actor' }
+            'gone_early_path_then_foreign_path' { 'unknown_or_foreign_actor' }
+            'gone_early_path_then_foreign_session' { 'unknown_or_foreign_actor' }
+            'live_path_unavailable' { 'unknown_or_foreign_actor' }
             'pid_reused' { 'actor_changed_during_inspection' }
+            'gone_early_path_then_pid_reused' { 'actor_changed_during_inspection' }
             'inventory_limit' { 'bounded_actor_inventory_required' }
             'cim_query_failed' { 'TEST_ONLY_PRIVATE_CIM_FAILURE' }
             'never_settles' { 'actor_inventory_did_not_settle' }
+            'never_early_settles' { 'actor_inventory_did_not_settle' }
             'package_root_changed' { 'official_package_root_changed' }
             'package_app_id_changed' { 'official_package_app_id_required' }
             'package_publisher_changed' { 'official_package_publisher_required' }
@@ -166,16 +208,19 @@ foreach ($case in $cases) {
         $snapshot = $null
         try { $snapshot = (& ([ScriptBlock]::Create($observer))) | ConvertFrom-Json }
         catch { $failure=$_.Exception.Message }
-        if ($state.name -eq 'exit_proof_denied') {
+        if ($state.name -in @('exit_proof_denied','early_exit_proof_denied','live_path_read_failed')) {
             if ($null -eq $failure) { throw 'observer_fixture_exit_proof_accepted' }
         } elseif ($failure -cne $expected) { throw 'observer_fixture_outcome_failed' }
-        $reads = if ($state.name -eq 'never_settles') { 3 } elseif ($state.name -like 'gone_then_*') { 2 } elseif ($state.name -like 'package_*' -or $state.name -like 'changed_root_*' -or $state.name -in @('entrypoint_not_signed','multiple_packages')) { 0 } else { 1 }
+        $reads = if ($state.name -in @('never_settles','never_early_settles')) { 3 } elseif ($state.name -like 'gone_*') { 2 } elseif ($state.name -like 'package_*' -or $state.name -like 'changed_root_*' -or $state.name -in @('entrypoint_not_signed','multiple_packages')) { 0 } else { 1 }
         if ($state.reads -ne $reads -or $state.pauses -ne [Math]::Max(0,($reads - 1))) { throw 'observer_fixture_retry_bound_failed' }
-        if ($state.name -eq 'gone_then_valid') {
+        if ($state.name -eq 'gone_then_valid' -or $state.name -like 'gone_*_then_valid') {
             if ($snapshot.actor_count -ne 1 -or @($snapshot.windows).Count -ne 1 -or $snapshot.windows[0].process_id -ne 201) { throw 'observer_fixture_partial_snapshot_reused' }
             if ($snapshot.windows[0].proxy -ne 'http://127.0.0.1:19908' -or -not $snapshot.windows[0].spki) { throw 'observer_fixture_binding_lost' }
         }
-        if ($state.name -eq 'gone_then_empty' -and ($snapshot.actor_count -ne 0 -or @($snapshot.windows).Count -ne 0)) { throw 'observer_fixture_stale_actor_count' }
+        if ($state.name -in @('gone_then_empty','gone_early_path_then_empty','unrelated_codex') -and ($snapshot.actor_count -ne 0 -or @($snapshot.windows).Count -ne 0)) { throw 'observer_fixture_stale_actor_count' }
+        if ($state.name -eq 'gone_before_metadata_then_valid' -and $state.metadata_reads -ne 0) { throw 'observer_fixture_exited_metadata_read' }
+        if ($state.name -like 'gone_early_*' -and $state.metadata_reads -ne 1) { throw 'observer_fixture_metadata_race_missing' }
+        if ($state.name -eq 'never_early_settles' -and $state.metadata_reads -ne 3) { throw 'observer_fixture_metadata_retry_bound_failed' }
         if ($state.name -eq 'refresh_empty' -and ($snapshot.actor_count -ne 0 -or @($snapshot.windows).Count -ne 0)) { throw 'observer_fixture_refresh_actor_count' }
         return @{name=$state.name;passed=$true;inventory_reads=$state.reads;pauses=$state.pauses}
     }
