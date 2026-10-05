@@ -286,6 +286,8 @@ CA 摘要和进程启动 SPKI 参数，再与受管启动记录及运行代理�
 `Directory.SetAccessControl`，只更新受管所有者和访问规则，不使用会要求
 `SeSecurityPrivilege` 的 PowerShell `Set-Acl`；普通权限终端不需要提权。
 目录权限初始化失败独立报告，不再误报为运行中 Desktop 的实例复用拒绝。
+其 Windows PowerShell 子进程独立初始化 `PSModulePath`，不继承调用方 PowerShell 7
+的模块搜索路径；这不修改父进程或 Windows 系统环境。
 只在确认冷启动窗口后写入记录；
 复用不重写记录或用户历史。冷启动仍通过 `codex://threads/new` 打开当前 workspace；
 已验证的实例复用只发送相同的 proxy/SPKI 激活参数，不再次发送新建对话链接，以保留
