@@ -1518,7 +1518,7 @@ mod tests {
         );
         let output = powershell(&script, &[]).unwrap();
         let cases: Vec<serde_json::Value> = serde_json::from_str(output.trim()).unwrap();
-        assert_eq!(cases.len(), 27);
+        assert_eq!(cases.len(), 40);
         for case in cases {
             assert_eq!(case["passed"], true, "observer fixture: {}", case["name"]);
         }
@@ -1583,10 +1583,14 @@ mod tests {
 
     #[test]
     fn actor_observer_retry_is_bounded_and_discards_partial_snapshots() {
-        let source = include_str!("windows_desktop_inspect.ps1");
+        let source = include_str!("windows_desktop_inspect.ps1").replace("\r\n", "\n");
         for required in [
+            "function Read-ActorIdentity($process)",
             "function Read-ActorSnapshot",
             "if ($process.HasExited) { return $null }",
+            "$identity = Read-ActorIdentity $process",
+            "if ($null -eq $identity) { return $null }",
+            "$relevant += @{process=$process;identity=$identity}",
             "throw 'live_actor_inspection_required'",
             "throw 'bounded_actor_command_line_required'",
             "$attempt -lt 3",
@@ -1607,10 +1611,33 @@ mod tests {
             .unwrap();
         assert!(
             snapshot.find("$relevant = @()").unwrap()
-                < snapshot.find("$process.HasExited").unwrap()
+                < snapshot
+                    .find("$identity = Read-ActorIdentity $process")
+                    .unwrap()
+        );
+        assert!(
+            snapshot
+                .find("if ($null -eq $identity) { return $null }")
+                .unwrap()
+                < snapshot.find("throw 'unknown_or_foreign_actor'").unwrap()
         );
         assert!(
             snapshot.find("$windows = @()").unwrap() < snapshot.find("$process.HasExited").unwrap()
+        );
+        let identity = source
+            .split("function Read-ActorIdentity($process) {")
+            .nth(1)
+            .unwrap()
+            .split("function Read-ActorSnapshot {")
+            .next()
+            .unwrap();
+        let (before, after) = identity.split_once("$identity = @{").unwrap();
+        assert!(before.contains("if ($process.HasExited) { return $null }"));
+        assert!(after.contains("if ($process.HasExited) { return $null }"));
+        assert!(
+            after.contains(
+                "catch {\n        if ($process.HasExited) { return $null }\n        throw"
+            )
         );
     }
 
