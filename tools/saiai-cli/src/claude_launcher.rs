@@ -232,8 +232,9 @@ fn resolve_windows_launch(directories: &[PathBuf], home: Option<&Path>) -> Resul
 mod tests {
     use super::*;
     use crate::{ProviderCredential, ProviderCredentials, SAIAI_CONFIG_VERSION};
+    #[cfg(unix)]
     use std::collections::HashMap;
-    use std::ffi::OsString;
+    use std::ffi::OsStr;
     use tempfile::TempDir;
 
     fn config() -> SaiaiConfig {
@@ -249,6 +250,43 @@ mod tests {
         }
     }
 
+    fn assert_child_environment(command: &Command, name: &str, expected: Option<&str>) {
+        let value = command
+            .get_envs()
+            .find(|(key, _)| {
+                if cfg!(windows) {
+                    key.to_string_lossy().eq_ignore_ascii_case(name)
+                } else {
+                    *key == OsStr::new(name)
+                }
+            })
+            .map(|(_, value)| value);
+        assert_eq!(
+            value,
+            Some(expected.map(OsStr::new)),
+            "child environment {name}"
+        );
+    }
+
+    #[test]
+    fn claude_launcher_environment_names_follow_platform_case_rules() {
+        let mut command = Command::new("claude");
+        command
+            .env("HTTP_PROXY", "synthetic-uppercase")
+            .env("http_proxy", "synthetic-lowercase");
+        let uppercase_value = if cfg!(windows) {
+            "synthetic-lowercase"
+        } else {
+            "synthetic-uppercase"
+        };
+        assert_child_environment(&command, "HTTP_PROXY", Some(uppercase_value));
+        assert_child_environment(&command, "http_proxy", Some("synthetic-lowercase"));
+        assert_eq!(
+            command.get_envs().count(),
+            if cfg!(windows) { 1 } else { 2 }
+        );
+    }
+
     #[test]
     fn claude_launcher_replaces_only_child_routing_environment() {
         let config = config();
@@ -262,33 +300,19 @@ mod tests {
             .env("ANTHROPIC_MODEL", "user-model")
             .env("UNRELATED", "keep");
         apply_environment(&mut command, &config, "synthetic-child-key");
-        let environment = command
-            .get_envs()
-            .map(|(name, value)| (name.to_os_string(), value.map(|value| value.to_os_string())))
-            .collect::<HashMap<_, _>>();
-        for name in ["HOME", "CLAUDE_CONFIG_DIR", "ANTHROPIC_MODEL", "UNRELATED"] {
-            assert!(environment[&OsString::from(name)].is_some());
+        for (name, value) in [
+            ("HOME", "/original-home"),
+            ("CLAUDE_CONFIG_DIR", "/original-config"),
+            ("ANTHROPIC_MODEL", "user-model"),
+            ("UNRELATED", "keep"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "synthetic-child-key"),
+            ("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+            ("NODE_EXTRA_CA_CERTS", "/synthetic/ca.crt"),
+            ("CLAUDE_STREAM_IDLE_TIMEOUT_MS", "600000"),
+            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+        ] {
+            assert_child_environment(&command, name, Some(value));
         }
-        assert_eq!(
-            environment[&OsString::from("HOME")],
-            Some("/original-home".into())
-        );
-        assert_eq!(
-            environment[&OsString::from("CLAUDE_CONFIG_DIR")],
-            Some("/original-config".into())
-        );
-        assert_eq!(
-            environment[&OsString::from("ANTHROPIC_MODEL")],
-            Some("user-model".into())
-        );
-        assert_eq!(
-            environment[&OsString::from("CLAUDE_CODE_OAUTH_TOKEN")],
-            Some("synthetic-child-key".into())
-        );
-        assert_eq!(
-            environment[&OsString::from("ANTHROPIC_BASE_URL")],
-            Some("https://api.anthropic.com".into())
-        );
         for name in [
             "HTTP_PROXY",
             "HTTPS_PROXY",
@@ -297,10 +321,7 @@ mod tests {
             "https_proxy",
             "all_proxy",
         ] {
-            assert_eq!(
-                environment[&OsString::from(name)],
-                Some("http://127.0.0.1:19908".into())
-            );
+            assert_child_environment(&command, name, Some("http://127.0.0.1:19908"));
         }
         for name in [
             "ANTHROPIC_AUTH_TOKEN",
@@ -309,13 +330,10 @@ mod tests {
             "NODE_TLS_REJECT_UNAUTHORIZED",
             "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
         ] {
-            assert_eq!(environment[&OsString::from(name)], None);
+            assert_child_environment(&command, name, None);
         }
         for name in ["NO_PROXY", "no_proxy"] {
-            assert_eq!(
-                environment[&OsString::from(name)],
-                Some(LOCAL_NO_PROXY.into())
-            );
+            assert_child_environment(&command, name, Some(LOCAL_NO_PROXY));
         }
         assert!(command.get_args().next().is_none());
     }
