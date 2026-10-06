@@ -919,15 +919,11 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
     }
 }
 
-async fn serve_openai_websocket(
-    state: Arc<State>,
-    mut client_stream: TlsStream<TcpStream>,
-    request: IncomingRequest,
-) -> Result<()> {
-    let sec_key = header_value(&request.headers, "sec-websocket-key")
-        .context("OpenAI WebSocket request did not include Sec-WebSocket-Key")?;
-    let route = state.route_for_host(CHATGPT_HOST);
-    let upstream_url = state.websocket_upstream_url(&request.target, route)?;
+fn build_openai_websocket_request(
+    upstream_url: &Url,
+    incoming_headers: &[(String, String)],
+    gateway_key: &str,
+) -> Result<tungstenite::http::Request<()>> {
     let mut upstream_request = upstream_url
         .as_str()
         .into_client_request()
@@ -938,7 +934,8 @@ async fn serve_openai_websocket(
     // key is replaced with Codex's key so the client-facing accept value is
     // derived from the exact incoming handshake.
     let upstream_headers = upstream_request.headers_mut();
-    for (name, value) in &request.headers {
+    let mut copied_names = std::collections::HashSet::new();
+    for (name, value) in incoming_headers {
         if name.eq_ignore_ascii_case("sec-websocket-extensions") {
             // The Rust upstream relay does not enable a compression codec.
             // Do not negotiate permessage-deflate on that leg; otherwise the
@@ -946,18 +943,23 @@ async fn serve_openai_websocket(
             continue;
         }
         if is_websocket_handshake_header(name)
-            || (should_forward_request_header(name) && !name.eq_ignore_ascii_case("authorization"))
+            || (should_forward_request_header_to_gateway(name, true))
         {
             let header_name = HeaderName::from_bytes(name.as_bytes())
                 .with_context(|| format!("invalid WebSocket header name {name:?}"))?;
             let header_value = HeaderValue::from_str(value)
                 .with_context(|| format!("invalid WebSocket header value for {name:?}"))?;
-            upstream_headers.insert(header_name, header_value);
+            // Replace a generated handshake default once, then preserve all
+            // client values (including duplicate future control headers).
+            if copied_names.insert(header_name.clone()) {
+                upstream_headers.remove(&header_name);
+            }
+            upstream_headers.append(header_name, header_value);
         }
     }
     upstream_headers.insert(
         HeaderName::from_static("authorization"),
-        HeaderValue::from_str(&format!("Bearer {}", *route.api_key))
+        HeaderValue::from_str(&format!("Bearer {}", gateway_key))
             .context("failed to build Gateway WebSocket authorization")?,
     );
     upstream_headers.insert(
@@ -965,6 +967,21 @@ async fn serve_openai_websocket(
         HeaderValue::from_str(upstream_url.authority())
             .context("invalid Gateway WebSocket host")?,
     );
+
+    Ok(upstream_request)
+}
+
+async fn serve_openai_websocket(
+    state: Arc<State>,
+    mut client_stream: TlsStream<TcpStream>,
+    request: IncomingRequest,
+) -> Result<()> {
+    let sec_key = header_value(&request.headers, "sec-websocket-key")
+        .context("OpenAI WebSocket request did not include Sec-WebSocket-Key")?;
+    let route = state.route_for_host(CHATGPT_HOST);
+    let upstream_url = state.websocket_upstream_url(&request.target, route)?;
+    let upstream_request =
+        build_openai_websocket_request(&upstream_url, &request.headers, &route.api_key)?;
 
     let (upstream_ws, upstream_response) = match connect_async(upstream_request).await {
         Ok(result) => result,
@@ -2577,6 +2594,77 @@ mod tests {
         };
         let response = chatgpt_sidecar_response(&oversized).unwrap();
         assert_eq!(response.status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn openai_websocket_preserves_duplicate_headers_and_query_on_wire() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!(
+            "ws://{}/v1/responses?future=a%2Fb&future=a+b",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut captured_tx = Some(captured_tx);
+            let _websocket = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |request: &tungstenite::handshake::server::Request, response| {
+                    captured_tx.take().unwrap().send(request.clone()).unwrap();
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let incoming = vec![
+            ("User-Agent".into(), "codex_vscode/0.159.2".into()),
+            ("Originator".into(), "codex_vscode".into()),
+            ("Version".into(), "0.159.2".into()),
+            ("OpenAI-Beta".into(), "responses=mock_native".into()),
+            ("X-Codex-Future-Control".into(), "first".into()),
+            ("x-codex-future-control".into(), "second".into()),
+            ("Cookie".into(), "MOCK_ONLY_PRIVATE_COOKIE".into()),
+            ("Authorization".into(), "Bearer MOCK_ONLY_CLIENT".into()),
+            (
+                "Sec-WebSocket-Extensions".into(),
+                "permessage-deflate".into(),
+            ),
+        ];
+        let request = build_openai_websocket_request(&url, &incoming, "MOCK_ONLY_GATEWAY").unwrap();
+        let (client, _) = connect_async(request).await.unwrap();
+        let outgoing = timeout(Duration::from_secs(3), captured_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outgoing.uri().path_and_query().unwrap().as_str(),
+            "/v1/responses?future=a%2Fb&future=a+b"
+        );
+        let headers = outgoing.headers();
+        assert_eq!(
+            headers
+                .get_all("x-codex-future-control")
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        for name in ["User-Agent", "Originator", "Version", "OpenAI-Beta"] {
+            assert_eq!(
+                headers.get(name).unwrap().to_str().unwrap(),
+                header_value(&incoming, name).unwrap()
+            );
+        }
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            "Bearer MOCK_ONLY_GATEWAY"
+        );
+        assert!(headers.get("cookie").is_none());
+        assert!(headers.get("sec-websocket-extensions").is_none());
+        drop(client);
+        server.await.unwrap();
     }
 
     #[test]

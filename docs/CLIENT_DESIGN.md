@@ -193,7 +193,11 @@ JavaScript launcher，避免 Rust `Command` 无法直接执行 `.cmd`。
 本地代理对 `api.openai.com:443` 终止 TLS 后，将 `/v1/responses` 和 `/v1/models`
 的 HTTP 与 WebSocket 请求转发到 Gateway。Codex 原始方法、路径、query、JSON body、
 WebSocket 帧、User-Agent、`originator`、session/thread/request id 等头保持不变；
-只有代理发往 Gateway 时的 `Authorization` 使用 SAIAI Key。代理仍只监听 loopback，
+WS 应用头的同名多值按原顺序保留，不用后一个值覆盖前一个值。WS 与 HTTP
+采用相同的 Gateway 鉴权边界，移除入站 Cookie 并替换 Authorization；连接与
+长度等逐跳字段由各段传输处理。WS 上游未启用压缩 codec，因此不透传
+`Sec-WebSocket-Extensions`。这些规则用合成凭据和本地 WS 握手验证。
+代理发往 Gateway 时的 `Authorization` 使用 SAIAI Key。代理仍只监听 loopback，
 用户 shell 和系统环境不变。
 
 Desktop 可能使用 `chatgpt.com`、`chat.openai.com` 或 `ab.chatgpt.com` 的
