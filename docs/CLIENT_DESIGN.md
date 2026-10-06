@@ -17,16 +17,19 @@
 - 无关用户配置和机器身份值必须保留。
 - 每个用户使用独立生成的 CA；release 中不得包含 CA 私钥。
 
-## 本次开发预览边界
+## 1.1.31 发布候选边界
 
-新增 Claude 启动器和 Windows Desktop 实例复用改动仅在专用预览分支生成测试包，
+本候选包含可选 Claude 环境恢复启动器、Windows Desktop 安全实例检查修复，以及
+默认 VSCode Codex 控制面配置，
 保持 `local-proxy`、manifest schema 1 和 configuration schema 1，不改变 Gateway
-接口、正常 Claude/VSCode 初始化方式或正式站发布坐标。完整包必须来自同一源码的
+接口或正常 Claude 启动方式。合并主线、生成候选包和正式站激活是三个独立步骤；
+本文不表示下载站已切换版本。完整包必须来自同一源码的
 成功 Actions run，包含六个平台二进制、三种 wrapper 和 manifest；不混入手工开发资产。
 
-Desktop 的完整历史保全、MCP 就绪和普通 Chat 兼容性仍是未关闭的验收项，预览不承诺
-这些能力已完成。测试站激活前须记录精确 manifest/文件哈希及完整旧包回滚路径；
-不打正式版本标签、不合并 main，也不将本次测试视为正式站发布授权。
+Desktop 的历史保全、MCP 就绪和交互窗口验收必须单独记录，app-server 自动测试不等于
+完整原生界面验收。普通 Chat、ChatGPT 侧栏和设置不在支持范围内，不作为已实现能力。
+打正式标签前须通过精确源码的完整 CI；测试站和生产激活前须分别记录精确
+manifest/文件哈希、验收结果及完整旧包回滚路径，并获得相应授权。
 
 ## Claude 配置
 
