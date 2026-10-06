@@ -196,7 +196,9 @@ WebSocket 帧、User-Agent、`originator`、session/thread/request id 等头保�
 WS 应用头的同名多值按原顺序保留，不用后一个值覆盖前一个值。WS 与 HTTP
 采用相同的 Gateway 鉴权边界，移除入站 Cookie 并替换 Authorization；连接与
 长度等逐跳字段由各段传输处理。WS 上游未启用压缩 codec，因此不透传
-`Sec-WebSocket-Extensions`。这些规则用合成凭据和本地 WS 握手验证。
+`Sec-WebSocket-Extensions`。101 返回中的安全应用头和同名多值也原样保留，
+握手 accept/framing 由本地连接重建，Cookie/鉴权等敏感返回头不回传。
+这些规则用合成凭据、本地 WS 握手及 Server 的可选官方二进制逐跳测试验证。
 代理发往 Gateway 时的 `Authorization` 使用 SAIAI Key。代理仍只监听 loopback，
 用户 shell 和系统环境不变。
 

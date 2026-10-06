@@ -1003,23 +1003,11 @@ async fn serve_openai_websocket(
     // codec. Do not accept permessage-deflate back to Codex; otherwise Codex
     // may send frames with RSV1 set and the raw client-side relay rejects them
     // as compressed.
-    let negotiated_headers = ["sec-websocket-protocol"]
-        .into_iter()
-        .filter_map(|name| {
-            upstream_response
-                .headers()
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .map(|value| format!("Sec-WebSocket-Protocol: {value}\r\n"))
-        })
-        .collect::<String>();
     client_stream
-        .write_all(
-            format!(
-                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key}\r\n{negotiated_headers}\r\n"
-            )
-            .as_bytes(),
-        )
+        .write_all(&build_openai_websocket_response(
+            &accept_key,
+            upstream_response.headers(),
+        ))
         .await
         .context("failed to acknowledge Codex WebSocket")?;
 
@@ -1055,6 +1043,42 @@ async fn serve_openai_websocket(
             }
         }
     }
+}
+
+fn build_openai_websocket_response(
+    accept_key: &str,
+    upstream_headers: &tungstenite::http::HeaderMap,
+) -> Vec<u8> {
+    let nominated: std::collections::HashSet<String> = upstream_headers
+        .get_all("connection")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .collect();
+    let mut response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key}\r\n"
+    )
+    .into_bytes();
+    for (name, value) in upstream_headers {
+        let lower = name.as_str();
+        if !should_forward_response_header(lower)
+            || nominated.contains(lower)
+            || matches!(
+                lower,
+                "authorization" | "cookie" | "set-cookie" | "chatgpt-account-id"
+            )
+            || (lower.starts_with("sec-websocket-") && lower != "sec-websocket-protocol")
+        {
+            continue;
+        }
+        response.extend_from_slice(name.as_str().as_bytes());
+        response.extend_from_slice(b": ");
+        response.extend_from_slice(value.as_bytes());
+        response.extend_from_slice(b"\r\n");
+    }
+    response.extend_from_slice(b"\r\n");
+    response
 }
 
 async fn read_http_request<R>(reader: &mut R) -> Result<IncomingRequest>
@@ -2681,6 +2705,34 @@ mod tests {
             body: Vec::new(),
         };
         assert!(is_websocket_upgrade(&request));
+    }
+
+    #[test]
+    fn openai_websocket_response_keeps_application_headers_and_duplicate_values() {
+        let mut headers = tungstenite::http::HeaderMap::new();
+        headers.append("x-codex-future", "first".parse().unwrap());
+        headers.append("x-codex-future", "second".parse().unwrap());
+        headers.insert("x-codex-turn-state", "mock_state".parse().unwrap());
+        headers.insert("sec-websocket-protocol", "mock_protocol".parse().unwrap());
+        headers.insert("connection", "upgrade, x-mock-hop".parse().unwrap());
+        for name in [
+            "x-mock-hop",
+            "authorization",
+            "set-cookie",
+            "chatgpt-account-id",
+            "content-length",
+            "sec-websocket-extensions",
+            "sec-websocket-accept",
+        ] {
+            headers.insert(name, "private_value".parse().unwrap());
+        }
+        let wire = build_openai_websocket_response("mock_client_accept", &headers);
+        let wire = String::from_utf8(wire).unwrap();
+        assert!(wire.contains("x-codex-future: first\r\nx-codex-future: second\r\n"));
+        assert!(wire.contains("x-codex-turn-state: mock_state\r\n"));
+        assert!(wire.contains("sec-websocket-protocol: mock_protocol\r\n"));
+        assert!(wire.contains("Sec-WebSocket-Accept: mock_client_accept\r\n"));
+        assert!(!wire.contains("private_value"));
     }
 
     #[test]
