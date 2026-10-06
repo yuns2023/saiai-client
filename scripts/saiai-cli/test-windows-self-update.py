@@ -40,6 +40,25 @@ def run(exe: Path, env: dict[str, str], *args: str) -> subprocess.CompletedProce
     return result
 
 
+def wait_for_update_status(result_path: Path, timeout: float = 45) -> str:
+    deadline = time.monotonic() + timeout
+    result = "missing status file"
+    while time.monotonic() < deadline:
+        try:
+            result = result_path.read_text(encoding="utf-8-sig").strip()
+        except FileNotFoundError:
+            result = "missing status file"
+        except PermissionError:
+            result = "status file not readable yet"
+        else:
+            if result.startswith("failed:"):
+                raise AssertionError(result)
+            if result.startswith("updated:"):
+                return result
+        time.sleep(0.1)
+    raise AssertionError(f"Windows update helper did not record completion: {result}")
+
+
 def main() -> None:
     faulthandler.dump_traceback_later(90, exit=True)
     parser = argparse.ArgumentParser()
@@ -98,18 +117,7 @@ def main() -> None:
             staged = run(installed, env, "update")
             assert "not yet installed" in staged.stdout
             result_path = install / ".saiai-update-status.txt"
-            deadline = time.monotonic() + 45
-            result = "missing status file"
-            while time.monotonic() < deadline:
-                if result_path.exists():
-                    result = result_path.read_text(encoding="utf-8-sig").strip()
-                    if result.startswith("failed:"):
-                        raise AssertionError(result)
-                    if result.startswith("updated:"):
-                        break
-                time.sleep(0.1)
-            else:
-                raise AssertionError(f"Windows update helper did not record completion: {result}")
+            result = wait_for_update_status(result_path)
             assert result == f"updated: {release_hash}", result
             print("Windows self-update fixture: replacement completed", flush=True)
             assert sha256(installed) == release_hash, "installed binary does not match release"

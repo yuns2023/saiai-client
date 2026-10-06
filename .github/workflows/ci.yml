@@ -49,6 +49,7 @@ jobs:
           node --test scripts/saiai-cli/test-vscode-certificates.js
           python3 scripts/saiai-cli/test-release-contract.py
           python3 scripts/saiai-cli/test-installed-codex-desktop-probe.py
+          python3 scripts/saiai-cli/test-windows-self-update-polling.py
           bash scripts/saiai-cli/test-setup-wrappers.sh
           python3 scripts/saiai-cli/verify-release.py
 
