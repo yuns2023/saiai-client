@@ -1813,8 +1813,11 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
                     "account": {
                         "account_id": account_id,
                         "account_user_id": "saiai-local-proxy-user",
+                        "account_user_role": "standard-user",
                         "structure": "personal",
                         "plan_type": "plus",
+                        "is_zdr": false,
+                        "is_openai_internal": false,
                         "is_deactivated": false,
                         "is_fedramp_compliant_workspace": false,
                         "is_hipaa_compliant_workspace": false,
@@ -2502,6 +2505,25 @@ mod tests {
                 body["accounts"]["account-test"]["can_access_with_session"],
                 true
             );
+            // Desktop 26.930's membership parser requires all of these
+            // fields before it can evaluate Chat access.
+            let account = &body["accounts"]["account-test"]["account"];
+            for field in [
+                "account_id",
+                "account_user_id",
+                "account_user_role",
+                "structure",
+                "plan_type",
+            ] {
+                assert!(
+                    account[field]
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty()),
+                    "missing membership field {field} for {target}"
+                );
+            }
+            assert!(account["is_zdr"].is_boolean());
+            assert!(account["is_openai_internal"].is_boolean());
         }
 
         let verified_access = IncomingRequest {

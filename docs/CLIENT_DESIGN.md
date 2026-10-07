@@ -17,7 +17,7 @@
 - 无关用户配置和机器身份值必须保留。
 - 每个用户使用独立生成的 CA；release 中不得包含 CA 私钥。
 
-## 1.1.32 发布候选边界
+## 1.1.33 发布候选边界
 
 本候选包含可选 Claude 环境恢复启动器、Windows Desktop 安全实例检查修复，以及
 默认 VSCode Codex 控制面配置，
@@ -25,6 +25,10 @@
 接口或正常 Claude 启动方式。合并主线、生成候选包和正式站激活是三个独立步骤；
 本文不表示下载站已切换版本。完整包必须来自同一源码的
 成功 Actions run，包含六个平台二进制、三种 wrapper 和 manifest；不混入手工开发资产。
+
+本候选补齐 Desktop 26.930 版本化账户响应的成员角色和隐私标记，
+通过官方解析器的离线验证。此项修复还需独立原生 UI 验收，不能据此宣称普通 Chat
+或 imagegen 已通过。
 
 本次候选保留已验证的 Codex HTTP/WS 重复应用头与原始 query/body 透传修复，
 补上隔离实验开关下普通 Chat 的原生模型目录路径。Gateway 必须同时支持该精确
@@ -228,7 +232,10 @@ SAIAI Key，也不把合成账户、Cookie 或请求体发往 Statsig/Gateway；
 发现合同，同时保留当前有效 ChatGPT origin，不施加区域路由。新版 Desktop 的
 `/backend-api/accounts/check/v4-2023-04-27` 必须返回版本化账户集合，不能用
 HTTP 200 加空对象代替：Renderer 会读取 `account_ordering.map`，形状错误时仍会
-出现 “ChatGPT hit a snag”。不得把
+出现 “ChatGPT hit a snag”。Desktop 26.930 的完整成员信息解析还要求
+`account_id`、`account_user_id`、`account_user_role`、`structure`、`plan_type`
+和布尔型 `is_zdr`；本地响应须与已有 wham 的个人账户角色和隐私标记一致。
+不得把
 成功的账户查询或目录加载宣称为完整 Desktop 模型支持；未做模型请求的验证前，
 `saiai desktop codex` 仍是受支持的隔离回退路径。
 
