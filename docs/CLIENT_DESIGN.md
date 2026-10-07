@@ -26,6 +26,12 @@
 本文不表示下载站已切换版本。完整包必须来自同一源码的
 成功 Actions run，包含六个平台二进制、三种 wrapper 和 manifest；不混入手工开发资产。
 
+Desktop 的本地 Statsig 启动响应必须与当前认证身份一致：`userID`、
+`custom.auth_method`、`customIDs.account_id/workspace_id` 和请求中的 `stable_id`
+保持对齐。重新初始化只投影这些身份字段，不回显私有属性；本地配置仍仅启用
+i18n，不启用 hosted experiments，也不绕过真实工作区策略。身份不一致会让
+官方 Work 首页持续等待策略就绪，即使本地配置与 sandbox 均已就绪。
+
 本候选补齐 Desktop 26.930 版本化账户响应的成员角色和隐私标记，
 通过官方解析器的离线验证。此项修复还需独立原生 UI 验收，不能据此宣称普通 Chat
 或 imagegen 已通过。
