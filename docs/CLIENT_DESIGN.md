@@ -17,7 +17,7 @@
 - 无关用户配置和机器身份值必须保留。
 - 每个用户使用独立生成的 CA；release 中不得包含 CA 私钥。
 
-## 1.1.34 发布候选边界
+## 1.1.35 发布候选边界
 
 本候选包含可选 Claude 环境恢复启动器、Windows Desktop 安全实例检查修复，以及
 默认 VSCode Codex 控制面配置，
@@ -232,7 +232,7 @@ Desktop/app-server 的 CA 信任必须独立验证，不能仅凭 CLI 的
 `CODEX_CA_CERTIFICATE` child 环境变量推断。Linux ChatGPT Desktop 26.901.51231 /
 Codex app-server 0.153.4 已实测：用户 NSS 导入后账户控制面从 CA 错误恢复。Desktop
 还会向 `ab.chatgpt.com/v1/initialize` 发送 Statsig beta-eligibility 请求；它不是
-Gateway 的 OpenAI `/v1/initialize` 契约，也不是模型流量。本地代理只对精确的
+Gateway 的 OpenAI `/v1/initialize`（包括 SDK 的 `se=1` 编码请求） 契约，也不是模型流量。本地代理只对精确的
 `POST /v1/initialize` 返回版本化的本地 Statsig bootstrap，并在
 `/backend-api/wham/statsig/bootstrap` 返回同一 payload。该 payload 只启用 Codex
 已内置消息包所需的 `72216192.enable_i18n`，不启用其他 hosted experiment，不携带
