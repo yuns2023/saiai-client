@@ -17,7 +17,7 @@
 - 无关用户配置和机器身份值必须保留。
 - 每个用户使用独立生成的 CA；release 中不得包含 CA 私钥。
 
-## 1.1.31 发布候选边界
+## 1.1.32 发布候选边界
 
 本候选包含可选 Claude 环境恢复启动器、Windows Desktop 安全实例检查修复，以及
 默认 VSCode Codex 控制面配置，
@@ -25,6 +25,10 @@
 接口或正常 Claude 启动方式。合并主线、生成候选包和正式站激活是三个独立步骤；
 本文不表示下载站已切换版本。完整包必须来自同一源码的
 成功 Actions run，包含六个平台二进制、三种 wrapper 和 manifest；不混入手工开发资产。
+
+本次候选保留已验证的 Codex HTTP/WS 重复应用头与原始 query/body 透传修复，
+补上隔离实验开关下普通 Chat 的原生模型目录路径。Gateway 必须同时支持该精确
+目录路由；这项实验能力不改变正常 Codex 入口或普通 Chat 的验收范围。
 
 Desktop 的历史保全、MCP 就绪和交互窗口验收必须单独记录，app-server 自动测试不等于
 完整原生界面验收。普通 Chat、ChatGPT 侧栏和设置不在支持范围内，不作为已实现能力。
@@ -193,7 +197,15 @@ JavaScript launcher，避免 Rust `Command` 无法直接执行 `.cmd`。
 本地代理对 `api.openai.com:443` 终止 TLS 后，将 `/v1/responses` 和 `/v1/models`
 的 HTTP 与 WebSocket 请求转发到 Gateway。Codex 原始方法、路径、query、JSON body、
 WebSocket 帧、User-Agent、`originator`、session/thread/request id 等头保持不变；
-只有代理发往 Gateway 时的 `Authorization` 使用 SAIAI Key。代理仍只监听 loopback，
+WS 应用头的同名多值按原顺序保留，不用后一个值覆盖前一个值。WS 与 HTTP
+采用相同的 Gateway 鉴权边界，移除入站 Cookie 并替换 Authorization；连接与
+长度等逐跳字段由各段传输处理。WS 上游未启用压缩 codec，因此不透传
+`Sec-WebSocket-Extensions`。101 返回中的安全应用头和同名多值也原样保留，
+握手 accept/framing 由本地连接重建，Cookie/鉴权等敏感返回头不回传。
+请求中的 `Connection` 指定的逐跳头在本地代理这一跳移除，避免丢弃
+`Connection` 后把对应的头误当作应用头继续发送。HTTP/WS 均覆盖此边界。
+这些规则用合成凭据、本地 WS 握手及 Server 的可选官方二进制逐跳测试验证。
+代理发往 Gateway 时的 `Authorization` 使用 SAIAI Key。代理仍只监听 loopback，
 用户 shell 和系统环境不变。
 
 Desktop 可能使用 `chatgpt.com`、`chat.openai.com` 或 `ab.chatgpt.com` 的
@@ -270,6 +282,13 @@ Desktop 合同。Desktop 26.924 的通知页会对 `/notifications/settings` 的
 配置目录、profile/onboarding、TLS/代理继承、模型目录和 UI readiness；这些差异不应
 继续堆进一个 OpenAI 专用 launcher 分支。代理进程、CA、profile 生命周期、日志和
 doctor 检查属于共享 Desktop runtime。
+
+隔离实验开关 `SAIAI_CHATGPT_CHAT_PASSTHROUGH=1` 的普通 Chat allowlist 包括
+`/backend-api/models`，映射到 Gateway 的 `/chatgpt/backend-api/models`，保留原始
+query 并透传原生目录内容。它与 Codex `/backend-api/codex/models` 是不同协议，
+不得互换或从 Codex 目录合成普通 Chat 选项。该实验路径需要可调度的 OpenAI OAuth
+账号；只有 API-key 账号时应明确失败且不占用其并发槽。这个精确目录修复不表示
+普通 Chat 的全部界面、账号能力与图片工具已经完成验收。
 
 macOS 会校验 bundle identifier、OpenAI Team ID `2DC432GLL2` 和 codesign，并在
 激活前先请求应用正常退出，必要时才终止该 bundle 内的旧进程；进程退出后等待

@@ -1,6 +1,6 @@
-# Windows 使用指南（SAIAI 1.1.31）
+# Windows 使用指南（SAIAI 1.1.32）
 
-SAIAI `1.1.31` 候选版本为 Claude Code 和 VSCode 提供用户级本地代理，不要求管理员权限。
+SAIAI `1.1.32` 候选版本为 Claude Code 和 VSCode 提供用户级本地代理，不要求管理员权限。
 下载站实际提供的版本以完整 manifest 和文件哈希为准；候选构建不代表已在生产激活。
 
 ## 一键配置 Claude Code
