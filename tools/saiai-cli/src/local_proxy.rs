@@ -1569,6 +1569,8 @@ fn is_forwarded_openai_path(path: &str) -> bool {
         || path.starts_with("/v1/responses/")
         || path == "/v1/models"
         || path.starts_with("/v1/models/")
+        || path == "/v1/codex/images/generations"
+        || path == "/v1/codex/images/edits"
         || is_forwarded_chatgpt_path(path)
 }
 
@@ -1592,6 +1594,10 @@ fn normalize_chatgpt_gateway_target(target: &str) -> Result<String> {
         "/v1/models"
     } else if path.starts_with("/backend-api/codex/models/") {
         return Ok(target.replacen("/backend-api/codex/models", "/v1/models", 1));
+    } else if path == "/backend-api/codex/images/generations" {
+        "/v1/codex/images/generations"
+    } else if path == "/backend-api/codex/images/edits" {
+        "/v1/codex/images/edits"
     } else {
         bail!("unsupported ChatGPT Codex path: {path}");
     };
@@ -2184,6 +2190,28 @@ fn request_path(target: &str) -> Result<String> {
 mod tests {
     use super::*;
     use rcgen::{BasicConstraints, IsCa};
+
+    #[test]
+    fn native_codex_images_keep_their_own_protocol_route() {
+        for operation in ["generations", "edits"] {
+            let path = format!("/backend-api/codex/images/{operation}");
+            let target = format!("{path}?opaque=a%2Fb&opaque=%2B");
+            let normalized = normalize_chatgpt_gateway_target(&target).unwrap();
+            assert_eq!(
+                normalized,
+                format!("/v1/codex/images/{operation}?opaque=a%2Fb&opaque=%2B")
+            );
+            assert!(is_forwarded_openai_path(
+                &request_path(&normalized).unwrap()
+            ));
+            assert!(!is_forwarded_chatgpt_path(
+                &request_path(&normalized).unwrap()
+            ));
+            assert!(normalize_chatgpt_gateway_target(&format!("{path}/unexpected")).is_err());
+        }
+        assert!(!is_forwarded_openai_path("/v1/codex/images/unknown"));
+        assert!(!is_forwarded_openai_path("/v1/images/generations"));
+    }
 
     fn test_ca() -> (String, String) {
         let key = KeyPair::generate().unwrap();
