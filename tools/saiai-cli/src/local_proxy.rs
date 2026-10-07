@@ -1733,6 +1733,23 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         .or_else(|| oauth_claim_account_id(&request.headers))
         .or_else(desktop_account_id_fallback)
         .unwrap_or_else(|| "fixture-chatgpt-account".to_string());
+    let user_id = oauth_claim_user_id(&request.headers)
+        .unwrap_or_else(|| "saiai-local-proxy-user".to_string());
+    if path == "/v1/initialize"
+        && request.method.eq_ignore_ascii_case("POST")
+        && request.body.len() <= DESKTOP_STATSIG_MAX_REQUEST_BYTES
+    {
+        // Re-evaluation must retain the identity used by the SDK. Returning a
+        // fixed user here makes Desktop's identity check wait indefinitely.
+        let body: Value = serde_json::from_slice(&request.body).ok()?;
+        let user = desktop_statsig_user(body.get("user")?)?;
+        return Some((
+            StatusCode::OK,
+            serde_json::to_vec(&desktop_statsig_payload(user)?).ok()?,
+            "desktop_statsig_identity_bootstrap",
+            &[],
+        ));
+    }
     if path == "/backend-api/ps/mcp" {
         let request_json: Value = serde_json::from_slice(&request.body).ok()?;
         let id = request_json.get("id").cloned().unwrap_or(Value::Null);
@@ -1774,7 +1791,7 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
             },
             "account_user": {
                 "account_id": account_id,
-                "user_id": "saiai-local-proxy-user",
+                "user_id": user_id,
                 "seat_type": "default",
                 "trial_expires_at": null,
                 "pending_seat_upgrade_request": false
@@ -1785,7 +1802,7 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
             "default_account_id": account_id,
             "accounts": [{
                 "id": account_id,
-                "account_user_id": "saiai-local-proxy-user",
+                "account_user_id": user_id,
                 "account_user_role": "standard-user",
                 // Codex app-server 0.155+ uses these fields to resolve the
                 // selected workspace before `account/read` can report the
@@ -1818,7 +1835,7 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
                 json!({
                     "account": {
                         "account_id": account_id,
-                        "account_user_id": "saiai-local-proxy-user",
+                        "account_user_id": user_id,
                         "account_user_role": "standard-user",
                         "structure": "personal",
                         "plan_type": "plus",
@@ -1843,9 +1860,29 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         // means no special access program is present; an object such as `{}`
         // can be interpreted as a non-standard access state and hide Astra.
         "/backend-api/accounts/verified_access" | "/accounts/verified_access" => Value::Null,
-        "/backend-api/wham/statsig/bootstrap" | "/wham/statsig/bootstrap" => json!({
-            "statsigPayload": DESKTOP_STATSIG_I18N_PAYLOAD
-        }),
+        "/backend-api/wham/statsig/bootstrap" | "/wham/statsig/bootstrap" => {
+            if request.body.len() > DESKTOP_STATSIG_MAX_REQUEST_BYTES {
+                return Some((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    br#"{"error":"payload_too_large"}"#.to_vec(),
+                    "desktop_statsig_payload_too_large",
+                    &[],
+                ));
+            }
+            let mut user = json!({
+                "userID": user_id,
+                "custom": {"auth_method": "chatgpt"},
+                "customIDs": {"account_id": account_id, "workspace_id": account_id}
+            });
+            if let Ok(body) = serde_json::from_slice::<Value>(&request.body)
+                && let Some(stable_id) = body
+                    .get("stable_id")
+                    .and_then(desktop_statsig_identity_value)
+            {
+                user["customIDs"]["stableID"] = Value::String(stable_id.to_owned());
+            }
+            json!({"statsigPayload": serde_json::to_string(&desktop_statsig_payload(user)?).ok()?})
+        }
         "/backend-api/conversations" => json!({
             "items": [],
             "total": 0,
@@ -1897,6 +1934,60 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         "desktop_account_identity",
         headers,
     ))
+}
+
+fn desktop_statsig_identity_value(value: &Value) -> Option<&str> {
+    let text = value.as_str()?;
+    (!text.is_empty() && text.len() <= 512 && !text.chars().any(char::is_control)).then_some(text)
+}
+
+// Only identity fields are projected. Never echo arbitrary request metadata,
+// private attributes, credentials or hosted experiment settings.
+fn desktop_statsig_user(input: &Value) -> Option<Value> {
+    let mut user = json!({"userID": desktop_statsig_identity_value(input.get("userID")?)?});
+    let mut ids = Map::new();
+    for key in ["account_id", "workspace_id", "stableID"] {
+        if let Some(value) = input
+            .get("customIDs")
+            .and_then(|ids| ids.get(key))
+            .and_then(desktop_statsig_identity_value)
+        {
+            ids.insert(key.to_owned(), Value::String(value.to_owned()));
+        }
+    }
+    user["customIDs"] = Value::Object(ids);
+    if input
+        .get("custom")
+        .and_then(|v| v.get("auth_method"))
+        .and_then(Value::as_str)
+        == Some("chatgpt")
+    {
+        user["custom"] = json!({"auth_method": "chatgpt"});
+    }
+    Some(user)
+}
+
+fn desktop_statsig_payload(user: Value) -> Option<Value> {
+    let mut payload: Value = serde_json::from_str(DESKTOP_STATSIG_I18N_PAYLOAD).ok()?;
+    payload["user"] = user;
+    Some(payload)
+}
+
+fn oauth_claim_user_id(headers: &[(String, String)]) -> Option<String> {
+    let authorization = header_value(headers, "authorization")?;
+    let token = authorization.strip_prefix("Bearer ")?.trim();
+    if token.len() > 32 * 1024 {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token.split('.').nth(1)?)
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    claims
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_user_id"))
+        .and_then(desktop_statsig_identity_value)
+        .map(str::to_owned)
 }
 
 fn oauth_claim_account_id(headers: &[(String, String)]) -> Option<String> {
@@ -2663,6 +2754,83 @@ mod tests {
         assert!(headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("set-cookie") && value.starts_with("_devicecheck=")
         }));
+    }
+
+    #[test]
+    fn desktop_statsig_bootstrap_tracks_authenticated_identity_without_enabling_gates() {
+        for (account, user) in [("account-one", "user-one"), ("account-two", "user-two")] {
+            let claims = json!({"https://api.openai.com/auth": {
+                "chatgpt_account_id": account, "chatgpt_user_id": user
+            }});
+            let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&claims).unwrap());
+            let request = IncomingRequest {
+                method: "POST".to_string(),
+                target: "/wham/statsig/bootstrap".to_string(),
+                http_version: "HTTP/1.1".to_string(),
+                headers: vec![("Authorization".to_string(), format!("Bearer e30.{encoded}.fixture"))],
+                body: br#"{"stable_id":"stable-test","token":"must-not-echo","prompt":"must-not-echo"}"#.to_vec(),
+            };
+            let (status, body, _, _) = chatgpt_account_sidecar_response(&request).unwrap();
+            assert_eq!(status, StatusCode::OK);
+            let envelope: Value = serde_json::from_slice(&body).unwrap();
+            let payload: Value =
+                serde_json::from_str(envelope["statsigPayload"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                payload["user"],
+                json!({
+                    "userID": user, "custom": {"auth_method": "chatgpt"},
+                    "customIDs": {"account_id": account, "workspace_id": account, "stableID": "stable-test"}
+                })
+            );
+            assert_eq!(payload["feature_gates"], json!({}));
+            assert_eq!(payload["dynamic_configs"], json!({}));
+            assert_eq!(payload["layer_configs"].as_object().unwrap().len(), 1);
+            assert!(!String::from_utf8(body).unwrap().contains("must-not-echo"));
+
+            let initialize = IncomingRequest {
+                target: "/v1/initialize".to_string(),
+                body: serde_json::to_vec(&json!({"user": payload["user"]})).unwrap(),
+                ..request
+            };
+            let (_, body, _, _) = chatgpt_account_sidecar_response(&initialize).unwrap();
+            let evaluated: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(evaluated["user"], payload["user"]);
+            assert_eq!(evaluated["feature_gates"], json!({}));
+        }
+    }
+
+    #[test]
+    fn desktop_statsig_initialize_projects_only_bounded_identity_fields() {
+        let request = IncomingRequest {
+            method: "POST".to_string(), target: "/v1/initialize".to_string(),
+            http_version: "HTTP/1.1".to_string(), headers: vec![],
+            body: serde_json::to_vec(&json!({"user": {
+                "userID": "user", "custom": {"auth_method": "chatgpt", "token": "must-not-echo"},
+                "customIDs": {"account_id": "account", "workspace_id": "account", "token": "must-not-echo"},
+                "privateAttributes": {"secret": "must-not-echo"}
+            }})).unwrap(),
+        };
+        let (_, body, _, _) = chatgpt_account_sidecar_response(&request).unwrap();
+        assert!(!String::from_utf8(body).unwrap().contains("must-not-echo"));
+        let oversized = IncomingRequest {
+            body: vec![0; DESKTOP_STATSIG_MAX_REQUEST_BYTES + 1],
+            ..request.clone()
+        };
+        assert!(chatgpt_account_sidecar_response(&oversized).is_none());
+        assert_eq!(
+            chatgpt_sidecar_response(&oversized).unwrap().status,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let get = IncomingRequest {
+            method: "GET".to_string(),
+            ..request
+        };
+        assert!(chatgpt_account_sidecar_response(&get).is_none());
+        assert_eq!(
+            chatgpt_sidecar_response(&get).unwrap().status,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
     }
 
     #[test]
