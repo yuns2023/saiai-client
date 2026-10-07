@@ -1741,7 +1741,7 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
     {
         // Re-evaluation must retain the identity used by the SDK. Returning a
         // fixed user here makes Desktop's identity check wait indefinitely.
-        let body: Value = serde_json::from_slice(&request.body).ok()?;
+        let body = desktop_statsig_request(request)?;
         let user = desktop_statsig_user(body.get("user")?)?;
         return Some((
             StatusCode::OK,
@@ -1934,6 +1934,27 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         "desktop_account_identity",
         headers,
     ))
+}
+
+fn desktop_statsig_request(request: &IncomingRequest) -> Option<Value> {
+    if request.body.len() > DESKTOP_STATSIG_MAX_REQUEST_BYTES {
+        return None;
+    }
+    let url = Url::parse(&format!("http://localhost{}", request.target)).ok()?;
+    let encoding: Vec<_> = url.query_pairs().filter(|(key, _)| key == "se").collect();
+    if encoding.is_empty() {
+        return serde_json::from_slice(&request.body).ok();
+    }
+    if encoding.len() != 1 || encoding[0].1 != "1" {
+        return None;
+    }
+    // Statsig JS 3.34 sends initialize JSON as reversed base64 when se=1.
+    // Decode only this bounded local control request; model traffic is untouched.
+    let reversed: Vec<u8> = request.body.iter().rev().copied().collect();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(reversed)
+        .ok()?;
+    serde_json::from_slice(&decoded).ok()
 }
 
 fn desktop_statsig_identity_value(value: &Value) -> Option<&str> {
@@ -2831,6 +2852,44 @@ mod tests {
             chatgpt_sidecar_response(&get).unwrap().status,
             StatusCode::METHOD_NOT_ALLOWED
         );
+    }
+
+    #[test]
+    fn desktop_statsig_encoded_initialize_retains_the_sdk_identity() {
+        let user = json!({"userID": "encoded-user", "custom": {"auth_method": "chatgpt"},
+            "customIDs": {"account_id": "encoded-account", "workspace_id": "encoded-account", "stableID": "encoded-stable"}});
+        let body = serde_json::to_vec(&json!({"user": user,
+            "statsigMetadata": {"private": "must-not-echo"}}))
+        .unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(body);
+        let request = IncomingRequest {
+            method: "POST".to_string(),
+            target: "/v1/initialize?k=fixture&se=1&sv=3.34.0".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: vec![],
+            body: encoded.bytes().rev().collect(),
+        };
+        let (_, body, _, _) = chatgpt_account_sidecar_response(&request).unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["user"], user);
+        assert_eq!(payload["feature_gates"], json!({}));
+        assert!(!String::from_utf8(body).unwrap().contains("must-not-echo"));
+        for target in [
+            "/v1/initialize?se=2",
+            "/v1/initialize?se=1&se=1",
+            "/v1/initialize",
+        ] {
+            let invalid = IncomingRequest {
+                target: target.to_string(),
+                ..request.clone()
+            };
+            assert!(desktop_statsig_request(&invalid).is_none());
+        }
+        let invalid = IncomingRequest {
+            body: b"invalid-base64".to_vec(),
+            ..request
+        };
+        assert!(desktop_statsig_request(&invalid).is_none());
     }
 
     #[test]
