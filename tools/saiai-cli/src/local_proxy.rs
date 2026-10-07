@@ -934,8 +934,12 @@ fn build_openai_websocket_request(
     // key is replaced with Codex's key so the client-facing accept value is
     // derived from the exact incoming handshake.
     let upstream_headers = upstream_request.headers_mut();
+    let nominated = connection_nominated_headers(incoming_headers);
     let mut copied_names = std::collections::HashSet::new();
     for (name, value) in incoming_headers {
+        if nominated.contains(&name.to_ascii_lowercase()) && !is_websocket_handshake_header(name) {
+            continue;
+        }
         if name.eq_ignore_ascii_case("sec-websocket-extensions") {
             // The Rust upstream relay does not enable a compression codec.
             // Do not negotiate permessage-deflate on that leg; otherwise the
@@ -1200,7 +1204,11 @@ where
     let mut builder = state.client.request(method, &upstream_url);
 
     let mut has_authorization = false;
+    let nominated = connection_nominated_headers(&request.headers);
     for (name, value) in &request.headers {
+        if nominated.contains(&name.to_ascii_lowercase()) {
+            continue;
+        }
         if name.eq_ignore_ascii_case("authorization") {
             has_authorization = true;
         }
@@ -1943,6 +1951,15 @@ fn should_forward_request_header(name: &str) -> bool {
         && !name.eq_ignore_ascii_case("proxy-connection")
 }
 
+fn connection_nominated_headers(headers: &[(String, String)]) -> std::collections::HashSet<String> {
+    headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, value)| value.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .collect()
+}
+
 fn should_forward_request_header_to_gateway(name: &str, replace_authorization: bool) -> bool {
     should_forward_request_header(name)
         && !(replace_authorization
@@ -2651,6 +2668,8 @@ mod tests {
             ("x-codex-future-control".into(), "second".into()),
             ("Cookie".into(), "MOCK_ONLY_PRIVATE_COOKIE".into()),
             ("Authorization".into(), "Bearer MOCK_ONLY_CLIENT".into()),
+            ("Connection".into(), "Upgrade, X-Mock-Hop".into()),
+            ("X-Mock-Hop".into(), "MOCK_ONLY_HOP".into()),
             (
                 "Sec-WebSocket-Extensions".into(),
                 "permessage-deflate".into(),
@@ -2687,6 +2706,7 @@ mod tests {
         );
         assert!(headers.get("cookie").is_none());
         assert!(headers.get("sec-websocket-extensions").is_none());
+        assert!(headers.get("x-mock-hop").is_none());
         drop(client);
         server.await.unwrap();
     }
@@ -2705,6 +2725,88 @@ mod tests {
             body: Vec::new(),
         };
         assert!(is_websocket_upgrade(&request));
+    }
+
+    #[tokio::test]
+    async fn openai_http_keeps_body_and_application_headers_and_removes_nominated_hops() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let request = read_http_request(&mut reader).await.unwrap();
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+            request
+        });
+        let (ca_cert_pem, ca_key_pem) = test_ca();
+        let state = State::new(Config {
+            listen: "127.0.0.1:0".into(),
+            base_url,
+            api_key: "MOCK_ONLY_GATEWAY".into(),
+            claude: None,
+            codex: None,
+            ca_cert_pem,
+            ca_key_pem,
+            verbose: false,
+            chatgpt_chat_passthrough: false,
+        })
+        .unwrap();
+        let body = b"{ \"model\":\"mock_native\",\"reasoning\":{\"effort\":\"high\"},\"future\":[null,true] }".to_vec();
+        let request = IncomingRequest {
+            method: "POST".into(),
+            target: "/v1/responses?future=a%2Fb&future=a+b".into(),
+            http_version: "HTTP/1.1".into(),
+            body: body.clone(),
+            headers: vec![
+                ("User-Agent".into(), "codex_cli_rs/0.159.2".into()),
+                ("X-Codex-Future".into(), "first".into()),
+                ("x-codex-future".into(), "second".into()),
+                ("Connection".into(), "keep-alive, X-Mock-Hop".into()),
+                ("connection".into(), "X-Other-Hop".into()),
+                ("x-mock-hop".into(), "MOCK_HOP".into()),
+                ("X-Other-Hop".into(), "MOCK_OTHER_HOP".into()),
+                ("Authorization".into(), "Bearer MOCK_ONLY_CLIENT".into()),
+                ("Cookie".into(), "MOCK_PRIVATE_COOKIE".into()),
+            ],
+        };
+        let (mut writer, mut output) = tokio::io::duplex(16_384);
+        forward_to_saiai(&state, &mut writer, request, true, true)
+            .await
+            .unwrap();
+        drop(writer);
+        let mut response = Vec::new();
+        output.read_to_end(&mut response).await.unwrap();
+        let captured = server.await.unwrap();
+        assert_eq!(captured.body, body);
+        assert_eq!(captured.target, "/v1/responses?future=a%2Fb&future=a+b");
+        assert_eq!(
+            header_value(&captured.headers, "authorization").unwrap(),
+            "Bearer MOCK_ONLY_GATEWAY"
+        );
+        assert_eq!(
+            captured
+                .headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("x-codex-future"))
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        for name in ["cookie", "x-mock-hop", "x-other-hop", "connection"] {
+            assert!(
+                header_value(&captured.headers, name).is_none(),
+                "unexpected hop or credential: {name}"
+            );
+        }
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 200")
+        );
     }
 
     #[test]
