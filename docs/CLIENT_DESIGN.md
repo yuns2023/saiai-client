@@ -17,18 +17,25 @@
 - 无关用户配置和机器身份值必须保留。
 - 每个用户使用独立生成的 CA；release 中不得包含 CA 私钥。
 
-## 1.1.33 发布候选边界
+## 1.1.34 发布候选边界
 
 本候选包含可选 Claude 环境恢复启动器、Windows Desktop 安全实例检查修复，以及
 默认 VSCode Codex 控制面配置，
-保持 `local-proxy`、manifest schema 1 和 configuration schema 1，不改变 Gateway
-接口或正常 Claude 启动方式。合并主线、生成候选包和正式站激活是三个独立步骤；
+保持 `local-proxy`、manifest schema 1 和 configuration schema 1，不改变正常 Claude
+启动方式。合并主线、生成候选包和正式站激活是三个独立步骤；
 本文不表示下载站已切换版本。完整包必须来自同一源码的
 成功 Actions run，包含六个平台二进制、三种 wrapper 和 manifest；不混入手工开发资产。
 
 本候选补齐 Desktop 26.930 版本化账户响应的成员角色和隐私标记，
 通过官方解析器的离线验证。此项修复还需独立原生 UI 验收，不能据此宣称普通 Chat
 或 imagegen 已通过。
+
+Codex 0.160.0 的独立内置 `image_gen` 使用
+`/backend-api/codex/images/generations` 和 `/backend-api/codex/images/edits`。
+代理将其分别路由到 Gateway 的 `/v1/codex/images/*`，保持 JSON、编码、query 和应用头；
+Gateway 必须实现这两个原生端点并透传到选定 OAuth 账号。此路径不经过公开 Images API
+到 Responses 的适配器，也不等同于普通 Chat 的文件下载流程。必须按兼容的完整
+Server/Client 组合验收后激活，不能仅凭 schema 相同把本客户端提前部署到旧 Gateway。
 
 本次候选保留已验证的 Codex HTTP/WS 重复应用头与原始 query/body 透传修复，
 补上隔离实验开关下普通 Chat 的原生模型目录路径。Gateway 必须同时支持该精确
