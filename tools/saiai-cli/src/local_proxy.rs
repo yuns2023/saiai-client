@@ -2639,6 +2639,24 @@ mod tests {
 
     #[tokio::test]
     async fn openai_websocket_preserves_duplicate_headers_and_query_on_wire() {
+        struct CaptureHandshake(
+            tokio::sync::oneshot::Sender<tungstenite::handshake::server::Request>,
+        );
+
+        impl tungstenite::handshake::server::Callback for CaptureHandshake {
+            fn on_request(
+                self,
+                request: &tungstenite::handshake::server::Request,
+                response: tungstenite::handshake::server::Response,
+            ) -> Result<
+                tungstenite::handshake::server::Response,
+                tungstenite::handshake::server::ErrorResponse,
+            > {
+                self.0.send(request.clone()).unwrap();
+                Ok(response)
+            }
+        }
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = Url::parse(&format!(
             "ws://{}/v1/responses?future=a%2Fb&future=a+b",
@@ -2648,16 +2666,10 @@ mod tests {
         let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut captured_tx = Some(captured_tx);
-            let _websocket = tokio_tungstenite::accept_hdr_async(
-                stream,
-                |request: &tungstenite::handshake::server::Request, response| {
-                    captured_tx.take().unwrap().send(request.clone()).unwrap();
-                    Ok(response)
-                },
-            )
-            .await
-            .unwrap();
+            let _websocket =
+                tokio_tungstenite::accept_hdr_async(stream, CaptureHandshake(captured_tx))
+                    .await
+                    .unwrap();
         });
         let incoming = vec![
             ("User-Agent".into(), "codex_vscode/0.159.2".into()),
