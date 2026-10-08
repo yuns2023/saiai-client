@@ -1654,6 +1654,16 @@ fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
 fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse> {
     let path = request_path(&request.target).ok()?;
     match path.as_str() {
+        // This bootstraps native conversation notifications and asynchronous
+        // task delivery. An empty 200 makes Desktop construct a WebSocket with
+        // a missing URL. It is not telemetry, and a shared account's provider
+        // subscription must not be exposed without scoped delivery support.
+        "/backend-api/celsius/ws/user" | "/celsius/ws/user" => Some(StaticResponse {
+            status: StatusCode::NOT_IMPLEMENTED,
+            content_type: "application/json",
+            body: br#"{"error":{"type":"native_chat_updates_unsupported","message":"Background Chat updates are not supported yet."}}"#,
+            reason: "native_chat_updates_unsupported",
+        }),
         "/v1/initialize" if !request.method.eq_ignore_ascii_case("POST") => Some(StaticResponse {
             status: StatusCode::METHOD_NOT_ALLOWED,
             content_type: "application/json",
@@ -2531,6 +2541,31 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn native_chat_updates_bootstrap_is_not_an_empty_success_sidecar() {
+        for target in [
+            "/backend-api/celsius/ws/user",
+            "/backend-api/celsius/ws/user?include_external=all",
+            "/celsius/ws/user",
+        ] {
+            let request = IncomingRequest {
+                method: "GET".to_string(),
+                target: target.to_string(),
+                http_version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            };
+            let response = chatgpt_sidecar_response(&request)
+                .expect("unsupported native conversation updates must fail explicitly");
+            assert_eq!(response.status, StatusCode::NOT_IMPLEMENTED);
+            let body: Value = serde_json::from_slice(response.body).unwrap();
+            assert_eq!(body["error"]["type"], "native_chat_updates_unsupported");
+            assert!(body.get("websocket_url").is_none());
+            assert_eq!(response.reason, "native_chat_updates_unsupported");
+            assert!(normalize_chatgpt_chat_target(target).is_err());
         }
     }
 

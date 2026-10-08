@@ -98,6 +98,14 @@ Desktop 的精确后台统计 POST `/ces/statsc/flush` 和 `/otlp/v1/metrics` �
 已开始上传的请求行、请求头或 body 失败仍报错。Windows 普通直连隧道的连接中止
 按 I/O 错误类型识别，避免依赖系统语言；该处理不隐藏模型流或上传失败。
 
+普通 Chat 的 `/backend-api/celsius/ws/user`（以及未加前缀的同一路径）用于获取
+会话更新订阅地址，属于结果交付协议。它不能作为遥测接口返回 `200 {}`：官方
+Desktop 会读取 `websocket_url` 并创建 WebSocket，缺少该字段会导致连接失败。
+当前尚未实现按 Gateway 用户、Key、会话和上游账号隔离的订阅交付，因此这两个
+精确路径明确返回 `501 native_chat_updates_unsupported`，不返回伪造订阅地址，
+也不把共用上游账号的订阅交给客户端。这个错误响应没有补齐后台任务交付；已有
+同步 Chat/画图成功记录不能证明异步 Chat 或图片任务受到支持。
+
 ### 可选的 Claude 环境恢复启动器
 
 `saiai claude [-- <claude arguments>]` 用于用户 shell 或系统继承环境存在旧
