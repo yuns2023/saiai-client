@@ -19,7 +19,7 @@ use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 use tokio::net::{TcpListener, TcpStream, lookup_host};
-use tokio::time::{timeout, timeout_at};
+use tokio::time::timeout_at;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 use tokio_tungstenite::WebSocketStream;
@@ -1610,6 +1610,25 @@ fn is_forwarded_chatgpt_path(path: &str) -> bool {
         || path == "/chatgpt/backend-api/sentinel/chat-requirements/prepare"
         || path.starts_with("/chatgpt/backend-api/files/download/")
         || path == "/chatgpt/backend-api/estuary/content"
+        || path == "/chatgpt/backend-api/celsius/ws/user"
+        || path == "/chatgpt/backend-api/saiai/chat-updates"
+        || is_chatgpt_owned_conversation_path(path.strip_prefix("/chatgpt").unwrap_or(path))
+}
+
+fn is_chatgpt_owned_conversation_path(path: &str) -> bool {
+    let Some(tail) = path
+        .strip_prefix("/backend-api/conversation/")
+        .or_else(|| path.strip_prefix("/backend-api/conversations/"))
+    else {
+        return false;
+    };
+    let id = tail.strip_suffix("/messages").unwrap_or(tail);
+    !id.is_empty()
+        && id.len() <= 512
+        && id != "init"
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 fn normalize_chatgpt_gateway_target(target: &str) -> Result<String> {
@@ -1638,13 +1657,23 @@ fn normalize_chatgpt_gateway_target(target: &str) -> Result<String> {
 
 fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
     let path = request_path(target)?;
+    if path == "/celsius/ws/user" {
+        return Ok(target.replacen(
+            "/celsius/ws/user",
+            "/chatgpt/backend-api/celsius/ws/user",
+            1,
+        ));
+    }
     let allowed = path == "/backend-api/models"
         || path == "/backend-api/f/conversation"
         || path.starts_with("/backend-api/f/conversation/")
         || path == "/backend-api/conversation/init"
         || path == "/backend-api/sentinel/chat-requirements/prepare"
         || path.starts_with("/backend-api/files/download/")
-        || path == "/backend-api/estuary/content";
+        || path == "/backend-api/estuary/content"
+        || path == "/backend-api/celsius/ws/user"
+        || path == "/backend-api/saiai/chat-updates"
+        || is_chatgpt_owned_conversation_path(&path);
     if !allowed {
         bail!("unsupported ChatGPT ordinary Chat path: {path}");
     }
@@ -2358,6 +2387,7 @@ fn request_path(target: &str) -> Result<String> {
 mod tests {
     use super::*;
     use rcgen::{BasicConstraints, IsCa};
+    use tokio::time::timeout;
 
     #[test]
     fn native_codex_images_keep_their_own_protocol_route() {
@@ -2565,6 +2595,35 @@ mod tests {
             assert_eq!(body["error"]["type"], "native_chat_updates_unsupported");
             assert!(body.get("websocket_url").is_none());
             assert_eq!(response.reason, "native_chat_updates_unsupported");
+            let forwarded = normalize_chatgpt_chat_target(target).unwrap();
+            assert!(is_forwarded_chatgpt_path(
+                &request_path(&forwarded).unwrap()
+            ));
+        }
+    }
+
+    #[test]
+    fn native_chat_delivery_routes_preserve_queries_and_bound_conversation_paths() {
+        for target in [
+            "/backend-api/conversation/TEST_ONLY_ID?history_off=true&x=a%2Bb",
+            "/backend-api/conversations/TEST_ONLY_ID?num_turns=10",
+            "/backend-api/conversations/TEST_ONLY_ID/messages?cursor=TEST_ONLY",
+            "/backend-api/saiai/chat-updates",
+        ] {
+            let forwarded = normalize_chatgpt_chat_target(target).unwrap();
+            assert_eq!(forwarded, format!("/chatgpt{target}"));
+            assert!(is_forwarded_chatgpt_path(
+                &request_path(&forwarded).unwrap()
+            ));
+        }
+        for target in [
+            "/backend-api/conversations",
+            "/backend-api/conversation/../accounts",
+            "/backend-api/conversation/%2Faccounts",
+            "/backend-api/conversation/id/unknown",
+            "/backend-api/celsius/ws/admin",
+            "/backend-api/saiai/chat-updates/admin",
+        ] {
             assert!(normalize_chatgpt_chat_target(target).is_err());
         }
     }
