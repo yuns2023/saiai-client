@@ -514,12 +514,28 @@ fn is_benign_client_error(err: &anyhow::Error) -> bool {
     is_idle_http_connection_end(err)
         || message.contains("client disconnected while")
         || is_benign_direct_tunnel_close(err)
+        || (message.contains("client TLS handshake failed for ") && is_peer_connection_close(err))
 }
 
 fn is_idle_http_connection_end(err: &anyhow::Error) -> bool {
     let message = format!("{err:#}");
     message.contains("idle HTTP connection closed before request line")
         || message.contains("idle HTTP connection timed out before request line")
+        || (message.contains("idle HTTP connection reset before request line")
+            && is_peer_connection_close(err))
+}
+
+fn is_peer_connection_close(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        })
+    })
 }
 
 fn is_benign_direct_tunnel_close(err: &anyhow::Error) -> bool {
@@ -1155,6 +1171,16 @@ where
     let first = timeout_at(deadline, reader.fill_buf())
         .await
         .context("idle HTTP connection timed out before request line")?
+        .map_err(|error| {
+            let error = anyhow::Error::from(error);
+            if is_peer_connection_close(&error) {
+                // No HTTP bytes have been consumed. Chromium may cancel a
+                // preconnection or close a reused socket during a cold launch.
+                error.context("idle HTTP connection reset before request line")
+            } else {
+                error
+            }
+        })
         .context("failed to read HTTP request start")?;
     if first.is_empty() {
         bail!("idle HTTP connection closed before request line");
@@ -4088,6 +4114,82 @@ mod tests {
         ))
         .context("failed to read request body");
         assert!(!is_benign_client_error(&active_upload));
+    }
+
+    #[test]
+    fn quiets_only_peer_closed_tls_preconnections_and_keeps_certificate_errors() {
+        for kind in [
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            let error = anyhow::Error::from(std::io::Error::new(kind, "localized peer close"))
+                .context("client TLS handshake failed for chatgpt.com");
+            assert!(is_benign_client_error(&error));
+            for phase in [
+                "failed to read request body",
+                "failed to read header line",
+                "failed to read upstream response",
+                "upstream TLS handshake failed",
+            ] {
+                let error = anyhow::Error::from(std::io::Error::new(kind, "localized peer close"))
+                    .context(phase);
+                assert!(!is_benign_client_error(&error), "{phase}");
+            }
+        }
+        let certificate = anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::AlertReceived(rustls::AlertDescription::CertificateUnknown),
+        ))
+        .context("client TLS handshake failed for chat.openai.com");
+        assert!(!is_benign_client_error(&certificate));
+    }
+
+    #[tokio::test]
+    async fn quiets_zero_byte_peer_resets_but_reports_partial_http_requests() {
+        struct ClosingReader {
+            remaining: &'static [u8],
+            kind: std::io::ErrorKind,
+        }
+        impl tokio::io::AsyncRead for ClosingReader {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                buffer: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if self.remaining.is_empty() {
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        self.kind,
+                        "localized peer close",
+                    )));
+                }
+                let n = self.remaining.len().min(buffer.remaining());
+                buffer.put_slice(&self.remaining[..n]);
+                self.remaining = &self.remaining[n..];
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        for kind in [
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::ConnectionReset,
+        ] {
+            for bytes in [
+                &b""[..],
+                &b"POST "[..],
+                &b"POST /backend-api/f/conversation HTTP/1.1\r\nHost: chatgpt.com"[..],
+                &b"POST /backend-api/f/conversation HTTP/1.1\r\nContent-Length: 2\r\n\r\nx"[..],
+            ] {
+                let reader = ClosingReader {
+                    remaining: bytes,
+                    kind,
+                };
+                let error = read_http_request(&mut BufReader::new(reader))
+                    .await
+                    .unwrap_err();
+                assert_eq!(is_benign_client_error(&error), bytes.is_empty());
+                assert_eq!(is_idle_http_connection_end(&error), bytes.is_empty());
+            }
+        }
     }
 
     #[test]
