@@ -58,6 +58,8 @@ const DESKTOP_STATSIG_I18N_PAYLOAD: &str = r#"{"feature_gates":{},"dynamic_confi
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HEADER_LINE: usize = 32 * 1024;
 const MAX_HEADER_BYTES: usize = 256 * 1024;
+const MAX_CHAT_INIT_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_DESKTOP_STATE_BYTES: u64 = 2 * 1024 * 1024;
 
 // Service-managed stdout/stderr is the primary diagnostic stream on all
 // supported platforms. Keep every proxy line timestamped consistently; this
@@ -1221,6 +1223,31 @@ async fn forward_to_saiai<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    let preferences_path = super::codex_config_dir()
+        .ok()
+        .map(|home| home.join(".codex-global-state.json"));
+    forward_to_saiai_with_preferences_path(
+        state,
+        writer,
+        request,
+        close_after,
+        replace_authorization,
+        preferences_path.as_deref(),
+    )
+    .await
+}
+
+async fn forward_to_saiai_with_preferences_path<W>(
+    state: &State,
+    writer: &mut W,
+    request: IncomingRequest,
+    close_after: bool,
+    replace_authorization: bool,
+    preferences_path: Option<&std::path::Path>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let route = if replace_authorization {
         state.route_for_host(OPENAI_HOST)
     } else {
@@ -1251,6 +1278,10 @@ where
     let request_method = request.method.clone();
     let request_target = request.target.clone();
     let request_bytes = request.body.len();
+    let preserve_chat_preference = state.chatgpt_chat_passthrough
+        && replace_authorization
+        && is_fresh_chat_init(&request)
+        && preferences_path.and_then(saved_chat_model_at).is_some();
     if state.verbose {
         eprintln!(
             "forward request method={} target={} upstream={} bytes={} close_after={}",
@@ -1263,11 +1294,14 @@ where
             "request phase failed forwarding {request_method} {request_target} to {upstream_url}"
         )
     })?;
-    let outcome = write_upstream_response(writer, response, close_after)
-        .await
-        .with_context(|| {
-            format!("response phase failed forwarding {request_method} {request_target}")
-        })?;
+    let outcome = if preserve_chat_preference {
+        write_chat_init_response(writer, response, close_after).await
+    } else {
+        write_upstream_response(writer, response, close_after).await
+    }
+    .with_context(|| {
+        format!("response phase failed forwarding {request_method} {request_target}")
+    })?;
     if state.verbose {
         eprintln!(
             "forward response method={} target={} status={} elapsed_ms={} response_bytes={} chunks={}",
@@ -1280,6 +1314,147 @@ where
         );
     }
     Ok(())
+}
+
+fn is_fresh_chat_init(request: &IncomingRequest) -> bool {
+    if !request.method.eq_ignore_ascii_case("POST")
+        || request.target.split('?').next() != Some("/chatgpt/backend-api/conversation/init")
+    {
+        return false;
+    }
+    let Ok(Value::Object(body)) = serde_json::from_slice(&request.body) else {
+        return false;
+    };
+    // Existing chats, Work/custom GPTs, explicit choices and model envelopes
+    // must retain the account's complete initialization response.
+    [
+        "conversation_id",
+        "conversation_origin",
+        "gizmo_id",
+        "requested_default_model",
+        "model",
+        "messages",
+        "input",
+        "prompt",
+        "tools",
+        "system_hints",
+    ]
+    .iter()
+    .all(|key| body.get(*key).is_none_or(Value::is_null))
+}
+
+fn saved_chat_model_at(path: &std::path::Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(file, MAX_DESKTOP_STATE_BYTES + 1),
+        &mut data,
+    )
+    .ok()?;
+    if data.len() as u64 > MAX_DESKTOP_STATE_BYTES {
+        return None;
+    }
+    let state: Value = serde_json::from_slice(&data).ok()?;
+    let slug = state
+        .get("electron-persisted-atom-state")?
+        .get("chatgpt-last-selected-model-v1")?
+        .get("slug")?
+        .as_str()?;
+    (slug != "auto"
+        && !slug.is_empty()
+        && slug.len() <= 128
+        && slug
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)))
+    .then(|| slug.to_owned())
+}
+
+fn without_account_chat_defaults(body: &[u8]) -> Option<Vec<u8>> {
+    let Value::Object(mut value) = serde_json::from_slice(body).ok()? else {
+        return None;
+    };
+    // A quota-driven model replacement belongs to the selected account.
+    if value
+        .get("model_limits")
+        .is_some_and(|v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()))
+    {
+        return None;
+    }
+    let mut changed = false;
+    for key in ["default_model_slug", "intended_default_model_slug"] {
+        if value
+            .get(key)
+            .is_some_and(|v| !v.is_null() && !v.is_string())
+        {
+            return None;
+        }
+    }
+    for key in ["default_model_slug", "intended_default_model_slug"] {
+        changed |= value.remove(key).is_some();
+    }
+    changed.then(|| serde_json::to_vec(&value).ok()).flatten()
+}
+
+async fn write_chat_init_response<W>(
+    writer: &mut W,
+    response: reqwest::Response,
+    close_after: bool,
+) -> Result<UpstreamResponseOutcome>
+where
+    W: AsyncWrite + Unpin,
+{
+    if response.status() != StatusCode::OK
+        || !response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.split(';')
+                    .next()
+                    .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json"))
+            })
+        || response
+            .headers()
+            .get("content-encoding")
+            .is_some_and(|v| v != "identity")
+    {
+        return write_upstream_response(writer, response, close_after).await;
+    }
+    let status = response.status();
+    let mut headers = response.headers().clone();
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("reading native Chat initialization metadata")?;
+        if body.len().saturating_add(chunk.len()) > MAX_CHAT_INIT_RESPONSE_BYTES {
+            let prefix = futures_util::stream::iter([
+                Ok::<_, reqwest::Error>(body),
+                Ok::<_, reqwest::Error>(chunk.to_vec()),
+            ]);
+            let rest = stream.map(|r| r.map(|b| b.to_vec()));
+            let mut original = tungstenite::http::Response::builder()
+                .status(status)
+                .body(reqwest::Body::wrap_stream(prefix.chain(rest)))?;
+            *original.headers_mut() = headers;
+            return write_upstream_response(writer, original.into(), close_after).await;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if let Some(adjusted) = without_account_chat_defaults(&body) {
+        body = adjusted;
+        for key in ["content-length", "etag", "content-md5", "digest"] {
+            headers.remove(key);
+        }
+        headers.insert("x-saiai-chat-preference-restored", "1".parse()?);
+    }
+    let mut result = tungstenite::http::Response::builder()
+        .status(status)
+        .body(body)?;
+    *result.headers_mut() = headers;
+    write_upstream_response(writer, result.into(), close_after).await
 }
 
 async fn write_upstream_response<W>(
@@ -3165,6 +3340,227 @@ mod tests {
             body: Vec::new(),
         };
         assert!(is_websocket_upgrade(&request));
+    }
+
+    #[test]
+    fn chat_preference_applies_only_to_unconfigured_new_chat_initialization() {
+        let request = IncomingRequest {
+            method: "POST".into(),
+            target: "/chatgpt/backend-api/conversation/init".into(),
+            http_version: "HTTP/1.1".into(),
+            headers: vec![],
+            body: br#"{ "requested_default_model":null,"conversation_origin":null }"#.to_vec(),
+        };
+        assert!(is_fresh_chat_init(&request));
+        for body in [
+            json!({"conversation_id":"MOCK_EXISTING_CHAT"}),
+            json!({"conversation_origin":"tpp"}),
+            json!({"conversation_origin":"flora"}),
+            json!({"gizmo_id":"MOCK_CUSTOM_GPT"}),
+            json!({"requested_default_model":"gpt-6-pro"}),
+            json!({"model":"gpt-6-pro"}),
+            json!({"messages":[]}),
+            json!({"input":"MOCK_MODEL_REQUEST"}),
+            json!({"system_hints":["MOCK_MODEL_POLICY"]}),
+        ] {
+            assert!(!is_fresh_chat_init(&IncomingRequest {
+                body: serde_json::to_vec(&body).unwrap(),
+                ..request.clone()
+            }));
+        }
+        for target in [
+            "/v1/responses",
+            "/chatgpt/backend-api/f/conversation",
+            "/chatgpt/backend-api/models",
+        ] {
+            assert!(!is_fresh_chat_init(&IncomingRequest {
+                target: target.into(),
+                ..request.clone()
+            }));
+        }
+    }
+
+    #[test]
+    fn saved_chat_preference_is_bounded_and_never_written() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".codex-global-state.json");
+        let body = br#"{"electron-persisted-atom-state":{"chatgpt-last-selected-model-v1":{"slug":"gpt-5-6-thinking","thinkingEffort":"extended","versionId":"MOCK_VERSION"}},"unrelated":"MOCK_KEEP"}"#;
+        fs::write(&path, body).unwrap();
+        assert_eq!(
+            saved_chat_model_at(&path).as_deref(),
+            Some("gpt-5-6-thinking")
+        );
+        assert_eq!(fs::read(&path).unwrap(), body);
+        for body in [br#"{"slug":"gpt-6"}"#.as_slice(),b"invalid JSON",br#"{"electron-persisted-atom-state":{"chatgpt-last-selected-model-v1":{"slug":"auto"}}}"#] {
+            fs::write(&path,body).unwrap();assert!(saved_chat_model_at(&path).is_none());
+        }
+        fs::write(&path, vec![b' '; MAX_DESKTOP_STATE_BYTES as usize + 1]).unwrap();
+        assert!(saved_chat_model_at(&path).is_none());
+    }
+
+    async fn chat_init_wire(
+        status: StatusCode,
+        content_type: &str,
+        encoding: Option<&str>,
+        body: Vec<u8>,
+    ) -> (String, Vec<u8>) {
+        let mut response = tungstenite::http::Response::builder()
+            .status(status)
+            .header("content-type", content_type)
+            .header("x-mock-upstream", "keep")
+            .header("etag", "MOCK_ORIGINAL");
+        if let Some(value) = encoding {
+            response = response.header("content-encoding", value);
+        }
+        let response: reqwest::Response = response.body(body.clone()).unwrap().into();
+        let (mut writer, mut reader) = tokio::io::duplex(body.len() + 8192);
+        write_chat_init_response(&mut writer, response, true)
+            .await
+            .unwrap();
+        drop(writer);
+        let mut raw = Vec::new();
+        reader.read_to_end(&mut raw).await.unwrap();
+        let split = raw.windows(4).position(|s| s == b"\r\n\r\n").unwrap();
+        let headers = String::from_utf8(raw[..split].to_vec()).unwrap();
+        let mut chunked = BufReader::new(&raw[split + 4..]);
+        let decoded = read_chunked_body(&mut chunked).await.unwrap();
+        (headers, decoded)
+    }
+
+    #[tokio::test]
+    async fn native_chat_initialization_retains_limits_and_only_withholds_account_defaults() {
+        let body = json!({"default_model_slug":"gpt-6-pro","intended_default_model_slug":"gpt-6-pro",
+            "type":"conversation_detail_metadata","model_limits":[],
+            "blocked_features":[{"name":"image_gen","remaining":0}],
+            "limits_progress":[{"feature_name":"image_gen","remaining":0}],
+            "file_attachment_limits":{"max_count_per_turn":20},"future":"MOCK_KEEP"});
+        let (headers, actual) = chat_init_wire(
+            StatusCode::OK,
+            "application/json",
+            None,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .await;
+        let mut expected = body;
+        expected
+            .as_object_mut()
+            .unwrap()
+            .remove("default_model_slug");
+        expected
+            .as_object_mut()
+            .unwrap()
+            .remove("intended_default_model_slug");
+        assert_eq!(serde_json::from_slice::<Value>(&actual).unwrap(), expected);
+        assert!(headers.contains("x-saiai-chat-preference-restored: 1"));
+        assert!(headers.contains("x-mock-upstream: keep"));
+        assert!(!headers.contains("etag:"));
+    }
+
+    #[tokio::test]
+    async fn native_chat_errors_quota_encoding_unknown_and_oversized_responses_pass_through() {
+        for (status,kind,encoding,body) in [
+            (StatusCode::FORBIDDEN,"text/html",None,b"MOCK_UPSTREAM_403".to_vec()),
+            (StatusCode::OK,"application/json",Some("gzip"),b"MOCK_ENCODED_BYTES".to_vec()),
+            (StatusCode::OK,"application/json",None,br#"{ "model_limits":[{"model_slug":"gpt-5-6-thinking","using_default_model_slug":"gpt-6-pro"}],"default_model_slug":"gpt-6-pro" }"#.to_vec()),
+            (StatusCode::OK,"application/json",None,b"MOCK_FUTURE_FORMAT".to_vec()),
+            (StatusCode::OK,"application/json",None,vec![b' ';MAX_CHAT_INIT_RESPONSE_BYTES+1]),
+        ] {
+            let (headers,actual)=chat_init_wire(status,kind,encoding,body.clone()).await;
+            assert_eq!(actual,body);assert!(!headers.contains("x-saiai-chat-preference-restored"));
+            assert!(headers.contains("etag: MOCK_ORIGINAL"));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_chat_preference_keeps_original_initialization_request_on_wire() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let captured = read_http_request(&mut reader).await.unwrap();
+            let body=br#"{"default_model_slug":"gpt-6-pro","intended_default_model_slug":"gpt-6-pro","file_attachment_limits":{"max_count_per_turn":20}}"#;
+            reader.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+            reader.get_mut().write_all(body).await.unwrap();
+            captured
+        });
+        let (ca_cert_pem, ca_key_pem) = test_ca();
+        let state = State::new(Config {
+            listen: "127.0.0.1:0".into(),
+            base_url,
+            api_key: "MOCK_ONLY_GATEWAY".into(),
+            claude: None,
+            codex: None,
+            ca_cert_pem,
+            ca_key_pem,
+            verbose: false,
+            chatgpt_chat_passthrough: true,
+        })
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".codex-global-state.json");
+        let preferences=br#"{"electron-persisted-atom-state":{"chatgpt-last-selected-model-v1":{"slug":"gpt-5-6-thinking","thinkingEffort":"extended"}}}"#;
+        fs::write(&path, preferences).unwrap();
+        let body=br#"{ "conversation_origin":null, "requested_default_model":null,"timezone":"MOCK_ZONE","timezone_offset_min":0 }"#.to_vec();
+        let target = "/chatgpt/backend-api/conversation/init?future=a%2Fb&future=a+b";
+        let request = IncomingRequest {
+            method: "POST".into(),
+            target: target.into(),
+            http_version: "HTTP/1.1".into(),
+            body: body.clone(),
+            headers: vec![
+                ("User-Agent".into(), "MOCK_DESKTOP".into()),
+                ("X-Desktop-Future".into(), "first".into()),
+                ("x-desktop-future".into(), "second".into()),
+                ("Authorization".into(), "Bearer MOCK_CLIENT".into()),
+            ],
+        };
+        let (mut writer, mut output) = tokio::io::duplex(16384);
+        forward_to_saiai_with_preferences_path(
+            &state,
+            &mut writer,
+            request,
+            true,
+            true,
+            Some(&path),
+        )
+        .await
+        .unwrap();
+        drop(writer);
+        let mut response = Vec::new();
+        output.read_to_end(&mut response).await.unwrap();
+        let captured = server.await.unwrap();
+        assert_eq!(captured.body, body);
+        assert_eq!(captured.target, target);
+        assert_eq!(
+            header_value(&captured.headers, "user-agent"),
+            Some("MOCK_DESKTOP")
+        );
+        assert_eq!(
+            captured
+                .headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("x-desktop-future"))
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(
+            header_value(&captured.headers, "authorization"),
+            Some("Bearer MOCK_ONLY_GATEWAY")
+        );
+        assert_eq!(fs::read(path).unwrap(), preferences);
+        let split = response.windows(4).position(|s| s == b"\r\n\r\n").unwrap();
+        assert!(
+            String::from_utf8_lossy(&response[..split])
+                .contains("x-saiai-chat-preference-restored: 1")
+        );
+        let mut reader = BufReader::new(&response[split + 4..]);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&read_chunked_body(&mut reader).await.unwrap())
+                .unwrap(),
+            json!({"file_attachment_limits":{"max_count_per_turn":20}})
+        );
     }
 
     #[tokio::test]
