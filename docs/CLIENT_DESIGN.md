@@ -17,7 +17,7 @@
 - 无关用户配置和机器身份值必须保留。
 - 每个用户使用独立生成的 CA；release 中不得包含 CA 私钥。
 
-## 1.1.35 发布候选边界
+## 1.1.36 发布候选边界
 
 本候选包含可选 Claude 环境恢复启动器、Windows Desktop 安全实例检查修复，以及
 默认 VSCode Codex 控制面配置，
@@ -101,10 +101,13 @@ Desktop 的精确后台统计 POST `/ces/statsc/flush` 和 `/otlp/v1/metrics` �
 普通 Chat 的 `/backend-api/celsius/ws/user`（以及未加前缀的同一路径）用于获取
 会话更新订阅地址，属于结果交付协议。它不能作为遥测接口返回 `200 {}`：官方
 Desktop 会读取 `websocket_url` 并创建 WebSocket，缺少该字段会导致连接失败。
-当前尚未实现按 Gateway 用户、Key、会话和上游账号隔离的订阅交付，因此这两个
-精确路径明确返回 `501 native_chat_updates_unsupported`，不返回伪造订阅地址，
-也不把共用上游账号的订阅交给客户端。这个错误响应没有补齐后台任务交付；已有
-同步 Chat/画图成功记录不能证明异步 Chat 或图片任务受到支持。
+测试候选在显式普通 Chat 开关下把这两个精确路径交给 Gateway，并允许
+`/backend-api/saiai/chat-updates` 的 WebSocket 升级及单个会话读取路径。
+Gateway 必须同时启用按用户、Key、分组和原 OAuth 账号隔离的更新交付；旧 Gateway
+不支持这些路由，必须与兼容 Server 组合激活。订阅 URL 只指向经本地代理认证的
+Gateway 通道，不携带上游订阅凭据。未开启普通 Chat 时保留明确的 501 响应。
+会话列表和任意后台路径仍不转发。同步成功记录、路由测试和本地模拟不能代替
+官方 Desktop 的后台画图验收；本候选尚未激活。
 
 ### 可选的 Claude 环境恢复启动器
 
