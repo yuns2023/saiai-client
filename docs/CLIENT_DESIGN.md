@@ -92,6 +92,12 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
 可访问任意目标，代理核心必须强制只监听 loopback，不能仅依赖初始化器生成的默认
 地址。Gateway Key 由代理从私有配置读取，程序不会把 Key 打印到输出或请求日志。
 
+Desktop 的精确后台统计 POST `/ces/statsc/flush` 和 `/otlp/v1/metrics` 在本机确认，
+不发往 Gateway 或模型；OTLP 按 JSON/protobuf 返回空成功响应。这不扩展普通 Chat
+模型路径的 allowlist。TLS 预连接在收到首个 HTTP 字节前空闲超时或关闭时静默结束，
+已开始上传的请求行、请求头或 body 失败仍报错。Windows 普通直连隧道的连接中止
+按 I/O 错误类型识别，避免依赖系统语言；该处理不隐藏模型流或上传失败。
+
 ### 可选的 Claude 环境恢复启动器
 
 `saiai claude [-- <claude arguments>]` 用于用户 shell 或系统继承环境存在旧
