@@ -31,6 +31,7 @@ use url::Url;
 use uuid::Uuid;
 
 mod claude_launcher;
+mod codex_diagnostics;
 mod desktop_product;
 mod local_proxy;
 mod vscode;
@@ -3940,6 +3941,7 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
         }
     }
     if check_codex {
+        codex_diagnostics::check(&mut report);
         check_codex_config(
             &mut report,
             cfg.as_ref(),
