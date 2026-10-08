@@ -17,7 +17,15 @@
 - 无关用户配置和机器身份值必须保留。
 - 每个用户使用独立生成的 CA；release 中不得包含 CA 私钥。
 
-## 1.1.40 发布候选边界
+## 1.1.41 发布候选边界
+
+`saiai doctor codex` 离线检查实际调用的官方 CLI 路径与版本，并提示 PATH 中的
+多份安装。SAIAI 版本、官方 CLI 版本、Desktop app-server 版本彼此独立。
+配置模型只与同一 CLI 版本、获取时间在一小时内且不超过五分钟未来偏差的本地
+`models_cache.json` 对比；过期、损坏、空目录或版本不匹配不能证明模型不支持。
+使用中的 profile 模型优先于根配置。目录中有模型也不能保证上游账号允许调用。
+检查只运行 `codex --version` 和读取配置/缓存，不刷新目录、不发送模型请求，不修改
+模型、思考强度、profile 或认证。显式命令行模型覆盖不在此配置诊断范围内。
 
 桌面端启动或重启时，Chromium 可取消 TLS 预连接或关闭复用连接。代理以类型化
 I/O 错误识别请求开始前的 ConnectionReset/ConnectionAborted（Windows
