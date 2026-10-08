@@ -17,7 +17,13 @@
 - 无关用户配置和机器身份值必须保留。
 - 每个用户使用独立生成的 CA；release 中不得包含 CA 私钥。
 
-## 1.1.39 发布候选边界
+## 1.1.40 发布候选边界
+
+桌面端启动或重启时，Chromium 可取消 TLS 预连接或关闭复用连接。代理以类型化
+I/O 错误识别请求开始前的 ConnectionReset/ConnectionAborted（Windows
+10054/10053）和握手前的 EOF，默认不将这些断连显示为请求错误。TLS 握手断连
+仍可在 verbose 模式诊断。此行为不重试或改变网络请求；证书拒绝、部分请求行、
+请求头、上传 body 和上游响应失败继续显示，不能用普通断连规则屏蔽。
 
 26.1002 原生 Chat 的 `GET /backend-api/system_hints` 由本地可选目录返回
 `{"system_hints":[]}`，不再返回会使官方 renderer 展开失败的空对象。
