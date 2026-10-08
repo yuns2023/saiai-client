@@ -143,6 +143,10 @@ jobs:
           & "$PWD/scripts/saiai-cli/test-windows-runtime.ps1" `
             -BinaryPath "$PWD/tools/saiai-cli/target/${{ matrix.target }}/release/saiai.exe"
 
+      - name: Verify Windows UTF-8 log reading
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: python scripts/saiai-cli/test-windows-log-encoding.py --binary tools/saiai-cli/target/${{ matrix.target }}/release/saiai.exe
+
       - name: Capture official Windows Codex through local proxy
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh

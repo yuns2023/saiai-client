@@ -3615,7 +3615,7 @@ fn run_service_logs() -> Result<()> {
 fn run_service_logs() -> Result<()> {
     let log_path = windows_log_path()?;
     let command = format!(
-        "Get-Content -LiteralPath {} -Tail 80 -Wait",
+        "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Get-Content -LiteralPath {} -Encoding UTF8 -Tail 80 -Wait",
         powershell_quote_path(&log_path)?
     );
     let status = ProcessCommand::new("powershell")
