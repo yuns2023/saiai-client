@@ -17,7 +17,23 @@
 - 无关用户配置和机器身份值必须保留。
 - 每个用户使用独立生成的 CA；release 中不得包含 CA 私钥。
 
-## 1.1.38 发布候选边界
+## 1.1.39 发布候选边界
+
+26.1002 原生 Chat 的 `GET /backend-api/system_hints` 由本地可选目录返回
+`{"system_hints":[]}`，不再返回会使官方 renderer 展开失败的空对象。
+这仅表示本地身份没有可选 system hint；不改写生成请求中的任何指令或工具。
+
+原生 Chat 图片粘贴支持 `/backend-api/files` 创建、Estuary 的
+`/backend-api/estuary/upload_content_bytes` 与 `/api/estuary/upload_content_bytes`
+两种地址，以及 `/backend-api/files/process_upload_stream` 的 NDJSON 就绪事件。
+请求 JSON、multipart 文件字节、query 和应用头原样送达对应 Gateway 路由。
+直接 Azure/AWS 签名上传仍走普通 CONNECT 隧道，不向 blob 发送 Gateway Key。
+Gateway 以用户/Key/分组隔离的摘要绑定文件和 OAuth 账号；后续对话必须使用文件
+所属账号，文件上传不计为模型轮次或生成图片。未知、过期或跨账号的附件不能转发。
+此候选要求 Gateway 实现精确上传路由，不能提前激活到不支持它们的旧版本。
+上传保留上游错误，处理流及时转发；签名 capability 不进入诊断日志。
+项目资料、Library 与 upload reservation 功能不在本次图片粘贴验收范围。
+
 
 Windows `saiai logs` 明确按 UTF-8 读取受管服务的 UTF-8 日志，同时将 PowerShell
 输出设置为 UTF-8。不能依赖中文 Windows 的默认 GBK 编码；实际 CLI 的离线回归

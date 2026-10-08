@@ -413,6 +413,15 @@ impl State {
         let Some(trace) = &self.openai_trace else {
             return;
         };
+        if is_chatgpt_upload_target(&request.target) {
+            trace.write(json!({
+                "event": event, "direction": direction, "method": request.method,
+                "path": request.target.split('?').next(),
+                "bytes": request.body.len(),
+                "sha256": format!("{:x}", Sha256::digest(&request.body)),
+            }));
+            return;
+        }
         let mut headers = Map::new();
         for (name, value) in &request.headers {
             let name = name.to_ascii_lowercase();
@@ -1276,7 +1285,22 @@ where
     }
 
     let request_method = request.method.clone();
-    let request_target = request.target.clone();
+    let upload = is_chatgpt_upload_target(&request.target);
+    let request_target = if upload {
+        request
+            .target
+            .split('?')
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        request.target.clone()
+    };
+    let log_upstream_url = if upload {
+        upstream_url.split('?').next().unwrap_or_default()
+    } else {
+        &upstream_url
+    };
     let request_bytes = request.body.len();
     let preserve_chat_preference = state.chatgpt_chat_passthrough
         && replace_authorization
@@ -1285,13 +1309,15 @@ where
     if state.verbose {
         eprintln!(
             "forward request method={} target={} upstream={} bytes={} close_after={}",
-            request_method, request_target, upstream_url, request_bytes, close_after
+            request_method, request_target, log_upstream_url, request_bytes, close_after
         );
     }
     let started = Instant::now();
-    let response = builder.body(request.body).send().await.with_context(|| {
+    let response = builder.body(request.body).send().await.map_err(|error| {
+        if upload { error.without_url() } else { error }
+    }).with_context(|| {
         format!(
-            "request phase failed forwarding {request_method} {request_target} to {upstream_url}"
+            "request phase failed forwarding {request_method} {request_target} to {log_upstream_url}"
         )
     })?;
     let outcome = if preserve_chat_preference {
@@ -1783,11 +1809,27 @@ fn is_forwarded_chatgpt_path(path: &str) -> bool {
         || path.starts_with("/chatgpt/backend-api/f/conversation/")
         || path == "/chatgpt/backend-api/conversation/init"
         || path == "/chatgpt/backend-api/sentinel/chat-requirements/prepare"
+        || path == "/chatgpt/backend-api/files"
+        || path == "/chatgpt/backend-api/files/process_upload_stream"
+        || path == "/chatgpt/backend-api/estuary/upload_content_bytes"
+        || path == "/chatgpt/api/estuary/upload_content_bytes"
         || path.starts_with("/chatgpt/backend-api/files/download/")
         || path == "/chatgpt/backend-api/estuary/content"
         || path == "/chatgpt/backend-api/celsius/ws/user"
         || path == "/chatgpt/backend-api/saiai/chat-updates"
         || is_chatgpt_owned_conversation_path(path.strip_prefix("/chatgpt").unwrap_or(path))
+}
+
+fn is_chatgpt_upload_target(target: &str) -> bool {
+    let path = target.split('?').next().unwrap_or_default();
+    let path = path.strip_prefix("/chatgpt").unwrap_or(path);
+    matches!(
+        path,
+        "/backend-api/files"
+            | "/backend-api/files/process_upload_stream"
+            | "/backend-api/estuary/upload_content_bytes"
+            | "/api/estuary/upload_content_bytes"
+    )
 }
 
 fn is_chatgpt_owned_conversation_path(path: &str) -> bool {
@@ -1832,6 +1874,9 @@ fn normalize_chatgpt_gateway_target(target: &str) -> Result<String> {
 
 fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
     let path = request_path(target)?;
+    if path == "/api/estuary/upload_content_bytes" {
+        return Ok(format!("/chatgpt{target}"));
+    }
     if path == "/celsius/ws/user" {
         return Ok(target.replacen(
             "/celsius/ws/user",
@@ -1844,6 +1889,9 @@ fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
         || path.starts_with("/backend-api/f/conversation/")
         || path == "/backend-api/conversation/init"
         || path == "/backend-api/sentinel/chat-requirements/prepare"
+        || path == "/backend-api/files"
+        || path == "/backend-api/files/process_upload_stream"
+        || path == "/backend-api/estuary/upload_content_bytes"
         || path.starts_with("/backend-api/files/download/")
         || path == "/backend-api/estuary/content"
         || path == "/backend-api/celsius/ws/user"
@@ -2149,6 +2197,12 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
             "limit": 100,
             "offset": 0
         }),
+        // Desktop 26.1002 iterates this optional tool catalog even on a
+        // plain Chat. The neutral local identity must return an array;
+        // a generic {} response throws "system_hints is not iterable".
+        "/backend-api/system_hints" if request.method.eq_ignore_ascii_case("GET") => {
+            json!({"system_hints": []})
+        }
         "/backend-api/wham/profiles/me" | "/wham/profiles/me" => json!({
             "profile": {
                 "display_name": null,
@@ -2775,6 +2829,28 @@ mod tests {
                 &request_path(&forwarded).unwrap()
             ));
         }
+    }
+
+    #[test]
+    fn native_chat_system_hints_catalog_is_an_array_for_official_renderer() {
+        let request = IncomingRequest {
+            method: "GET".into(),
+            target: "/backend-api/system_hints?mode=plugins&exclude_logo=true".into(),
+            http_version: "HTTP/1.1".into(),
+            headers: vec![],
+            body: vec![],
+        };
+        let (status, body, _, _) = chatgpt_account_sidecar_response(&request).unwrap();
+        assert_eq!(status, StatusCode::OK);
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["system_hints"], json!([]));
+        assert!(
+            chatgpt_account_sidecar_response(&IncomingRequest {
+                method: "POST".into(),
+                ..request
+            })
+            .is_none()
+        );
     }
 
     #[test]
@@ -3643,6 +3719,124 @@ mod tests {
                 .unwrap()
                 .starts_with("HTTP/1.1 200")
         );
+    }
+
+    #[tokio::test]
+    async fn native_chat_upload_wire_keeps_binary_json_headers_and_queries_without_tracing_capabilities()
+     {
+        for path in [
+            "/backend-api/files",
+            "/backend-api/files/process_upload_stream",
+            "/backend-api/estuary/upload_content_bytes",
+            "/api/estuary/upload_content_bytes",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let request = read_http_request(&mut reader).await.unwrap();
+                reader
+                    .get_mut()
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await
+                    .unwrap();
+                request
+            });
+            let (ca_cert_pem, ca_key_pem) = test_ca();
+            let mut state = State::new(Config {
+                listen: "127.0.0.1:0".into(),
+                base_url,
+                api_key: "MOCK_ONLY_GATEWAY".into(),
+                claude: None,
+                codex: None,
+                ca_cert_pem,
+                ca_key_pem,
+                verbose: false,
+                chatgpt_chat_passthrough: true,
+            })
+            .unwrap();
+            let trace = tempfile::NamedTempFile::new().unwrap();
+            state.openai_trace = Some(Arc::new(OpenAITrace {
+                file: Mutex::new(trace.reopen().unwrap()),
+            }));
+            let target = format!("{path}?upload_url=MOCK_ONLY_CAPABILITY&future=a%2Fb&future=a+b");
+            let normalized = normalize_chatgpt_chat_target(&target).unwrap();
+            assert_eq!(normalized, format!("/chatgpt{target}"));
+            assert!(is_forwarded_chatgpt_path(
+                &request_path(&normalized).unwrap()
+            ));
+            let multipart = path.contains("estuary");
+            let body = if multipart {
+                b"--MOCK_ONLY_BOUNDARY\r\nContent-Disposition: form-data; name=\"file\"; filename=\"MOCK_ONLY.png\"\r\n\r\nPNG\0\xff\r\n--MOCK_ONLY_BOUNDARY--\r\n".to_vec()
+            } else {
+                b"{ \"file_id\":\"file-MOCK_ONLY\",\"future\":[true,null] }".to_vec()
+            };
+            let content_type = if multipart {
+                "multipart/form-data; boundary=MOCK_ONLY_BOUNDARY"
+            } else {
+                "application/json"
+            };
+            let request = IncomingRequest {
+                method: "POST".into(),
+                target: normalized.clone(),
+                http_version: "HTTP/1.1".into(),
+                body: body.clone(),
+                headers: vec![
+                    ("Content-Type".into(), content_type.into()),
+                    ("X-Upload-Future".into(), "first".into()),
+                    ("x-upload-future".into(), "second".into()),
+                    ("Authorization".into(), "Bearer MOCK_ONLY_CLIENT".into()),
+                    ("Cookie".into(), "MOCK_ONLY_COOKIE".into()),
+                ],
+            };
+            state.trace_openai_request("request", "to_gateway", &request);
+            let (mut writer, mut output) = tokio::io::duplex(16384);
+            forward_to_saiai(&state, &mut writer, request, true, true)
+                .await
+                .unwrap();
+            drop(writer);
+            let mut response = Vec::new();
+            output.read_to_end(&mut response).await.unwrap();
+            let captured = server.await.unwrap();
+            assert_eq!(captured.method, "POST");
+            assert_eq!(captured.target, normalized);
+            assert_eq!(captured.body, body);
+            assert_eq!(
+                header_value(&captured.headers, "content-type"),
+                Some(content_type)
+            );
+            assert_eq!(
+                header_value(&captured.headers, "authorization"),
+                Some("Bearer MOCK_ONLY_GATEWAY")
+            );
+            assert!(header_value(&captured.headers, "cookie").is_none());
+            assert_eq!(
+                captured
+                    .headers
+                    .iter()
+                    .filter(|(n, _)| n.eq_ignore_ascii_case("x-upload-future"))
+                    .map(|(_, v)| v.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["first", "second"]
+            );
+            let evidence = fs::read_to_string(trace.path()).unwrap();
+            assert!(!evidence.contains("MOCK_ONLY_CAPABILITY"));
+            assert!(!evidence.contains("MOCK_ONLY.png"));
+            let evidence: Value = serde_json::from_str(evidence.trim()).unwrap();
+            assert_eq!(evidence["bytes"], body.len());
+            assert!(evidence.get("body").is_none());
+            assert!(evidence.get("headers").is_none());
+        }
+        for path in [
+            "/backend-api/files/admin",
+            "/api/estuary/other",
+            "/backend-api/files/upload_reservations",
+        ] {
+            assert!(normalize_chatgpt_chat_target(path).is_err());
+        }
     }
 
     #[tokio::test]
