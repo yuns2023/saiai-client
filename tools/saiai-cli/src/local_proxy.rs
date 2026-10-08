@@ -19,7 +19,7 @@ use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 use tokio::net::{TcpListener, TcpStream, lookup_host};
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 use tokio_tungstenite::WebSocketStream;
@@ -500,20 +500,31 @@ pub fn validate_tls_config(ca_cert_pem: &str, ca_key_pem: &str) -> Result<()> {
 
 fn is_benign_client_error(err: &anyhow::Error) -> bool {
     let message = format!("{err:#}");
-    message.contains("connection closed while reading header line")
+    is_idle_http_connection_end(err)
         || message.contains("client disconnected while")
-        || is_benign_direct_tunnel_close(&message)
+        || is_benign_direct_tunnel_close(err)
 }
 
 fn is_idle_http_connection_end(err: &anyhow::Error) -> bool {
     let message = format!("{err:#}");
-    message.contains("connection closed while reading header line")
-        || message.contains("timed out reading HTTP request line")
+    message.contains("idle HTTP connection closed before request line")
+        || message.contains("idle HTTP connection timed out before request line")
 }
 
-fn is_benign_direct_tunnel_close(message: &str) -> bool {
+fn is_benign_direct_tunnel_close(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}");
     message.contains("direct tunnel copy failed for ")
-        && (message.contains("Connection reset by peer")
+        && (err.chain().any(|cause| {
+            cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                )
+            })
+        }) || message.contains("Connection reset by peer")
             || message.contains("Broken pipe")
             || message.contains("UnexpectedEof")
             || message.contains("unexpected end of file")
@@ -734,7 +745,7 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
         let mut request = match read_http_request(&mut reader).await {
             Ok(request) => request,
             Err(err) => {
-                if handled_requests > 0 && is_idle_http_connection_end(&err) {
+                if is_idle_http_connection_end(&err) {
                     return Ok(());
                 }
                 let _ = write_static_response(
@@ -1089,9 +1100,7 @@ async fn read_http_request<R>(reader: &mut R) -> Result<IncomingRequest>
 where
     R: AsyncBufRead + Unpin,
 {
-    let request_line = timeout(HEADER_READ_TIMEOUT, read_line_limited(reader))
-        .await
-        .context("timed out reading HTTP request line")??;
+    let request_line = read_http_request_line(reader, HEADER_READ_TIMEOUT).await?;
     let parts = request_line.split_whitespace().collect::<Vec<_>>();
     if parts.len() != 3 || !parts[2].starts_with("HTTP/") {
         bail!("invalid HTTP request line");
@@ -1123,6 +1132,25 @@ where
         headers,
         body,
     })
+}
+
+async fn read_http_request_line<R>(reader: &mut R, wait: Duration) -> Result<String>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + wait;
+    // Chromium opens TLS preconnections before it has an HTTP request. Only
+    // zero-byte idle connections are quiet; a partial request remains an error.
+    let first = timeout_at(deadline, reader.fill_buf())
+        .await
+        .context("idle HTTP connection timed out before request line")?
+        .context("failed to read HTTP request start")?;
+    if first.is_empty() {
+        bail!("idle HTTP connection closed before request line");
+    }
+    timeout_at(deadline, read_line_limited(reader))
+        .await
+        .context("timed out reading HTTP request line")?
 }
 
 async fn read_request_body<R>(reader: &mut R, headers: &[(String, String)]) -> Result<Vec<u8>>
@@ -1646,6 +1674,24 @@ fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse>
             body: DESKTOP_STATSIG_I18N_PAYLOAD.as_bytes(),
             reason: "desktop_statsig_i18n_bootstrap",
         }),
+        "/ces/statsc/flush" if request.method.eq_ignore_ascii_case("POST") => {
+            Some(StaticResponse {
+                status: StatusCode::OK,
+                content_type: "application/json",
+                body: br#"{"success":true}"#,
+                reason: "desktop_statsc_noop",
+            })
+        }
+        "/otlp/v1/metrics" if request.method.eq_ignore_ascii_case("POST") => {
+            let json = header_value(&request.headers, "content-type")
+                .is_some_and(|value| value.starts_with("application/json"));
+            Some(StaticResponse {
+                status: StatusCode::OK,
+                content_type: if json { "application/json" } else { "application/x-protobuf" },
+                body: if json { b"{}" } else { b"" },
+                reason: "desktop_metrics_noop",
+            })
+        }
         "/ces/v1/rgstr" | "/ces/v1/telemetry/intake" => Some(StaticResponse {
             status: StatusCode::NO_CONTENT,
             content_type: "text/plain",
@@ -3302,12 +3348,102 @@ mod tests {
 
     #[test]
     fn detects_idle_http_connection_end() {
-        let closed = anyhow::anyhow!("connection closed while reading header line");
+        let closed = anyhow::anyhow!("idle HTTP connection closed before request line");
         assert!(is_idle_http_connection_end(&closed));
 
-        let timed_out =
-            anyhow::anyhow!("timed out reading HTTP request line: deadline has elapsed");
+        let timed_out = anyhow::anyhow!(
+            "idle HTTP connection timed out before request line: deadline has elapsed"
+        );
         assert!(is_idle_http_connection_end(&timed_out));
+        let partial = anyhow::anyhow!("timed out reading HTTP request line: deadline has elapsed");
+        assert!(!is_idle_http_connection_end(&partial));
+        assert!(!is_benign_client_error(&partial));
+        let headers = anyhow::anyhow!("connection closed while reading header line");
+        assert!(!is_benign_client_error(&headers));
+    }
+
+    #[tokio::test]
+    async fn distinguishes_empty_preconnections_from_partial_request_uploads() {
+        let (mut sender, receiver) = tokio::io::duplex(256);
+        let mut reader = BufReader::new(receiver);
+        let idle = read_http_request_line(&mut reader, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(is_benign_client_error(&idle));
+        sender.write_all(b"POST ").await.unwrap();
+        let partial = read_http_request_line(&mut reader, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(!is_benign_client_error(&partial));
+
+        let (sender, receiver) = tokio::io::duplex(256);
+        drop(sender);
+        let empty_eof = read_http_request(&mut BufReader::new(receiver))
+            .await
+            .unwrap_err();
+        assert!(is_benign_client_error(&empty_eof));
+        let mut partial_headers =
+            &b"POST /backend-api/f/conversation HTTP/1.1\r\nHost: chatgpt.com\r\n"[..];
+        let partial_eof = read_http_request(&mut partial_headers).await.unwrap_err();
+        assert!(!is_benign_client_error(&partial_eof));
+    }
+
+    #[test]
+    fn treats_windows_direct_tunnel_shutdowns_as_benign_by_error_kind() {
+        for kind in [
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::ConnectionReset,
+        ] {
+            let err = anyhow::Error::from(std::io::Error::new(kind, "localized Windows close"))
+                .context("direct tunnel copy failed for example.test:443");
+            assert!(is_benign_client_error(&err));
+        }
+        let active_upload = anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "localized Windows close",
+        ))
+        .context("failed to read request body");
+        assert!(!is_benign_client_error(&active_upload));
+    }
+
+    #[test]
+    fn acknowledges_only_exact_background_stats_and_metrics_posts() {
+        for path in ["/ces/statsc/flush", "/otlp/v1/metrics"] {
+            for content_type in ["application/json", "application/x-protobuf"] {
+                let mut request = IncomingRequest {
+                    method: "POST".to_string(),
+                    target: path.to_string(),
+                    http_version: "HTTP/1.1".to_string(),
+                    headers: vec![("content-type".to_string(), content_type.to_string())],
+                    body: b"TEST_ONLY_BACKGROUND_BYTES".to_vec(),
+                };
+                let response = chatgpt_sidecar_response(&request).unwrap();
+                assert!(response.status.is_success());
+                if path == "/ces/statsc/flush" {
+                    // Desktop 26.1002 parses the JSON and requires success=true;
+                    // an empty 204 increments its lost-metrics/retry counters.
+                    assert_eq!(response.status, StatusCode::OK);
+                    let body: Value = serde_json::from_slice(response.body).unwrap();
+                    assert_eq!(body["success"], true);
+                }
+                if path == "/otlp/v1/metrics" {
+                    assert_eq!(response.content_type, content_type);
+                    assert_eq!(
+                        response.body,
+                        if content_type == "application/json" {
+                            &b"{}"[..]
+                        } else {
+                            &b""[..]
+                        }
+                    );
+                }
+                request.method = "GET".to_string();
+                assert!(chatgpt_sidecar_response(&request).is_none());
+                request.method = "POST".to_string();
+                request.target.push_str("/other");
+                assert!(chatgpt_sidecar_response(&request).is_none());
+            }
+        }
     }
 
     #[test]
