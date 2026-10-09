@@ -1998,6 +1998,17 @@ fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
 
 fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse> {
     let path = request_path(&request.target).ok()?;
+    if matches!(
+        path.as_str(),
+        "/backend-api/plugins/featured"
+            | "/backend-api/ps/plugins/home"
+            | "/ps/plugins/home"
+            | "/backend-api/ps/plugins/suggested/codex"
+            | "/backend-api/ps/plugins/list"
+    ) && !request.method.eq_ignore_ascii_case("GET")
+    {
+        return Some(desktop_control_unsupported_response());
+    }
     match path.as_str() {
         // This bootstraps native conversation notifications and asynchronous
         // task delivery. An empty 200 makes Desktop construct a WebSocket with
@@ -2071,7 +2082,7 @@ fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse>
             body: br#"{"plugins":[],"enabled":false}"#,
             reason: "desktop_recommended_plugins_disabled",
         }),
-        _ if path.starts_with("/backend-api/ps/plugins/") => Some(StaticResponse {
+        "/backend-api/ps/plugins/list" => Some(StaticResponse {
             status: StatusCode::OK,
             content_type: "application/json",
             body: br#"{"plugins":[],"pagination":{"total":0,"limit":200,"offset":0}}"#,
@@ -2106,14 +2117,18 @@ fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse>
             || path == "/settings/user"
             || path == "/automations" =>
         {
-            Some(StaticResponse {
-                status: StatusCode::OK,
-                content_type: "application/json",
-                body: br#"{}"#,
-                reason: "desktop_account_sidecar_empty",
-            })
+            Some(desktop_control_unsupported_response())
         }
         _ => None,
+    }
+}
+
+fn desktop_control_unsupported_response() -> StaticResponse {
+    StaticResponse {
+        status: StatusCode::NOT_IMPLEMENTED,
+        content_type: "application/json",
+        body: br#"{"error":{"type":"desktop_control_unsupported","message":"This Desktop control endpoint is unavailable through SAIAI."}}"#,
+        reason: "desktop_control_unsupported",
     }
 }
 
@@ -2129,6 +2144,16 @@ fn chatgpt_chat_disabled_response(request: &IncomingRequest) -> Option<StaticRes
 
 fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<AccountSidecarResponse> {
     let path = request_path(&request.target).ok()?;
+    // These are local identity reads, not hosted account APIs. A write must
+    // never receive a synthetic success or be sent to a pooled account.
+    if is_desktop_identity_read_path(&path) && !request.method.eq_ignore_ascii_case("GET") {
+        return Some((
+            StatusCode::NOT_IMPLEMENTED,
+            br#"{"error":{"type":"desktop_identity_write_unsupported","message":"Hosted account changes are unavailable through SAIAI Desktop."}}"#.to_vec(),
+            "desktop_identity_write_unsupported",
+            &[],
+        ));
+    }
     let account_id = header_value(&request.headers, "chatgpt-account-id")
         .map(str::to_owned)
         .or_else(|| oauth_claim_account_id(&request.headers))
@@ -2227,35 +2252,7 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         // expects an ordered map of account records, not the wham array. A
         // generic `{}` fallback makes `account_ordering.map(...)` throw and
         // displays "ChatGPT hit a snag" despite an HTTP 200 response.
-        _ if path.starts_with("/accounts/check/")
-            || path.starts_with("/backend-api/accounts/check/") =>
-        {
-            let mut accounts = serde_json::Map::new();
-            accounts.insert(
-                account_id.clone(),
-                json!({
-                    "account": {
-                        "account_id": account_id,
-                        "account_user_id": user_id,
-                        "account_user_role": "standard-user",
-                        "structure": "personal",
-                        "plan_type": "plus",
-                        "is_zdr": false,
-                        "is_openai_internal": false,
-                        "is_deactivated": false,
-                        "is_fedramp_compliant_workspace": false,
-                        "is_hipaa_compliant_workspace": false,
-                        "ekm_config": null
-                    },
-                    "features": [],
-                    "can_access_with_session": true
-                }),
-            );
-            json!({
-                "account_ordering": [account_id],
-                "accounts": accounts
-            })
-        }
+        _ if is_desktop_full_account_path(&path) => desktop_account_catalog(&account_id, &user_id),
         // Codex Desktop's model picker treats this authenticated control-plane
         // response as the source of optional Daybreak access. A null root
         // means no special access program is present; an object such as `{}`
@@ -2345,26 +2342,91 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         "/backend-api/payments/payment_methods" => json!({
             "payment_methods": []
         }),
-        "/backend-api/devicecheck" | "/settings/user" => json!({}),
+        "/settings/user" => json!({}),
         _ if path.starts_with("/backend-api/accounts/") && path.ends_with("/settings") => {
             json!({"account_id": account_id, "settings": {}})
         }
         _ => return None,
     };
-    let headers = if path == "/backend-api/devicecheck" {
-        &[(
-            "Set-Cookie",
-            "_devicecheck=saiai-local-proxy; Domain=.chatgpt.com; Path=/; Secure; HttpOnly; SameSite=Lax",
-        )][..]
-    } else {
-        &[]
-    };
     Some((
         StatusCode::OK,
         serde_json::to_vec(&response).ok()?,
         "desktop_account_identity",
-        headers,
+        &[],
     ))
+}
+
+fn is_desktop_full_account_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/accounts/check/v4-2023-04-27" | "/backend-api/accounts/check/v4-2023-04-27"
+    )
+}
+
+fn is_desktop_identity_read_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/backend-api/accounts/optimized/check"
+            | "/accounts/optimized/check"
+            | "/backend-api/wham/accounts/check"
+            | "/wham/accounts/check"
+            | "/backend-api/accounts/verified_access"
+            | "/accounts/verified_access"
+            | "/backend-api/conversations"
+            | "/backend-api/system_hints"
+            | "/backend-api/wham/profiles/me"
+            | "/wham/profiles/me"
+            | "/backend-api/me"
+            | "/backend-api/payments/payment_methods"
+            | "/settings/user"
+    ) || is_desktop_full_account_path(path)
+        || (path.starts_with("/backend-api/accounts/") && path.ends_with("/settings"))
+}
+
+// The synthetic Desktop identity has no hosted subscription. Keep the complete
+// account record together: sidebar membership, Chat home, and Work home read
+// the same catalog, and subscription observers run even when trial UI is off.
+// Desktop 26.1007 mounts a timer that dereferences `entitlement.expires_at`
+// before checking whether the account has a trial. An omitted object throws
+// inside Jotai's onMount and becomes a renderer-wide AggregateError.
+fn desktop_account_catalog(account_id: &str, user_id: &str) -> Value {
+    let record = json!({
+        "account": {
+            "account_id": account_id,
+            "account_user_id": user_id,
+            "account_user_role": "standard-user",
+            "account_owner_id": null,
+            "structure": "personal",
+            "plan_type": "plus",
+            "is_zdr": false,
+            "is_openai_internal": false,
+            "is_deactivated": false,
+            "is_fedramp_compliant_workspace": false,
+            "is_hipaa_compliant_workspace": false,
+            "ekm_config": null
+        },
+        "entitlement": {
+            "subscription_id": null,
+            "subscription_plan": null,
+            "expires_at": null,
+            "renews_at": null,
+            "has_active_subscription": false,
+            "is_active_subscription_gratis": false,
+            "trial": null
+        },
+        "last_active_subscription": {
+            "subscription_id": null,
+            "purchase_origin_platform": null,
+            "will_renew": false
+        },
+        "eligible_offers": [],
+        "eligible_promo_campaigns": {},
+        "features": [],
+        "can_access_with_session": true
+    });
+    let mut accounts = Map::new();
+    accounts.insert(account_id.to_owned(), record);
+    json!({"account_ordering": [account_id], "accounts": accounts})
 }
 
 fn desktop_statsig_request(request: &IncomingRequest) -> Option<Value> {
@@ -3003,12 +3065,14 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["system_hints"], json!([]));
-        assert!(
+        assert_eq!(
             chatgpt_account_sidecar_response(&IncomingRequest {
                 method: "POST".into(),
                 ..request
             })
-            .is_none()
+            .unwrap()
+            .0,
+            StatusCode::NOT_IMPLEMENTED
         );
     }
 
@@ -3307,8 +3371,9 @@ mod tests {
             body: Vec::new(),
         };
         let response = chatgpt_sidecar_response(&request).expect("desktop sidecar response");
-        assert_eq!(response.status, StatusCode::OK);
-        assert_eq!(response.body, br#"{}"#);
+        // Account reads are handled by the complete identity response first.
+        // Falling through must not manufacture a second, malformed success.
+        assert_eq!(response.status, StatusCode::NOT_IMPLEMENTED);
 
         let telemetry = IncomingRequest {
             target: "/ces/v1/rgstr".to_string(),
@@ -3579,11 +3644,98 @@ mod tests {
             headers: Vec::new(),
             body: Vec::new(),
         };
-        let (status, _, _, headers) = chatgpt_account_sidecar_response(&settings).unwrap();
-        assert_eq!(status, StatusCode::OK);
-        assert!(headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("set-cookie") && value.starts_with("_devicecheck=")
-        }));
+        assert!(chatgpt_account_sidecar_response(&settings).is_none());
+        assert_eq!(
+            chatgpt_sidecar_response(&settings).unwrap().status,
+            StatusCode::NOT_IMPLEMENTED
+        );
+    }
+
+    #[test]
+    fn unknown_desktop_controls_never_fabricate_success_or_plugin_catalogs() {
+        for target in [
+            "/backend-api/future/control?extension=TEST_ONLY",
+            "/backend-api/wham/future",
+            "/backend-api/ps/plugins/future",
+            "/accounts/check/v5-future",
+            "/backend-api/accounts/check/v5-future",
+            "/accounts/future",
+            "/settings/future",
+            "/wham/future",
+            "/automations",
+        ] {
+            for method in ["GET", "POST", "PATCH", "DELETE"] {
+                let request = IncomingRequest {
+                    method: method.into(),
+                    target: target.into(),
+                    http_version: "HTTP/1.1".into(),
+                    headers: vec![],
+                    body: vec![],
+                };
+                assert!(chatgpt_account_sidecar_response(&request).is_none());
+                let response = chatgpt_sidecar_response(&request).unwrap();
+                assert_eq!(response.status, StatusCode::NOT_IMPLEMENTED);
+                let body: Value = serde_json::from_slice(response.body).unwrap();
+                assert_eq!(body["error"]["type"], "desktop_control_unsupported");
+                assert!(body.get("plugins").is_none());
+                assert!(normalize_chatgpt_chat_target(target).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn desktop_identity_and_optional_catalog_writes_cannot_report_success() {
+        for target in [
+            "/backend-api/me",
+            "/backend-api/accounts/optimized/check",
+            "/accounts/check/v4-2023-04-27",
+            "/backend-api/accounts/check/v4-2023-04-27",
+            "/backend-api/wham/profiles/me",
+            "/backend-api/payments/payment_methods",
+            "/settings/user",
+            "/backend-api/ps/plugins/list",
+            "/ps/plugins/home",
+        ] {
+            for method in ["POST", "PUT", "PATCH", "DELETE"] {
+                let request = IncomingRequest {
+                    method: method.into(),
+                    target: target.into(),
+                    http_version: "HTTP/1.1".into(),
+                    headers: vec![],
+                    body: br#"{"TEST_ONLY_CHANGE":true}"#.to_vec(),
+                };
+                let status = if let Some(response) = chatgpt_account_sidecar_response(&request) {
+                    response.0
+                } else {
+                    chatgpt_sidecar_response(&request).unwrap().status
+                };
+                assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{method} {target}");
+                assert!(normalize_chatgpt_chat_target(target).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn desktop_account_catalog_has_no_hosted_subscription_or_trial() {
+        let response = desktop_account_catalog("TEST_ONLY_ACCOUNT", "TEST_ONLY_USER");
+        let record = &response["accounts"]["TEST_ONLY_ACCOUNT"];
+        let entitlement = &record["entitlement"];
+        for field in [
+            "subscription_id",
+            "subscription_plan",
+            "expires_at",
+            "renews_at",
+            "trial",
+        ] {
+            assert!(entitlement.get(field).unwrap().is_null(), "{field}");
+        }
+        assert_eq!(entitlement["has_active_subscription"], false);
+        assert_eq!(entitlement["is_active_subscription_gratis"], false);
+        assert!(record["last_active_subscription"]["subscription_id"].is_null());
+        assert_eq!(record["last_active_subscription"]["will_renew"], false);
+        assert!(record["account"]["account_owner_id"].is_null());
+        assert_eq!(record["eligible_offers"], json!([]));
+        assert_eq!(record["eligible_promo_campaigns"], json!({}));
     }
 
     #[test]
