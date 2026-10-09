@@ -1,6 +1,6 @@
 [package]
 name = "saiai"
-version = "1.1.41"
+version = "1.1.42"
 edition = "2024"
 rust-version = "1.97"
 description = "SAIAI managed local proxy for Claude Code and Codex configuration"
@@ -15,6 +15,8 @@ base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", default-features = true, features = ["clock"] }
 futures-util = "0.3"
+hkdf = "0.12"
+p256 = { version = "0.13", default-features = false, features = ["arithmetic", "pkcs8", "std"] }
 rand = "0.9"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }

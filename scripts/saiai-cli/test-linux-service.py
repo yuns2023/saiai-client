@@ -103,6 +103,19 @@ def wait_for_port(port: int, expected_open: bool) -> None:
     raise AssertionError(f"local proxy port {port} did not become {state}")
 
 
+def desktop_pins(port: int) -> str:
+    with socket.create_connection((LISTEN_HOST, port), timeout=2) as stream:
+        stream.sendall(b"CONNECT certificate.saiai.local:443 HTTP/1.1\r\nHost: certificate.saiai.local:443\r\n\r\n")
+        response = stream.makefile("rb").read(4096).decode("ascii")
+    for line in response.split("\r\n"):
+        if line.lower().startswith("x-saiai-leaf-spki-sha256: "):
+            pins = line.split(": ", 1)[1]
+            if len(set(pins.split(","))) != 4:
+                raise AssertionError("Desktop requires four distinct domain leaf pins")
+            return pins
+    raise AssertionError("local certificate identity response omitted Desktop pins")
+
+
 def stop_service(binary: Path, environment: dict[str, str]) -> None:
     result = subprocess.run(
         [str(binary), "stop"],
@@ -171,6 +184,10 @@ def main() -> int:
         home.mkdir()
         claude_dir.mkdir()
         fake_bin.mkdir()
+        editor_settings = home / ".config/Code/User/settings.json"
+        editor_settings.parent.mkdir(parents=True)
+        editor_original = '// TEST_ONLY preserved editor comment\n{"editor.fontSize":16}\n'
+        editor_settings.write_text(editor_original, encoding="utf-8")
 
         systemctl = fake_bin / "systemctl"
         systemctl.write_text(
@@ -208,7 +225,7 @@ def main() -> int:
 
         initialization_environment = environment.copy()
         initialization_environment["SAIAI_SKIP_START"] = "1"
-        run_checked(
+        initialized = run_checked(
             [
                 str(binary),
                 "init",
@@ -217,6 +234,10 @@ def main() -> int:
             ],
             initialization_environment,
         )
+        if "WARN VSCode editor setup is incomplete" not in initialized.stderr:
+            raise AssertionError("Claude initialization did not attempt the existing editor trust/configuration flow")
+        if editor_settings.read_text(encoding="utf-8") != editor_original:
+            raise AssertionError("an untrusted CA changed the editor's settings")
         config_path = saiai_home / "config.json"
         config = json.loads(config_path.read_text(encoding="utf-8"))
         config["listen"] = f"{LISTEN_HOST}:{port}"
@@ -238,6 +259,7 @@ def main() -> int:
             if "using a managed background process" not in start.stderr:
                 raise AssertionError(f"start did not explain the fallback:\n{start.stderr}")
             wait_for_port(port, True)
+            pins_before_refresh = desktop_pins(port)
 
             state = json.loads(state_path.read_text(encoding="utf-8"))
             first_pid = int(state["pid"])
@@ -288,13 +310,26 @@ def main() -> int:
 
             verify_logs_command(binary, environment)
 
+            # Changing the Claude Key forces a genuine managed proxy refresh.
+            # A Desktop already launched with these pins must keep trusting the
+            # new process without a root-store edit or another private key file.
+            run_checked([str(binary), "init", gateway_url, "TEST_ONLY_REFRESH_KEY"], environment)
+            wait_for_port(port, True)
+            refreshed_pid = int(json.loads(state_path.read_text(encoding="utf-8"))["pid"])
+            if refreshed_pid == first_pid:
+                raise AssertionError("changed Claude initialization did not refresh the proxy")
+            if desktop_pins(port) != pins_before_refresh:
+                raise AssertionError("Claude initialization invalidated the existing Desktop pins")
+
             restart = run_checked([str(binary), "restart"], environment)
             if "SAIAI background proxy started or refreshed." not in restart.stdout:
                 raise AssertionError(f"restart did not use the fallback:\n{restart.stdout}")
             wait_for_port(port, True)
             second_pid = int(json.loads(state_path.read_text(encoding="utf-8"))["pid"])
-            if second_pid == first_pid:
+            if second_pid == refreshed_pid:
                 raise AssertionError("restart did not replace the managed background process")
+            if desktop_pins(port) != pins_before_refresh:
+                raise AssertionError("service restart invalidated the existing Desktop pins")
 
             stopped = run_checked([str(binary), "stop"], environment)
             if "SAIAI background proxy stopped." not in stopped.stdout:

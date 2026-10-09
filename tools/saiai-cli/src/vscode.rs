@@ -18,6 +18,64 @@ pub fn certificate_trust(home: &Path, ca_cert: &Path) -> Result<bool> {
     inspect_certificate_trust(&program, &app, ca_cert)
 }
 
+#[cfg(windows)]
+pub fn trust_windows_current_user_ca(ca_cert: &Path) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let raw = fs::read(ca_cert).context("could not read the public installation CA")?;
+    let certificates = rustls_pemfile::certs(&mut std::io::Cursor::new(&raw))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("could not parse the public installation CA")?;
+    if certificates.len() != 1 {
+        bail!("expected exactly one public installation CA");
+    }
+    let hash = format!("{:x}", Sha256::digest(certificates[0].as_ref()));
+    let program =
+        PathBuf::from(env::var_os("SystemRoot").context("Windows SystemRoot is missing")?)
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let mut child = Command::new(program)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            include_str!("vscode_trust_windows.ps1"),
+        ])
+        .env("SAIAI_VSCODE_CA_PATH", ca_cert)
+        .env("SAIAI_VSCODE_CA_SHA256", hash)
+        .env_remove("PSModulePath")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("could not start Windows current-user CA trust setup")?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!(
+                    "Windows current-user CA trust setup did not complete; editor settings were preserved"
+                );
+            }
+        }
+    }
+    let result = child.wait_with_output()?;
+    let value: Value = serde_json::from_slice(&result.stdout)
+        .context("Windows CA trust setup returned an invalid result")?;
+    if !result.status.success()
+        || value.get("current_user_only").and_then(Value::as_bool) != Some(true)
+        || value.get("imported").and_then(Value::as_bool).is_none()
+    {
+        bail!(
+            "Windows current-user CA trust could not be established; editor settings were preserved"
+        );
+    }
+    Ok(())
+}
+
 fn inspect_certificate_trust(program: &Path, app: &Path, ca_cert: &Path) -> Result<bool> {
     let mut child = Command::new(program)
         .args(["-"])
@@ -253,6 +311,13 @@ pub fn settings_paths(home: &Path) -> Vec<PathBuf> {
 
 pub fn configure(home: &Path, listen: &str) -> Result<Vec<PathBuf>> {
     configure_paths(&settings_paths(home), listen)
+}
+
+pub fn preflight(home: &Path, listen: &str) -> Result<()> {
+    for path in settings_paths(home) {
+        merge_settings(&read_settings(&path)?, listen)?;
+    }
+    Ok(())
 }
 
 fn configure_paths(paths: &[PathBuf], listen: &str) -> Result<Vec<PathBuf>> {

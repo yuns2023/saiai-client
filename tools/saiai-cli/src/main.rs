@@ -62,7 +62,9 @@ Usage:
   saiai vscode                                                    # configure the Codex VSCode extension for SAIAI
   saiai desktop [codex] [-- <Desktop arguments>]                # launch Codex Desktop through SAIAI
   saiai init       --base-url <base_url> --api-key <api_key>      # initialize Claude Code
-  saiai init-codex --base-url <base_url> --api-key <api_key> [--websockets]";
+  saiai init-codex --base-url <base_url> --api-key <api_key> [--websockets]
+Windows setup may prompt for CurrentUser Root CA trust for VSCode. Use
+--trust-vscode-ca with init/init-codex only after consenting to this user-wide trust.";
 
 const SAIAI_CA_FILENAME: &str = "saiai-ca.crt";
 const SAIAI_CA_KEY_FILENAME: &str = "saiai-ca.key";
@@ -300,6 +302,8 @@ struct InitArgs {
     api_key: String,
     /// Only consulted by `init-codex`. `init` (Claude) ignores this field.
     websockets: bool,
+    /// Explicit Windows current-user CA trust consent for non-interactive setup.
+    trust_vscode_ca: bool,
 }
 
 fn parse_command(args: &[String]) -> Result<Command> {
@@ -422,6 +426,7 @@ fn parse_named_args(command: &str, args: &[String]) -> Result<InitArgs> {
     let mut base_url = String::new();
     let mut api_key = String::new();
     let mut websockets = false;
+    let mut trust_vscode_ca = false;
     let mut positionals = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -445,6 +450,9 @@ fn parse_named_args(command: &str, args: &[String]) -> Result<InitArgs> {
             // `init-codex` no longer writes a direct-provider transport mode.
             "--websockets" if command == "init-codex" => {
                 websockets = true;
+            }
+            "--trust-vscode-ca" if cfg!(windows) => {
+                trust_vscode_ca = true;
             }
             "-h" | "--help" => {
                 bail!(USAGE);
@@ -487,6 +495,7 @@ fn parse_named_args(command: &str, args: &[String]) -> Result<InitArgs> {
         base_url,
         api_key,
         websockets,
+        trust_vscode_ca,
     })
 }
 
@@ -616,6 +625,12 @@ fn init_claude(args: InitArgs) -> Result<()> {
     println!("Removed stale Claude OAuth credentials if present:");
     println!("  {}", credentials_path.display());
     warn_claude_settings_overrides_for_paths(&paths);
+    configure_vscode_editor_after_initialization(
+        &saiai_config.config.listen,
+        &ca_path,
+        "Claude Code",
+        args.trust_vscode_ca,
+    );
     start_managed_service_after_initialization(saiai_config.changed || ca_changed)?;
 
     Ok(())
@@ -639,12 +654,12 @@ fn init_codex(args: InitArgs) -> Result<()> {
     prepare_desktop_onboarding_state(&codex_dir)?;
     #[cfg(target_os = "linux")]
     ensure_direct_linux_desktop_trust(&proxy_init.ca_cert_path);
-    if let Err(error) = configure_vscode_editor_proxy(&proxy_init.listen, &proxy_init.ca_cert_path)
-    {
-        eprintln!(
-            "WARN VSCode editor setup is incomplete: {error:#}; Codex CLI remains configured."
-        );
-    }
+    configure_vscode_editor_after_initialization(
+        &proxy_init.listen,
+        &proxy_init.ca_cert_path,
+        "Codex CLI",
+        args.trust_vscode_ca,
+    );
 
     println!("SAIAI configured Codex for local-proxy OAuth mode.");
     println!("Updated:");
@@ -984,7 +999,7 @@ fn find_windows_program(search_path: &OsStr, names: &[&str]) -> Option<PathBuf> 
 }
 
 /// Configure both the Codex app-server environment and the VSCode editor's
-/// native HTTP route without changing shell or operating-system settings.
+/// native HTTP route. Windows current-user CA trust requires explicit consent.
 fn configure_vscode() -> Result<()> {
     let codex_dir = codex_config_dir().context("failed to resolve Codex config directory")?;
     fs::create_dir_all(&codex_dir)
@@ -1015,14 +1030,50 @@ fn configure_vscode() -> Result<()> {
     Ok(())
 }
 
+fn configure_vscode_editor_after_initialization(
+    listen: &str,
+    ca_cert: &Path,
+    provider: &str,
+    trust_vscode_ca: bool,
+) {
+    if let Err(error) = configure_vscode_editor_proxy_with_consent(listen, ca_cert, trust_vscode_ca)
+    {
+        eprintln!(
+            "WARN VSCode editor setup is incomplete: {error:#}; {provider} remains configured."
+        );
+    }
+}
+
 fn configure_vscode_editor_proxy(listen: &str, ca_cert: &Path) -> Result<()> {
+    configure_vscode_editor_proxy_with_consent(listen, ca_cert, false)
+}
+
+fn configure_vscode_editor_proxy_with_consent(
+    listen: &str,
+    ca_cert: &Path,
+    trust_vscode_ca: bool,
+) -> Result<()> {
     let home = home_dir().context("failed to resolve VSCode's home directory")?;
     let paths = vscode::settings_paths(&home);
     if paths.is_empty() {
         println!("No existing VSCode user settings directory was found; editor setup was skipped.");
         return Ok(());
     }
-    if !vscode::certificate_trust(&home, ca_cert)? {
+    vscode::preflight(&home, listen)?;
+    let trusted = vscode::certificate_trust(&home, ca_cert)?;
+    #[cfg(windows)]
+    let trusted = if !trusted && (trust_vscode_ca || confirm_windows_vscode_ca_trust()?) {
+        println!(
+            "Trusting this installation's SAIAI CA in Windows CurrentUser\\Root. Other applications of this Windows user also trust it; the system proxy and TLS verification are unchanged."
+        );
+        vscode::trust_windows_current_user_ca(ca_cert)?;
+        vscode::certificate_trust(&home, ca_cert)?
+    } else {
+        trusted
+    };
+    #[cfg(not(windows))]
+    let _ = trust_vscode_ca;
+    if !trusted {
         bail!(
             "VSCode's certificate loader does not trust the SAIAI CA; editor settings were preserved. Establish certificate trust before repeating initialization; TLS verification will not be disabled."
         );
@@ -1036,6 +1087,25 @@ fn configure_vscode_editor_proxy(listen: &str, ca_cert: &Path) -> Result<()> {
         "VSCode's certificate loader recognizes the SAIAI CA. TLS verification remains enabled; fully quit and reopen the editor to load the new route."
     );
     Ok(())
+}
+
+#[cfg(windows)]
+fn confirm_windows_vscode_ca_trust() -> Result<bool> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        eprintln!(
+            "VSCode needs the installation CA in Windows CurrentUser\\Root. After reviewing its effect on other applications of this user, repeat initialization with --trust-vscode-ca to consent."
+        );
+        return Ok(false);
+    }
+    eprintln!(
+        "VSCode needs this installation's CA trusted in Windows CurrentUser\\Root. Other applications of this Windows user will also trust it. The system proxy and TLS verification stay unchanged."
+    );
+    eprint!("Trust this CA for the current Windows user? Type YES to continue, or Enter to skip: ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(answer.trim().eq_ignore_ascii_case("yes"))
 }
 
 fn write_codex_ide_env(path: &Path, listen: &str, ca_cert_path: &str) -> Result<()> {
@@ -3947,17 +4017,16 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
             cfg.as_ref(),
             matches!(target, DoctorTarget::Codex),
         );
-        if let Some(cfg) = &cfg
-            && (matches!(target, DoctorTarget::Codex) || cfg.providers.codex.is_some())
-        {
-            check_vscode_editor_config(&mut report, cfg);
-        }
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         check_desktop_permission_visibility(&mut report);
         #[cfg(target_os = "linux")]
         check_direct_linux_desktop_trust(&mut report);
         #[cfg(target_os = "macos")]
         check_direct_macos_desktop_trust(&mut report);
+    }
+
+    if let Some(cfg) = &cfg {
+        check_vscode_editor_config(&mut report, cfg);
     }
 
     if let Some(cfg) = &cfg {
@@ -4028,7 +4097,7 @@ fn check_vscode_editor_config(report: &mut DoctorReport, cfg: &SaiaiConfig) {
     }
     match vscode::certificate_trust(&home, Path::new(&cfg.ca_cert_path)) {
         Ok(true) => report.ok("VSCode certificate loader", "recognizes the current SAIAI CA; this is not a live UI or model-request test"),
-        Ok(false) => report.warn("VSCode certificate loader", "does not trust the SAIAI CA; Codex's SSL_CERT_FILE in .env does not establish editor-host trust"),
+        Ok(false) => report.warn("VSCode certificate loader", "does not trust the SAIAI CA; provider-specific CA settings do not establish editor-host trust"),
         Err(error) => report.warn("VSCode certificate loader", error.to_string()),
     }
 }
@@ -7969,6 +8038,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             base_url: "https://gateway.example.test/v1".to_string(),
             api_key: "TEST_ONLY_CODEX_PROXY_KEY".to_string(),
             websockets: false,
+            trust_vscode_ca: false,
         };
 
         let initialized =
@@ -8021,6 +8091,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             base_url: "https://first.example.test".to_string(),
             api_key: "TEST_ONLY_FIRST_CODEX_PROXY_KEY".to_string(),
             websockets: false,
+            trust_vscode_ca: false,
         };
         let first =
             initialize_codex_local_proxy_at(temporary.path(), &first_args, "test-first").unwrap();
@@ -8040,6 +8111,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             base_url: "https://second.example.test".to_string(),
             api_key: "TEST_ONLY_SECOND_CODEX_PROXY_KEY".to_string(),
             websockets: true,
+            trust_vscode_ca: false,
         };
         let second =
             initialize_codex_local_proxy_at(temporary.path(), &second_args, "test-second").unwrap();
@@ -8604,8 +8676,31 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             Command::Init(init) => {
                 assert_eq!(init.base_url, "https://api.saiai.top");
                 assert_eq!(init.api_key, "sk-test");
+                assert!(!init.trust_vscode_ca);
             }
             _ => panic!("expected init command"),
+        }
+    }
+
+    #[test]
+    fn windows_ca_trust_requires_an_explicit_platform_scoped_option() {
+        for verb in ["init", "init-codex"] {
+            let args = [
+                verb,
+                "https://gateway.example",
+                "TEST_ONLY_KEY",
+                "--trust-vscode-ca",
+            ]
+            .map(String::from);
+            if cfg!(windows) {
+                let init = match parse_command(&args).unwrap() {
+                    Command::Init(init) | Command::InitCodex(init) => init,
+                    _ => panic!("expected initialization"),
+                };
+                assert!(init.trust_vscode_ca);
+            } else {
+                assert!(parse_command(&args).is_err());
+            }
         }
     }
 
