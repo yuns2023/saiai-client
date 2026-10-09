@@ -2230,12 +2230,15 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
             &[],
         ));
     }
-    let response = match path.as_str() {
+    // Match the known local identity contract once. Native Desktop fetch adds
+    // /backend-api, while older callers may supply the relative path directly.
+    // This only selects local responses; forwarded business URLs are unchanged.
+    let response = match desktop_identity_path(&path) {
         // The Desktop renderer uses the optimized account endpoint for seat
         // access.  It is not the same wire shape as the app-server's
         // `/wham/accounts/check` workspace-discovery endpoint: the renderer
         // dereferences `account_user.seat_type` directly during startup.
-        "/backend-api/accounts/optimized/check" | "/accounts/optimized/check" => json!({
+        "/accounts/optimized/check" => json!({
             "account": {
                 "id": account_id,
                 "is_fedramp_compliant_workspace": false
@@ -2248,7 +2251,7 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
                 "pending_seat_upgrade_request": false
             }
         }),
-        "/backend-api/wham/accounts/check" | "/wham/accounts/check" => json!({
+        "/wham/accounts/check" => json!({
             "account_ordering": [account_id],
             "default_account_id": account_id,
             "accounts": [{
@@ -2282,8 +2285,8 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         // response as the source of optional Daybreak access. A null root
         // means no special access program is present; an object such as `{}`
         // can be interpreted as a non-standard access state and hide Astra.
-        "/backend-api/accounts/verified_access" | "/accounts/verified_access" => Value::Null,
-        "/backend-api/wham/statsig/bootstrap" | "/wham/statsig/bootstrap" => {
+        "/accounts/verified_access" => Value::Null,
+        "/wham/statsig/bootstrap" => {
             if request.body.len() > DESKTOP_STATSIG_MAX_REQUEST_BYTES {
                 return Some((
                     StatusCode::PAYLOAD_TOO_LARGE,
@@ -2306,7 +2309,7 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
             }
             json!({"statsigPayload": serde_json::to_string(&desktop_statsig_payload(user)?).ok()?})
         }
-        "/backend-api/conversations" => json!({
+        "/conversations" => json!({
             "items": [],
             "total": 0,
             "limit": 100,
@@ -2315,10 +2318,10 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         // Desktop 26.1002 iterates this optional tool catalog even on a
         // plain Chat. The neutral local identity must return an array;
         // a generic {} response throws "system_hints is not iterable".
-        "/backend-api/system_hints" if request.method.eq_ignore_ascii_case("GET") => {
+        "/system_hints" if request.method.eq_ignore_ascii_case("GET") => {
             json!({"system_hints": []})
         }
-        "/backend-api/wham/profiles/me" | "/wham/profiles/me" => json!({
+        "/wham/profiles/me" => json!({
             "profile": {
                 "display_name": null,
                 "username": null,
@@ -2336,9 +2339,7 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         // `profile_details.profile_picture_url` even when no hosted profile
         // is configured. Keep optional identity fields empty for the local
         // account; a generic `{}` response crashes the entire renderer.
-        "/backend-api/profiles/me" | "/profiles/me"
-            if request.method.eq_ignore_ascii_case("GET") =>
-        {
+        "/profiles/me" if request.method.eq_ignore_ascii_case("GET") => {
             json!({
                 "profile_details": {
                     "display_name": null,
@@ -2347,7 +2348,7 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
                 }
             })
         }
-        "/backend-api/profiles/me" | "/profiles/me" => {
+        "/profiles/me" => {
             return Some((
                 StatusCode::NOT_IMPLEMENTED,
                 br#"{"error":{"type":"desktop_profile_update_unsupported","message":"Profile updates are unavailable through SAIAI Desktop."}}"#.to_vec(),
@@ -2355,7 +2356,7 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
                 &[],
             ));
         }
-        "/backend-api/me" => json!({
+        "/me" => json!({
             "id": account_id,
             "account_id": account_id,
             "email": SAIAI_DESKTOP_EMAIL
@@ -2364,9 +2365,12 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         // when no checkout flow is enabled. Returning an empty collection is
         // the neutral authenticated shape; `{}` makes the renderer panic on
         // `payment_methods.length`.
-        "/backend-api/payments/payment_methods" => json!({
+        "/payments/payment_methods" => json!({
             "payment_methods": []
         }),
+        // Desktop's native fetch resolves the relative settings read under
+        // /backend-api. Both spellings refer to the same local identity;
+        // hosted account settings and writes remain unavailable.
         "/settings/user" => json!({}),
         _ if desktop_settings_account_id(&path).is_some() => {
             if desktop_settings_account_id(&path) != Some(account_id.as_str()) {
@@ -2385,34 +2389,33 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
 }
 
 fn is_desktop_full_account_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/accounts/check/v4-2023-04-27" | "/backend-api/accounts/check/v4-2023-04-27"
-    )
+    desktop_identity_path(path) == "/accounts/check/v4-2023-04-27"
+}
+
+fn desktop_identity_path(path: &str) -> &str {
+    path.strip_prefix("/backend-api")
+        .filter(|relative| relative.starts_with('/'))
+        .unwrap_or(path)
 }
 
 fn desktop_settings_account_id(path: &str) -> Option<&str> {
-    let account_id = path
-        .strip_prefix("/backend-api/accounts/")?
+    let account_id = desktop_identity_path(path)
+        .strip_prefix("/accounts/")?
         .strip_suffix("/settings")?;
     (!account_id.is_empty() && !account_id.contains('/')).then_some(account_id)
 }
 
 fn is_desktop_identity_read_path(path: &str) -> bool {
     matches!(
-        path,
-        "/backend-api/accounts/optimized/check"
-            | "/accounts/optimized/check"
-            | "/backend-api/wham/accounts/check"
+        desktop_identity_path(path),
+        "/accounts/optimized/check"
             | "/wham/accounts/check"
-            | "/backend-api/accounts/verified_access"
             | "/accounts/verified_access"
-            | "/backend-api/conversations"
-            | "/backend-api/system_hints"
-            | "/backend-api/wham/profiles/me"
+            | "/conversations"
+            | "/system_hints"
             | "/wham/profiles/me"
-            | "/backend-api/me"
-            | "/backend-api/payments/payment_methods"
+            | "/me"
+            | "/payments/payment_methods"
             | "/settings/user"
     ) || is_desktop_full_account_path(path)
         || desktop_settings_account_id(path).is_some()
@@ -3747,6 +3750,190 @@ mod tests {
                 assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{method} {target}");
                 assert!(normalize_chatgpt_chat_target(target).is_err());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_user_settings_aliases_are_local_reads_over_tls() {
+        ensure_rustls_crypto_provider();
+        let (ca_cert_pem, ca_key_pem) = test_ca();
+        let ca_der = rustls_pemfile::certs(&mut std::io::Cursor::new(ca_cert_pem.as_bytes()))
+            .next()
+            .unwrap()
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_der).unwrap();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ));
+        let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = Arc::new(
+            State::new(Config {
+                listen: "127.0.0.1:0".into(),
+                base_url: format!("http://{}", gateway.local_addr().unwrap()),
+                api_key: "MOCK_ONLY_GATEWAY".into(),
+                claude: None,
+                codex: None,
+                ca_cert_pem,
+                ca_key_pem,
+                verbose: false,
+                chatgpt_chat_passthrough: true,
+            })
+            .unwrap(),
+        );
+        for (method, path, expected_status) in [
+            ("GET", "/settings/user", 200),
+            ("GET", "/backend-api/settings/user", 200),
+            ("GET", "/backend-api/settings/user?extension=MOCK_ONLY", 200),
+            ("PATCH", "/settings/user", 501),
+            ("PATCH", "/backend-api/settings/user", 501),
+            (
+                "POST",
+                "/backend-api/settings/user?extension=MOCK_ONLY",
+                501,
+            ),
+            ("GET", "/backend-api/settings/user/future", 501),
+            (
+                "GET",
+                "/backend-api/settings/user_tpp_last_used_model_config",
+                501,
+            ),
+        ] {
+            let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = proxy.local_addr().unwrap();
+            let state = Arc::clone(&state);
+            let task = tokio::spawn(async move {
+                let (stream, _) = proxy.accept().await.unwrap();
+                serve_managed_tls(state, stream, CHATGPT_HOST)
+                    .await
+                    .unwrap();
+            });
+            let mut tls = connector
+                .connect(
+                    rustls::pki_types::ServerName::try_from(CHATGPT_HOST).unwrap(),
+                    TcpStream::connect(address).await.unwrap(),
+                )
+                .await
+                .unwrap();
+            tls.write_all(format!(
+                "{method} {path} HTTP/1.1\r\nHost: chatgpt.com\r\nChatGPT-Account-ID: MOCK_ONLY_LOCAL\r\nAuthorization: Bearer MOCK_ONLY_LOCAL\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ).as_bytes()).await.unwrap();
+            let mut response = BufReader::new(tls);
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                response.read_line(&mut line).await.unwrap();
+                assert!(!line.is_empty());
+                headers.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            assert!(
+                headers.starts_with(&format!("HTTP/1.1 {expected_status} ")),
+                "{method} {path}: {headers}"
+            );
+            assert!(!headers.to_lowercase().contains("set-cookie:"));
+            let length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let mut body = vec![0; length];
+            response.read_exact(&mut body).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            if expected_status == 200 {
+                // The official settings schema accepts the neutral local
+                // identity's empty optional settings, without hosted flags.
+                assert_eq!(body, json!({}));
+            } else {
+                assert!(body.get("error").is_some());
+            }
+            task.await.unwrap();
+        }
+        assert!(
+            timeout(Duration::from_millis(20), gateway.accept())
+                .await
+                .is_err(),
+            "local settings or an unsupported write reached the Gateway"
+        );
+    }
+
+    #[test]
+    fn desktop_local_identity_contract_has_consistent_native_read_aliases() {
+        // These are the established local reads used by installed Desktop
+        // consumers, rather than a list inferred from the routing match arms.
+        for path in [
+            "/accounts/optimized/check",
+            "/wham/accounts/check",
+            "/accounts/check/v4-2023-04-27",
+            "/accounts/verified_access",
+            "/wham/statsig/bootstrap",
+            "/conversations",
+            "/system_hints",
+            "/wham/profiles/me",
+            "/profiles/me",
+            "/me",
+            "/payments/payment_methods",
+            "/settings/user",
+            "/accounts/MOCK_ONLY_LOCAL/settings",
+        ] {
+            let mut responses = Vec::new();
+            for target in [
+                format!("{path}?extension=MOCK_ONLY"),
+                format!("/backend-api{path}?extension=MOCK_ONLY"),
+            ] {
+                let request = IncomingRequest {
+                    method: "GET".into(),
+                    target,
+                    http_version: "HTTP/1.1".into(),
+                    headers: vec![("ChatGPT-Account-ID".into(), "MOCK_ONLY_LOCAL".into())],
+                    body: vec![],
+                };
+                let response = chatgpt_account_sidecar_response(&request).unwrap();
+                assert_eq!(response.0, StatusCode::OK, "GET {}", request.target);
+                responses.push(response.1);
+                for method in ["PUT", "PATCH", "DELETE"] {
+                    assert_eq!(
+                        chatgpt_account_sidecar_response(&IncomingRequest {
+                            method: method.into(),
+                            ..request.clone()
+                        })
+                        .unwrap()
+                        .0,
+                        StatusCode::NOT_IMPLEMENTED,
+                        "{method} {}",
+                        request.target
+                    );
+                }
+            }
+            assert_eq!(responses[0], responses[1], "{path}");
+        }
+        for target in [
+            "/backend-apix/settings/user",
+            "/backend-api//settings/user",
+            "/backend-api/backend-api/settings/user",
+            "/settings/user/future",
+            "/backend-api/settings/user/future",
+            "/backend-api/accounts/check/v5-future",
+            "/accounts/MOCK_ONLY_FOREIGN/settings",
+            "/backend-api/accounts/MOCK_ONLY_FOREIGN/settings",
+            "/backend-api/v1/initialize",
+        ] {
+            let request = IncomingRequest {
+                method: "GET".into(),
+                target: target.into(),
+                http_version: "HTTP/1.1".into(),
+                headers: vec![("ChatGPT-Account-ID".into(), "MOCK_ONLY_LOCAL".into())],
+                body: vec![],
+            };
+            assert!(
+                chatgpt_account_sidecar_response(&request).is_none(),
+                "{target}"
+            );
         }
     }
 
