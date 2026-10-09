@@ -1882,6 +1882,7 @@ fn is_chatgpt_device_cookie_target(target: &str) -> bool {
             | "/backend-api/models"
             | "/backend-api/ios/attestation_challenge"
             | "/backend-api/f/conversation"
+            | "/backend-api/f/conversation/prepare"
             | "/backend-api/f/conversation/resume"
             | "/backend-api/conversation/init"
             | "/backend-api/sentinel/chat-requirements/prepare"
@@ -3013,6 +3014,15 @@ mod tests {
         assert!(!is_chatgpt_device_cookie_target(
             "/chatgpt/backend-api/files"
         ));
+        for target in [
+            "/backend-api/f/conversation/prepare?x=a%2Fb&x=a+b",
+            "/chatgpt/backend-api/f/conversation/prepare",
+        ] {
+            assert!(is_chatgpt_device_cookie_target(target));
+        }
+        assert!(!is_chatgpt_device_cookie_target(
+            "/backend-api/f/conversation/prepare/future"
+        ));
         assert!(normalize_chatgpt_chat_target("/backend-api/devicecheck/future").is_err());
         let settings = IncomingRequest {
             method: "POST".into(),
@@ -3058,6 +3068,27 @@ mod tests {
                 "",
                 "session=MOCK_ONLY_AUTH; _devicecheck=MOCK_ONLY_PROOF",
                 Some("_devicecheck=MOCK_ONLY_PROOF"),
+            ),
+            (
+                "POST",
+                "/backend-api/f/conversation/prepare?x=a%2Fb&x=a+b",
+                "{ \"model\":\"auto\",\"app_attest_challenge\":\"MOCK_ONLY_CHALLENGE\",\"future\":null }",
+                "session=MOCK_ONLY_AUTH; _devicecheck=MOCK_ONLY_PROOF",
+                Some("_devicecheck=MOCK_ONLY_PROOF"),
+            ),
+            (
+                "POST",
+                "/backend-api/f/conversation/prepare",
+                "{ \"model\":\"auto\",\"future\":null }",
+                "session=MOCK_ONLY_AUTH",
+                None,
+            ),
+            (
+                "POST",
+                "/backend-api/f/conversation/prepare",
+                "{ \"model\":\"auto\",\"future\":null }",
+                "session=MOCK_ONLY_AUTH; _devicecheck=saiai-local-proxy",
+                None,
             ),
             (
                 "POST",
