@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import socket
 import subprocess
 import tempfile
 
@@ -76,7 +77,7 @@ def main():
             path = root / "settings.json"
             path.write_bytes(plain if index % 2 == 0 else managed)
             protected[path] = path.read_bytes()
-        for verb in ("init", "init-codex", "init"):
+        for index, verb in enumerate(("init", "init-codex", "init")):
             code, output = invoke(binary, [verb, "--base-url", "http://127.0.0.1:9", "--api-key", "TEST_ONLY_SCOPE_KEY"], environment)
             assert code == 0, "provider initialization failed; raw output withheld"
             assert "VSCode editor settings and OS certificate stores were preserved" in output
@@ -88,6 +89,16 @@ def main():
             for root in editor_roots:
                 assert {p.name for p in root.iterdir()} == {"settings.json"}, "editor setup created a backup or profile"
             assert windows_roots() == roots, "Windows root store changed"
+            if index == 0:
+                # Never let doctor contact an unrelated proxy already running
+                # on the default port of a field machine.
+                with socket.socket() as reservation:
+                    reservation.bind(("127.0.0.1", 0))
+                    listen = "127.0.0.1:" + str(reservation.getsockname()[1])
+                path = home / ".saiai/config.json"
+                config = json.loads(path.read_text())
+                config["listen"] = listen
+                path.write_text(json.dumps(config))
         claude = json.loads((home / ".claude/settings.json").read_text())
         config = json.loads((home / ".saiai/config.json").read_text())
         assert claude["env"]["NODE_EXTRA_CA_CERTS"] == config["ca_cert_path"]
