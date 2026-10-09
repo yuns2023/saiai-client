@@ -2176,7 +2176,27 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
             &[],
         ));
     }
+    if matches!(
+        path.as_str(),
+        "/backend-api/wham/statsig/bootstrap" | "/wham/statsig/bootstrap"
+    ) && !matches!(request.method.as_str(), "GET" | "POST")
+    {
+        return Some((
+            StatusCode::NOT_IMPLEMENTED,
+            desktop_control_unsupported_response().body.to_vec(),
+            "desktop_control_unsupported",
+            &[],
+        ));
+    }
     if path == "/backend-api/ps/mcp" {
+        if !request.method.eq_ignore_ascii_case("POST") {
+            return Some((
+                StatusCode::NOT_IMPLEMENTED,
+                desktop_control_unsupported_response().body.to_vec(),
+                "desktop_control_unsupported",
+                &[],
+            ));
+        }
         let request_json: Value = serde_json::from_slice(&request.body).ok()?;
         let id = request_json.get("id").cloned().unwrap_or(Value::Null);
         let method = request_json.get("method").and_then(Value::as_str);
@@ -2188,16 +2208,21 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
                 &[],
             ));
         }
-        let result = match method {
-            Some("initialize") => json!({
+        let response = match method {
+            Some("initialize") => json!({"jsonrpc": "2.0", "id": id, "result": {
                 "protocolVersion": "2025-03-26",
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "saiai-local", "version": "1"}
-            }),
-            Some("tools/list") => json!({"tools": []}),
-            _ => json!({}),
+            }}),
+            Some("tools/list") => json!({"jsonrpc": "2.0", "id": id, "result": {"tools": []}}),
+            Some("ping") => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+            Some(_) => json!({"jsonrpc": "2.0", "id": id, "error": {
+                "code": -32601, "message": "Method not found"
+            }}),
+            None => json!({"jsonrpc": "2.0", "id": id, "error": {
+                "code": -32600, "message": "Invalid Request"
+            }}),
         };
-        let response = json!({"jsonrpc": "2.0", "id": id, "result": result});
         return Some((
             StatusCode::OK,
             serde_json::to_vec(&response).ok()?,
@@ -2343,7 +2368,10 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
             "payment_methods": []
         }),
         "/settings/user" => json!({}),
-        _ if path.starts_with("/backend-api/accounts/") && path.ends_with("/settings") => {
+        _ if desktop_settings_account_id(&path).is_some() => {
+            if desktop_settings_account_id(&path) != Some(account_id.as_str()) {
+                return None;
+            }
             json!({"account_id": account_id, "settings": {}})
         }
         _ => return None,
@@ -2363,6 +2391,13 @@ fn is_desktop_full_account_path(path: &str) -> bool {
     )
 }
 
+fn desktop_settings_account_id(path: &str) -> Option<&str> {
+    let account_id = path
+        .strip_prefix("/backend-api/accounts/")?
+        .strip_suffix("/settings")?;
+    (!account_id.is_empty() && !account_id.contains('/')).then_some(account_id)
+}
+
 fn is_desktop_identity_read_path(path: &str) -> bool {
     matches!(
         path,
@@ -2380,7 +2415,7 @@ fn is_desktop_identity_read_path(path: &str) -> bool {
             | "/backend-api/payments/payment_methods"
             | "/settings/user"
     ) || is_desktop_full_account_path(path)
-        || (path.starts_with("/backend-api/accounts/") && path.ends_with("/settings"))
+        || desktop_settings_account_id(path).is_some()
 }
 
 // The synthetic Desktop identity has no hosted subscription. Keep the complete
@@ -3736,6 +3771,84 @@ mod tests {
         assert!(record["account"]["account_owner_id"].is_null());
         assert_eq!(record["eligible_offers"], json!([]));
         assert_eq!(record["eligible_promo_campaigns"], json!({}));
+    }
+
+    #[test]
+    fn desktop_mcp_unknown_methods_return_protocol_errors_without_fake_results() {
+        for (method, expected_code) in [
+            (json!("tools/call"), -32601),
+            (json!("future/control"), -32601),
+            (json!(false), -32600),
+        ] {
+            let request = IncomingRequest {
+                method: "POST".into(),
+                target: "/backend-api/ps/mcp".into(),
+                http_version: "HTTP/1.1".into(),
+                headers: vec![],
+                body: serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 17, "method": method}))
+                    .unwrap(),
+            };
+            let (status, body, _, _) = chatgpt_account_sidecar_response(&request).unwrap();
+            assert_eq!(status, StatusCode::OK);
+            let response: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(response["id"], 17);
+            assert_eq!(response["error"]["code"], expected_code);
+            assert!(response.get("result").is_none());
+            assert_eq!(
+                chatgpt_account_sidecar_response(&IncomingRequest {
+                    method: "GET".into(),
+                    ..request
+                })
+                .unwrap()
+                .0,
+                StatusCode::NOT_IMPLEMENTED
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_account_settings_match_only_the_current_identity_and_exact_path() {
+        let request = IncomingRequest {
+            method: "GET".into(),
+            target: "/backend-api/accounts/TEST_ONLY_ACCOUNT/settings".into(),
+            http_version: "HTTP/1.1".into(),
+            headers: vec![("chatgpt-account-id".into(), "TEST_ONLY_ACCOUNT".into())],
+            body: vec![],
+        };
+        assert_eq!(
+            chatgpt_account_sidecar_response(&request).unwrap().0,
+            StatusCode::OK
+        );
+        for target in [
+            "/backend-api/accounts/TEST_ONLY_FOREIGN/settings",
+            "/backend-api/accounts/TEST_ONLY_ACCOUNT/future/settings",
+            "/backend-api/accounts//settings",
+            "/backend-api/accounts/TEST_ONLY_ACCOUNT/settings/future",
+        ] {
+            let request = IncomingRequest {
+                target: target.into(),
+                ..request.clone()
+            };
+            assert!(chatgpt_account_sidecar_response(&request).is_none());
+            assert_eq!(
+                chatgpt_sidecar_response(&request).unwrap().status,
+                StatusCode::NOT_IMPLEMENTED
+            );
+        }
+        for target in [
+            "/backend-api/wham/statsig/bootstrap",
+            "/wham/statsig/bootstrap",
+        ] {
+            let request = IncomingRequest {
+                method: "PATCH".into(),
+                target: target.into(),
+                ..request.clone()
+            };
+            assert_eq!(
+                chatgpt_account_sidecar_response(&request).unwrap().0,
+                StatusCode::NOT_IMPLEMENTED
+            );
+        }
     }
 
     #[test]
