@@ -413,7 +413,9 @@ impl State {
         let Some(trace) = &self.openai_trace else {
             return;
         };
-        if is_chatgpt_upload_target(&request.target) {
+        if is_chatgpt_upload_target(&request.target)
+            || is_chatgpt_device_cookie_target(&request.target)
+        {
             trace.write(json!({
                 "event": event, "direction": direction, "method": request.method,
                 "path": request.target.split('?').next(),
@@ -1310,6 +1312,17 @@ where
         builder = builder.bearer_auth(&*route.api_key);
     }
 
+    // Native Mac requires only the provider-issued device proof. The Gateway
+    // verifies its scoped digest and original account before forwarding it.
+    // Session/auth cookies still never cross this credential substitution.
+    if replace_authorization
+        && is_chatgpt_device_cookie_target(&request.target)
+        && !nominated.contains("cookie")
+        && let Some(cookie) = chatgpt_device_cookie(&request.headers)?
+    {
+        builder = builder.header("Cookie", cookie);
+    }
+
     let request_method = request.method.clone();
     let upload = is_chatgpt_upload_target(&request.target);
     let request_target = if upload {
@@ -1831,6 +1844,7 @@ fn is_forwarded_openai_path(path: &str) -> bool {
 
 fn is_forwarded_chatgpt_path(path: &str) -> bool {
     path == "/chatgpt/backend-api/models"
+        || path == "/chatgpt/backend-api/devicecheck"
         || path == "/chatgpt/backend-api/ios/attestation_challenge"
         || path == "/chatgpt/backend-api/f/conversation"
         || path.starts_with("/chatgpt/backend-api/f/conversation/")
@@ -1857,6 +1871,55 @@ fn is_chatgpt_upload_target(target: &str) -> bool {
             | "/backend-api/estuary/upload_content_bytes"
             | "/api/estuary/upload_content_bytes"
     )
+}
+
+fn is_chatgpt_device_cookie_target(target: &str) -> bool {
+    let path = target.split('?').next().unwrap_or_default();
+    let path = path.strip_prefix("/chatgpt").unwrap_or(path);
+    matches!(
+        path,
+        "/backend-api/devicecheck"
+            | "/backend-api/models"
+            | "/backend-api/ios/attestation_challenge"
+            | "/backend-api/f/conversation"
+            | "/backend-api/f/conversation/resume"
+            | "/backend-api/conversation/init"
+            | "/backend-api/sentinel/chat-requirements/prepare"
+    )
+}
+
+fn chatgpt_device_cookie(headers: &[(String, String)]) -> Result<Option<String>> {
+    let mut proof = None;
+    let mut seen = false;
+    for (_, raw) in headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+    {
+        for part in raw.split(';') {
+            let Some((name, value)) = part.trim().split_once('=') else {
+                continue;
+            };
+            if name != "_devicecheck" {
+                continue;
+            }
+            if seen
+                || value.is_empty()
+                || value.len() > 16 * 1024
+                || value
+                    .bytes()
+                    .any(|ch| !(0x21..=0x7e).contains(&ch) || b"\";,\\".contains(&ch))
+            {
+                bail!("invalid native Chat device proof");
+            }
+            seen = true;
+            // Never replay the historical local bootstrap placeholder as a
+            // provider proof. A real registration replaces it on startup.
+            if value != "saiai-local-proxy" {
+                proof = Some(format!("_devicecheck={value}"));
+            }
+        }
+    }
+    Ok(proof)
 }
 
 fn is_chatgpt_owned_conversation_path(path: &str) -> bool {
@@ -1912,6 +1975,7 @@ fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
         ));
     }
     let allowed = path == "/backend-api/models"
+        || path == "/backend-api/devicecheck"
         || path == "/backend-api/ios/attestation_challenge"
         || path == "/backend-api/f/conversation"
         || path.starts_with("/backend-api/f/conversation/")
@@ -2262,7 +2326,7 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         }
         _ => return None,
     };
-    let headers = if matches!(path.as_str(), "/backend-api/devicecheck" | "/settings/user") {
+    let headers = if path == "/backend-api/devicecheck" {
         &[(
             "Set-Cookie",
             "_devicecheck=saiai-local-proxy; Domain=.chatgpt.com; Path=/; Secure; HttpOnly; SameSite=Lax",
@@ -2921,6 +2985,177 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn native_chat_device_cookie_is_narrow_and_never_a_local_placeholder() {
+        let headers = vec![(
+            "Cookie".into(),
+            "session=MOCK_ONLY_AUTH; _devicecheck=MOCK_ONLY_PROOF; other=MOCK_ONLY_OTHER".into(),
+        )];
+        assert_eq!(
+            chatgpt_device_cookie(&headers).unwrap().as_deref(),
+            Some("_devicecheck=MOCK_ONLY_PROOF")
+        );
+        for invalid in [
+            "_devicecheck=",
+            "_devicecheck=\"MOCK_ONLY_PROOF\"",
+            "_devicecheck=MOCK_ONLY_FIRST; _devicecheck=MOCK_ONLY_SECOND",
+        ] {
+            assert!(chatgpt_device_cookie(&[("Cookie".into(), invalid.into())]).is_err());
+        }
+        assert!(
+            chatgpt_device_cookie(&[("Cookie".into(), "_devicecheck=saiai-local-proxy".into())])
+                .unwrap()
+                .is_none()
+        );
+        assert!(!is_chatgpt_device_cookie_target("/v1/responses"));
+        assert!(!is_chatgpt_device_cookie_target(
+            "/chatgpt/backend-api/files"
+        ));
+        assert!(normalize_chatgpt_chat_target("/backend-api/devicecheck/future").is_err());
+        let settings = IncomingRequest {
+            method: "POST".into(),
+            target: "/settings/user".into(),
+            http_version: "HTTP/1.1".into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        assert!(
+            chatgpt_account_sidecar_response(&settings)
+                .unwrap()
+                .3
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_chat_device_registration_uses_tls_forwarding_and_keeps_proofs_private() {
+        ensure_rustls_crypto_provider();
+        let (ca_cert_pem, ca_key_pem) = test_ca();
+        let ca_der = rustls_pemfile::certs(&mut std::io::Cursor::new(ca_cert_pem.as_bytes()))
+            .next()
+            .unwrap()
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_der).unwrap();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ));
+        for (method, path, body, cookie, expected_cookie) in [
+            (
+                "POST",
+                "/backend-api/devicecheck?x=a%2Fb&x=a+b",
+                "{ \"device_token\":\"MOCK_ONLY_APPLE\",\"bundle_id\":\"com.openai.codex\",\"future\":null }",
+                "session=MOCK_ONLY_AUTH; _devicecheck=saiai-local-proxy",
+                None,
+            ),
+            (
+                "GET",
+                "/backend-api/ios/attestation_challenge?x=a%2Fb",
+                "",
+                "session=MOCK_ONLY_AUTH; _devicecheck=MOCK_ONLY_PROOF",
+                Some("_devicecheck=MOCK_ONLY_PROOF"),
+            ),
+            (
+                "POST",
+                "/backend-api/f/conversation",
+                "{ \"model\":\"auto\",\"app_attest_challenge\":\"MOCK_ONLY_CHALLENGE\",\"future\":null }",
+                "session=MOCK_ONLY_AUTH; _devicecheck=MOCK_ONLY_PROOF",
+                Some("_devicecheck=MOCK_ONLY_PROOF"),
+            ),
+        ] {
+            let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", gateway.local_addr().unwrap());
+            let captured = tokio::spawn(async move {
+                let (stream, _) = gateway.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let request = read_http_request(&mut reader).await.unwrap();
+                reader.get_mut().write_all(b"HTTP/1.1 200 OK\r\nSet-Cookie: _devicecheck=MOCK_ONLY_PROOF; Domain=.chatgpt.com; Path=/; Secure; HttpOnly\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+                request
+            });
+            let trace_dir = tempfile::tempdir().unwrap();
+            let trace_path = trace_dir.path().join("trace.jsonl");
+            let mut state = State::new(Config {
+                listen: "127.0.0.1:0".into(),
+                base_url,
+                api_key: "MOCK_ONLY_GATEWAY".into(),
+                claude: None,
+                codex: None,
+                ca_cert_pem: ca_cert_pem.clone(),
+                ca_key_pem: ca_key_pem.clone(),
+                verbose: false,
+                chatgpt_chat_passthrough: true,
+            })
+            .unwrap();
+            state.openai_trace = Some(Arc::new(OpenAITrace {
+                file: Mutex::new(fs::File::create(&trace_path).unwrap()),
+            }));
+            let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = proxy.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (stream, _) = proxy.accept().await.unwrap();
+                serve_managed_tls(Arc::new(state), stream, CHATGPT_HOST)
+                    .await
+                    .unwrap();
+            });
+            let stream = TcpStream::connect(address).await.unwrap();
+            let mut tls = connector
+                .connect(
+                    rustls::pki_types::ServerName::try_from("chatgpt.com").unwrap(),
+                    stream,
+                )
+                .await
+                .unwrap();
+            let wire = format!(
+                "{method} {path} HTTP/1.1\r\nHost: chatgpt.com\r\nAuthorization: Bearer MOCK_ONLY_LOCAL\r\nCookie: {cookie}\r\nOAI-DID: MOCK_ONLY_DEVICE\r\nX-Sentinel-DC: MOCK_ONLY_HEADER_PROOF\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            tls.write_all(wire.as_bytes()).await.unwrap();
+            let mut response_reader = BufReader::new(tls);
+            let mut response_headers = String::new();
+            loop {
+                let mut line = String::new();
+                response_reader.read_line(&mut line).await.unwrap();
+                assert!(!line.is_empty());
+                response_headers.push_str(&line);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            assert_eq!(
+                read_chunked_body(&mut response_reader).await.unwrap(),
+                b"{}"
+            );
+            task.await.unwrap();
+            let request = captured.await.unwrap();
+            assert_eq!(request.target, format!("/chatgpt{path}"));
+            assert_eq!(request.method, method);
+            assert_eq!(request.body, body.as_bytes());
+            assert_eq!(header_value(&request.headers, "cookie"), expected_cookie);
+            assert_eq!(
+                header_value(&request.headers, "authorization"),
+                Some("Bearer MOCK_ONLY_GATEWAY")
+            );
+            assert_eq!(
+                header_value(&request.headers, "x-sentinel-dc"),
+                Some("MOCK_ONLY_HEADER_PROOF")
+            );
+            assert!(response_headers.contains("_devicecheck=MOCK_ONLY_PROOF; Domain=.chatgpt.com"));
+            let trace = fs::read_to_string(&trace_path).unwrap();
+            for secret in [
+                "MOCK_ONLY_APPLE",
+                "MOCK_ONLY_PROOF",
+                "MOCK_ONLY_LOCAL",
+                "MOCK_ONLY_AUTH",
+                "MOCK_ONLY_CHALLENGE",
+                "MOCK_ONLY_HEADER_PROOF",
+            ] {
+                assert!(!trace.contains(secret));
+            }
+        }
     }
 
     #[test]

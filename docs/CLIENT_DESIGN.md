@@ -17,6 +17,18 @@
 - 无关用户配置和机器身份值必须保留。
 - 每个用户使用独立生成的 CA；release 中不得包含 CA 私钥。
 
+## 1.1.45 发布候选边界
+
+普通 Chat 实验模式下，Mac 的 POST `/backend-api/devicecheck` 进入同名 Gateway
+控制路由，注册 JSON、Apple token、query、完整性头和返回字节保持原样。它不再走
+旧 Codex 身份 sidecar；`/settings/user` 不再写入本地 `_devicecheck` 占位 Cookie。
+客户端只在明确的 Chat 注册、challenge、目录、准备与生成路径转交 `_devicecheck`，
+其他登录/session Cookie 和 Responses/附件/WebSocket 路径仍被隔离。历史占位值不作为
+真实 proof 转交。Gateway 必须验证 proof 在当前用户、Key、分组、设备和原 OAuth 账号
+中的归属；不得提前激活到没有该能力的 Gateway。真实 token 不被替换、生成或绕过。
+诊断 trace 对这些校验路径仅记录无 query 的方法、路径、字节数及摘要。
+本地 TLS/HTTP mocks 不能证明真实 Apple/OpenAI 设备校验已经通过。
+
 ## 1.1.44 发布候选边界
 
 普通 `init` / `init-codex` 仅配置 provider 的代理与 CA 文件，不读取或写入 VSCode
