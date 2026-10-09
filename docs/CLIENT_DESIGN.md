@@ -17,6 +17,31 @@
 - 无关用户配置和机器身份值必须保留。
 - 每个用户使用独立生成的 CA；release 中不得包含 CA 私钥。
 
+## 当前 Desktop 和编辑器边界（1.1.49）
+
+启动入口仍是 `saiai desktop codex`；入口名称不等于内部只有一种协议。
+当前配置默认启用已定义的原生 Chat 路由，官方壳内 Chat 与 Work/Responses 必须
+分别验证。普通 Chat 的可用性还依赖兼容 Gateway、管理员启用和正向价格配置。
+Chat 的原生目录、准备、生成、上传、结果和真实设备 proof 按精确路由转发；
+本地身份控制面使用明确的版本化响应，不读取共享 OAuth 账号的私有资料或设置。
+未知控制接口和不支持的写操作拒绝，不能通过通用 `200 {}` 假装成功。
+这不构成整个官方侧栏、账号权益、插件或所有历史功能的支持承诺。
+
+OAuth 表示账号认证，不免除官方原生 Chat 的设备完整性/浏览器验证。
+`devicecheck` 和 `ios/attestation_challenge` 不等于 OAuth device-code 登录；
+真实 proof 和 challenge 必须保留其归属。不能伪造 Cookie、挑战或把上游 403
+转换为成功。菜单可用、`account/read` 通过或图片占位出现，均不能证明生成完成、
+图片资产已下载或费用已结算。这些面需要独立证据。
+
+普通 Claude/Codex 初始化仍只配置 provider 的代理和 CA 文件；不默认导入操作系统
+信任根，也不默认改 VSCode 整体代理。编辑器宿主配置是显式可选功能，见下文。
+1.1.42/1.1.43 的默认编辑器信任流程为历史行为，已由 1.1.44 替代。
+
+下文保留按版本的实验记录；与本节冲突的“未发布研究”“Codex only”表述不代表
+当前路由默认值。1.1.49 二进制的启动 banner 仍保留旧的 `Codex only` 范围提示；
+这是已识别的文案欠账，不是判断实际 Chat 路由或全部官方功能支持的证据。
+精确生产启用状态和发布坐标由私有 Ops 当前账本决定，不从这份公共设计文档推断。
+
 ## 1.1.49 发布候选边界
 
 官方 Desktop 的相对 GET `/settings/user` 会由原生 fetch 拼接成
@@ -475,9 +500,9 @@ Linux 隔离启动器改写子进程 `HOME` 以避免复用正常 Codex state。
 不会复制、修改或写入该文件。这样 Electron 仍可连接已有 X server，而隔离 home、
 Codex state 和 user-data 保持独立。
 
-Desktop 当前只接受 `saiai desktop codex`。官方应用的壳层仍可能显示“ChatGPT”以及
-其左栏，但普通 ChatGPT 会话、历史、语言、设置、插件和图片/文件 UI 不属于 SAIAI
-Desktop 合同。Desktop 26.924 的通知页会对 `/notifications/settings` 的返回值直接调用
+Desktop 启动入口只接受 `saiai desktop codex`。官方应用的壳层显示“ChatGPT”；
+已定义原生 Chat 路由与本地身份控制面见“当前 Desktop 和编辑器边界”。完整侧栏、
+账号权益、偏好和插件功能不能从启动入口名称或普通 Chat 生成通过推断。Desktop 26.924 的通知页会对 `/notifications/settings` 的返回值直接调用
 `settings.map()`；通用 `200 {}` 会使 Renderer 显示“ChatGPT hit a snag”，HTTP 501
 则令页面持续加载重试。本地代理对该精确路径（含 `/backend-api` 前缀）的 GET 返回
 `{"settings":[]}`，表示本地身份没有托管 ChatGPT 通知类别；修改请求仍返回 501，
@@ -488,7 +513,8 @@ Desktop 合同。Desktop 26.924 的通知页会对 `/notifications/settings` 的
 继续堆进一个 OpenAI 专用 launcher 分支。代理进程、CA、profile 生命周期、日志和
 doctor 检查属于共享 Desktop runtime。
 
-隔离实验开关 `SAIAI_CHATGPT_CHAT_PASSTHROUGH=1` 的普通 Chat allowlist 包括
+普通 Chat 转发配置的历史隔离实验开关为 `SAIAI_CHATGPT_CHAT_PASSTHROUGH=1`；
+当前配置默认启用已定义路由。其 allowlist 包括
 `/backend-api/models`，映射到 Gateway 的 `/chatgpt/backend-api/models`，保留原始
 query 并透传原生目录内容。它与 Codex `/backend-api/codex/models` 是不同协议，
 不得互换或从 Codex 目录合成普通 Chat 选项。该实验路径需要可调度的 OpenAI OAuth
@@ -543,10 +569,10 @@ Keychain 行为，也不会静默安装用户信任根：2026-09-15 在 macOS 15
 该状态只控制 selector 可见性，不选择模式、不修改 approval/sandbox，也不授予 Full
 Access。修改既有 Desktop state 前会备份，其他 atom 和用户状态保持不变。
 
-普通 Chat 协议的现有 allowlist 只保留为未发布研究代码，不能当作 Desktop 产品支持。
-它没有会话历史或语言偏好持久化合同，也不能因 Codex 的模型目录通过就推断可用。
-支持入口拒绝 `saiai desktop chatgpt`，普通 Chat 后续若恢复必须独立完成账户、历史、
-偏好、模型、资产、计费和多账户亲和性验证，不能与 Codex Desktop 共用“已支持”结论。
+普通 Chat 已定义的转发路径与 Gateway 合同独立演进；历史“仅未发布研究”分类
+已不适用于这些路径。入口仍拒绝 `saiai desktop chatgpt`。账户、历史、偏好、模型、
+上传、资产、计费和多账户亲和性仍是独立验收面，不能与 Codex Desktop 共用
+“已支持”结论；真实上游拒绝不能由 UI 或本地协议 mock 成功覆盖。
 
 Claude `init` 默认写入 Claude 配置的代理和 `NODE_EXTRA_CA_CERTS`；`init-codex`
 默认配置 Codex 扩展的 app-server 环境。编辑器整体代理需要显式选择
