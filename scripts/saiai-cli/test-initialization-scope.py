@@ -16,7 +16,7 @@ def windows_roots():
     if os.name != "nt":
         return None
     powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
-    script = r"""+$ErrorActionPreference='Stop'
+    script = r"""$ErrorActionPreference='Stop'
 $roots=@{}
 foreach($scope in @('CurrentUser','LocalMachine')) {
   $roots[$scope]=@((Get-ChildItem ('Cert:\'+$scope+'\Root')).Thumbprint | Sort-Object)
