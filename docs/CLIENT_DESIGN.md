@@ -17,7 +17,22 @@
 - 无关用户配置和机器身份值必须保留。
 - 每个用户使用独立生成的 CA；release 中不得包含 CA 私钥。
 
-## 1.1.43 发布候选边界
+## 1.1.44 发布候选边界
+
+普通 `init` / `init-codex` 仅配置 provider 的代理与 CA 文件，不读取或写入 VSCode
+编辑器设置、不触发 Windows 根证书导入或授权提示。Claude Code 及其扩展继续使用
+Claude 配置中的 `NODE_EXTRA_CA_CERTS`，Codex app-server 保留 `.env` 中的
+`SSL_CERT_FILE`。这些配置不证明编辑器宿主自身的控制面请求已建立信任。
+
+编辑器整体代理是独立可选功能：初始化显式传入 `--configure-vscode-editor` 或执行
+`saiai vscode` 才检查并配置编辑器；Windows 的 `--trust-vscode-ca` 仍明确授权
+CurrentUser Root 导入并启用编辑器配置。单独选择编辑器配置不会询问或添加根证书。
+已有受管编辑器配置、已有授权的证书信任和用户自定义代理均保留，不自动撤销。
+`doctor claude` 只检查 Claude 进程配置；普通 `doctor` / `doctor codex` 仅检查
+已有 SAIAI ownership marker 的编辑器配置，未启用该可选功能不产生缺失信任警告。
+TLS 校验、Desktop 的稳定叶证书指纹和 Mac 原生 challenge 转发保持有效。
+
+## 1.1.43 发布候选边界（历史行为，初始化默认值见 1.1.44）
 
 Windows 当前用户根证书导入遵守系统自己的安全确认。明确同意后，初始化提示 Windows
 安全警告和当前 CA 的 SHA-256，并最多等待 90 秒；原来的 15 秒期限不足以完成确认。
@@ -26,7 +41,7 @@ SSH 等 session zero 无法显示确认窗口：需要新增信任时立即提�
 保留 VSCode 设置；已有信任时仍可复用。该变更仅调整初始化的信任建立流程，不改变
 代理请求内容、已有 CA 或 manifest/configuration schema。
 
-## 1.1.42 发布候选边界
+## 1.1.42 发布候选边界（历史行为，初始化默认值见 1.1.44）
 
 Claude 与 Codex 初始化共用已有 VSCode 编辑器配置流程：仅处理发现的用户设置目录，
 先检查显式配置冲突，再用编辑器实际证书加载器检查当前 CA，最后备份并写入受管
@@ -464,10 +479,11 @@ Access。修改既有 Desktop state 前会备份，其他 atom 和用户状态�
 支持入口拒绝 `saiai desktop chatgpt`，普通 Chat 后续若恢复必须独立完成账户、历史、
 偏好、模型、资产、计费和多账户亲和性验证，不能与 Codex Desktop 共用“已支持”结论。
 
-Claude `init` 和 `init-codex` 默认配置 VSCode 编辑器代理；后者同时配置 Codex
-扩展的 app-server 环境。它们不新增 launcher、模式选择或隔离用户目录；之后用户
-仍正常启动 VSCode 和官方 Codex 扩展。已有 `saiai vscode` 仅保留为无需再次传入
-Gateway/Key 的修复与刷新入口，不是新增的必选操作。两者复用 OAuth
+Claude `init` 默认写入 Claude 配置的代理和 `NODE_EXTRA_CA_CERTS`；`init-codex`
+默认配置 Codex 扩展的 app-server 环境。编辑器整体代理需要显式选择
+`--configure-vscode-editor`，或执行独立的 `saiai vscode`。这些入口不新增隔离
+用户目录。`saiai vscode` 可在无需再次传入 Gateway/Key 时刷新 Codex 与编辑器配置，
+不是普通 Claude 初始化的必选步骤。`init-codex` 与 `saiai vscode` 复用 OAuth
 占位、第三方 provider/base URL 清理和备份逻辑，在 `CODEX_HOME/.env` 中写入当前
 loopback HTTP(S) proxy、`NO_PROXY` 和
 `SSL_CERT_FILE`，并按同一平台规则在 Codex 配置中写入
@@ -479,7 +495,7 @@ loopback HTTP(S) proxy、`NO_PROXY` 和
 `CODEX_CA_CERTIFICATE` 写入 `.env` 则不足以建立信任，因此 IDE 路径固定使用标准
 TLS 变量，CLI 子进程路径继续使用 `CODEX_CA_CERTIFICATE`。
 
-默认初始化还检查已有标准 VSCode、portable 与 VSCode Server 用户设置目录。
+显式选择编辑器整体配置后，检查已有标准 VSCode、portable 与 VSCode Server 用户设置目录。
 Windows 运行时定位兼容传统安装目录及官方 `bin/code.cmd` 指向的版本化资源目录；
 读取的是当前 launcher 的版本，不猜测残留版本或执行该批处理文件。
 没有发现目录时不创建一个新的编辑器 profile，也不影响 Codex CLI 初始化。在写入
