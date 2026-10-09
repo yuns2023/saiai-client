@@ -2,6 +2,7 @@
 """Verify provider initialization preserves editor settings and Windows roots."""
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -18,15 +19,36 @@ def windows_roots():
     powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
     script = r"""$ErrorActionPreference='Stop'
 $roots=@{}
-foreach($scope in @('CurrentUser','LocalMachine')) {
-  $roots[$scope]=@((Get-ChildItem ('Cert:\'+$scope+'\Root')).Thumbprint | Sort-Object)
+try {
+  foreach($scope in @('CurrentUser','LocalMachine')) {
+    $store=[System.Security.Cryptography.X509Certificates.X509Store]::new(
+      'Root', [System.Security.Cryptography.X509Certificates.StoreLocation]$scope)
+    try {
+      $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+      $roots[$scope]=@($store.Certificates.Thumbprint | Sort-Object)
+    } finally {
+      $store.Close()
+    }
+  }
+  $roots|ConvertTo-Json -Compress
+} catch {
+  [Console]::Error.WriteLine('SAIAI_ROOT_READ_ERROR '+$_.Exception.GetType().FullName+' '+$_.FullyQualifiedErrorId)
+  exit 1
 }
-$roots|ConvertTo-Json -Compress
 """
+    environment = os.environ.copy()
+    # A pwsh CI parent may export its module search path. Let Windows
+    # PowerShell build its own native module path for this read-only child.
+    environment.pop("PSModulePath", None)
     result = subprocess.run(
-        [str(powershell), "-NoProfile", "-NonInteractive", "-Command", script],
-        capture_output=True, timeout=20, check=True,
+        [str(powershell), "-NoProfile", "-NonInteractive", "-EncodedCommand",
+         base64.b64encode(script.encode("utf-16le")).decode("ascii")],
+        env=environment, capture_output=True, timeout=20,
     )
+    if result.returncode:
+        messages = result.stderr.decode("utf-8-sig", errors="replace").splitlines()
+        error = next((line for line in messages if line.startswith("SAIAI_ROOT_READ_ERROR ")), "unclassified PowerShell error")
+        raise RuntimeError(f"read-only Windows Root inventory failed: {error}")
     return json.loads(result.stdout.decode("utf-8-sig"))
 
 
