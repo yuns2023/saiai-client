@@ -24,7 +24,19 @@ try {
     $store=[System.Security.Cryptography.X509Certificates.X509Store]::new(
       'Root', [System.Security.Cryptography.X509Certificates.StoreLocation]$scope)
     try {
-      $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+      try {
+        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly -bor
+          [System.Security.Cryptography.X509Certificates.OpenFlags]::OpenExistingOnly)
+      } catch {
+        $storeReadException=$_.Exception.GetBaseException()
+        if ($storeReadException -is [System.Security.Cryptography.CryptographicException] -and
+            $storeReadException.HResult -in @(-2146885628, -2147024894)) {
+          # An absent store has no certificates. Never create it for a probe.
+          $roots[$scope]=@()
+          continue
+        }
+        throw
+      }
       $roots[$scope]=@($store.Certificates.Thumbprint | Sort-Object)
     } finally {
       $store.Close()
