@@ -32,6 +32,9 @@ pub fn trust_windows_current_user_ca(ca_cert: &Path) -> Result<()> {
     let program =
         PathBuf::from(env::var_os("SystemRoot").context("Windows SystemRoot is missing")?)
             .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    eprintln!(
+        "Windows may show a Security Warning for the existing SAIAI CA (SHA-256: {hash}). Confirm that certificate within 90 seconds to finish VSCode setup."
+    );
     let mut child = Command::new(program)
         .args([
             "-NoLogo",
@@ -48,7 +51,7 @@ pub fn trust_windows_current_user_ca(ca_cert: &Path) -> Result<()> {
         .stderr(Stdio::null())
         .spawn()
         .context("could not start Windows current-user CA trust setup")?;
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -57,7 +60,7 @@ pub fn trust_windows_current_user_ca(ca_cert: &Path) -> Result<()> {
                 let _ = child.kill();
                 let _ = child.wait();
                 bail!(
-                    "Windows current-user CA trust setup did not complete; editor settings were preserved"
+                    "Windows CA trust confirmation did not complete within 90 seconds; editor settings were preserved"
                 );
             }
         }
@@ -65,6 +68,11 @@ pub fn trust_windows_current_user_ca(ca_cert: &Path) -> Result<()> {
     let result = child.wait_with_output()?;
     let value: Value = serde_json::from_slice(&result.stdout)
         .context("Windows CA trust setup returned an invalid result")?;
+    if value.get("error").and_then(Value::as_str) == Some("interactive_session_required") {
+        bail!(
+            "Windows CA trust needs an interactive Windows desktop; run initialization in a Windows terminal and confirm the Security Warning; editor settings were preserved"
+        );
+    }
     if !result.status.success()
         || value.get("current_user_only").and_then(Value::as_bool) != Some(true)
         || value.get("imported").and_then(Value::as_bool).is_none()
@@ -847,6 +855,67 @@ mod tests {
         let merged = merge_settings(raw, LISTEN).unwrap();
         assert!(merged.contains("\"http.noProxy\": [\"example.test\", \".com:80\"]"));
         validate_settings(&merged, LISTEN).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_trust_rejects_leaf_and_expired_ca_without_store_changes() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+        fn roots() -> Value {
+            let script = r#"
+                $ErrorActionPreference = 'Stop'
+                $result = @{}
+                foreach ($location in @('CurrentUser', 'LocalMachine')) {
+                    $store = [Security.Cryptography.X509Certificates.X509Store]::new('Root', $location)
+                    try {
+                        $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+                        $hash = [Security.Cryptography.SHA256]::Create()
+                        try {
+                            $result[$location] = @($store.Certificates | ForEach-Object {
+                                [BitConverter]::ToString($hash.ComputeHash($_.RawData))
+                            } | Sort-Object)
+                        } finally { $hash.Dispose() }
+                    } finally { $store.Close(); $store.Dispose() }
+                }
+                $result | ConvertTo-Json -Compress
+            "#;
+            let output = Command::new(
+                PathBuf::from(env::var_os("SystemRoot").unwrap())
+                    .join("System32/WindowsPowerShell/v1.0/powershell.exe"),
+            )
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
+            .env_remove("PSModulePath")
+            .output()
+            .unwrap();
+            assert!(output.status.success());
+            serde_json::from_slice(&output.stdout).unwrap()
+        }
+
+        let before = roots();
+        let directory = tempfile::tempdir().unwrap();
+        for expired_ca in [false, true] {
+            let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            if expired_ca {
+                params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+                params.not_before = rcgen::date_time_ymd(1990, 1, 1);
+                params.not_after = rcgen::date_time_ymd(2000, 1, 1);
+            }
+            let key = KeyPair::generate().unwrap();
+            let certificate = params.self_signed(&key).unwrap();
+            // Only public certificates are written; these rejected inputs must
+            // never reach Windows' protected-root confirmation or store write.
+            let path = directory.path().join("rejected-public-certificate.crt");
+            fs::write(&path, certificate.pem()).unwrap();
+            assert!(trust_windows_current_user_ca(&path).is_err());
+            assert_eq!(roots(), before);
+        }
     }
 
     #[cfg(unix)]

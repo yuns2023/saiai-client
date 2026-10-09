@@ -3,6 +3,7 @@ Set-StrictMode -Version Latest
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $store = $null
 $certificate = $null
+$failure = 'trust_not_established'
 try {
     $pem = [IO.File]::ReadAllText($env:SAIAI_VSCODE_CA_PATH)
     $match = [regex]::Match($pem, '\A\s*-----BEGIN CERTIFICATE-----\s*(?<der>[A-Za-z0-9+/=\s]+)-----END CERTIFICATE-----\s*\z')
@@ -32,13 +33,22 @@ try {
         }
     }
     $imported = $prior.Count -eq 0
-    if ($imported) { $store.Add($certificate) }
+    if ($imported) {
+        # Protected CurrentUser roots require Windows' own confirmation UI.
+        # Session zero (for example SSH) cannot present it. Never bypass that
+        # confirmation by changing protected-root policy or the store provider.
+        if ([Diagnostics.Process]::GetCurrentProcess().SessionId -eq 0) {
+            $failure = 'interactive_session_required'
+            throw 'An interactive Windows desktop is required'
+        }
+        $store.Add($certificate)
+    }
     $installed = @($store.Certificates.Find('FindByThumbprint', $certificate.Thumbprint, $false))
     if ($installed.Count -eq 0) { throw 'Installation CA trust was not established' }
     [pscustomobject]@{ imported = $imported; current_user_only = $true } | ConvertTo-Json -Compress
 } catch {
     # Certificate bytes, file content and native exceptions never reach logs.
-    [Console]::Out.Write('{"imported":null,"current_user_only":true}')
+    [pscustomobject]@{ imported = $null; current_user_only = $true; error = $failure } | ConvertTo-Json -Compress
     exit 1
 } finally {
     if ($null -ne $store) { $store.Close(); $store.Dispose() }
