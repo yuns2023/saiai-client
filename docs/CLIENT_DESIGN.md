@@ -17,6 +17,14 @@
 - 无关用户配置和机器身份值必须保留。
 - 每个用户使用独立生成的 CA；release 中不得包含 CA 私钥。
 
+## 开发分支：Chat prepare 设备凭据
+
+POST `/backend-api/f/conversation/prepare` 与现有注册、challenge 和生成路径一样，
+只转交客户端已有的 `_devicecheck`，由 Gateway 验证原 OAuth 账号归属；不补造缺失
+Cookie，不转交登录/session Cookie。该准备请求的 trace 仅记录无 query 的方法、
+路径、字节数和摘要，不记录准备请求原文或设备凭据。
+这项修复尚未包含在 1.1.45 的已发布 bundle；本地回归通过不代表上游浏览器验证已解决。
+
 ## 1.1.45 发布候选边界
 
 普通 Chat 实验模式下，Mac 的 POST `/backend-api/devicecheck` 进入同名 Gateway
