@@ -393,6 +393,19 @@ pub fn validate_settings(raw: &str, listen: &str) -> Result<()> {
     validate_no_proxy(&document.parsed)
 }
 
+pub fn has_managed_proxy(raw: &str) -> bool {
+    match parse_document(raw) {
+        Ok(document) => document
+            .comments
+            .iter()
+            .any(|span| raw[span.clone()].starts_with(MARKER)),
+        // Keep diagnosing broken settings previously written by this tool.
+        Err(_) => raw
+            .lines()
+            .any(|line| line.trim_start().starts_with(MARKER)),
+    }
+}
+
 fn proxy_url(listen: &str) -> Result<String> {
     let address: SocketAddr = listen.parse().context("invalid VSCode proxy address")?;
     if !address.ip().is_loopback() || address.port() == 0 {
@@ -943,4 +956,19 @@ mod tests {
             assert_eq!(result.as_ref().ok().copied(), expected, "{result:?}");
         }
     }
+}
+#[test]
+fn editor_diagnostics_require_an_actual_managed_proxy_marker() {
+    assert!(!has_managed_proxy(
+        r#"{"http.proxy": "http://127.0.0.1:19908"}"#
+    ));
+    assert!(!has_managed_proxy(
+        r#"{"description": "// SAIAI managed VSCode proxy: http://127.0.0.1:19908"}"#
+    ));
+    assert!(has_managed_proxy(
+        "{\n // SAIAI managed VSCode proxy: http://127.0.0.1:19908\n}\n"
+    ));
+    assert!(has_managed_proxy(
+        "{\n // SAIAI managed VSCode proxy: http://127.0.0.1:19908\n broken json\n"
+    ));
 }

@@ -234,8 +234,16 @@ def main() -> int:
             ],
             initialization_environment,
         )
-        if "WARN VSCode editor setup is incomplete" not in initialized.stderr:
-            raise AssertionError("Claude initialization did not attempt the existing editor trust/configuration flow")
+        if "VSCode editor setup is incomplete" in initialized.stderr:
+            raise AssertionError("ordinary Claude initialization entered optional editor setup")
+        if "VSCode editor settings and OS certificate stores were preserved" not in initialized.stdout:
+            raise AssertionError("ordinary Claude initialization did not preserve editor scope")
+        optional_editor = run_checked(
+            [str(binary), "init", gateway_url, TEST_KEY, "--configure-vscode-editor"],
+            initialization_environment,
+        )
+        if "WARN VSCode editor setup is incomplete" not in optional_editor.stderr:
+            raise AssertionError("explicit optional editor setup did not check trust/configuration")
         if editor_settings.read_text(encoding="utf-8") != editor_original:
             raise AssertionError("an untrusted CA changed the editor's settings")
         config_path = saiai_home / "config.json"

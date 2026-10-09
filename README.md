@@ -8,6 +8,9 @@ Desktop 使用同一套 OAuth/local-proxy 配置。客户端不创建隔离 home
 
 本分支用于生成测试站专用的 Actions 预览包，不代表当前正式版本已提供这些改动：
 
+- 1.1.44 普通 Claude/Codex 初始化使用各自的 CA 文件，保留 VSCode 编辑器设置，
+  不询问或导入 Windows 根证书。编辑器整体配置通过 `--configure-vscode-editor`
+  或独立的 `saiai vscode` 明确选择；Windows `--trust-vscode-ca` 是额外的用户级信任授权。
 - 新增可选的 `saiai claude`，仅替换子进程的连接环境；正常 Claude/VSCode 用法不变。
 - Windows 商店版 Desktop 仅复用身份、代理和证书绑定均匹配的受管实例；未知实例
   要求用户正常 `File > Quit`，不强制关闭，也不静默改写其配置。
@@ -159,14 +162,14 @@ launcher 会直接运行 PATH 中的原生 Codex 可执行文件。Linux 官方�
 saiai vscode
 ```
 
-该命令会重复应用相同的 OAuth/local-proxy 配置：清理同一 `CODEX_HOME` 中冲突的
+该可选命令会应用 OAuth/local-proxy 配置和 **VSCode 整体代理**：清理同一 `CODEX_HOME` 中冲突的
 provider/base URL，创建或保留本地代理 OAuth 状态，并在 Codex 专属 `.env` 中写入
 当前 loopback 代理、`SSL_CERT_FILE` 和
 `NO_PROXY`；同时按平台在 Codex 配置中写入 `features.respect_system_proxy`：
 Linux 为 `true`，Windows/macOS 为 `false`。它不会
-修改 shell 或操作系统环境变量，也不会写入第三方 `base_url`。配置完成后重启
-VSCode（或 reload window），继续正常使用官方 Codex 扩展。若用户显式配置了 VSCode
-的 `http.proxy`，该值可能优先于 Codex `.env`，需要移除冲突值。
+修改 shell 或操作系统环境变量，也不会写入第三方 `base_url`。其他扩展共享编辑器代理；
+证书加载器未信任当前 CA 时保留编辑器设置并提示，不自动导入根证书或关闭 TLS 校验。
+配置完成后完全退出并重新打开 VSCode。已有不同的显式 `http.proxy` 会保留并报告冲突。
 
 `saiai desktop codex` 使用现有 ChatGPT OAuth `auth.json` 的副本启动隔离的 Desktop
 `CODEX_HOME`，不会修改原始 Codex 目录。Linux 下还会在 SAIAI 管理目录创建独立
