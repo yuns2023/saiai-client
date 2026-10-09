@@ -17,6 +17,16 @@
 - 无关用户配置和机器身份值必须保留。
 - 每个用户使用独立生成的 CA；release 中不得包含 CA 私钥。
 
+## 1.1.47 发布候选边界
+
+Desktop 26.1007 在侧栏加载时读取 GET `/backend-api/profiles/me`（同名无前缀
+路径也使用相同本地响应），并直接访问 `profile_details.profile_picture_url`。
+本地身份响应包含 `profile_details` 对象，显示名、用户名和头像均为 `null`，
+供官方客户端使用现有身份回退；不读取池中 OAuth 账号的个人资料。
+该接口与旧 `/wham/profiles/me` 的用量响应分别处理。资料写入仍不可用，明确返回
+501，不能返回伪成功。该启动兼容修复不改变原生 Chat 生成、设备校验或计费路径，
+也不表示此前的上游浏览器验证 403 已解决。
+
 ## 1.1.46 发布候选边界
 
 POST `/backend-api/f/conversation/prepare` 与现有注册、challenge 和生成路径一样，

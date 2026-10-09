@@ -2309,6 +2309,30 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
                 "stats_error": null
             }
         }),
+        // Desktop 26.1007 reads this identity endpoint during sidebar render.
+        // It is distinct from `/wham/profiles/me` (usage), and dereferences
+        // `profile_details.profile_picture_url` even when no hosted profile
+        // is configured. Keep optional identity fields empty for the local
+        // account; a generic `{}` response crashes the entire renderer.
+        "/backend-api/profiles/me" | "/profiles/me"
+            if request.method.eq_ignore_ascii_case("GET") =>
+        {
+            json!({
+                "profile_details": {
+                    "display_name": null,
+                    "username": null,
+                    "profile_picture_url": null
+                }
+            })
+        }
+        "/backend-api/profiles/me" | "/profiles/me" => {
+            return Some((
+                StatusCode::NOT_IMPLEMENTED,
+                br#"{"error":{"type":"desktop_profile_update_unsupported","message":"Profile updates are unavailable through SAIAI Desktop."}}"#.to_vec(),
+                "desktop_profile_update_unsupported",
+                &[],
+            ));
+        }
         "/backend-api/me" => json!({
             "id": account_id,
             "account_id": account_id,
@@ -3212,6 +3236,64 @@ mod tests {
             "/backend-api/saiai/chat-updates/admin",
         ] {
             assert!(normalize_chatgpt_chat_target(target).is_err());
+        }
+    }
+
+    #[test]
+    fn desktop_profile_identity_read_has_the_required_nested_shape() {
+        for target in [
+            "/backend-api/profiles/me",
+            "/profiles/me",
+            "/backend-api/profiles/me?source=sidebar",
+        ] {
+            let request = IncomingRequest {
+                method: "GET".to_string(),
+                target: target.to_string(),
+                http_version: "HTTP/1.1".to_string(),
+                headers: vec![(
+                    "ChatGPT-Account-ID".to_string(),
+                    "local-account".to_string(),
+                )],
+                body: Vec::new(),
+            };
+            let (status, bytes, reason, headers) =
+                chatgpt_account_sidecar_response(&request).unwrap();
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(reason, "desktop_account_identity");
+            assert!(headers.is_empty());
+            let response: Value = serde_json::from_slice(&bytes).unwrap();
+            let profile = response["profile_details"].as_object().unwrap();
+            for field in ["display_name", "username", "profile_picture_url"] {
+                assert_eq!(profile.get(field), Some(&Value::Null));
+            }
+            assert_eq!(response.as_object().unwrap().len(), 1);
+            assert!(normalize_chatgpt_chat_target(target).is_err());
+        }
+    }
+
+    #[test]
+    fn desktop_profile_identity_does_not_report_success_for_updates() {
+        for target in ["/backend-api/profiles/me", "/profiles/me"] {
+            for method in ["POST", "PATCH", "PUT", "DELETE"] {
+                let request = IncomingRequest {
+                    method: method.to_string(),
+                    target: target.to_string(),
+                    http_version: "HTTP/1.1".to_string(),
+                    headers: Vec::new(),
+                    body: br#"{"display_name":"fixture"}"#.to_vec(),
+                };
+                let (status, bytes, reason, headers) =
+                    chatgpt_account_sidecar_response(&request).unwrap();
+                assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+                assert_eq!(reason, "desktop_profile_update_unsupported");
+                assert!(headers.is_empty());
+                let response: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    response["error"]["type"],
+                    "desktop_profile_update_unsupported"
+                );
+                assert!(response.get("profile_details").is_none());
+            }
         }
     }
 
