@@ -17,6 +17,29 @@
 - 无关用户配置和机器身份值必须保留。
 - 每个用户使用独立生成的 CA；release 中不得包含 CA 私钥。
 
+## 1.1.42 发布候选边界
+
+Claude 与 Codex 初始化共用已有 VSCode 编辑器配置流程：仅处理发现的用户设置目录，
+先检查显式配置冲突，再用编辑器实际证书加载器检查当前 CA，最后备份并写入受管
+代理设置。`doctor claude` 也检查这项配置。Windows 首次发现 CA 未受信任时，交互式
+初始化明确说明其他当前用户应用也会信任它，输入 `YES` 才导入固定的
+`CurrentUser\\Root`。已知情同意的自动化可在 `init` / `init-codex` 使用
+`--trust-vscode-ca`；无交互或未同意时保留编辑器设置并提示。重复初始化复用现有
+信任，不重复导入。该流程不导入 LocalMachine、系统信任库或 macOS Keychain，
+不关闭 TLS 校验，不改系统代理；现有显式代理冲突在证书导入前拒绝。
+
+代理为每个托管域名使用安装专属 CA 私钥经 HKDF-SHA256 派生的独立 ECDSA P-256
+叶证书密钥，使 Desktop 启动时取得的四个叶证书 SPKI 在代理刷新后保持稳定。
+派生密钥仅驻留内存；不新增私钥文件，不改变 CA、系统代理或信任库。更换 CA 私钥
+会更换指纹。首次从旧候选升级仍需完整退出并重新启动 Desktop，之后同一安装的代理
+重启不再使既有 Desktop 指纹过期。真实证书拒绝和部分上传失败继续记录。
+
+在显式普通 Chat 测试开关下，允许 macOS Desktop 26.930 使用的精确 GET
+`/backend-api/ios/attestation_challenge`。它需要兼容 Gateway 的同名控制路由；请求的
+查询、客户端完整性头和上游响应字节保持不变，不返回模拟挑战值。Gateway 将挑战
+摘要与同一用户、Key、分组、OAuth 账号关联，后续 `app_attest_challenge` 必须匹配。
+控制请求不算模型轮次。这项候选修复不等于原生 Chat/DeviceCheck 已完成真实验收。
+
 ## 1.1.41 发布候选边界
 
 `saiai doctor codex` 离线检查实际调用的官方 CLI 路径与版本，并提示 PATH 中的
@@ -432,7 +455,8 @@ Access。修改既有 Desktop state 前会备份，其他 atom 和用户状态�
 支持入口拒绝 `saiai desktop chatgpt`，普通 Chat 后续若恢复必须独立完成账户、历史、
 偏好、模型、资产、计费和多账户亲和性验证，不能与 Codex Desktop 共用“已支持”结论。
 
-`init-codex` 默认配置 VSCode，不新增 launcher、模式选择或隔离用户目录；之后用户
+Claude `init` 和 `init-codex` 默认配置 VSCode 编辑器代理；后者同时配置 Codex
+扩展的 app-server 环境。它们不新增 launcher、模式选择或隔离用户目录；之后用户
 仍正常启动 VSCode 和官方 Codex 扩展。已有 `saiai vscode` 仅保留为无需再次传入
 Gateway/Key 的修复与刷新入口，不是新增的必选操作。两者复用 OAuth
 占位、第三方 provider/base URL 清理和备份逻辑，在 `CODEX_HOME/.env` 中写入当前

@@ -1831,6 +1831,7 @@ fn is_forwarded_openai_path(path: &str) -> bool {
 
 fn is_forwarded_chatgpt_path(path: &str) -> bool {
     path == "/chatgpt/backend-api/models"
+        || path == "/chatgpt/backend-api/ios/attestation_challenge"
         || path == "/chatgpt/backend-api/f/conversation"
         || path.starts_with("/chatgpt/backend-api/f/conversation/")
         || path == "/chatgpt/backend-api/conversation/init"
@@ -1911,6 +1912,7 @@ fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
         ));
     }
     let allowed = path == "/backend-api/models"
+        || path == "/backend-api/ios/attestation_challenge"
         || path == "/backend-api/f/conversation"
         || path.starts_with("/backend-api/f/conversation/")
         || path == "/backend-api/conversation/init"
@@ -2499,7 +2501,7 @@ fn build_leaf_server_config(
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, host);
     params.distinguished_name = dn;
-    let leaf_key = KeyPair::generate().context("failed to generate leaf key")?;
+    let leaf_key = desktop_leaf_key(&ca_key, host)?;
     let spki_sha256 =
         base64::engine::general_purpose::STANDARD.encode(Sha256::digest(leaf_key.public_key_der()));
     let leaf = params
@@ -2519,6 +2521,37 @@ fn build_leaf_server_config(
         config: Arc::new(config),
         spki_sha256,
     })
+}
+
+fn desktop_leaf_key(ca_key: &KeyPair, host: &str) -> Result<KeyPair> {
+    use p256::pkcs8::EncodePrivateKey;
+    // HKDF-SHA256 derives an independent, per-host P-256 key from this
+    // installation's private CA key. A service refresh retains the same leaf
+    // SPKI; a CA-key rotation changes it. No additional private key is stored.
+    // Preserve the existing leaf-only pin boundary instead of pinning a CA
+    // certificate anywhere in a Chromium-supplied chain.
+    let private_der = Zeroizing::new(ca_key.serialize_der());
+    let hkdf = hkdf::Hkdf::<Sha256>::new(Some(b"SAIAI local proxy TLS leaf v1"), &private_der);
+    let mut seed = Zeroizing::new([0_u8; 32]);
+    for counter in 0_u8..16 {
+        let mut info = host.as_bytes().to_vec();
+        info.extend_from_slice(&[0, counter]);
+        hkdf.expand(&info, seed.as_mut())
+            .map_err(|_| anyhow::anyhow!("failed to derive local TLS leaf key"))?;
+        // Reject the extremely rare zero/out-of-range scalar. Keep the same
+        // ECDSA P-256 algorithm as the previous randomly generated leaves.
+        if let Ok(key) = p256::SecretKey::from_slice(seed.as_ref()) {
+            let pkcs8 = key
+                .to_pkcs8_der()
+                .context("failed to encode local TLS leaf key")?;
+            return KeyPair::from_pkcs8_der_and_sign_algo(
+                &PrivatePkcs8KeyDer::from(pkcs8.as_bytes()),
+                &rcgen::PKCS_ECDSA_P256_SHA256,
+            )
+            .context("failed to load local TLS leaf key");
+        }
+    }
+    bail!("failed to derive a valid local TLS leaf key")
 }
 
 async fn read_line_limited<R>(reader: &mut R) -> Result<String>
@@ -2727,6 +2760,17 @@ mod tests {
 
     #[test]
     fn normalizes_ordinary_chatgpt_targets_only_when_allowlisted() {
+        assert_eq!(
+            normalize_chatgpt_chat_target("/backend-api/ios/attestation_challenge?x=a%2Fb&x=a+b")
+                .unwrap(),
+            "/chatgpt/backend-api/ios/attestation_challenge?x=a%2Fb&x=a+b"
+        );
+        assert!(is_forwarded_openai_path(
+            "/chatgpt/backend-api/ios/attestation_challenge"
+        ));
+        assert!(
+            normalize_chatgpt_chat_target("/backend-api/ios/attestation_challenge/future").is_err()
+        );
         assert_eq!(
             normalize_chatgpt_chat_target("/backend-api/models?language=zh-CN&x=a%2Bb&x=c")
                 .unwrap(),
@@ -3867,66 +3911,86 @@ mod tests {
 
     #[tokio::test]
     async fn ordinary_chat_model_catalog_preserves_native_query_and_response_on_wire() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let catalog =
-            br#"{ "models":[{"slug":"auto","title":"Automatic"}], "future":{"enabled":true} }"#;
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            let request = read_http_request(&mut reader).await.unwrap();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                catalog.len()
-            );
-            reader
-                .get_mut()
-                .write_all(response.as_bytes())
+        for (target, payload) in [
+            (
+                "/backend-api/models?language=zh-CN&x=a%2Bb&x=c",
+                br#"{ "models":[{"slug":"auto","title":"Automatic"}], "future":{"enabled":true} }"#
+                    .as_slice(),
+            ),
+            (
+                "/backend-api/ios/attestation_challenge?x=a%2Fb&x=a+b",
+                br#"{ "attestation_challenge":"MOCK_ONLY_CHALLENGE", "future":null }"#.as_slice(),
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let catalog = payload;
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let request = read_http_request(&mut reader).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    catalog.len()
+                );
+                reader
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+                reader.get_mut().write_all(catalog).await.unwrap();
+                request
+            });
+            let (ca_cert_pem, ca_key_pem) = test_ca();
+            let state = State::new(Config {
+                listen: "127.0.0.1:0".into(),
+                base_url,
+                api_key: "MOCK_ONLY_GATEWAY".into(),
+                claude: None,
+                codex: None,
+                ca_cert_pem,
+                ca_key_pem,
+                verbose: false,
+                chatgpt_chat_passthrough: true,
+            })
+            .unwrap();
+            let request = IncomingRequest {
+                method: "GET".into(),
+                target: normalize_chatgpt_chat_target(target).unwrap(),
+                http_version: "HTTP/1.1".into(),
+                headers: vec![
+                    ("Accept".into(), "application/json".into()),
+                    ("X-OpenAI-Devicecheck".into(), "MOCK_ONLY_FIRST".into()),
+                    ("X-OpenAI-Devicecheck".into(), "MOCK_ONLY_SECOND".into()),
+                ],
+                body: Vec::new(),
+            };
+            let (mut writer, mut output) = tokio::io::duplex(16_384);
+            forward_to_saiai(&state, &mut writer, request, true, true)
                 .await
                 .unwrap();
-            reader.get_mut().write_all(catalog).await.unwrap();
-            request
-        });
-        let (ca_cert_pem, ca_key_pem) = test_ca();
-        let state = State::new(Config {
-            listen: "127.0.0.1:0".into(),
-            base_url,
-            api_key: "MOCK_ONLY_GATEWAY".into(),
-            claude: None,
-            codex: None,
-            ca_cert_pem,
-            ca_key_pem,
-            verbose: false,
-            chatgpt_chat_passthrough: true,
-        })
-        .unwrap();
-        let request = IncomingRequest {
-            method: "GET".into(),
-            target: normalize_chatgpt_chat_target("/backend-api/models?language=zh-CN&x=a%2Bb&x=c")
-                .unwrap(),
-            http_version: "HTTP/1.1".into(),
-            headers: vec![("Accept".into(), "application/json".into())],
-            body: Vec::new(),
-        };
-        let (mut writer, mut output) = tokio::io::duplex(16_384);
-        forward_to_saiai(&state, &mut writer, request, true, true)
-            .await
-            .unwrap();
-        drop(writer);
-        let mut response = Vec::new();
-        output.read_to_end(&mut response).await.unwrap();
-        let captured = server.await.unwrap();
-        assert_eq!(captured.method, "GET");
-        assert_eq!(
-            captured.target,
-            "/chatgpt/backend-api/models?language=zh-CN&x=a%2Bb&x=c"
-        );
-        assert!(captured.body.is_empty());
-        assert!(
-            response
-                .windows(catalog.len())
-                .any(|bytes| bytes == catalog)
-        );
+            drop(writer);
+            let mut response = Vec::new();
+            output.read_to_end(&mut response).await.unwrap();
+            let captured = server.await.unwrap();
+            assert_eq!(captured.method, "GET");
+            assert_eq!(captured.target, format!("/chatgpt{target}"));
+            assert_eq!(
+                captured
+                    .headers
+                    .iter()
+                    .filter(|(key, _)| key.eq_ignore_ascii_case("X-OpenAI-Devicecheck"))
+                    .map(|(_, value)| value.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["MOCK_ONLY_FIRST", "MOCK_ONLY_SECOND"]
+            );
+            assert!(captured.body.is_empty());
+            assert!(
+                response
+                    .windows(catalog.len())
+                    .any(|bytes| bytes == catalog)
+            );
+        }
     }
 
     #[test]
@@ -3957,10 +4021,61 @@ mod tests {
         assert!(!wire.contains("private_value"));
     }
 
+    #[tokio::test]
+    async fn restarted_proxy_preserves_leaf_pin_and_valid_tls_without_extra_key_files() {
+        ensure_rustls_crypto_provider();
+        let (ca_pem, key_pem) = test_ca();
+        let ca_der = rustls_pemfile::certs(&mut std::io::Cursor::new(ca_pem.as_bytes()))
+            .next()
+            .unwrap()
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_der.clone()).unwrap();
+        let client = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let connector = tokio_rustls::TlsConnector::from(client);
+        let mut prior_pin = None;
+        for _ in 0..2 {
+            // A fresh server config represents a restarted service. The
+            // launched Desktop pin must still match its domain's leaf key.
+            let certificate =
+                build_leaf_server_config(CHAT_OPENAI_HOST, &ca_pem, &key_pem).unwrap();
+            if let Some(pin) = &prior_pin {
+                assert_eq!(pin, &certificate.spki_sha256);
+            }
+            prior_pin = Some(certificate.spki_sha256);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let acceptor = TlsAcceptor::from(certificate.config);
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut tls = acceptor.accept(socket).await.unwrap();
+                tls.write_all(b"OK").await.unwrap();
+                tls.shutdown().await.unwrap();
+            });
+            let mut tls = connector
+                .connect(
+                    rustls::pki_types::ServerName::try_from(CHAT_OPENAI_HOST).unwrap(),
+                    TcpStream::connect(address).await.unwrap(),
+                )
+                .await
+                .unwrap();
+            let chain = tls.get_ref().1.peer_certificates().unwrap();
+            assert_eq!(chain.len(), 1, "only the pinned leaf is sent");
+            let mut response = Vec::new();
+            tls.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, b"OK");
+            server.await.unwrap();
+        }
+    }
+
     #[test]
     fn builds_tls_config_with_explicit_crypto_provider() {
         let (ca_cert_pem, ca_key_pem) = test_ca();
-        let state = State::new(Config {
+        let cfg = Config {
             listen: "127.0.0.1:0".to_string(),
             base_url: "https://api.saiai.top".to_string(),
             api_key: "sk-test".to_string(),
@@ -3976,8 +4091,8 @@ mod tests {
             ca_key_pem,
             verbose: false,
             chatgpt_chat_passthrough: true,
-        })
-        .unwrap();
+        };
+        let state = State::new(cfg.clone()).unwrap();
 
         let config = state.tls_config_for_host(ANTHROPIC_HOST).unwrap();
         assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
@@ -4009,6 +4124,27 @@ mod tests {
                 .len(),
             4
         );
+        let restarted = State::new(cfg.clone()).unwrap();
+        assert_eq!(desktop_pins, restarted.desktop_tls_spki_list().unwrap());
+        for host in [
+            OPENAI_HOST,
+            CHATGPT_HOST,
+            CHAT_OPENAI_HOST,
+            CHATGPT_AUX_HOST,
+        ] {
+            assert_eq!(
+                state.tls_spki_for_host(host).unwrap(),
+                restarted.tls_spki_for_host(host).unwrap()
+            );
+        }
+        let (rotated_cert, rotated_key) = test_ca();
+        let rotated = State::new(Config {
+            ca_cert_pem: rotated_cert,
+            ca_key_pem: rotated_key,
+            ..cfg
+        })
+        .unwrap();
+        assert_ne!(desktop_pins, rotated.desktop_tls_spki_list().unwrap());
         assert_eq!(
             state.route_for_host(ANTHROPIC_HOST).base_url,
             "https://claude.example.test"
