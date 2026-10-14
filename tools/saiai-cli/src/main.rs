@@ -31,6 +31,7 @@ use url::Url;
 use uuid::Uuid;
 
 mod claude_launcher;
+mod codex_daemon;
 mod codex_diagnostics;
 mod desktop_product;
 mod environment_scope;
@@ -729,6 +730,7 @@ fn init_codex(args: InitArgs) -> Result<()> {
     );
     warn_claude_settings_overrides();
     start_managed_service_after_initialization(proxy_init.config_changed)?;
+    codex_daemon::after_initialization(&codex_dir);
 
     Ok(())
 }
@@ -4155,6 +4157,7 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
             cfg.as_ref(),
             matches!(target, DoctorTarget::Codex),
         );
+        codex_daemon::check(&mut report);
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         check_desktop_permission_visibility(&mut report);
         #[cfg(target_os = "linux")]

@@ -44,6 +44,25 @@ jobs:
       - name: Test
         run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml
 
+      - name: Verify official Codex daemon initialization without model turns
+        env:
+          CARGO_BUILD_JOBS: 2
+        run: |
+          cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml
+          python3 - <<'PY'
+          import hashlib, pathlib, tarfile, urllib.request
+          root = pathlib.Path("dist/codex-daemon-regression")
+          root.mkdir(parents=True)
+          archive = root / "codex.tar.gz"
+          urllib.request.urlretrieve("https://github.com/openai/codex/releases/download/rust-v0.162.1/codex-x86_64-unknown-linux-musl.tar.gz", archive)
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == "86f268d81b898f3e144c5ecff2ad2fda2c5802e042d6195b72538fe0fa125057"
+          with tarfile.open(archive) as bundle:
+              bundle.extractall(root, filter="data")
+          PY
+          python3 scripts/saiai-cli/test-codex-daemon.py \
+            --binary tools/saiai-cli/target/debug/saiai \
+            --codex dist/codex-daemon-regression/codex-x86_64-unknown-linux-musl
+
       - name: Verify public release contract
         run: |
           node --test scripts/saiai-cli/test-vscode-certificates.js
