@@ -56,10 +56,31 @@ const DESKTOP_STATSIG_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 // into unrelated hosted experiments or send it to the Statsig control plane.
 const DESKTOP_STATSIG_I18N_PAYLOAD: &str = r#"{"feature_gates":{},"dynamic_configs":{},"layer_configs":{"72216192":{"name":"72216192","value":{"enable_i18n":true},"rule_id":"saiai-local-i18n","secondary_exposures":[],"is_user_in_experiment":false,"is_experiment_active":false,"allocated_experiment_name":"","explicit_parameters":["enable_i18n"],"undelegated_secondary_exposures":[]}},"has_updates":true,"time":0,"user":{"userID":"saiai-local-proxy-user","customIDs":{"stableID":"saiai-local-proxy"}}}"#;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(600);
+// Match the Gateway's default ingress ceiling. Buffer only bytes received,
+// never allocate the client-declared length before the upload arrives.
+const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024 * 1024;
 const MAX_HEADER_LINE: usize = 32 * 1024;
 const MAX_HEADER_BYTES: usize = 256 * 1024;
 const MAX_CHAT_INIT_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_DESKTOP_STATE_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Debug)]
+struct RequestReadFailure(StatusCode);
+
+impl std::fmt::Display for RequestReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for RequestReadFailure {}
+
+fn request_read_error_status(error: &anyhow::Error) -> StatusCode {
+    error
+        .downcast_ref::<RequestReadFailure>()
+        .map_or(StatusCode::BAD_REQUEST, |failure| failure.0)
+}
 
 // Service-managed stdout/stderr is the primary diagnostic stream on all
 // supported platforms. Keep every proxy line timestamped consistently; this
@@ -573,7 +594,7 @@ async fn handle_client(
     let request = match read_initial_proxy_request(&mut reader).await {
         Ok(request) => request,
         Err(err) => {
-            let _ = write_plain_error(reader.get_mut(), StatusCode::BAD_REQUEST).await;
+            let _ = write_plain_error(reader.get_mut(), request_read_error_status(&err)).await;
             return Err(err);
         }
     };
@@ -777,14 +798,7 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                 if is_idle_http_connection_end(&err) {
                     return Ok(());
                 }
-                let _ = write_static_response(
-                    reader.get_mut(),
-                    StatusCode::BAD_REQUEST,
-                    "text/plain",
-                    b"bad request",
-                    true,
-                )
-                .await;
+                let _ = write_plain_error(reader.get_mut(), request_read_error_status(&err)).await;
                 return Err(err).with_context(|| {
                     format!(
                         "managed TLS stream ended host={host} alpn={alpn} requests_handled={handled_requests}"
@@ -1129,7 +1143,18 @@ async fn read_http_request<R>(reader: &mut R) -> Result<IncomingRequest>
 where
     R: AsyncBufRead + Unpin,
 {
-    let request_line = read_http_request_line(reader, HEADER_READ_TIMEOUT).await?;
+    read_http_request_with_timeouts(reader, HEADER_READ_TIMEOUT, BODY_READ_TIMEOUT).await
+}
+
+async fn read_http_request_with_timeouts<R>(
+    reader: &mut R,
+    header_wait: Duration,
+    body_wait: Duration,
+) -> Result<IncomingRequest>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let request_line = read_http_request_line(reader, header_wait).await?;
     let parts = request_line.split_whitespace().collect::<Vec<_>>();
     if parts.len() != 3 || !parts[2].starts_with("HTTP/") {
         bail!("invalid HTTP request line");
@@ -1137,8 +1162,11 @@ where
 
     let mut headers = Vec::new();
     let mut header_bytes = request_line.len();
+    let header_deadline = tokio::time::Instant::now() + header_wait;
     loop {
-        let line = read_line_limited(reader).await?;
+        let line = timeout_at(header_deadline, read_line_limited(reader))
+            .await
+            .map_err(|_| RequestReadFailure(StatusCode::REQUEST_TIMEOUT))??;
         header_bytes += line.len();
         if header_bytes > MAX_HEADER_BYTES {
             bail!("HTTP headers are too large");
@@ -1153,7 +1181,9 @@ where
         headers.push((name.trim().to_string(), value.trim().to_string()));
     }
 
-    let body = read_request_body(reader, &headers).await?;
+    let body = tokio::time::timeout(body_wait, read_request_body(reader, &headers))
+        .await
+        .map_err(|_| RequestReadFailure(StatusCode::REQUEST_TIMEOUT))??;
     Ok(IncomingRequest {
         method: parts[0].to_string(),
         target: parts[1].to_string(),
@@ -1196,8 +1226,19 @@ async fn read_request_body<R>(reader: &mut R, headers: &[(String, String)]) -> R
 where
     R: AsyncBufRead + Unpin,
 {
+    read_request_body_with_limit(reader, headers, MAX_REQUEST_BODY_BYTES).await
+}
+
+async fn read_request_body_with_limit<R>(
+    reader: &mut R,
+    headers: &[(String, String)],
+    limit: usize,
+) -> Result<Vec<u8>>
+where
+    R: AsyncBufRead + Unpin,
+{
     if header_contains(headers, "transfer-encoding", "chunked") {
-        return read_chunked_body(reader).await;
+        return read_chunked_body_with_limit(reader, limit).await;
     }
     let Some(content_length) = header_value(headers, "content-length") else {
         return Ok(Vec::new());
@@ -1205,15 +1246,30 @@ where
     let length = content_length
         .parse::<usize>()
         .with_context(|| format!("invalid content-length {content_length:?}"))?;
-    let mut body = vec![0u8; length];
+    if length > limit {
+        return Err(RequestReadFailure(StatusCode::PAYLOAD_TOO_LARGE).into());
+    }
+    let mut body = Vec::new();
     reader
-        .read_exact(&mut body)
+        .take(length as u64)
+        .read_to_end(&mut body)
         .await
         .context("failed to read request body")?;
+    if body.len() != length {
+        bail!("incomplete request body");
+    }
     Ok(body)
 }
 
+#[cfg(test)]
 async fn read_chunked_body<R>(reader: &mut R) -> Result<Vec<u8>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    read_chunked_body_with_limit(reader, MAX_REQUEST_BODY_BYTES).await
+}
+
+async fn read_chunked_body_with_limit<R>(reader: &mut R, limit: usize) -> Result<Vec<u8>>
 where
     R: AsyncBufRead + Unpin,
 {
@@ -1224,8 +1280,13 @@ where
         let size = usize::from_str_radix(size_hex, 16)
             .with_context(|| format!("invalid chunk size {size_hex:?}"))?;
         if size == 0 {
+            let mut trailer_bytes = 0usize;
             loop {
                 let trailer = read_line_limited(reader).await?;
+                trailer_bytes += trailer.len();
+                if trailer_bytes > MAX_HEADER_BYTES {
+                    bail!("HTTP trailers are too large");
+                }
                 if is_blank_line(&trailer) {
                     break;
                 }
@@ -1233,11 +1294,18 @@ where
             break;
         }
         let start = body.len();
-        body.resize(start + size, 0);
+        let end = start
+            .checked_add(size)
+            .filter(|end| *end <= limit)
+            .ok_or(RequestReadFailure(StatusCode::PAYLOAD_TOO_LARGE))?;
         reader
-            .read_exact(&mut body[start..])
+            .take(size as u64)
+            .read_to_end(&mut body)
             .await
             .context("failed to read chunk body")?;
+        if body.len() != end {
+            bail!("incomplete chunk body");
+        }
         let mut crlf = [0u8; 2];
         reader
             .read_exact(&mut crlf)
@@ -2865,6 +2933,171 @@ mod tests {
     use super::*;
     use rcgen::{BasicConstraints, IsCa};
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn bounded_upload_rejects_declared_and_cumulative_oversize_before_reading() {
+        let headers = vec![(
+            "Content-Length".into(),
+            (MAX_REQUEST_BODY_BYTES + 1).to_string(),
+        )];
+        let error = read_request_body(&mut &b""[..], &headers)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            request_read_error_status(&error),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        for input in ["5\r\n", "3\r\nabc\r\n2\r\n", "ffffffffffffffff\r\n"] {
+            let error = read_chunked_body_with_limit(&mut input.as_bytes(), 4)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                request_read_error_status(&error),
+                StatusCode::PAYLOAD_TOO_LARGE
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_upload_keeps_binary_bytes_and_the_next_request() {
+        let headers = vec![("Content-Length".into(), "4".into())];
+        let mut fixed = &b"\0\xffabNEXT"[..];
+        assert_eq!(
+            read_request_body_with_limit(&mut fixed, &headers, 4)
+                .await
+                .unwrap(),
+            b"\0\xffab"
+        );
+        assert_eq!(fixed, b"NEXT");
+        let mut chunked = &b"2\r\n\0\xff\r\n2;extension=yes\r\nab\r\n0\r\n\r\nNEXT"[..];
+        assert_eq!(
+            read_chunked_body_with_limit(&mut chunked, 4).await.unwrap(),
+            b"\0\xffab"
+        );
+        assert_eq!(chunked, b"NEXT");
+    }
+
+    #[tokio::test]
+    async fn bounded_upload_rejects_truncation_and_bad_chunk_framing() {
+        let headers = vec![("Content-Length".into(), "4".into())];
+        assert!(
+            read_request_body_with_limit(&mut &b"abc"[..], &headers, 4)
+                .await
+                .is_err()
+        );
+        for input in ["4\r\nabc", "1\r\naXX", "not-hex\r\n"] {
+            let error = read_chunked_body_with_limit(&mut input.as_bytes(), 4)
+                .await
+                .unwrap_err();
+            assert_eq!(request_read_error_status(&error), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_upload_times_out_partial_headers_fixed_and_chunked_bodies() {
+        for input in [
+            "POST /v1/messages HTTP/1.1\r\nX-Partial: ",
+            "POST /v1/messages HTTP/1.1\r\nContent-Length: 4\r\n\r\na",
+            "POST /v1/messages HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\na",
+        ] {
+            let (mut sender, receiver) = tokio::io::duplex(256);
+            sender.write_all(input.as_bytes()).await.unwrap();
+            let error = read_http_request_with_timeouts(
+                &mut BufReader::new(receiver),
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                request_read_error_status(&error),
+                StatusCode::REQUEST_TIMEOUT
+            );
+            assert!(!is_benign_client_error(&error));
+            // Keep sender alive while waiting, so EOF cannot satisfy the test.
+            drop(sender);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_upload_returns_413_over_tls_without_contacting_gateway() {
+        ensure_rustls_crypto_provider();
+        let (ca_cert_pem, ca_key_pem) = test_ca();
+        let ca_der = rustls_pemfile::certs(&mut std::io::Cursor::new(ca_cert_pem.as_bytes()))
+            .next()
+            .unwrap()
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_der).unwrap();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ));
+        let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = Arc::new(
+            State::new(Config {
+                listen: "127.0.0.1:0".into(),
+                base_url: format!("http://{}", gateway.local_addr().unwrap()),
+                api_key: "MOCK_ONLY_GATEWAY".into(),
+                claude: None,
+                codex: None,
+                ca_cert_pem,
+                ca_key_pem,
+                verbose: false,
+                chatgpt_chat_passthrough: false,
+            })
+            .unwrap(),
+        );
+        for framing in [
+            format!("Content-Length: {}\r\n\r\n", MAX_REQUEST_BODY_BYTES + 1),
+            format!(
+                "Transfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                MAX_REQUEST_BODY_BYTES + 1
+            ),
+        ] {
+            let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = proxy.local_addr().unwrap();
+            let state = state.clone();
+            let task = tokio::spawn(async move {
+                let (stream, _) = proxy.accept().await.unwrap();
+                serve_managed_tls(state, stream, ANTHROPIC_HOST).await
+            });
+            let tcp = TcpStream::connect(address).await.unwrap();
+            let mut tls = connector
+                .connect(ANTHROPIC_HOST.try_into().unwrap(), tcp)
+                .await
+                .unwrap();
+            tls.write_all(
+                format!("POST /v1/messages HTTP/1.1\r\nHost: {ANTHROPIC_HOST}\r\n{framing}")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+            tls.flush().await.unwrap();
+            let mut reader = BufReader::new(tls);
+            let status = timeout(Duration::from_secs(2), read_line_limited(&mut reader))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(status.starts_with("HTTP/1.1 413 "), "{status}");
+            let error = timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(
+                request_read_error_status(&error),
+                StatusCode::PAYLOAD_TOO_LARGE
+            );
+        }
+        assert!(
+            timeout(Duration::from_millis(20), gateway.accept())
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn native_codex_images_keep_their_own_protocol_route() {
