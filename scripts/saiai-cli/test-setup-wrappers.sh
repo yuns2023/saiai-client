@@ -62,7 +62,13 @@ chmod +x "${fake_bin}/curl"
 
 run_setup() {
   rm -f "${output}" "${invoked}"
-  HOME="${home}" \
+  local scope_environment=()
+  if [ "${SAIAI_TEST_CODEX_HOME+x}" = x ]; then
+    scope_environment=("CODEX_HOME=${SAIAI_TEST_CODEX_HOME}")
+  fi
+  env -u CODEX_HOME -u CLAUDE_CONFIG_DIR "${scope_environment[@]}" \
+    HOME="${home}" \
+    SAIAI_HOME="${home}/.saiai" \
     PATH="${fake_bin}:${PATH}" \
     SAIAI_DOWNLOAD_BASE="https://download.example.test/client" \
     SAIAI_INSTALL_DIR="${install_dir}" \
@@ -153,5 +159,20 @@ grep -Fq '$installedMatches' "${script_dir}/setup.ps1"
 grep -Fq 'binary download skipped' "${script_dir}/setup.ps1"
 grep -Fq 'INSTALLED_MATCHES=1' "${script_dir}/setup.cmd"
 grep -Fq 'binary download skipped' "${script_dir}/setup.cmd"
+
+
+# An interactive project setup must not silently reuse the default Key.
+mkdir -p "${home}/.saiai"
+printf '%s\n' '{"base_url":"https://default.example.test","api_key":"TEST_ONLY_DEFAULT_SCOPE_KEY"}' >"${home}/.saiai/config.json"
+printf 'https://project.example.test\nTEST_ONLY_PROJECT_SCOPE_KEY\n' | \
+  SAIAI_TEST_CODEX_HOME="${home}/project-codex" run_setup init-codex
+mapfile -t project_invocation <"${invoked}"
+test "${project_invocation[2]}" = "init-codex"
+test "${project_invocation[3]}" = "https://project.example.test"
+test "${project_invocation[4]}" = "TEST_ONLY_PROJECT_SCOPE_KEY"
+if grep -Fq 'TEST_ONLY_DEFAULT_SCOPE_KEY' "${invoked}"; then
+  echo "interactive project setup reused the default Key" >&2
+  exit 1
+fi
 
 echo "SAIAI local-proxy wrapper checks passed"

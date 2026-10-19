@@ -3029,8 +3029,11 @@ fn ensure_local_proxy_running(listen: &str) -> Result<()> {
     ensure_local_proxy_running_with_start(listen, run_service_start)
 }
 
-fn verify_selected_proxy_identity() -> Result<()> {
+fn verify_selected_proxy_identity(listen: &str) -> Result<()> {
     let config = read_saiai_config()?;
+    if config.listen != listen {
+        bail!("the environment configuration changed during launch; retry the command");
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -3048,7 +3051,7 @@ fn ensure_local_proxy_running_with_start(
         .with_context(|| format!("invalid local proxy listen address {listen}"))?;
     if TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
         if environment_scope::isolated() {
-            verify_selected_proxy_identity()?;
+            verify_selected_proxy_identity(listen)?;
         }
         return Ok(());
     }
@@ -3057,7 +3060,7 @@ fn ensure_local_proxy_running_with_start(
     while std::time::Instant::now() < deadline {
         if TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
             if environment_scope::isolated() {
-                verify_selected_proxy_identity()?;
+                verify_selected_proxy_identity(listen)?;
             }
             return Ok(());
         }
@@ -3226,8 +3229,8 @@ fn selected_service_owns_listener(addr: SocketAddr) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn selected_service_owns_listener(_addr: SocketAddr) -> bool {
-    managed_service_is_active()
+fn selected_service_owns_listener(addr: SocketAddr) -> bool {
+    managed_service_is_active() && verify_selected_proxy_identity(&addr.to_string()).is_ok()
 }
 
 fn select_local_proxy_listen(existing: Option<&str>) -> Result<String> {

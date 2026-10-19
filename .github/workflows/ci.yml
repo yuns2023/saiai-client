@@ -162,7 +162,13 @@ jobs:
         run: python scripts/saiai-cli/test-initialization-scope.py --binary tools/saiai-cli/target/debug/saiai.exe
 
       - name: Verify native Windows environment lifecycle isolation
+        timeout-minutes: 5
         run: python scripts/saiai-cli/test-windows-environments.py --binary tools/saiai-cli/target/debug/saiai.exe
+
+      - name: Verify Windows installer environment routing
+        shell: pwsh
+        run: |
+          & "$env:WINDIR/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -File scripts/saiai-cli/test-setup-environments.ps1 -WrapperPath "$PWD/scripts/saiai-cli/setup.ps1"
 
       - name: Smoke-test Windows PowerShell 5.1 setup wrapper
         shell: pwsh

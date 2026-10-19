@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Native Windows environment lifecycle and stale-PID safety, with no upstream requests."""
 import argparse
+import faulthandler
 import http.client
 import json
 import os
@@ -12,6 +13,7 @@ import time
 
 
 def main():
+    faulthandler.dump_traceback_later(240, exit=True)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
     binary = parser.parse_args().binary.resolve(strict=True)
@@ -30,8 +32,15 @@ def main():
         initialized, followers = [], []
 
         def run(environment, *args, ok=True):
-            result = subprocess.run([str(binary), *args], env=environment, capture_output=True, timeout=40)
-            output = (result.stdout + result.stderr).decode("utf-8", errors="replace")
+            print("Windows environment check: " + args[0], flush=True)
+            # A detached worker can retain inherited Windows pipe handles even
+            # after the CLI exits. Wait on the CLI, not pipe EOF (as in the
+            # existing native runtime fixture), and collect output in a file.
+            capture = root / f"command-{time.monotonic_ns()}.log"
+            with capture.open("wb") as output_file:
+                result = subprocess.run([str(binary), *args], env=environment,
+                                        stdout=output_file, stderr=subprocess.STDOUT, timeout=40)
+            output = capture.read_bytes().decode("utf-8", errors="replace")
             assert "TEST_ONLY_WINDOWS_ENV_KEY" not in output
             assert (result.returncode == 0) == ok, f"unexpected result for {args[0]}: {output}"
             return output
