@@ -33,6 +33,7 @@ use uuid::Uuid;
 mod claude_launcher;
 mod codex_diagnostics;
 mod desktop_product;
+mod environment_scope;
 mod local_proxy;
 mod vscode;
 #[cfg(any(windows, test))]
@@ -45,6 +46,7 @@ const ANTHROPIC_HOST: &str = "api.anthropic.com";
 const SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME: &str = "saiai-local-proxy";
 const USAGE: &str = "\
 Usage:
+  saiai --environment claude|codex|default <command>              # select a proxy environment
   saiai                                                           # run local Claude Code proxy
   saiai --verbose                                                 # run local proxy with request logs
   saiai start                                                     # install and start user service
@@ -199,9 +201,7 @@ const CLAUDE_PROXY_ENV_VARS: [&str; 8] = [
 ];
 const CLAUDE_PROXY_ENV_UNSET_KEYS: &str =
     "HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy";
-const SAIAI_SERVICE_NAME: &str = "saiai.service";
-#[cfg(target_os = "macos")]
-const SAIAI_LAUNCHD_LABEL: &str = "top.saiai.local-proxy";
+
 #[cfg(target_os = "macos")]
 const MACOS_ID_COMMAND: &str = "/usr/bin/id";
 #[cfg(target_os = "macos")]
@@ -233,8 +233,10 @@ fn is_managed_claude_env(key: &str) -> bool {
 }
 
 fn main() -> Result<()> {
-    let args = env::args().skip(1).collect::<Vec<_>>();
+    let mut args = env::args().skip(1).collect::<Vec<_>>();
+    let selector = environment_scope::parse_selector(&mut args)?;
     let command = parse_command(&args)?;
+    environment_scope::initialize(&command, selector)?;
     #[cfg(target_os = "windows")]
     if matches!(
         &command,
@@ -575,15 +577,38 @@ fn generate_installation_ca() -> Result<(String, String)> {
     Ok((certificate.pem(), key.serialize_pem()))
 }
 
+fn lock_initialization() -> Result<fs::File> {
+    let directory = environment_scope::active()
+        .map(|s| s.root.clone())
+        .unwrap_or(saiai_config_dir()?);
+    fs::create_dir_all(&directory)?;
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(directory.join("initialization.lock"))?;
+    file.lock().context("failed to lock SAIAI initialization")?;
+    Ok(file)
+}
+
 fn init_claude(args: InitArgs) -> Result<()> {
+    let _initialization_lock = lock_initialization()?;
     warn_process_env_conflicts();
     let paths = resolve_claude_config_paths().context("failed to resolve Claude config paths")?;
     let claude_dir = &paths.config_dir;
     let settings_path = &paths.settings_path;
     let state_path = &paths.state_path;
     let credentials_path = &paths.credentials_path;
-    let default_ca_path = claude_dir.join(SAIAI_CA_FILENAME);
-    let default_ca_key_path = claude_dir.join(SAIAI_CA_KEY_FILENAME);
+    let ca_dir = if environment_scope::isolated() {
+        saiai_config_dir()?
+    } else {
+        claude_dir.clone()
+    };
+    let default_ca_path = ca_dir.join(SAIAI_CA_FILENAME);
+    let default_ca_key_path = ca_dir.join(SAIAI_CA_KEY_FILENAME);
     let (ca_path, ca_key_path) =
         existing_runtime_ca_paths().unwrap_or((default_ca_path, default_ca_key_path));
 
@@ -647,6 +672,7 @@ fn init_claude(args: InitArgs) -> Result<()> {
 }
 
 fn init_codex(args: InitArgs) -> Result<()> {
+    let _initialization_lock = lock_initialization()?;
     let codex_dir = codex_config_dir().context("failed to resolve Codex config directory")?;
     fs::create_dir_all(&codex_dir)
         .with_context(|| format!("failed to create {}", codex_dir.display()))?;
@@ -663,7 +689,9 @@ fn init_codex(args: InitArgs) -> Result<()> {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     prepare_desktop_onboarding_state(&codex_dir)?;
     #[cfg(target_os = "linux")]
-    ensure_direct_linux_desktop_trust(&proxy_init.ca_cert_path);
+    if !environment_scope::isolated() {
+        ensure_direct_linux_desktop_trust(&proxy_init.ca_cert_path);
+    }
     configure_vscode_editor_after_initialization(
         &proxy_init.listen,
         &proxy_init.ca_cert_path,
@@ -759,6 +787,7 @@ fn initialize_codex_local_proxy_at(
         let mut migrated_legacy = false;
         if existing.providers.claude.is_none()
             && existing.providers.codex.is_none()
+            && !environment_scope::isolated()
             && legacy_claude_proxy_configured()
         {
             let mut migrated = existing;
@@ -2995,6 +3024,16 @@ fn ensure_local_proxy_running(listen: &str) -> Result<()> {
     ensure_local_proxy_running_with_start(listen, run_service_start)
 }
 
+fn verify_selected_proxy_identity() -> Result<()> {
+    let config = read_saiai_config()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(connect_local_proxy_tls(&config))
+        .context("the listener does not authenticate with this environment's CA; rerun initialization to allocate an available port")?;
+    Ok(())
+}
+
 fn ensure_local_proxy_running_with_start(
     listen: &str,
     start: impl FnOnce() -> Result<()>,
@@ -3003,6 +3042,9 @@ fn ensure_local_proxy_running_with_start(
         .parse::<SocketAddr>()
         .with_context(|| format!("invalid local proxy listen address {listen}"))?;
     if TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
+        if environment_scope::isolated() {
+            verify_selected_proxy_identity()?;
+        }
         return Ok(());
     }
     start().context("failed to start the SAIAI local proxy")?;
@@ -3112,14 +3154,84 @@ struct ProviderCredential {
     api_key: String,
 }
 
+// Initialization holds the shared root lock, so stopped environments also
+// reserve their configured ports. Never copy another environment's credentials.
+fn other_environment_listeners() -> Result<Vec<String>> {
+    let Some(scope) = environment_scope::active() else {
+        return Ok(Vec::new());
+    };
+    let mut paths = vec![scope.root.join(SAIAI_CONFIG_FILENAME)];
+    match fs::read_dir(scope.root.join("environments")) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    paths.push(entry.path().join(SAIAI_CONFIG_FILENAME));
+                }
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("cannot inspect SAIAI environments"),
+    }
+    let own = scope.directory.join(SAIAI_CONFIG_FILENAME);
+    let mut reserved = Vec::new();
+    for path in paths.into_iter().filter(|path| path != &own) {
+        let raw = match fs::read(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).context("cannot read another environment's port reservation");
+            }
+        };
+        let value: Value =
+            serde_json::from_slice(&raw).context("invalid SAIAI environment configuration")?;
+        if let Some(listen) = value["listen"].as_str() {
+            reserved.push(listen.to_string());
+        }
+    }
+    Ok(reserved)
+}
+
+#[cfg(target_os = "linux")]
+fn selected_service_owns_listener(addr: SocketAddr) -> bool {
+    let pid = linux_background_state()
+        .ok()
+        .flatten()
+        .filter(linux_background_state_is_running)
+        .map(|s| s.pid)
+        .or_else(|| {
+            if ensure_systemd_user_available().is_ok() {
+                systemctl_value("MainPID")
+                    .ok()?
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|pid| *pid != 0)
+            } else {
+                None
+            }
+        });
+    pid.is_some_and(|pid| {
+        listen_port_owners(addr)
+            .iter()
+            .any(|owner| owner.pid == pid)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn selected_service_owns_listener(_addr: SocketAddr) -> bool {
+    managed_service_is_active()
+}
+
 fn select_local_proxy_listen(existing: Option<&str>) -> Result<String> {
-    if let Some(listen) = existing.filter(|value| !value.trim().is_empty())
+    let reserved = other_environment_listeners()?;
+    if let Some(listen) =
+        existing.filter(|value| !value.trim().is_empty() && !reserved.iter().any(|r| r == value))
         && let Ok(addr) = listen.parse::<SocketAddr>()
         && addr.ip().is_loopback()
     {
         // Keep the current port when our managed service owns it. On a
         // repeat initialization this avoids needless proxy churn.
-        if managed_service_is_active()
+        if selected_service_owns_listener(addr)
             && TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
         {
             return Ok(listen.to_string());
@@ -3131,13 +3243,15 @@ fn select_local_proxy_listen(existing: Option<&str>) -> Result<String> {
         }
     }
 
-    let listener = StdTcpListener::bind(("127.0.0.1", 0))
-        .context("failed to allocate a loopback port for the SAIAI local proxy")?;
-    let port = listener
-        .local_addr()
-        .context("failed to read the allocated SAIAI local proxy port")?
-        .port();
-    Ok(format!("127.0.0.1:{port}"))
+    for _ in 0..128 {
+        let listener = StdTcpListener::bind(("127.0.0.1", 0))
+            .context("failed to allocate a loopback port for the SAIAI local proxy")?;
+        let listen = listener.local_addr()?.to_string();
+        if !reserved.contains(&listen) {
+            return Ok(listen);
+        }
+    }
+    bail!("failed to allocate a distinct local proxy port")
 }
 
 #[derive(Clone, Copy)]
@@ -3368,11 +3482,11 @@ fn run_service_start() -> Result<()> {
             }
             let service_path = write_user_service()?;
             run_systemctl(&["daemon-reload"])?;
-            run_systemctl(&["enable", SAIAI_SERVICE_NAME])?;
+            run_systemctl(&["enable", &environment_scope::service_name()])?;
             if was_active {
-                run_systemctl(&["restart", SAIAI_SERVICE_NAME])?;
+                run_systemctl(&["restart", &environment_scope::service_name()])?;
             } else {
-                run_systemctl(&["start", SAIAI_SERVICE_NAME])?;
+                run_systemctl(&["start", &environment_scope::service_name()])?;
             }
             println!("SAIAI user service started or refreshed.");
             println!("Service: {}", service_path.display());
@@ -3650,7 +3764,7 @@ fn run_service_logs() -> Result<()> {
     let mut command = ProcessCommand::new("journalctl");
     apply_systemd_user_environment(&mut command);
     let status = command
-        .args(["--user", "-u", SAIAI_SERVICE_NAME, "-f"])
+        .args(["--user", "-u", &environment_scope::service_name(), "-f"])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -5308,7 +5422,9 @@ async fn check_gateway_health(base_url: &str) -> Result<String> {
     Ok(format!("GET {health_url} returned {}", status))
 }
 
-async fn check_local_proxy_mitm(cfg: &SaiaiConfig) -> Result<String> {
+async fn connect_local_proxy_tls(
+    cfg: &SaiaiConfig,
+) -> Result<tokio_rustls::client::TlsStream<TokioTcpStream>> {
     let addr = cfg
         .listen
         .parse::<SocketAddr>()
@@ -5333,20 +5449,28 @@ async fn check_local_proxy_mitm(cfg: &SaiaiConfig) -> Result<String> {
     }
 
     let roots = load_ca_root_store(Path::new(&cfg.ca_cert_path))?;
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(tls_config));
     let server_name = rustls::pki_types::ServerName::try_from(ANTHROPIC_HOST.to_string())
         .context("failed to build Anthropic TLS server name")?;
-    let mut tls = timeout(
+    let tls = timeout(
         Duration::from_secs(5),
         connector.connect(server_name, stream),
     )
     .await
     .context("timed out during local proxy MITM TLS handshake")?
     .context("local proxy MITM TLS handshake failed")?;
+    Ok(tls)
+}
 
+async fn check_local_proxy_mitm(cfg: &SaiaiConfig) -> Result<String> {
+    let addr = &cfg.listen;
+    let mut tls = connect_local_proxy_tls(cfg).await?;
     tls.write_all(
         b"GET /api/claude_code/settings HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: keep-alive\r\n\r\n",
     )
@@ -6005,7 +6129,7 @@ fn write_user_service() -> Result<PathBuf> {
     let exe = env::current_exe().context("failed to resolve current saiai executable")?;
     let saiai_home = absolute_existing_or_raw(saiai_config_dir()?);
     let working_dir = home_dir().context("failed to resolve home directory")?;
-    let service_path = service_dir.join(SAIAI_SERVICE_NAME);
+    let service_path = service_dir.join(environment_scope::service_name());
     let content = render_user_service(&exe, &saiai_home, &working_dir)?;
     write_bytes_atomic(&service_path, content.as_bytes(), 0o644)
         .with_context(|| format!("failed to write {}", service_path.display()))?;
@@ -6027,7 +6151,7 @@ Wants=network-online.target\n\
 Type=simple\n\
 Environment={}\n\
 WorkingDirectory={}\n\
-ExecStart={}\n\
+ExecStart={} --instance-dir {}\n\
 Restart=on-failure\n\
 RestartSec=2s\n\
 StandardOutput=journal\n\
@@ -6037,7 +6161,8 @@ StandardError=journal\n\
 WantedBy=default.target\n",
         systemd_quote(&format!("SAIAI_HOME={saiai_home}"))?,
         systemd_path_setting(&working_dir)?,
-        systemd_quote(&exe)?
+        systemd_quote(&exe)?,
+        systemd_quote(&saiai_home)?
     ))
 }
 
@@ -6170,6 +6295,8 @@ fn render_launchd_plist(
   <key>ProgramArguments</key>\n\
   <array>\n\
     <string>{exe}</string>\n\
+    <string>--instance-dir</string>\n\
+    <string>{saiai_home}</string>\n\
   </array>\n\
   <key>EnvironmentVariables</key>\n\
   <dict>\n\
@@ -6188,7 +6315,7 @@ fn render_launchd_plist(
   <string>{log_path}</string>\n\
 </dict>\n\
 </plist>\n",
-        SAIAI_LAUNCHD_LABEL
+        environment_scope::launchd_label()
     ))
 }
 
@@ -6202,7 +6329,7 @@ fn launchd_agents_dir() -> Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn launchd_plist_path() -> Result<PathBuf> {
-    Ok(launchd_agents_dir()?.join(format!("{SAIAI_LAUNCHD_LABEL}.plist")))
+    Ok(launchd_agents_dir()?.join(format!("{}.plist", environment_scope::launchd_label())))
 }
 
 #[cfg(target_os = "macos")]
@@ -6219,7 +6346,7 @@ fn launchctl_gui_domain() -> Result<String> {
 
 #[cfg(target_os = "macos")]
 fn launchctl_service_target(domain: &str) -> String {
-    format!("{domain}/{SAIAI_LAUNCHD_LABEL}")
+    format!("{domain}/{}", environment_scope::launchd_label())
 }
 
 #[cfg(target_os = "macos")]
@@ -6314,6 +6441,8 @@ fn start_linux_background_proxy(cfg: &SaiaiConfig) -> Result<u32> {
     let mut child = ProcessCommand::new(exe)
         .arg(SAIAI_LINUX_BACKGROUND_COMMAND)
         .env("SAIAI_HOME", &saiai_home)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
@@ -6667,6 +6796,8 @@ fn start_windows_background_proxy() -> Result<u32> {
     let child = ProcessCommand::new(exe)
         .arg(SAIAI_WINDOWS_BACKGROUND_COMMAND)
         .env("SAIAI_HOME", &saiai_home)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
@@ -6914,14 +7045,19 @@ fn stop_systemd_user_service_if_present() -> Result<bool> {
     if load_state == "not-found" || load_state.is_empty() {
         return Ok(false);
     }
-    run_systemctl(&["disable", "--now", SAIAI_SERVICE_NAME])?;
+    run_systemctl(&["disable", "--now", &environment_scope::service_name()])?;
     Ok(true)
 }
 
 #[cfg(target_os = "linux")]
 fn service_is_active() -> Result<bool> {
     let status = systemctl_user_command()
-        .args(["--user", "is-active", "--quiet", SAIAI_SERVICE_NAME])
+        .args([
+            "--user",
+            "is-active",
+            "--quiet",
+            &environment_scope::service_name(),
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -6937,7 +7073,7 @@ fn systemctl_value(property: &str) -> Result<String> {
         .args([
             "--user",
             "show",
-            SAIAI_SERVICE_NAME,
+            &environment_scope::service_name(),
             "--property",
             property,
             "--value",
@@ -6964,7 +7100,7 @@ fn print_recent_logs(lines: usize) -> Result<()> {
         .args([
             "--user",
             "-u",
-            SAIAI_SERVICE_NAME,
+            &environment_scope::service_name(),
             "-n",
             &lines.to_string(),
             "--no-pager",
@@ -7065,6 +7201,9 @@ fn codex_config_dir() -> Result<PathBuf> {
 }
 
 fn saiai_config_dir() -> Result<PathBuf> {
+    if let Some(scope) = environment_scope::active() {
+        return Ok(scope.directory.clone());
+    }
     if let Some(dir) = env_dir_override("SAIAI_HOME") {
         return Ok(dir);
     }

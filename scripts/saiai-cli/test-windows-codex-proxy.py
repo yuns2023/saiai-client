@@ -204,7 +204,10 @@ def main() -> int:
                     "init-codex did not expose the Desktop permission selector"
                 )
 
-            config = json.loads((root / "saiai" / "config.json").read_text())
+            config_paths = list((root / "saiai/environments").glob("codex-*/config.json"))
+            if len(config_paths) != 1:
+                raise AssertionError("expected one isolated Codex proxy configuration")
+            config = json.loads(config_paths[0].read_text())
             listen = urllib.parse.urlsplit("//" + config["listen"])
             proxy_port = listen.port
             if proxy_port is None:

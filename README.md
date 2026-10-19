@@ -78,11 +78,28 @@ JSON 字段和机器本地身份值保持不变。客户端为每个用户生成
 
 默认路径是 `~/.claude/settings.json`、`~/.claude.json` 和
 `~/.claude/.credentials.json`、`~/.claude/saiai-ca.crt` 和
-`~/.claude/saiai-ca.key`。设置 `CLAUDE_CONFIG_DIR` 时，这些 Claude 配置、状态、
-credentials 和 CA 文件全部跟随该目录。代理配置和 Key 独立保存于
-`~/.saiai/config.json`；可用 `SAIAI_HOME` 改变其目录，且不受
-`CLAUDE_CONFIG_DIR` 影响。配置完成后直接运行 `claude`，VSCode 中的 Claude
-Code 也读取同一份配置。
+`~/.claude/saiai-ca.key`。设置 `CLAUDE_CONFIG_DIR` 时，Claude 配置、状态和
+credentials 跟随该目录。默认代理配置和 Key 保留在 `~/.saiai/config.json`；
+自定义配置目录对应的代理配置、Key 和 CA 保存在
+`~/.saiai/environments/claude-<目录标识>/`。`CODEX_HOME` 使用同样规则，前缀为
+`codex-`。`SAIAI_HOME` 可以改变整个代理配置根目录。配置完成后直接运行
+`claude`，VSCode 中的 Claude Code 也读取同一份配置。
+
+每个自定义环境独立分配端口、后台进程、服务名称、PID 文件和日志；重新初始化
+一个项目不会覆盖默认环境或其他项目的 Base URL/Key。环境标识按客户端类型和
+规范化配置目录生成，相对路径与符号链接指向同一目录时复用同一环境；显式指向
+`~/.claude` / `~/.codex` 仍归入默认环境。环境变量为空或不是有效目录时拒绝操作。
+配置目录应由调用进程通过环境变量传入；仅在项目中放置 `.env` 不会自动加载它。
+
+`init` / `saiai claude` 选择 Claude 环境；`init-codex` / `saiai codex` 选择 Codex
+环境。`start/stop/restart/status/logs/doctor` 在只设置一个自定义环境时自动选择它；
+同时设置两个时须明确指定，例如 `saiai --environment codex status`，或
+`saiai --environment default status` 查看默认代理。项目初始化不会导入用户 NSS
+信任，也不会默认修改编辑器代理或系统证书；需要 Desktop 时使用对应启动器。
+
+升级本身不会迁移已有配置。旧项目仍指向共享代理时，启动器验证原有代理与 CA
+配置后继续复用该连接；再次初始化该项目才创建独立实例并备份、更新客户端配置。
+未初始化的新项目不会自动使用默认 Key，管理命令也不会静默操作默认代理。
 
 如果 shell 或系统继承了不兼容的 Base URL、认证或代理变量，可选择使用
 `saiai claude`（或 `saiai claude -- <Claude 参数>`）。它仅覆盖官方 Claude

@@ -144,6 +144,30 @@ def main():
         _, doctor = invoke(binary, ["doctor", "claude"], environment)
         assert "OK   NODE_EXTRA_CA_CERTS:" in doctor
         assert "VSCode certificate loader" not in doctor and "VSCode settings:" not in doctor
+        # Custom product directories allocate independent proxy configs and CAs.
+        default_path = home / ".saiai/config.json"
+        default_bytes = default_path.read_bytes()
+        project = {**environment, "CODEX_HOME": str(home / "project/codex"),
+                   "CLAUDE_CONFIG_DIR": str(home / "project/claude")}
+        for verb in ("init", "init-codex"):
+            code, output = invoke(binary, [verb, "http://127.0.0.1:9", "TEST_ONLY_SCOPE_KEY"], project)
+            assert code == 0, "project initialization failed; raw output withheld"
+            assert "Trusted the SAIAI CA in the current user's NSS" not in output
+        paths = list((home / ".saiai/environments").glob("*/config.json"))
+        assert len(paths) == 2
+        configs = [json.loads(path.read_text()) for path in paths]
+        assert len({c["listen"] for c in configs} | {config["listen"]}) == 3
+        for path, selected in zip(paths, configs):
+            assert Path(selected["ca_cert_path"]).parent == path.parent
+            assert Path(selected["ca_key_path"]).parent == path.parent
+        assert default_path.read_bytes() == default_bytes
+        assert all(path.read_bytes() == data for path, data in protected.items())
+        code, output = invoke(binary, ["stop"], project)
+        assert code != 0 and "both Claude and Codex" in output
+        code, _ = invoke(binary, ["init-codex", "http://127.0.0.1:9", "TEST_ONLY_SCOPE_KEY"],
+                         {**project, "CODEX_HOME": " "})
+        assert code != 0
+        assert default_path.read_bytes() == default_bytes
     assert windows_roots() == roots
     print(json.dumps({
         "status": "pass", "platform": platform.system(),

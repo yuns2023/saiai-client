@@ -65,6 +65,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         let mut start =
             Command::new(env::current_exe().context("failed to resolve SAIAI executable")?);
         apply_environment(&mut start, &config, token);
+        crate::environment_scope::pin_start(&mut start)?;
         let status = start
             .arg("start")
             .stdin(Stdio::null())
