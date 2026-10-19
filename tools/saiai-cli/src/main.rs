@@ -3056,6 +3056,9 @@ fn ensure_local_proxy_running_with_start(
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
         if TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
+            if environment_scope::isolated() {
+                verify_selected_proxy_identity()?;
+            }
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));

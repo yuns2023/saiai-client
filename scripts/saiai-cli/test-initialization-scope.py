@@ -168,6 +168,18 @@ def main():
                          {**project, "CODEX_HOME": " "})
         assert code != 0
         assert default_path.read_bytes() == default_bytes
+        # An explicit root/project must not depend on unused default paths being valid.
+        alternate_home = home / "alternate-home"
+        alternate_home.mkdir()
+        (alternate_home / ".saiai").write_text("unrelated file")
+        (alternate_home / ".codex").write_text("unrelated file")
+        alternate = {**environment, "HOME": str(alternate_home), "USERPROFILE": str(alternate_home),
+                     "SAIAI_HOME": str(home / "alternate-saiai"),
+                     "CODEX_HOME": str(home / "alternate-project")}
+        code, _ = invoke(binary, ["init-codex", "http://127.0.0.1:9", "TEST_ONLY_SCOPE_KEY"], alternate)
+        assert code == 0, "explicit environment depended on an unused default directory"
+        assert (alternate_home / ".saiai").read_text() == "unrelated file"
+        assert (alternate_home / ".codex").read_text() == "unrelated file"
     assert windows_roots() == roots
     print(json.dumps({
         "status": "pass", "platform": platform.system(),

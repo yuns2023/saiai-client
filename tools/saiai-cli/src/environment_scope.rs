@@ -81,6 +81,10 @@ pub(crate) fn normalize(path: &Path) -> Result<PathBuf> {
             );
         }
     }
+    // Windows canonicalize returns a verbatim path. Use ordinary spelling when
+    // semantically equivalent, so Desktop/user-data and CA consumers keep working.
+    #[cfg(windows)]
+    let resolved = dunce::simplified(&resolved).to_path_buf();
     Ok(resolved)
 }
 
@@ -109,7 +113,7 @@ fn product_directory(root: &Path, home: &Path, product: &str) -> Result<PathBuf>
     let Some(directory) = override_dir(variable)? else {
         return Ok(root.to_path_buf());
     };
-    if directory == normalize(&home.join(default))? {
+    if normalize(&home.join(default)).ok().as_ref() == Some(&directory) {
         return Ok(root.to_path_buf());
     }
     Ok(root
@@ -138,7 +142,10 @@ pub(crate) fn initialize(command: &Command, selector: Option<(String, String)>) 
         return Ok(());
     }
     let home = normalize(&crate::home_dir().context("failed to resolve home directory")?)?;
-    let root = override_dir("SAIAI_HOME")?.unwrap_or(normalize(&home.join(".saiai"))?);
+    let root = match override_dir("SAIAI_HOME")? {
+        Some(directory) => directory,
+        None => normalize(&home.join(".saiai"))?,
+    };
     let product = match command {
         Command::Init(_) | Command::Claude(_) | Command::Doctor(DoctorTarget::Claude) => {
             Some("claude")
