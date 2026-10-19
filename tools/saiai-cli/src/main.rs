@@ -36,6 +36,8 @@ mod desktop_product;
 mod environment_scope;
 mod local_proxy;
 mod vscode;
+#[cfg(target_os = "windows")]
+mod windows_background;
 #[cfg(any(windows, test))]
 mod windows_desktop_runtime;
 
@@ -397,6 +399,9 @@ fn parse_command(args: &[String]) -> Result<Command> {
         }
         #[cfg(target_os = "windows")]
         SAIAI_WINDOWS_BACKGROUND_COMMAND => {
+            if args.len() == 2 && args[1] == "--instance-v2" {
+                return Ok(Command::RunWindowsBackgroundProxy);
+            }
             return parse_no_arg_command(
                 SAIAI_WINDOWS_BACKGROUND_COMMAND,
                 &args[1..],
@@ -3395,6 +3400,8 @@ struct LinuxBackgroundState {
     schema_version: u32,
     pid: u32,
     start_time_ticks: u64,
+    #[serde(default)]
+    instance: Option<String>,
 }
 
 #[cfg(target_os = "linux")]
@@ -3542,6 +3549,7 @@ fn run_service_start() -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn run_service_start() -> Result<()> {
+    let _service_lock = lock_windows_service()?;
     warn_process_env_conflicts();
     warn_claude_settings_overrides();
     let cfg = read_saiai_config()?;
@@ -3606,6 +3614,7 @@ fn run_service_stop() -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn run_service_stop() -> Result<()> {
+    let _service_lock = lock_windows_service()?;
     stop_windows_background_proxy()?;
     println!("SAIAI background proxy stopped.");
     Ok(())
@@ -3802,7 +3811,8 @@ fn run_service_logs() -> Result<()> {
         "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Get-Content -LiteralPath {} -Encoding UTF8 -Tail 80 -Wait",
         powershell_quote_path(&log_path)?
     );
-    let status = ProcessCommand::new("powershell")
+    let service_lock = lock_windows_service()?;
+    let mut child = ProcessCommand::new("powershell")
         .arg("-NoProfile")
         .arg("-ExecutionPolicy")
         .arg("Bypass")
@@ -3811,8 +3821,17 @@ fn run_service_logs() -> Result<()> {
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .status()
+        .spawn()
         .with_context(|| format!("failed to read {}", log_path.display()))?;
+    let registration = register_windows_log_follower(child.id());
+    if registration.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let registration = registration?;
+    drop(service_lock);
+    let status = child.wait()?;
+    let _ = fs::remove_file(registration);
     if !status.success() {
         bail!("PowerShell exited with {status}");
     }
@@ -5956,6 +5975,9 @@ fn finalize_update(
     fs::write(&script_path, script)
         .with_context(|| format!("failed to write {}", script_path.display()))?;
     if let Err(err) = ProcessCommand::new("powershell")
+        .env("SAIAI_HOME", saiai_config_dir()?)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
         .arg("-NoProfile")
         .arg("-ExecutionPolicy")
         .arg("Bypass")
@@ -6478,6 +6500,7 @@ fn start_linux_background_proxy(cfg: &SaiaiConfig) -> Result<u32> {
             schema_version: SAIAI_LINUX_BACKGROUND_STATE_VERSION,
             pid,
             start_time_ticks: identity.start_time_ticks,
+            instance: Some(saiai_config_dir()?.display().to_string()),
         };
         write_linux_background_state(&state)?;
 
@@ -6614,6 +6637,13 @@ fn write_linux_background_state(state: &LinuxBackgroundState) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn linux_background_state_matches(state: &LinuxBackgroundState) -> Result<bool> {
+    if let Some(instance) = &state.instance {
+        if instance != &saiai_config_dir()?.display().to_string() {
+            return Ok(false);
+        }
+    } else if environment_scope::isolated() {
+        return Ok(false);
+    }
     let Some(identity) = linux_process_identity(state.pid)? else {
         return Ok(false);
     };
@@ -6793,8 +6823,9 @@ fn start_windows_background_proxy() -> Result<u32> {
         .try_clone()
         .with_context(|| format!("failed to clone {}", log_path.display()))?;
 
-    let child = ProcessCommand::new(exe)
+    let mut child = ProcessCommand::new(exe)
         .arg(SAIAI_WINDOWS_BACKGROUND_COMMAND)
+        .arg("--instance-v2")
         .env("SAIAI_HOME", &saiai_home)
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CODEX_HOME")
@@ -6805,152 +6836,179 @@ fn start_windows_background_proxy() -> Result<u32> {
         .spawn()
         .context("failed to start SAIAI background proxy")?;
     let pid = child.id();
-    write_bytes_atomic(&windows_pid_path()?, pid.to_string().as_bytes(), 0o600)?;
-    Ok(pid)
+    let result = (|| -> Result<u32> {
+        let process = windows_background::Process::open(pid, false)?
+            .context("background proxy exited before its identity could be recorded")?;
+        let state = WindowsBackgroundState {
+            version: 2,
+            pid,
+            created: process.created,
+            instance: saiai_config_dir()?.display().to_string(),
+        };
+        write_bytes_atomic(&windows_pid_path()?, &serde_json::to_vec(&state)?, 0o600)?;
+        Ok(pid)
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
 }
 
 #[cfg(target_os = "windows")]
 fn stop_windows_background_proxy() -> Result<()> {
-    if let Some(pid) = windows_background_pid()? {
-        if windows_pid_is_running(pid).unwrap_or(false) {
-            let status = ProcessCommand::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .status()
-                .context("failed to run taskkill")?;
-            if !status.success() {
-                // Detached/background workers can reject taskkill's tree walk even
-                // when the owning user can still terminate the exact process.
-                // Retry narrowly through PowerShell before surfacing an error.
-                let fallback = ProcessCommand::new("powershell")
-                    .args([
-                        "-NoProfile",
-                        "-NonInteractive",
-                        "-Command",
-                        "& { param($pid) Stop-Process -Id $pid -Force -ErrorAction Stop }",
-                        &pid.to_string(),
-                    ])
-                    .status();
-                if fallback
-                    .as_ref()
-                    .map(|value| !value.success())
-                    .unwrap_or(true)
-                    && windows_pid_is_running(pid).unwrap_or(false)
-                {
-                    bail!(
-                        "could not stop SAIAI background process {pid}; taskkill exited with {status} and the exact-process fallback was rejected. Run PowerShell as the same user or Administrator and retry."
-                    );
-                }
-            }
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while std::time::Instant::now() < deadline {
-                if !windows_pid_is_running(pid).unwrap_or(false) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            if windows_pid_is_running(pid).unwrap_or(false) {
-                bail!("SAIAI background process {pid} did not exit after forced termination");
-            }
-        }
+    if let Some(process) = windows_background_process(true)? {
+        process.stop()?;
     }
-    stop_windows_exact_path_stragglers()?;
+    stop_windows_log_followers()?;
     let _ = fs::remove_file(windows_pid_path()?);
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-fn stop_windows_exact_path_stragglers() -> Result<()> {
-    let executable = env::current_exe().context("failed to resolve the SAIAI executable path")?;
-    let executable = fs::canonicalize(&executable)
-        .with_context(|| format!("failed to canonicalize {}", executable.display()))?;
-    let output = ProcessCommand::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "$items = @(Get-CimInstance Win32_Process -Filter \"Name = 'saiai.exe'\" | Where-Object { $_.ExecutablePath } | ForEach-Object { @{ pid = $_.ProcessId; path = $_.ExecutablePath } }); ConvertTo-Json -InputObject $items -Compress",
-        ])
-        .output()
-        .context("failed to inspect same-path SAIAI processes")?;
-    if !output.status.success() {
-        bail!(
-            "could not inspect same-path SAIAI processes: {}",
-            output.status
-        );
+#[derive(Serialize, Deserialize)]
+struct WindowsBackgroundState {
+    version: u32,
+    pid: u32,
+    created: u64,
+    instance: String,
+}
+
+#[cfg(target_os = "windows")]
+fn windows_background_process(terminate: bool) -> Result<Option<windows_background::Process>> {
+    let path = windows_pid_path()?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("cannot read background process state"),
+    };
+    if let Ok(state) = serde_json::from_str::<WindowsBackgroundState>(&raw) {
+        if state.version != 2 || state.instance != saiai_config_dir()?.display().to_string() {
+            bail!("background process state belongs to a different environment");
+        }
+        let Some(process) = windows_background::Process::open(state.pid, terminate)? else {
+            return Ok(None);
+        };
+        return Ok((process.created == state.created && process.running()).then_some(process));
     }
-    let processes: Vec<Value> = serde_json::from_slice(&output.stdout)
-        .context("failed to parse same-path SAIAI process inventory")?;
-    for process in processes {
-        let Some(pid) = process
-            .get("pid")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-        else {
-            continue;
-        };
-        if pid == std::process::id() {
-            continue;
+    // Upgrade compatibility: only the default instance may own a legacy bare PID.
+    // Verify its exact executable and old worker command before touching it.
+    let pid = raw
+        .trim()
+        .parse::<u32>()
+        .context("invalid background process state")?;
+    if environment_scope::isolated() {
+        bail!("isolated environment has unverified legacy process state");
+    }
+    let Some(process) = windows_background::Process::open(pid, terminate)? else {
+        return Ok(None);
+    };
+    if !process.running() {
+        return Ok(None);
+    }
+    if !legacy_windows_worker_matches(pid)? {
+        return Ok(None);
+    }
+    Ok(Some(process))
+}
+
+#[cfg(target_os = "windows")]
+fn legacy_windows_worker_matches(pid: u32) -> Result<bool> {
+    let executable = env::current_exe()?;
+    let output = ProcessCommand::new("powershell")
+        .env("SAIAI_CHECK_PID", pid.to_string())
+        .env("SAIAI_CHECK_EXE", executable)
+        .args(["-NoProfile", "-NonInteractive", "-Command",
+            r#"$ErrorActionPreference='Stop'; $p=Get-CimInstance Win32_Process -Filter ('ProcessId = '+$env:SAIAI_CHECK_PID); if (!$p) { exit 1 }; $expected=$env:SAIAI_CHECK_EXE -replace '^\\\\\?\\',''; $actual=$p.ExecutablePath -replace '^\\\\\?\\',''; if ($actual -ieq $expected -and $p.CommandLine -match '\s__run-background-proxy\s*$') { exit 0 }; exit 1"#])
+        .stdout(Stdio::null()).stderr(Stdio::null()).status()
+        .context("cannot verify legacy SAIAI worker identity")?;
+    Ok(output.success())
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Serialize, Deserialize)]
+struct WindowsLogFollower {
+    parent: WindowsBackgroundState,
+    child: WindowsBackgroundState,
+}
+
+#[cfg(target_os = "windows")]
+fn register_windows_log_follower(child: u32) -> Result<PathBuf> {
+    let directory = saiai_config_dir()?;
+    let state = |pid| -> Result<WindowsBackgroundState> {
+        let process =
+            windows_background::Process::open(pid, false)?.context("log follower exited")?;
+        Ok(WindowsBackgroundState {
+            version: 2,
+            pid,
+            created: process.created,
+            instance: directory.display().to_string(),
+        })
+    };
+    let parent = std::process::id();
+    let record = WindowsLogFollower {
+        parent: state(parent)?,
+        child: state(child)?,
+    };
+    let path = directory
+        .join("log-followers")
+        .join(format!("{parent}.json"));
+    fs::create_dir_all(path.parent().unwrap())?;
+    write_bytes_atomic(&path, &serde_json::to_vec(&record)?, 0o600)?;
+    Ok(path)
+}
+
+#[cfg(target_os = "windows")]
+fn stop_windows_log_followers() -> Result<()> {
+    let directory = saiai_config_dir()?;
+    let entries = match fs::read_dir(directory.join("log-followers")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).context("cannot inspect selected environment log followers");
         }
-        let Some(path) = process.get("path").and_then(Value::as_str) else {
-            continue;
-        };
-        let Ok(process_path) = fs::canonicalize(path) else {
-            continue;
-        };
-        if !process_path
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&executable.to_string_lossy())
-        {
-            continue;
-        }
-        let status = ProcessCommand::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .status()
-            .with_context(|| format!("failed to terminate same-path SAIAI process {pid}"))?;
-        if !status.success() && windows_pid_is_running(pid).unwrap_or(false) {
-            bail!("could not terminate same-path SAIAI process {pid}: {status}");
-        }
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while windows_pid_is_running(pid).unwrap_or(false) {
-            if std::time::Instant::now() >= deadline {
-                bail!("same-path SAIAI process {pid} did not exit after termination");
+    };
+    for entry in entries {
+        let path = entry?.path();
+        let record: WindowsLogFollower =
+            serde_json::from_slice(&fs::read(&path)?).context("invalid log follower record")?;
+        for state in [&record.child, &record.parent] {
+            if state.version != 2 || state.instance != directory.display().to_string() {
+                bail!("log follower record belongs to another environment");
             }
-            std::thread::sleep(Duration::from_millis(100));
+            if let Some(process) = windows_background::Process::open(state.pid, true)?
+                && process.created == state.created
+            {
+                process.stop()?;
+            }
         }
+        let _ = fs::remove_file(path);
     }
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
+fn lock_windows_service() -> Result<fs::File> {
+    let dir = saiai_config_dir()?;
+    fs::create_dir_all(&dir)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join("saiai.lock"))?;
+    file.lock().context("cannot lock selected SAIAI service")?;
+    Ok(file)
+}
+
+#[cfg(target_os = "windows")]
 fn windows_background_pid() -> Result<Option<u32>> {
-    let path = windows_pid_path()?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    let pid = trimmed
-        .parse::<u32>()
-        .with_context(|| format!("invalid pid in {}", path.display()))?;
-    Ok(Some(pid))
+    Ok(windows_background_process(false)?.map(|process| process.pid))
 }
 
 #[cfg(target_os = "windows")]
 fn windows_pid_is_running(pid: u32) -> Result<bool> {
-    let filter = format!("PID eq {pid}");
-    let output = ProcessCommand::new("tasklist")
-        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
-        .output()
-        .context("failed to run tasklist")?;
-    if !output.status.success() {
-        bail!("tasklist exited with {}", output.status);
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.contains(&format!("\"{pid}\"")) || stdout.contains(&format!(",{pid},")))
+    Ok(windows_background_process(false)?.is_some_and(|process| process.pid == pid))
 }
 
 #[cfg(target_os = "windows")]

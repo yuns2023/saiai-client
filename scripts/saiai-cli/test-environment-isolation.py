@@ -179,6 +179,13 @@ def main():
             assert migrated["listen"] != default["listen"]
             request(migrated, servers[1], "TEST_ENV_KEY_LEGACY")
             invoke({**environment, "CODEX_HOME": str(root / "fresh")}, "codex", success=False)
+            # A copied receipt from another instance must never authorize stopping it.
+            own_state = path_a.with_name("saiai.pid").read_bytes()
+            path_a.with_name("saiai.pid").write_bytes(path_b.with_name("saiai.pid").read_bytes())
+            invoke(a, "stop", success=False)
+            assert pid(path_b) == b_pid
+            request(cfg_b, servers[2], "TEST_ENV_KEY_B")
+            path_a.with_name("saiai.pid").write_bytes(own_state)
             # Stop only A; then restart it. Default and B keep their exact process.
             invoke(a, "stop")
             assert not path_a.with_name("saiai.pid").exists()

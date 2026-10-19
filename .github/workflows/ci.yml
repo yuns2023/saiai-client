@@ -161,6 +161,9 @@ jobs:
       - name: Verify provider initialization preserves editor and certificate stores
         run: python scripts/saiai-cli/test-initialization-scope.py --binary tools/saiai-cli/target/debug/saiai.exe
 
+      - name: Verify native Windows environment lifecycle isolation
+        run: python scripts/saiai-cli/test-windows-environments.py --binary tools/saiai-cli/target/debug/saiai.exe
+
       - name: Smoke-test Windows PowerShell 5.1 setup wrapper
         shell: pwsh
         run: |
@@ -236,6 +239,11 @@ jobs:
       - name: Smoke-test macOS LaunchAgent lifecycle
         run: >-
           python3 scripts/saiai-cli/test-macos-service.py
+          --binary tools/saiai-cli/target/debug/saiai
+
+      - name: Verify native macOS environment lifecycle isolation
+        run: >-
+          python3 scripts/saiai-cli/test-macos-environments.py
           --binary tools/saiai-cli/target/debug/saiai
 
       - name: Capture official macOS Codex through local proxy

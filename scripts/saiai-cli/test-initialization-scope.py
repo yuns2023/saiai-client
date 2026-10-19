@@ -158,8 +158,8 @@ def main():
         configs = [json.loads(path.read_text()) for path in paths]
         assert len({c["listen"] for c in configs} | {config["listen"]}) == 3
         for path, selected in zip(paths, configs):
-            assert Path(selected["ca_cert_path"]).parent == path.parent
-            assert Path(selected["ca_key_path"]).parent == path.parent
+            assert Path(selected["ca_cert_path"]).parent.resolve() == path.parent.resolve()
+            assert Path(selected["ca_key_path"]).parent.resolve() == path.parent.resolve()
         assert default_path.read_bytes() == default_bytes
         assert all(path.read_bytes() == data for path, data in protected.items())
         code, output = invoke(binary, ["stop"], project)
