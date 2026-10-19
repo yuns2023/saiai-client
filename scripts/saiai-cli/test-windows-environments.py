@@ -74,6 +74,11 @@ def main():
             snapshots = [p.read_bytes() for p in states]
             configs = [p.read_bytes() for p in paths]
             assert len({json.loads(c)["listen"] for c in configs}) == 3
+            # A legacy bare PID must not be allowed to stop a new project worker.
+            states[0].write_text(str(json.loads(snapshots[2])["pid"]))
+            run(env, "stop")
+            assert "service active: yes" in run(b, "status")
+            states[0].write_bytes(snapshots[0])
             # Scoped stop must neither terminate another environment nor trust its copied receipt.
             states[1].write_bytes(snapshots[2])
             run(a, "stop", ok=False)
@@ -102,6 +107,20 @@ def main():
             assert followers[1].poll() is None
             assert states[1].read_bytes() == snapshots[1] and states[2].read_bytes() == snapshots[2]
             probe(json.loads(configs[1])); probe(json.loads(configs[2]))
+            # Exercise the supported upgrade shape: an old default worker command
+            # with a bare PID, using only the test binary and temporary config.
+            with (root / "legacy-worker.log").open("wb") as legacy_output:
+                legacy_worker = subprocess.Popen([str(binary), "__run-background-proxy"], env=env,
+                                                 stdout=legacy_output, stderr=subprocess.STDOUT)
+            try:
+                states[0].write_text(str(legacy_worker.pid))
+                probe(json.loads(configs[0]))
+                run(env, "stop")
+                legacy_worker.wait(timeout=10)
+            finally:
+                if legacy_worker.poll() is None:
+                    legacy_worker.kill()
+                    legacy_worker.wait(timeout=10)
             run(a, "restart")
             assert states[2].read_bytes() == snapshots[2]
             assert [p.read_bytes() for p in paths] == configs
