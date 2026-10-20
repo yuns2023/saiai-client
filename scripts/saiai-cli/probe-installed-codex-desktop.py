@@ -464,6 +464,23 @@ def storage_session(binary: Path, env: dict[str, str], cwd: Path,
             process.stdout.close()
 
 
+def initialized_proxy_config(saiai_home: Path, codex_home: Path, version: str) -> dict[str, Any]:
+    match = re.fullmatch(r"saiai (\d+)\.(\d+)\.(\d+)", version)
+    if not match:
+        raise ProbeError("unsupported candidate version shape")
+    scoped = tuple(map(int, match.groups())) >= (1, 1, 51)
+    directory = saiai_home
+    if scoped:
+        digest = hashlib.sha256(os.fsencode(codex_home.resolve())).hexdigest()[:24]
+        directory = saiai_home / "environments" / f"codex-{digest}"
+        if (saiai_home / "config.json").exists():
+            raise ProbeError("project initialization unexpectedly wrote default configuration")
+    config_path = directory / "config.json"
+    if config_path.is_symlink() or not config_path.is_file():
+        raise ProbeError("selected proxy configuration is missing or unsafe")
+    return json.loads(config_path.read_text(encoding="utf-8"))
+
+
 def probe(
     saiai: Path,
     app_server_override: Path | None,
@@ -541,7 +558,7 @@ def probe(
             )
             if init.returncode != 0:
                 raise ProbeError("candidate init-codex failed in the isolated home")
-            config = json.loads((saiai_home / "config.json").read_text(encoding="utf-8"))
+            config = initialized_proxy_config(saiai_home, codex_home, saiai_version)
             ca_path = Path(config["ca_cert_path"])
             listen = str(config["listen"])
             proxy_url = f"http://{listen}"

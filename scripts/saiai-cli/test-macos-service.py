@@ -122,7 +122,7 @@ def main() -> int:
     binary.chmod(binary.stat().st_mode | 0o111)
 
     with tempfile.TemporaryDirectory(prefix="saiai-macos-service-") as temporary_text:
-        temporary = Path(temporary_text)
+        temporary = Path(temporary_text).resolve()
         home = temporary / "home"
         claude_dir = home / ".claude"
         saiai_home = home / ".saiai"

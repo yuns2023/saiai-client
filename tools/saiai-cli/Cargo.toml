@@ -1,6 +1,6 @@
 [package]
 name = "saiai"
-version = "1.1.50"
+version = "1.1.51"
 edition = "2024"
 rust-version = "1.97"
 description = "SAIAI managed local proxy for Claude Code and Codex configuration"
@@ -35,6 +35,9 @@ zeroize = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+dunce = "1"
 
 [dev-dependencies]
 tempfile = "3"

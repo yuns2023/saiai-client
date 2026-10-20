@@ -9,13 +9,53 @@
 稳定边界：
 
 - 代理只监听 loopback。首次初始化会分配一个可用的随机 loopback 端口并持久化到
-  `SAIAI_HOME/config.json`；重复初始化在端口仍由 SAIAI 管理时复用它，被其它进程占用
+  所选环境的 `config.json`；默认环境保留 `SAIAI_HOME/config.json`。重复初始化
+  在端口仍由所选 SAIAI 实例管理时复用它，被其它进程占用
   时重新分配。
 - 不创建隔离 home 或 generation，也不调用 Gateway bootstrap。
 - 初始化、doctor 和 release 验证不发送模型请求。
 - 同一命令可重复执行；新 Base URL/Key 覆盖旧值。
 - 无关用户配置和机器身份值必须保留。
-- 每个用户使用独立生成的 CA；release 中不得包含 CA 私钥。
+- 默认环境保留用户级 CA；自定义环境独立生成 CA，release 中不得包含 CA 私钥。
+
+## 环境隔离
+
+`SAIAI_HOME` 是配置根目录，默认 `~/.saiai`。没有产品目录覆盖时继续读取原有
+`config.json`；自定义 `CLAUDE_CONFIG_DIR` / `CODEX_HOME` 分别映射为
+`environments/claude-<目录标识>/config.json` 和
+`environments/codex-<目录标识>/config.json`。标识为规范化绝对路径的 SHA-256
+前 24 位十六进制；类型前缀保证两个产品即使指向同一路径也不共享代理凭据。
+规范化解析已有符号链接及相对路径，显式指向默认目录时归并默认环境。
+空白、无效目录和不可解析路径拒绝执行，不回退写默认配置。
+
+命令在产生副作用之前一次性解析环境。产品命令只看对应产品变量；通用管理命令
+在两个自定义环境同时存在时拒绝猜测，可用前置参数
+`--environment claude|codex|default` 明确选择。内部服务和 launcher 的 start 子命令
+固定使用已解析的配置目录，不因继承另一个产品变量而重新选错实例。
+
+每个自定义环境独立拥有凭据、CA、loopback 端口、进程、日志、PID/锁文件，以及
+systemd unit / launchd label。默认服务名称保留。Windows 进程状态记录配置目录、PID
+和创建时间，停止时持有精确进程句柄验证身份，禁止按可执行文件路径批量杀进程；
+日志跟随进程也按环境注册和清理。默认旧版 PID 仅在核实旧 worker 命令和路径后兼容。初始化通过根目录文件锁串行化，
+分配端口时排除其他环境（包括已停止环境）的已保存端口；端口被外部程序占用时
+不接管它。启动器还通过所选环境 CA 验证监听者的 TLS 身份，支持前台与后台代理，
+该握手不发送 Gateway 或模型请求。
+
+初始化只更新所选产品配置目录；隔离 CA 留在相应 SAIAI 环境目录，不使用共享
+Claude CA，也不默认导入用户 NSS。显式编辑器设置仍是用户级选项，不因项目
+初始化自动开启。私钥及含 Key 的配置保持用户私有权限。
+
+升级不自动修改已有客户端配置。已有项目通过明确匹配的共享 proxy/CA 配置
+继续使用旧 launcher 路径，直到用户再次初始化项目；此时备份客户端配置并切换
+到新独立实例，不改默认代理。新项目或无法验证旧连接的项目不回退到默认 Key。
+start/stop/restart 等管理命令始终只操作所选环境，不使用这种兼容回退。
+
+Linux 集成测试使用临时 HOME、合成凭据和本地 Gateway，覆盖默认环境与多个项目
+并行运行、实际 TLS 转发、凭据更新、启动器、旧配置过渡、停止/重启、端口冲突和
+systemd 命令隔离。跨平台初始化用例验证默认配置和编辑器/信任范围保持不变；
+原生 Windows 多实例测试覆盖 stale PID、其他环境状态文件和日志跟随进程隔离；
+Windows/macOS 生命周期结果以对应 CI 为准。共享二进制更新不授权终止其他环境，
+若 Windows 因其他进程占用而拒绝替换，应保留运行环境并报告失败。
 
 ## 本地 HTTP 上传边界
 
@@ -266,8 +306,9 @@ Claude 路径解析遵守 `CLAUDE_CONFIG_DIR`。未设置时使用：
 - `~/.claude/saiai-ca.key`
 
 代理配置和 Key 使用独立的 `SAIAI_HOME`，默认写入
-`~/.saiai/config.json`。改变 `CLAUDE_CONFIG_DIR` 不会移动代理配置；改变
-`SAIAI_HOME` 也不会移动 Claude 配置、状态、credentials 或 CA。
+`~/.saiai/config.json`。自定义 `CLAUDE_CONFIG_DIR` 选择 `SAIAI_HOME/environments`
+下对应的独立实例，其 CA 也保存在该实例目录。改变 `SAIAI_HOME` 不会移动 Claude
+配置、状态或 credentials。
 
 初始化会先解析并备份已有配置，然后：
 
@@ -391,7 +432,7 @@ metrics exporter。SAIAI 网络下该非模型端点可能不可达，因此 lau
 
 `init-codex` 在独立的 `SAIAI_HOME` 中创建或更新本地代理配置和安装 CA，并同步
 `CODEX_HOME/.env` 的 loopback port、`SSL_CERT_FILE` 和 `NO_PROXY`，使同一次 WebUI
-初始化后可直接启动 CLI 与 VSCode app-server。Linux 还会将安装 CA 刷新到当前用户
+初始化后可直接启动 CLI 与 VSCode app-server。仅默认环境的 Linux 初始化会将安装 CA 刷新到当前用户
 `~/.pki/nssdb` 的唯一 `saiai-local-proxy` 条目，以让直接启动的 Electron Desktop
 信任 loopback MITM；这不写系统信任库，也不触发系统弹窗。该用户级信任会影响同一
 用户使用该 NSS 数据库的应用，因此命令输出会明确披露它；缺少 `certutil`

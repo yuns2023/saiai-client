@@ -28,6 +28,11 @@ if [ "$#" -eq 1 ] && [ "$1" = "init-codex" ]; then
   config_path="${SAIAI_HOME:-${HOME:?HOME is required}/.saiai}/config.json"
   base_url=""
   api_key=""
+  # A product override may identify a project. Never silently import the
+  # default proxy's credentials into it; let the caller supply its own pair.
+  if [ "${CODEX_HOME+x}" = x ]; then
+    config_path=""
+  fi
   if [ -f "${config_path}" ]; then
     if command -v python3 >/dev/null 2>&1; then
       read -r base_url api_key < <(python3 - "${config_path}" <<'PY'

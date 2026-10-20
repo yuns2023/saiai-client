@@ -68,6 +68,8 @@ $caKeyPath = Join-Path $claudeDir "saiai-ca.key"
 $testKey = "TEST_ONLY_WINDOWS_RUNTIME_KEY"
 $replacementKey = "TEST_ONLY_WINDOWS_REPLACEMENT_KEY"
 $codexKey = "TEST_ONLY_WINDOWS_CODEX_PROXY_KEY"
+$savedHome = $env:HOME
+$savedUserProfile = $env:USERPROFILE
 $savedConfigDir = $env:CLAUDE_CONFIG_DIR
 $savedSaiaiHome = $env:SAIAI_HOME
 $savedCodexHome = $env:CODEX_HOME
@@ -80,6 +82,10 @@ $savedVSCodeAgent = $env:VSCODE_AGENT_FOLDER
 $savedVSCodePortable = $env:VSCODE_PORTABLE
 
 try {
+    # This fixture exercises the default shared profile; project isolation has a separate test.
+    $env:HOME = $temporary
+    $env:USERPROFILE = $temporary
+    $env:CODEX_HOME = Join-Path $temporary ".codex"
     $env:APPDATA = Join-Path $temporary "AppData\Roaming"
     $env:VSCODE_AGENT_FOLDER = Join-Path $temporary ".vscode-server"
     $env:VSCODE_PORTABLE = $null
@@ -268,6 +274,8 @@ finally {
     if ((Test-Path -LiteralPath $binary -PathType Leaf) -and (Test-Path -LiteralPath $env:SAIAI_HOME -PathType Container)) {
         & $binary stop *> $null
     }
+    $env:HOME = $savedHome
+    $env:USERPROFILE = $savedUserProfile
     $env:CLAUDE_CONFIG_DIR = $savedConfigDir
     $env:SAIAI_HOME = $savedSaiaiHome
     $env:CODEX_HOME = $savedCodexHome

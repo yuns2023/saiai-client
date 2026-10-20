@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
+import os
 import plistlib
 import tempfile
 import unittest
@@ -18,6 +20,22 @@ SPEC.loader.exec_module(PROBE)
 
 
 class InstalledCodexDesktopProbeTests(unittest.TestCase):
+    def test_project_probe_reads_exact_environment_and_rejects_default_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            codex = root / "project"
+            codex.mkdir()
+            home = root / "saiai"
+            digest = hashlib.sha256(os.fsencode(codex.resolve())).hexdigest()[:24]
+            scoped = home / "environments" / f"codex-{digest}"
+            scoped.mkdir(parents=True)
+            (scoped / "config.json").write_text('{"listen":"127.0.0.1:1234"}')
+            self.assertEqual(PROBE.initialized_proxy_config(home, codex, "saiai 1.1.51")["listen"], "127.0.0.1:1234")
+            (home / "config.json").write_text('{}')
+            with self.assertRaises(PROBE.ProbeError):
+                PROBE.initialized_proxy_config(home, codex, "saiai 1.1.51")
+            self.assertEqual(PROBE.initialized_proxy_config(home, codex, "saiai 1.1.50"), {})
+
     def test_storage_fixture_is_only_temporary_synthetic_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

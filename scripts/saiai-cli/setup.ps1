@@ -77,14 +77,41 @@ function Add-SaiaiPath {
     }
 }
 
-function Stop-SaiaiForReplacement {
-    param([Parameter(Mandatory = $true)][string]$Path)
+function Test-SaiaiDirectoryOverride {
+    param([string]$Name, [string]$Default)
+    $raw = [Environment]::GetEnvironmentVariable($Name, "Process")
+    if ($null -eq $raw) { return $false }
+    if ([string]::IsNullOrWhiteSpace($raw)) { throw "$Name is empty; unset it to use the default environment." }
+    return -not [string]::Equals([IO.Path]::GetFullPath($raw).TrimEnd('\'),
+        [IO.Path]::GetFullPath($Default).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)
+}
 
-    Write-Host "Stopping the running SAIAI background proxy before updating..." -ForegroundColor DarkGray
-    & $Path stop | Out-Host
+function Stop-SaiaiForReplacement {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [ValidateSet("claude", "codex")][string]$Product = "claude"
+    )
+
+    $helpText = (& $Path --help | Out-String)
+    if ($LASTEXITCODE -ne 0) { throw "Could not inspect the installed SAIAI client's environment support." }
+    if ($helpText.Contains("--environment")) {
+        Write-Host "Stopping only the selected SAIAI environment before updating..." -ForegroundColor DarkGray
+        & $Path --environment $Product stop | Out-Host
+    }
+    else {
+        $variable = if ($Product -eq "codex") { "CODEX_HOME" } else { "CLAUDE_CONFIG_DIR" }
+        $defaultDirectory = Join-Path $env:USERPROFILE ("." + $Product)
+        if ((Test-SaiaiDirectoryOverride -Name $variable -Default $defaultDirectory) -or
+            (Test-SaiaiDirectoryOverride -Name "SAIAI_HOME" -Default (Join-Path $env:USERPROFILE ".saiai"))) {
+            Write-Host "Preserving the old shared proxy while installing for a separate environment. If Windows prevents replacement, close the existing client explicitly and retry." -ForegroundColor DarkGray
+            return
+        }
+        Write-Host "Stopping the legacy default SAIAI proxy before updating..." -ForegroundColor DarkGray
+        & $Path stop | Out-Host
+    }
     $stopExitCode = [int]$LASTEXITCODE
     if ($stopExitCode -ne 0) {
-        throw "Existing SAIAI client could not be stopped before update (exit $stopExitCode)."
+        throw "Selected SAIAI environment could not be stopped before update (exit $stopExitCode)."
     }
 }
 
@@ -294,7 +321,7 @@ function Invoke-Saiai {
 
                 $installedExists = Test-Path -LiteralPath $installPath -PathType Leaf
                 if ($installedExists) {
-                    Stop-SaiaiForReplacement -Path $installPath
+                    Stop-SaiaiForReplacement -Path $installPath -Product $(if ($provided[0] -eq "init-codex") { "codex" } else { "claude" })
                 }
                 if ($installedExists -and
                     -not (Test-Path -LiteralPath $backupPath)) {
