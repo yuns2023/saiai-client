@@ -1,0 +1,4 @@
+interface:
+  display_name: "SAIAI Desktop 诊断"
+  short_description: "只读排查客户电脑上的 Desktop 登录与 Chat 故障，生成脱敏维护报告"
+  default_prompt: "使用 $saiai-codex-desktop-triage 排查本机 Desktop 故障，只读检查并输出可交给 SAIAI 维护者的脱敏报告。"
