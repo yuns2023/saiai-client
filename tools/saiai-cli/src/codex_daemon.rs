@@ -20,7 +20,9 @@ use std::os::unix::net::UnixStream as ControlStream;
 use uds_windows::UnixStream as ControlStream;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-const RESTART_TIMEOUT: Duration = Duration::from_secs(45);
+// Exceed the official default 60s shutdown grace so a slow drain is not cut
+// off after the old daemon stops but before the new one starts.
+const RESTART_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_COMMAND_OUTPUT: u64 = 16 * 1024;
 const MANUAL_RESTART: &str =
     "finish Codex tasks, then run `codex app-server daemon restart`; meanwhile use `saiai codex`";
