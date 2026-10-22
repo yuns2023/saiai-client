@@ -446,6 +446,42 @@ auth；根 provider 固定为内置 `openai`，不保留 `model_providers.OpenAI
 上下文预算。有效的用户 CA、监听地址和既有兼容字段会复用，只替换 Gateway 与 Key；
 已有真实 ChatGPT OAuth 原样保留，API-key-only auth 会迁移为本地代理 OAuth 占位。
 
+### 待发布：已运行的 Codex daemon
+
+Codex 0.162.1 的普通 CLI 会复用共享 app-server daemon。若它在 SAIAI 初始化前
+启动，磁盘上的 `auth.json` / `.env` 已更新也不能证明后台认证缓存和代理环境已
+刷新；`codex login status` 可以显示已登录，而普通 `codex` 仍进入登录菜单。
+`saiai codex` 的启动覆盖会选择进程内 app-server，可能掩盖该差异。
+
+候选实现中，`init-codex` 在写入并校验配置、成功启动或刷新 SAIAI 代理后，检查
+当前 `CODEX_HOME/app-server-control/app-server-control.sock`。没有 socket 时跳过，
+不会为初始化启动一个新的 Codex daemon。已有 socket 时，用官方
+`codex app-server daemon version` 确认运行状态和受管归属，再通过本地 WebSocket
+控制接口核对 `CODEX_HOME`、`account/read`（`refreshToken=false`）和
+`thread/loaded/list`。只有受管 daemon 且没有任何已加载会话时才调用官方
+`codex app-server daemon restart`；新进程继承当前 SAIAI 代理、CA 和 `NO_PROXY`，
+移除冲突的受管 API-key/base-url 环境值，随后复查后台账户。
+
+任何已加载会话（包括空闲会话）、未知响应、超时、不支持命令或非受管 app-server
+都会保留进程并提示用户完成任务后手动重启；初始化配置仍保留。没有按进程名
+`pkill` / `taskkill` 的回退，不删除用户历史或真实 OAuth。控制查询和子命令均有
+时间、响应大小限制，原始账户响应和子命令输出不打印。官方没有原子的“仅空闲时
+重启”接口，初始化期间应避免同时启动新任务；会话查询放在重启前的最后一次控制
+查询以缩短竞争窗口。`SAIAI_SKIP_START=1` 同时跳过代理启动和 daemon 重启。
+
+`doctor` / `doctor codex` 只查询现有 daemon，不启动、重启或刷新 token。
+文件认证有效但后台 `account/read` 没有 ChatGPT 账户时，明确提示该状态可能导致
+登录菜单，并给出 `codex app-server daemon restart` 与临时 `saiai codex` 指引。
+这些检查不发送模型请求，也不能证明模型权限、生成或计费已通过。
+
+回归入口为 `scripts/saiai-cli/test-codex-daemon.py`：使用精确的官方 Codex 0.162.1
+独立 Linux 二进制、临时 home 和 loopback Gateway mock，先启动无认证 daemon，
+再验证只读诊断、初始化刷新、普通 CLI 主界面和已加载会话保护。Linux CI 固定
+官方资产 SHA-256；Windows/macOS CI 的 Rust 测试验证本机控制 socket 协议和
+重启决策，不等于这两个平台已通过完整官方 daemon 生命周期/UI 验收。
+
+### 现有 CLI、IDE 与 Desktop 启动边界
+
 在已安装 Codex、但尚未生成 OAuth `auth.json` 的环境中，`saiai codex` 会在目标
 `CODEX_HOME` 中创建一个仅供本地代理使用的 ChatGPT OAuth 形状占位文件，然后完成
 正常配置迁移。占位 token 不代表 provider 凭证，只有本地代理正在运行且由 Gateway
