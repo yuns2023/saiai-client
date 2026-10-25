@@ -88,7 +88,10 @@ Codex profile，不在启动时改写该 profile；`saiai doctor codex` 会报�
 标准 `%USERPROFILE%\.codex` profile；启动前要求该 profile 的 `.env` 已有与当前
 SAIAI 代理和 CA 一致的受管配置。未配置时先运行 `saiai init-codex`，配置过期时运行
 `saiai vscode`。不要从 SSH 或服务会话启动需要交互窗口的商店版 Desktop，也不要设置
-自定义 `CODEX_HOME` 或仅供子进程使用的时区覆盖。启动器不会修改 HKCU 系统代理、
+自定义 `CODEX_HOME` 或仅供子进程使用的时区覆盖（`SAIAI_CHATGPT_TIMEZONE`；Desktop
+不再有默认 `TZ` 覆盖，且 Codex 在 Windows 上本就不读取 `TZ`）。商店版不会改写标准
+profile；若其 `config.toml` 未设置 `include_environment_context_time = false`，
+launcher 会提示先运行 `saiai init-codex`，否则 Codex 0.163+ 仍会上报本机时区。启动器不会修改 HKCU 系统代理、
 Windows 系统环境或 `CurrentUser\Root`；升级时如发现旧版本遗留的 proxy lease，
 只执行一次有所有权校验的恢复和清理。
 

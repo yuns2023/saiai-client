@@ -120,11 +120,18 @@ const CODEX_PLACEHOLDER_ID_TOKEN: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.ey
 // both fields; the local proxy replaces authorization before Gateway egress.
 const CODEX_PLACEHOLDER_ACCESS_TOKEN: &str = CODEX_PLACEHOLDER_ID_TOKEN;
 
-// Optional fixed timezone for ChatGPT Desktop ordinary Chat. It is read by
-// the launcher and applied only to the Desktop child process; the parent
-// shell and system timezone are never modified.
+// Explicit opt-in only: when set to an IANA zone, the launcher exports `TZ`
+// to the Desktop child process (never the parent shell or the system). There
+// is no default override. It is not a privacy control for Codex requests:
+// Codex resolves its timezone through iana-time-zone, which ignores `TZ` on
+// Linux and Windows. Codex time reporting is disabled through the managed
+// `include_environment_context_time = false` configuration key instead.
 const SAIAI_CHATGPT_TIMEZONE_ENV: &str = "SAIAI_CHATGPT_TIMEZONE";
-const DEFAULT_CHATGPT_TIMEZONE: &str = "America/Los_Angeles";
+
+// Codex >= 0.163.0 omits the machine timezone and current date from the
+// model-visible <environment_context> only when this top-level key is false.
+// SAIAI manages it in every Codex profile it prepares.
+const CODEX_ENVIRONMENT_CONTEXT_TIME_KEY: &str = "include_environment_context_time";
 
 // Remove stale routing, authentication, model, proxy, and CA values before
 // installing the exact local-proxy environment. Unrelated user settings are
@@ -1233,7 +1240,7 @@ fn is_managed_codex_env(key: &str) -> bool {
 }
 
 fn codex_launcher_args(args: &[String]) -> Vec<String> {
-    let mut launch_args = Vec::with_capacity(args.len() + 6);
+    let mut launch_args = Vec::with_capacity(args.len() + 8);
     if !codex_args_override_feature(args, "respect_system_proxy") {
         launch_args.push("-c".to_string());
         launch_args.push(format!(
@@ -1258,6 +1265,13 @@ fn codex_launcher_args(args: &[String]) -> Vec<String> {
         launch_args.push("-c".to_string());
         launch_args.push("features.apps=false".to_string());
     }
+    // Keep Codex time reporting off for this launch even if a config layer
+    // outside the managed files re-enables it. An explicit caller override
+    // wins.
+    if !codex_args_override_config_key(args, CODEX_ENVIRONMENT_CONTEXT_TIME_KEY) {
+        launch_args.push("-c".to_string());
+        launch_args.push("include_environment_context_time=false".to_string());
+    }
     launch_args.extend(args.iter().cloned());
     launch_args
 }
@@ -1274,6 +1288,11 @@ fn codex_args_override_feature(args: &[String], feature: &str) -> bool {
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
+        // Everything after `--` is positional (for example a prompt), not a
+        // Codex configuration override.
+        if arg == "--" {
+            break;
+        }
         let value = if arg == "-c" || arg == "--config" || arg == "--enable" || arg == "--disable" {
             i += 1;
             args.get(i).map(String::as_str)
@@ -1300,6 +1319,11 @@ fn codex_args_override_config_key(args: &[String], expected_key: &str) -> bool {
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
+        // Everything after `--` is positional (for example a prompt), not a
+        // Codex configuration override.
+        if arg == "--" {
+            break;
+        }
         let value = if arg == "-c" || arg == "--config" {
             i += 1;
             args.get(i).map(String::as_str)
@@ -1990,6 +2014,18 @@ fn run_windows_packaged_desktop(
     validate_codex_oauth_auth(&codex_home.join("auth.json")).context(
         "packaged Windows Desktop needs a configured Codex account; run `saiai init-codex` first",
     )?;
+    // The packaged Desktop reads the standard profile that `saiai init-codex`
+    // and `saiai vscode` prepare; this launcher never rewrites it. Point at the
+    // fix instead of silently launching with Codex time reporting enabled.
+    if !matches!(
+        read_codex_environment_context_time(&codex_home.join("config.toml")),
+        Ok(CodexEnvironmentContextTime::Disabled)
+    ) {
+        eprintln!(
+            "WARN {} does not set `{CODEX_ENVIRONMENT_CONTEXT_TIME_KEY} = false`; Codex may report the local timezone. Run `saiai init-codex`, then fully quit and reopen Desktop.",
+            codex_home.join("config.toml").display()
+        );
+    }
     let session_id = command_output(
         "powershell",
         &[
@@ -2470,7 +2506,9 @@ fn resolve_chatgpt_timezone() -> Result<Option<String>> {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn resolve_chatgpt_timezone_value(value: Option<&str>) -> Result<Option<String>> {
-    let value = value.unwrap_or(DEFAULT_CHATGPT_TIMEZONE).trim();
+    let Some(value) = value.map(str::trim) else {
+        return Ok(None);
+    };
     if value.is_empty() {
         return Ok(None);
     }
@@ -2968,6 +3006,12 @@ fn prepare_codex_oauth_files(codex_dir: &Path, persist_system_proxy: bool) -> Re
     let mut written = Vec::with_capacity(documents.len());
     for (path, mut document) in documents {
         clean_codex_oauth_document(&mut document);
+        if disable_codex_environment_context_time(&mut document) {
+            println!(
+                "NOTE {}: `{CODEX_ENVIRONMENT_CONTEXT_TIME_KEY}` was not false; SAIAI manages this key and set it to false so Codex does not report the local timezone and date.",
+                path.display()
+            );
+        }
         if persist_system_proxy {
             enable_codex_system_proxy(&mut document, &path)?;
         }
@@ -2981,6 +3025,62 @@ fn prepare_codex_oauth_files(codex_dir: &Path, persist_system_proxy: bool) -> Re
     auth.insert("OPENAI_API_KEY".to_string(), Value::Null);
     write_json_object(&auth_path, Value::Object(auth))?;
     Ok(written)
+}
+
+/// State of the managed top-level Codex time-reporting key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexEnvironmentContextTime {
+    Disabled,
+    Missing,
+    Enabled,
+    Invalid,
+}
+
+fn codex_environment_context_time(document: &DocumentMut) -> CodexEnvironmentContextTime {
+    match document.get(CODEX_ENVIRONMENT_CONTEXT_TIME_KEY) {
+        None => CodexEnvironmentContextTime::Missing,
+        Some(item) => match item.as_bool() {
+            Some(false) => CodexEnvironmentContextTime::Disabled,
+            Some(true) => CodexEnvironmentContextTime::Enabled,
+            None => CodexEnvironmentContextTime::Invalid,
+        },
+    }
+}
+
+fn read_codex_environment_context_time(path: &Path) -> Result<CodexEnvironmentContextTime> {
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let document = raw
+        .parse::<DocumentMut>()
+        .with_context(|| format!("failed to parse {} as TOML", path.display()))?;
+    Ok(codex_environment_context_time(&document))
+}
+
+/// Set the top-level `include_environment_context_time = false`, keeping the
+/// rest of the document (including comments on an existing entry) intact.
+/// Returns true when an explicit non-false value was overwritten.
+fn disable_codex_environment_context_time(document: &mut DocumentMut) -> bool {
+    let previous = codex_environment_context_time(document);
+    if previous == CodexEnvironmentContextTime::Disabled {
+        return false;
+    }
+    let mut replacement = toml_edit::Value::from(false);
+    // Replace the item in place: `Table::insert` would reset the key's
+    // formatting and drop comments placed above an existing entry.
+    match document.get_mut(CODEX_ENVIRONMENT_CONTEXT_TIME_KEY) {
+        Some(item) => {
+            if let Some(existing) = item.as_value() {
+                *replacement.decor_mut() = existing.decor().clone();
+            }
+            *item = Item::Value(replacement);
+        }
+        None => {
+            document
+                .as_table_mut()
+                .insert(CODEX_ENVIRONMENT_CONTEXT_TIME_KEY, Item::Value(replacement));
+        }
+    }
+    previous != CodexEnvironmentContextTime::Missing
 }
 
 fn enable_codex_system_proxy(document: &mut DocumentMut, path: &Path) -> Result<()> {
@@ -5174,6 +5274,101 @@ fn check_codex_config(report: &mut DoctorReport, cfg: Option<&SaiaiConfig>, requ
     }
     if cfg.is_none() {
         report.warn("Codex route", "SAIAI config is unavailable");
+    }
+    check_codex_environment_context_time(report, &codex_dir);
+}
+
+fn managed_codex_config_paths(codex_dir: &Path) -> Result<Vec<PathBuf>> {
+    let config_path = codex_dir.join("config.toml");
+    let mut paths = Vec::new();
+    if config_path.is_file() {
+        paths.push(config_path);
+    }
+    let mut extra = Vec::new();
+    for entry in fs::read_dir(codex_dir)
+        .with_context(|| format!("failed to list {}", codex_dir.display()))?
+    {
+        let path = entry
+            .with_context(|| format!("failed to list {}", codex_dir.display()))?
+            .path();
+        if path.is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".config.toml"))
+        {
+            extra.push(path);
+        }
+    }
+    extra.sort();
+    paths.extend(extra);
+    Ok(paths)
+}
+
+fn check_codex_environment_context_time(report: &mut DoctorReport, codex_dir: &Path) {
+    const LABEL: &str = "Codex time reporting";
+    let mut profiles = vec![(codex_dir.to_path_buf(), false)];
+    match saiai_config_dir() {
+        Ok(saiai_dir) => {
+            let desktop_codex = saiai_dir.join("desktop").join("codex");
+            if desktop_codex.is_dir() {
+                profiles.push((desktop_codex, true));
+            }
+        }
+        Err(error) => report.warn(
+            LABEL,
+            format!("check incomplete: isolated Desktop profile could not be located: {error:#}"),
+        ),
+    }
+    for (directory, isolated_desktop) in profiles {
+        // A missing standard config.toml is reported by the general Codex
+        // config check; the isolated Desktop profile needs its own warning.
+        let config_path = directory.join("config.toml");
+        if isolated_desktop && !config_path.is_file() {
+            report.warn(
+                LABEL,
+                format!(
+                    "{} is missing; time reporting is not turned off for the isolated Desktop profile. Relaunch `saiai desktop codex` to recreate it",
+                    config_path.display()
+                ),
+            );
+        }
+        let paths = match managed_codex_config_paths(&directory) {
+            Ok(paths) => paths,
+            Err(error) => {
+                report.warn(LABEL, format!("check incomplete: {error:#}"));
+                continue;
+            }
+        };
+        let remedy = if isolated_desktop {
+            "relaunch `saiai desktop codex`"
+        } else {
+            "re-run `saiai init-codex`"
+        };
+        for path in paths {
+            let path_text = path.display();
+            match read_codex_environment_context_time(&path) {
+                Ok(CodexEnvironmentContextTime::Disabled) => report.ok(
+                    LABEL,
+                    format!("{path_text}: {CODEX_ENVIRONMENT_CONTEXT_TIME_KEY} = false"),
+                ),
+                Ok(CodexEnvironmentContextTime::Missing | CodexEnvironmentContextTime::Enabled) => {
+                    report.warn(
+                        LABEL,
+                        format!(
+                            "{path_text}: time reporting is not turned off by this config; {remedy}, then restart Codex and start a new session"
+                        ),
+                    )
+                }
+                Ok(CodexEnvironmentContextTime::Invalid) => report.warn(
+                    LABEL,
+                    format!(
+                        "{path_text}: invalid type for {CODEX_ENVIRONMENT_CONTEXT_TIME_KEY}; fix it or {remedy}"
+                    ),
+                ),
+                Err(error) => report.warn(LABEL, format!("check incomplete: {error:#}")),
+            }
+        }
     }
 }
 
@@ -7760,6 +7955,116 @@ requires_openai_auth = true
         assert!(env.contains("USER_SETTING=keep"));
         assert!(env.contains("HTTP_PROXY=\"http://127.0.0.1:31234\""));
         assert!(!env.contains("19908"));
+        assert_eq!(
+            document[CODEX_ENVIRONMENT_CONTEXT_TIME_KEY].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn disables_codex_time_reporting_and_preserves_user_content() {
+        let raw = r#"# user header
+model = "gpt-5" # keep model
+
+# comment above the managed key
+include_environment_context_time = true # user wanted time
+
+[profiles.work]
+model = "other"
+include_environment_context_time = true
+"#;
+        let mut doc = raw.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            codex_environment_context_time(&doc),
+            CodexEnvironmentContextTime::Enabled
+        );
+        assert!(disable_codex_environment_context_time(&mut doc));
+        assert_eq!(
+            doc.to_string(),
+            raw.replacen(
+                "include_environment_context_time = true # user",
+                "include_environment_context_time = false # user",
+                1
+            )
+        );
+        assert_eq!(
+            codex_environment_context_time(&doc),
+            CodexEnvironmentContextTime::Disabled
+        );
+        // Idempotent and silent once managed.
+        let managed = doc.to_string();
+        assert!(!disable_codex_environment_context_time(&mut doc));
+        assert_eq!(doc.to_string(), managed);
+
+        // A missing key is added at the top level without a notice, even when
+        // the document only has tables.
+        let mut doc = "[features]\napps = false\n".parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            codex_environment_context_time(&doc),
+            CodexEnvironmentContextTime::Missing
+        );
+        assert!(!disable_codex_environment_context_time(&mut doc));
+        let reparsed = doc.to_string().parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            reparsed[CODEX_ENVIRONMENT_CONTEXT_TIME_KEY].as_bool(),
+            Some(false)
+        );
+        assert!(
+            reparsed["features"]
+                .get(CODEX_ENVIRONMENT_CONTEXT_TIME_KEY)
+                .is_none()
+        );
+
+        // A non-boolean value is replaced as a managed key.
+        let mut doc = "include_environment_context_time = \"yes\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            codex_environment_context_time(&doc),
+            CodexEnvironmentContextTime::Invalid
+        );
+        assert!(disable_codex_environment_context_time(&mut doc));
+        assert_eq!(
+            doc.to_string(),
+            "include_environment_context_time = false\n"
+        );
+    }
+
+    #[test]
+    fn prepares_codex_time_reporting_in_every_managed_profile_file() {
+        let codex = TempDir::new().unwrap();
+        let config_path = codex.path().join("config.toml");
+        let extra_path = codex.path().join("work.config.toml");
+        let unrelated_path = codex.path().join("notes.toml");
+        write_str(&config_path, "# keep\nmodel = \"gpt-5\"\n");
+        write_str(&extra_path, "include_environment_context_time = true\n");
+        write_str(&unrelated_path, "include_environment_context_time = true\n");
+        write_str(
+            &codex.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"TEST_ONLY"}}"#,
+        );
+
+        let written = prepare_codex_oauth_files(codex.path(), false).unwrap();
+
+        assert_eq!(written.len(), 2);
+        for path in [&config_path, &extra_path] {
+            assert_eq!(
+                read_codex_environment_context_time(path).unwrap(),
+                CodexEnvironmentContextTime::Disabled,
+                "{}",
+                path.display()
+            );
+        }
+        assert!(read_str(&config_path).starts_with("# keep\nmodel = \"gpt-5\"\n"));
+        assert_eq!(
+            read_str(&unrelated_path),
+            "include_environment_context_time = true\n"
+        );
+        assert_eq!(
+            managed_codex_config_paths(codex.path()).unwrap(),
+            vec![config_path, extra_path]
+        );
+        assert!(managed_codex_config_paths(&codex.path().join("absent")).is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -8157,10 +8462,8 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn validates_optional_chatgpt_timezone() {
-        assert_eq!(
-            resolve_chatgpt_timezone_value(None).unwrap().as_deref(),
-            Some(DEFAULT_CHATGPT_TIMEZONE)
-        );
+        assert_eq!(resolve_chatgpt_timezone_value(None).unwrap(), None);
+        assert_eq!(resolve_chatgpt_timezone_value(Some("  ")).unwrap(), None);
         assert_eq!(
             resolve_chatgpt_timezone_value(Some("system")).unwrap(),
             None
@@ -8440,6 +8743,8 @@ HTTPS_PROXY="http://127.0.0.1:1111"
                 "otel.metrics_exporter=\"none\"".to_string(),
                 "-c".to_string(),
                 "features.apps=false".to_string(),
+                "-c".to_string(),
+                "include_environment_context_time=false".to_string(),
                 "exec".to_string(),
                 "probe".to_string(),
             ]
@@ -8464,6 +8769,8 @@ HTTPS_PROXY="http://127.0.0.1:1111"
                         "otel.metrics_exporter=\"none\"".to_string(),
                         "-c".to_string(),
                         "features.apps=false".to_string(),
+                        "-c".to_string(),
+                        "include_environment_context_time=false".to_string(),
                     ],
                     args,
                 ]
@@ -8498,6 +8805,33 @@ HTTPS_PROXY="http://127.0.0.1:1111"
                 .count(),
             1
         );
+        assert!(launch_args.ends_with(&args));
+    }
+
+    #[test]
+    fn codex_launcher_honors_explicit_time_reporting_override() {
+        for args in [
+            vec![
+                "-c".to_string(),
+                "include_environment_context_time=true".to_string(),
+            ],
+            vec!["--config=include_environment_context_time=true".to_string()],
+        ] {
+            let launch_args = codex_launcher_args(&args);
+            assert!(!launch_args.contains(&"include_environment_context_time=false".to_string()));
+            assert!(launch_args.ends_with(&args));
+        }
+
+        // A prompt after `--` is positional text, not a caller override.
+        let args = vec![
+            "exec".to_string(),
+            "--".to_string(),
+            "--config=include_environment_context_time=true".to_string(),
+            "--enable=apps".to_string(),
+        ];
+        let launch_args = codex_launcher_args(&args);
+        assert!(launch_args.contains(&"include_environment_context_time=false".to_string()));
+        assert!(launch_args.contains(&"features.apps=false".to_string()));
         assert!(launch_args.ends_with(&args));
     }
 

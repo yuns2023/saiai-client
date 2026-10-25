@@ -159,6 +159,17 @@ Codex 默认还会向 `ab.chatgpt.com` 发送 Statsig OTEL 指标；该非模型
 不可达，所以 launcher 同样只对子进程设置 `otel.metrics_exporter="none"`。这不会
 改变 Responses 请求，用户显式传入该配置时仍以用户值为准。
 
+官方 Codex 默认把本机时区和日期写入发给模型的环境上下文，0.163.0 起才支持用顶层
+`include_environment_context_time = false` 关闭。`init-codex`、`saiai codex`、
+`saiai vscode` 和隔离 profile 的 `saiai desktop codex` 会在受管 Codex 配置中写入该键
+（只改这一键，用户显式设为 `true` 时会覆盖并提示），`saiai codex` 还会对子进程传入
+同名 `-c` 覆盖。Windows 商店版 Desktop 使用标准 profile，launcher 不改写它，只在未
+配置时提示先运行 `saiai init-codex`。Gateway 可能拒绝仍上报
+中国地区时区的请求；遇到提示时请把 Codex 升级到 0.163 或以上，重新运行
+`saiai init-codex`，重启 Codex 并新开会话。`saiai doctor codex` 会检查该配置和 CLI
+版本（不检查 Desktop/VS Code 内嵌后端版本）。对旧版本启用严格配置校验时，未知键可能
+导致加载失败，请先升级。
+
 第一阶段接受 `auth_mode = "chatgpt"` 或 `auth_mode = "chatgptAuthTokens"` 且存在
 access-token 形状的状态；若用户从未登录，launcher 会创建只对本地代理有意义的
 `chatgptAuthTokens` 占位状态，Gateway 仍是实际认证边界。该模式明确告诉 Codex

@@ -446,6 +446,39 @@ auth；根 provider 固定为内置 `openai`，不保留 `model_providers.OpenAI
 上下文预算。有效的用户 CA、监听地址和既有兼容字段会复用，只替换 Gateway 与 Key；
 已有真实 ChatGPT OAuth 原样保留，API-key-only auth 会迁移为本地代理 OAuth 占位。
 
+### 待发布：关闭 Codex 时区与日期上报
+
+官方 Codex 默认把本机时区和当前日期写入模型可见的 `<environment_context>`；
+0.163.0 起才支持用顶层配置 `include_environment_context_time = false` 省略（旧版本
+不支持通过该键关闭）。Gateway 可按分组开关拒绝携带中国地区时区的请求，并提示重新运行 SAIAI
+初始化。客户端因此把该键作为受管键：
+
+- `init-codex`、`saiai codex`、`saiai vscode` 和隔离 Desktop profile（Linux、macOS、
+  Windows 普通可执行文件的 `saiai desktop codex`）都经过同一个配置准备流程，会在
+  生效 `CODEX_HOME` 的 `config.toml` 与 `*.config.toml` 中设置顶层
+  `include_environment_context_time = false`。toml_edit 只改这一键，保留其余内容和
+  注释；用户显式写成 `true`（或非布尔值）时会被覆盖并输出 `NOTE`。`profiles.*` 下的
+  同名键不受管理。
+- `saiai codex` 另外对子进程传入 `-c include_environment_context_time=false`；用户显式
+  传入同名 `-c`/`--config` 覆盖时以用户参数为准。
+- Windows 商店版 Desktop 由 AppX broker 激活，读取标准 profile，launcher 不改写它；
+  若标准 `config.toml` 未设置该键为 `false`，启动时输出 `WARN`，提示运行
+  `saiai init-codex` 后完全退出并重开 Desktop。
+- `saiai doctor` 报告每个受管 Codex 配置（标准 profile 及已存在的隔离 Desktop
+  profile）是否包含该键为 `false`：缺失或为 `true` 时 WARN“该配置未关闭时间上报，
+  请重新运行 `saiai init-codex`”，非布尔值时 WARN 类型无效；目录或文件读取失败时
+  WARN“检查不完整”，已存在的隔离 Desktop profile 缺少 `config.toml` 时也会 WARN。
+  同时比较 PATH 中 `codex --version` 与 0.163.0，低于该版本时 WARN“该版本不支持通过
+  `include_environment_context_time` 关闭时间上报，请升级到 0.163+”。Desktop 和 VS Code 内嵌的 Codex 后端版本不在此检查范围内。
+
+旧于 0.163.0 的 Codex 不识别这个顶层键，无法通过它关闭时间上报；若用户对旧版本启用了
+严格配置校验（strict config），未知键可能导致配置加载失败，此时应先升级 Codex。
+
+Desktop 子进程不再默认设置 `TZ=America/Los_Angeles`。Codex 通过 iana-time-zone 读取
+时区，该库在 Linux 和 Windows 上忽略 `TZ`，因此该覆盖不能可靠隐藏时区。
+`SAIAI_CHATGPT_TIMEZONE` 仍作为显式 opt-in 保留：设为 IANA 时区时只对 Desktop 子进程
+导出 `TZ`，设为空或 `system` 时不覆盖；它与上述 Gateway 时区校验无关。
+
 ### 待发布：已运行的 Codex daemon
 
 Codex 0.162.1 的普通 CLI 会复用共享 app-server daemon。若它在 SAIAI 初始化前
