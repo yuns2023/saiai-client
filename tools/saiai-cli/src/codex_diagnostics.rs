@@ -43,6 +43,20 @@ pub(crate) fn check(report: &mut DoctorReport) {
         "Codex CLI version",
         format!("{version}; independent of SAIAI and Desktop app-server versions"),
     );
+    match supports_environment_context_time_toggle(&version) {
+        Some(true) => report.ok(
+            "Codex time reporting support",
+            format!("CLI {version} honors include_environment_context_time; Desktop and VS Code embedded Codex backends are not checked here"),
+        ),
+        Some(false) => report.warn(
+            "Codex time reporting support",
+            format!("CLI {version} is older than {MIN_TIME_TOGGLE_VERSION_TEXT} and always reports the local timezone; upgrade Codex to {MIN_TIME_TOGGLE_VERSION_TEXT}+ and rerun `saiai init-codex`. Desktop and VS Code embedded Codex backends are not checked here"),
+        ),
+        None => report.warn(
+            "Codex time reporting support",
+            format!("could not compare CLI {version} with {MIN_TIME_TOGGLE_VERSION_TEXT}; Codex older than {MIN_TIME_TOGGLE_VERSION_TEXT} always reports the local timezone"),
+        ),
+    }
     let Ok(home) = codex_config_dir() else { return };
     let Some(config) = fs::read_to_string(home.join("config.toml"))
         .ok()
@@ -65,6 +79,23 @@ pub(crate) fn check(report: &mut DoctorReport) {
         CacheStatus::VersionMismatch => report.warn("Codex model metadata", "cache belongs to a different CLI version; do not infer support from this cache"),
         CacheStatus::Stale => report.warn("Codex model metadata", "cache timestamp is stale or invalid; model support cannot be established offline"),
     }
+}
+
+// First official Codex release that reads `include_environment_context_time`.
+const MIN_TIME_TOGGLE_VERSION: (u64, u64, u64) = (0, 163, 0);
+const MIN_TIME_TOGGLE_VERSION_TEXT: &str = "0.163.0";
+
+/// Compare the numeric `major.minor.patch` core of a codex-cli version with
+/// the first release that supports the time-reporting toggle. A pre-release
+/// suffix is ignored. Returns None when the version is not parseable.
+fn supports_environment_context_time_toggle(version: &str) -> Option<bool> {
+    let core = version.split(['-', '+']).next()?;
+    let mut parts = core.split('.').map(|part| part.parse::<u64>().ok());
+    let parsed = (parts.next()??, parts.next()??, parts.next()??);
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(parsed >= MIN_TIME_TOGGLE_VERSION)
 }
 
 fn cli_version(command: &mut std::process::Command) -> Option<String> {
@@ -247,6 +278,27 @@ mod tests {
             cached_model(Some("bad-json"), "0.161.0", "missing", now),
             CacheStatus::Unavailable
         );
+    }
+
+    #[test]
+    fn time_toggle_support_starts_at_codex_0_163() {
+        for (version, expected) in [
+            ("0.163.0", Some(true)),
+            ("0.163.1", Some(true)),
+            ("0.170.0-alpha.2", Some(true)),
+            ("1.0.0", Some(true)),
+            ("0.162.9", Some(false)),
+            ("0.147.0", Some(false)),
+            ("0.163", None),
+            ("0.163.0.1", None),
+            ("dev", None),
+        ] {
+            assert_eq!(
+                supports_environment_context_time_toggle(version),
+                expected,
+                "{version}"
+            );
+        }
     }
 
     #[test]

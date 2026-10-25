@@ -231,6 +231,7 @@ fn main() {
     Assert-Saiai ($desktopLines -contains "ENV=TZ=America/Los_Angeles") "Windows Desktop timezone differs"
     $desktopConfig = Get-Content -LiteralPath (Join-Path $desktopCodex "config.toml") -Raw
     Assert-Saiai ($desktopConfig.Contains("respect_system_proxy = false")) "Windows Desktop config can bypass the child proxy through WinHTTP DIRECT"
+    Assert-Saiai ($desktopConfig.Contains("include_environment_context_time = false")) "Windows Desktop config does not disable Codex time reporting"
 
     # Rust's std::process::Command does not execute .cmd files directly. A
     # normal Windows npm installation exposes codex.cmd plus the JavaScript
@@ -251,6 +252,8 @@ fn main() {
     Assert-Saiai ($npmCodex.Output.Contains("features.respect_system_proxy=false")) "SAIAI did not force Windows Codex to use the child proxy environment"
     Assert-Saiai ($npmCodex.Output.Contains("otel.metrics_exporter=")) "SAIAI did not disable the unreachable Statsig OTEL endpoint"
     Assert-Saiai ($npmCodex.Output.Contains("features.apps=false")) "SAIAI did not disable the unsupported hosted Apps MCP control plane"
+    Assert-Saiai ($npmCodex.Output.Contains("include_environment_context_time=false")) "SAIAI did not disable Codex time reporting for the launch"
+    Assert-Saiai ($codexConfig.Contains("include_environment_context_time = false")) "Windows Codex config does not disable Codex time reporting"
     Assert-Saiai ($npmCodex.Output.Contains("--version")) "SAIAI did not preserve Codex arguments"
     $env:PATH = $savedPath
     $preStartStop = Invoke-SaiaiProcess -Path $binary -Arguments @("stop")
