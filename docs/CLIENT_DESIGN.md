@@ -450,7 +450,7 @@ auth；根 provider 固定为内置 `openai`，不保留 `model_providers.OpenAI
 
 官方 Codex 默认把本机时区和当前日期写入模型可见的 `<environment_context>`；
 0.163.0 起才支持用顶层配置 `include_environment_context_time = false` 省略（旧版本
-无法关闭）。Gateway 可按分组开关拒绝携带中国地区时区的请求，并提示重新运行 SAIAI
+不支持通过该键关闭）。Gateway 可按分组开关拒绝携带中国地区时区的请求，并提示重新运行 SAIAI
 初始化。客户端因此把该键作为受管键：
 
 - `init-codex`、`saiai codex`、`saiai vscode` 和隔离 Desktop profile（Linux、macOS、
@@ -465,11 +465,13 @@ auth；根 provider 固定为内置 `openai`，不保留 `model_providers.OpenAI
   若标准 `config.toml` 未设置该键为 `false`，启动时输出 `WARN`，提示运行
   `saiai init-codex` 后完全退出并重开 Desktop。
 - `saiai doctor` 报告每个受管 Codex 配置（标准 profile 及已存在的隔离 Desktop
-  profile）是否包含该键为 `false`，否则 WARN 并提示重新初始化；同时比较 PATH 中
-  `codex --version` 与 0.163.0，低于该版本时 WARN“升级 Codex 到 0.163+，旧版本总会
-  上报本机时区”。Desktop 和 VS Code 内嵌的 Codex 后端版本不在此检查范围内。
+  profile）是否包含该键为 `false`：缺失或为 `true` 时 WARN“该配置未关闭时间上报，
+  请重新运行 `saiai init-codex`”，非布尔值时 WARN 类型无效；目录或文件读取失败时
+  WARN“检查不完整”，已存在的隔离 Desktop profile 缺少 `config.toml` 时也会 WARN。
+  同时比较 PATH 中 `codex --version` 与 0.163.0，低于该版本时 WARN“该版本不支持通过
+  `include_environment_context_time` 关闭时间上报，请升级到 0.163+”。Desktop 和 VS Code 内嵌的 Codex 后端版本不在此检查范围内。
 
-旧于 0.163.0 的 Codex 会忽略这个未知顶层键，但仍会上报时区；若用户对旧版本启用了
+旧于 0.163.0 的 Codex 不识别这个顶层键，无法通过它关闭时间上报；若用户对旧版本启用了
 严格配置校验（strict config），未知键可能导致配置加载失败，此时应先升级 Codex。
 
 Desktop 子进程不再默认设置 `TZ=America/Los_Angeles`。Codex 通过 iana-time-zone 读取

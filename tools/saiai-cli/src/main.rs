@@ -3032,14 +3032,18 @@ fn prepare_codex_oauth_files(codex_dir: &Path, persist_system_proxy: bool) -> Re
 enum CodexEnvironmentContextTime {
     Disabled,
     Missing,
-    Other,
+    Enabled,
+    Invalid,
 }
 
 fn codex_environment_context_time(document: &DocumentMut) -> CodexEnvironmentContextTime {
     match document.get(CODEX_ENVIRONMENT_CONTEXT_TIME_KEY) {
         None => CodexEnvironmentContextTime::Missing,
-        Some(item) if item.as_bool() == Some(false) => CodexEnvironmentContextTime::Disabled,
-        Some(_) => CodexEnvironmentContextTime::Other,
+        Some(item) => match item.as_bool() {
+            Some(false) => CodexEnvironmentContextTime::Disabled,
+            Some(true) => CodexEnvironmentContextTime::Enabled,
+            None => CodexEnvironmentContextTime::Invalid,
+        },
     }
 }
 
@@ -3076,7 +3080,7 @@ fn disable_codex_environment_context_time(document: &mut DocumentMut) -> bool {
                 .insert(CODEX_ENVIRONMENT_CONTEXT_TIME_KEY, Item::Value(replacement));
         }
     }
-    previous == CodexEnvironmentContextTime::Other
+    previous != CodexEnvironmentContextTime::Missing
 }
 
 fn enable_codex_system_proxy(document: &mut DocumentMut, path: &Path) -> Result<()> {
@@ -5274,63 +5278,95 @@ fn check_codex_config(report: &mut DoctorReport, cfg: Option<&SaiaiConfig>, requ
     check_codex_environment_context_time(report, &codex_dir);
 }
 
-fn managed_codex_config_paths(codex_dir: &Path) -> Vec<PathBuf> {
+fn managed_codex_config_paths(codex_dir: &Path) -> Result<Vec<PathBuf>> {
     let config_path = codex_dir.join("config.toml");
     let mut paths = Vec::new();
     if config_path.is_file() {
         paths.push(config_path);
     }
-    let mut extra = fs::read_dir(codex_dir)
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.ends_with(".config.toml"))
-        })
-        .collect::<Vec<_>>();
+    let mut extra = Vec::new();
+    for entry in fs::read_dir(codex_dir)
+        .with_context(|| format!("failed to list {}", codex_dir.display()))?
+    {
+        let path = entry
+            .with_context(|| format!("failed to list {}", codex_dir.display()))?
+            .path();
+        if path.is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".config.toml"))
+        {
+            extra.push(path);
+        }
+    }
     extra.sort();
     paths.extend(extra);
-    paths
+    Ok(paths)
 }
 
 fn check_codex_environment_context_time(report: &mut DoctorReport, codex_dir: &Path) {
-    let mut profiles = vec![(codex_dir.to_path_buf(), "run `saiai init-codex`")];
-    if let Ok(saiai_dir) = saiai_config_dir() {
-        let desktop_codex = saiai_dir.join("desktop").join("codex");
-        if desktop_codex.is_dir() {
-            profiles.push((
-                desktop_codex,
-                "the next `saiai desktop codex` launch rewrites it",
-            ));
+    const LABEL: &str = "Codex time reporting";
+    let mut profiles = vec![(codex_dir.to_path_buf(), false)];
+    match saiai_config_dir() {
+        Ok(saiai_dir) => {
+            let desktop_codex = saiai_dir.join("desktop").join("codex");
+            if desktop_codex.is_dir() {
+                profiles.push((desktop_codex, true));
+            }
         }
+        Err(error) => report.warn(
+            LABEL,
+            format!("check incomplete: isolated Desktop profile could not be located: {error:#}"),
+        ),
     }
-    for (directory, remedy) in profiles {
-        for path in managed_codex_config_paths(&directory) {
+    for (directory, isolated_desktop) in profiles {
+        // A missing standard config.toml is reported by the general Codex
+        // config check; the isolated Desktop profile needs its own warning.
+        let config_path = directory.join("config.toml");
+        if isolated_desktop && !config_path.is_file() {
+            report.warn(
+                LABEL,
+                format!(
+                    "{} is missing; time reporting is not turned off for the isolated Desktop profile. Relaunch `saiai desktop codex` to recreate it",
+                    config_path.display()
+                ),
+            );
+        }
+        let paths = match managed_codex_config_paths(&directory) {
+            Ok(paths) => paths,
+            Err(error) => {
+                report.warn(LABEL, format!("check incomplete: {error:#}"));
+                continue;
+            }
+        };
+        let remedy = if isolated_desktop {
+            "relaunch `saiai desktop codex`"
+        } else {
+            "re-run `saiai init-codex`"
+        };
+        for path in paths {
+            let path_text = path.display();
             match read_codex_environment_context_time(&path) {
                 Ok(CodexEnvironmentContextTime::Disabled) => report.ok(
-                    "Codex time reporting",
+                    LABEL,
+                    format!("{path_text}: {CODEX_ENVIRONMENT_CONTEXT_TIME_KEY} = false"),
+                ),
+                Ok(CodexEnvironmentContextTime::Missing | CodexEnvironmentContextTime::Enabled) => {
+                    report.warn(
+                        LABEL,
+                        format!(
+                            "{path_text}: time reporting is not turned off by this config; {remedy}, then restart Codex and start a new session"
+                        ),
+                    )
+                }
+                Ok(CodexEnvironmentContextTime::Invalid) => report.warn(
+                    LABEL,
                     format!(
-                        "{}: {CODEX_ENVIRONMENT_CONTEXT_TIME_KEY} = false",
-                        path.display()
+                        "{path_text}: invalid type for {CODEX_ENVIRONMENT_CONTEXT_TIME_KEY}; fix it or {remedy}"
                     ),
                 ),
-                Ok(state) => report.warn(
-                    "Codex time reporting",
-                    format!(
-                        "{}: {CODEX_ENVIRONMENT_CONTEXT_TIME_KEY} is {}; Codex reports the local timezone and date to the model and the Gateway may reject the request. {remedy}, then restart Codex and start a new session",
-                        path.display(),
-                        if state == CodexEnvironmentContextTime::Missing {
-                            "not set"
-                        } else {
-                            "not false"
-                        }
-                    ),
-                ),
-                Err(error) => report.warn("Codex time reporting", format!("{error:#}")),
+                Err(error) => report.warn(LABEL, format!("check incomplete: {error:#}")),
             }
         }
     }
@@ -7940,7 +7976,7 @@ include_environment_context_time = true
         let mut doc = raw.parse::<DocumentMut>().unwrap();
         assert_eq!(
             codex_environment_context_time(&doc),
-            CodexEnvironmentContextTime::Other
+            CodexEnvironmentContextTime::Enabled
         );
         assert!(disable_codex_environment_context_time(&mut doc));
         assert_eq!(
@@ -7983,6 +8019,10 @@ include_environment_context_time = true
         let mut doc = "include_environment_context_time = \"yes\"\n"
             .parse::<DocumentMut>()
             .unwrap();
+        assert_eq!(
+            codex_environment_context_time(&doc),
+            CodexEnvironmentContextTime::Invalid
+        );
         assert!(disable_codex_environment_context_time(&mut doc));
         assert_eq!(
             doc.to_string(),
@@ -8021,9 +8061,10 @@ include_environment_context_time = true
             "include_environment_context_time = true\n"
         );
         assert_eq!(
-            managed_codex_config_paths(codex.path()),
+            managed_codex_config_paths(codex.path()).unwrap(),
             vec![config_path, extra_path]
         );
+        assert!(managed_codex_config_paths(&codex.path().join("absent")).is_err());
     }
 
     #[cfg(target_os = "linux")]

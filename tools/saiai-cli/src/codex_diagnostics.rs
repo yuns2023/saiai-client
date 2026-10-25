@@ -50,11 +50,11 @@ pub(crate) fn check(report: &mut DoctorReport) {
         ),
         Some(false) => report.warn(
             "Codex time reporting support",
-            format!("CLI {version} is older than {MIN_TIME_TOGGLE_VERSION_TEXT} and always reports the local timezone; upgrade Codex to {MIN_TIME_TOGGLE_VERSION_TEXT}+ and rerun `saiai init-codex`. Desktop and VS Code embedded Codex backends are not checked here"),
+            format!("CLI {version} does not support turning off time reporting via include_environment_context_time; upgrade Codex to {MIN_TIME_TOGGLE_VERSION_TEXT}+ and re-run `saiai init-codex`. Desktop and VS Code embedded Codex backends are not checked here"),
         ),
         None => report.warn(
             "Codex time reporting support",
-            format!("could not compare CLI {version} with {MIN_TIME_TOGGLE_VERSION_TEXT}; Codex older than {MIN_TIME_TOGGLE_VERSION_TEXT} always reports the local timezone"),
+            format!("could not compare CLI {version} with {MIN_TIME_TOGGLE_VERSION_TEXT}; Codex older than {MIN_TIME_TOGGLE_VERSION_TEXT} does not support turning off time reporting via include_environment_context_time. Desktop and VS Code embedded Codex backends are not checked here"),
         ),
     }
     let Ok(home) = codex_config_dir() else { return };
