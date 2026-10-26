@@ -495,6 +495,17 @@ Codex 0.162.1 的普通 CLI 会复用共享 app-server daemon。若它在 SAIAI 
 `codex app-server daemon restart`；新进程继承当前 SAIAI 代理、CA 和 `NO_PROXY`，
 移除冲突的受管 API-key/base-url 环境值，随后复查后台账户。
 
+模型请求使用 daemon 自身的版本（UA、是否支持 `include_environment_context_time`），
+而 daemon 的自动更新可能停滞（实测 CLI 0.164、daemon 0.160）。因此 `version`
+报告中 restart 将启动的包（`managedCodexVersion`，缺失时为运行版本）低于 CLI 时，
+空闲受管 daemon 改用官方 `codex app-server daemon update --from-cli -y`（同样的
+代理/CA 环境，等待上限 330 秒），并打印“daemon 已固定跟随此 CLI 包，升级 Codex 后
+重新 init 或运行 `codex app-server daemon update` 恢复官方更新”。运行中的 daemon
+比 restart/update 的目标更新时不替换（避免降级）。替换后要求后台已登录，且
+app-server 版本不低于 CLI 和原运行版本；update 失败或超时报告“可能部分完成”，
+不会回退为 restart。控制 socket 文件存在但官方 `version` 失败、且 socket 主动
+拒绝连接（Windows 上停止的 daemon 会残留 socket）时视为未运行。
+
 任何已加载会话（包括空闲会话）、未知响应、超时、不支持命令或非受管 app-server
 都会保留进程并提示用户完成任务后手动重启；初始化配置仍保留。没有按进程名
 `pkill` / `taskkill` 的回退，不删除用户历史或真实 OAuth。控制查询和子命令均有
@@ -505,6 +516,9 @@ Codex 0.162.1 的普通 CLI 会复用共享 app-server daemon。若它在 SAIAI 
 `doctor` / `doctor codex` 只查询现有 daemon，不启动、重启或刷新 token。
 文件认证有效但后台 `account/read` 没有 ChatGPT 账户时，明确提示该状态可能导致
 登录菜单，并给出 `codex app-server daemon restart` 与临时 `saiai codex` 指引。
+`doctor` 还单独报告 app-server 与 CLI 版本（与 auth.json 和账户探测无关）：
+daemon 比 CLI 旧、版本无法比较、或 app-server 低于 0.163.0（不支持关闭时间上报）
+时给出警告和 `codex app-server daemon update --from-cli -y` 指引。
 这些检查不发送模型请求，也不能证明模型权限、生成或计费已通过。
 
 回归入口为 `scripts/saiai-cli/test-codex-daemon.py`：使用精确的官方 Codex 0.162.1
@@ -549,6 +563,11 @@ WS 应用头的同名多值按原顺序保留，不用后一个值覆盖前一�
 长度等逐跳字段由各段传输处理。WS 上游未启用压缩 codec，因此不透传
 `Sec-WebSocket-Extensions`。101 返回中的安全应用头和同名多值也原样保留，
 握手 accept/framing 由本地连接重建，Cookie/鉴权等敏感返回头不回传。
+Gateway 在升级前拒绝握手时，只原样转发 400 和 426（状态、同样过滤后的返回头；
+仅当已缓冲的正文是完整、无 chunked/压缩的 identity 正文且不超过 64 KiB 时才转发
+正文，否则以状态原因短语代替并去掉描述原正文的元数据），其余状态仍返回 502。
+实测 Codex 0.164：400 透传后不再重试 5 次和 HTTPS 回退，426 立即回退 HTTPS；
+透传 401 会触发 Codex 认证恢复，握手次数约为 502 的 3 倍；403/429/5xx 与 502 无差异。
 请求中的 `Connection` 指定的逐跳头在本地代理这一跳移除，避免丢弃
 `Connection` 后把对应的头误当作应用头继续发送。HTTP/WS 均覆盖此边界。
 这些规则用合成凭据、本地 WS 握手及 Server 的可选官方二进制逐跳测试验证。
