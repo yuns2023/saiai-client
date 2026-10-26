@@ -1043,6 +1043,15 @@ async fn serve_openai_websocket(
 
     let (upstream_ws, upstream_response) = match connect_async(upstream_request).await {
         Ok(result) => result,
+        Err(tungstenite::Error::Http(response))
+            if relays_websocket_rejection(response.status().as_u16()) =>
+        {
+            let _ = client_stream
+                .write_all(&build_openai_websocket_rejection(&response))
+                .await;
+            let _ = client_stream.flush().await;
+            bail!("Gateway WebSocket handshake returned {}", response.status());
+        }
         Err(error) => {
             let _ = write_plain_error(&mut client_stream, StatusCode::BAD_GATEWAY).await;
             return Err(error).context("failed to establish Gateway WebSocket");
@@ -1107,6 +1116,84 @@ fn build_openai_websocket_response(
     accept_key: &str,
     upstream_headers: &tungstenite::http::HeaderMap,
 ) -> Vec<u8> {
+    let mut response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key}\r\n"
+    )
+    .into_bytes();
+    append_websocket_upstream_headers(&mut response, upstream_headers);
+    response.extend_from_slice(b"\r\n");
+    response
+}
+
+const MAX_WEBSOCKET_REJECTION_BODY: usize = 64 * 1024;
+
+/// Gateway handshake rejections that Codex handles better than a generic 502.
+/// Measured with Codex 0.164: 400 ends the turn without the 5 WebSocket
+/// retries and HTTPS fallback, and 426 falls back to HTTPS at once. A relayed
+/// 401 triggers Codex auth recovery and roughly triples the handshakes, and
+/// 403/429/5xx behave the same as 502, so those keep the 502.
+fn relays_websocket_rejection(status: u16) -> bool {
+    matches!(status, 400 | 426)
+}
+
+fn build_openai_websocket_rejection(
+    upstream: &tungstenite::http::Response<Option<Vec<u8>>>,
+) -> Vec<u8> {
+    let status = upstream.status();
+    let reason = status.canonical_reason().unwrap_or("");
+    // tungstenite keeps only the bytes buffered after the headers, without
+    // decoding chunked or compressed framing. Relay that body only when it is
+    // provably the complete identity body; otherwise send the status reason.
+    let headers = upstream.headers();
+    let buffered = upstream.body().as_deref().unwrap_or_default();
+    let mut lengths = headers.get_all("content-length").iter();
+    let complete = headers.get("transfer-encoding").is_none()
+        && headers.get("content-encoding").is_none()
+        && buffered.len() <= MAX_WEBSOCKET_REJECTION_BODY
+        && lengths
+            .next()
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            == Some(buffered.len())
+        && lengths.next().is_none();
+    let body = if complete {
+        buffered
+    } else {
+        reason.as_bytes()
+    };
+    let mut response = format!(
+        "HTTP/1.1 {} {reason}\r\nConnection: close\r\nContent-Length: {}\r\n",
+        status.as_u16(),
+        body.len()
+    )
+    .into_bytes();
+    let mut headers = headers.clone();
+    if !complete {
+        // Drop metadata that described the replaced body.
+        for name in [
+            "content-type",
+            "content-encoding",
+            "content-range",
+            "content-md5",
+            "content-digest",
+            "repr-digest",
+            "digest",
+            "etag",
+            "last-modified",
+        ] {
+            headers.remove(name);
+        }
+    }
+    append_websocket_upstream_headers(&mut response, &headers);
+    response.extend_from_slice(b"\r\n");
+    response.extend_from_slice(body);
+    response
+}
+
+fn append_websocket_upstream_headers(
+    response: &mut Vec<u8>,
+    upstream_headers: &tungstenite::http::HeaderMap,
+) {
     let nominated: std::collections::HashSet<String> = upstream_headers
         .get_all("connection")
         .iter()
@@ -1114,10 +1201,6 @@ fn build_openai_websocket_response(
         .flat_map(|value| value.split(','))
         .map(|name| name.trim().to_ascii_lowercase())
         .collect();
-    let mut response = format!(
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key}\r\n"
-    )
-    .into_bytes();
     for (name, value) in upstream_headers {
         let lower = name.as_str();
         if !should_forward_response_header(lower)
@@ -1135,8 +1218,6 @@ fn build_openai_websocket_response(
         response.extend_from_slice(value.as_bytes());
         response.extend_from_slice(b"\r\n");
     }
-    response.extend_from_slice(b"\r\n");
-    response
 }
 
 async fn read_http_request<R>(reader: &mut R) -> Result<IncomingRequest>
@@ -4503,6 +4584,142 @@ mod tests {
         assert!(headers.get("x-mock-hop").is_none());
         drop(client);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn openai_websocket_gateway_rejection_is_relayed_not_rewritten_to_502() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!(
+            "ws://{}/v1/responses",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let body =
+            r#"{"error":{"type":"invalid_request_error","code":"codex_version_unsupported"}}"#;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nSet-Cookie: MOCK_ONLY_PRIVATE\r\nX-Request-Id: mock_request\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let request = build_openai_websocket_request(&url, &[], "MOCK_ONLY_GATEWAY").unwrap();
+        let Err(tungstenite::Error::Http(response)) = connect_async(request).await else {
+            panic!("expected an HTTP handshake rejection");
+        };
+        server.await.unwrap();
+        let wire = String::from_utf8(build_openai_websocket_rejection(&response)).unwrap();
+        assert!(wire.starts_with("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n"));
+        assert!(wire.contains("x-request-id: mock_request\r\n"));
+        assert!(!wire.contains("MOCK_ONLY_PRIVATE"));
+        // One write is not guaranteed to arrive in one read: the complete body
+        // or the reason fallback, each with an exact Content-Length.
+        let relayed = if wire.ends_with(&format!("\r\n\r\n{body}")) {
+            assert!(wire.contains("content-type: application/json\r\n"));
+            body
+        } else {
+            "Bad Request"
+        };
+        assert!(wire.contains(&format!("Content-Length: {}\r\n", relayed.len())));
+        assert!(wire.ends_with(&format!("\r\n\r\n{relayed}")));
+    }
+
+    #[test]
+    fn only_websocket_rejections_with_better_codex_handling_are_relayed() {
+        for status in [400, 426] {
+            assert!(relays_websocket_rejection(status));
+        }
+        for status in [401, 403, 404, 429, 500, 502, 503] {
+            assert!(!relays_websocket_rejection(status));
+        }
+    }
+
+    #[test]
+    fn openai_websocket_rejection_relays_only_complete_identity_bodies() {
+        let rejection = |headers: &[(&str, &str)], body: Vec<u8>| {
+            let mut response = tungstenite::http::Response::builder().status(426);
+            for (name, value) in headers {
+                response = response.header(*name, *value);
+            }
+            String::from_utf8_lossy(&build_openai_websocket_rejection(
+                &response.body(Some(body)).unwrap(),
+            ))
+            .into_owned()
+        };
+        let complete = rejection(
+            &[
+                ("content-type", "application/json"),
+                ("content-length", "2"),
+            ],
+            b"{}".to_vec(),
+        );
+        assert!(complete.starts_with("HTTP/1.1 426 Upgrade Required\r\n"));
+        assert!(complete.ends_with("content-type: application/json\r\n\r\n{}"));
+
+        let oversized = vec![b'x'; MAX_WEBSOCKET_REJECTION_BODY + 1];
+        let length = oversized.len().to_string();
+        for (headers, body) in [
+            // Partial: more bytes announced than tungstenite buffered.
+            (
+                vec![
+                    ("content-type", "application/json"),
+                    ("content-length", "9"),
+                ],
+                b"{}".to_vec(),
+            ),
+            (
+                vec![
+                    ("content-type", "application/json"),
+                    ("transfer-encoding", "chunked"),
+                ],
+                b"2\r\n{}\r\n0\r\n\r\n".to_vec(),
+            ),
+            (
+                vec![
+                    ("content-type", "application/json"),
+                    ("content-encoding", "gzip"),
+                    ("content-length", "2"),
+                ],
+                b"\x1f\x8b".to_vec(),
+            ),
+            (vec![("content-type", "text/plain")], b"no length".to_vec()),
+            (
+                vec![
+                    ("content-type", "text/plain"),
+                    ("content-length", "2"),
+                    ("content-length", "2"),
+                    ("etag", "\"mock\""),
+                ],
+                b"{}".to_vec(),
+            ),
+            (
+                vec![
+                    ("content-type", "text/plain"),
+                    ("content-length", length.as_str()),
+                ],
+                oversized,
+            ),
+        ] {
+            let wire = rejection(&headers, body);
+            assert!(
+                wire.starts_with(
+                    "HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\nContent-Length: 16\r\n"
+                ),
+                "{wire}"
+            );
+            assert!(wire.ends_with("\r\n\r\nUpgrade Required"), "{wire}");
+            assert!(!wire.contains("content-type"), "{wire}");
+            assert!(!wire.contains("content-encoding"), "{wire}");
+            assert!(!wire.contains("etag"), "{wire}");
+        }
     }
 
     #[test]

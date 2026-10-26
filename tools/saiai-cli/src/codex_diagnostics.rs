@@ -83,12 +83,12 @@ pub(crate) fn check(report: &mut DoctorReport) {
 
 // First official Codex release that reads `include_environment_context_time`.
 const MIN_TIME_TOGGLE_VERSION: (u64, u64, u64) = (0, 163, 0);
-const MIN_TIME_TOGGLE_VERSION_TEXT: &str = "0.163.0";
+pub(crate) const MIN_TIME_TOGGLE_VERSION_TEXT: &str = "0.163.0";
 
 /// Compare the numeric `major.minor.patch` core of a codex-cli version with
 /// the first release that supports the time-reporting toggle. A pre-release
 /// suffix is ignored. Returns None when the version is not parseable.
-fn supports_environment_context_time_toggle(version: &str) -> Option<bool> {
+pub(crate) fn supports_environment_context_time_toggle(version: &str) -> Option<bool> {
     let core = version.split(['-', '+']).next()?;
     let mut parts = core.split('.').map(|part| part.parse::<u64>().ok());
     let parsed = (parts.next()??, parts.next()??, parts.next()??);
