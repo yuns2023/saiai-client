@@ -401,6 +401,11 @@ impl OfficialDaemon<'_> {
             Err(_) => bail!("the current CODEX_HOME control socket is not readable"),
             Ok(_) => {}
         }
+        // A stopped daemon can leave its socket behind (seen on Windows); the
+        // official command then fails instead of reporting it as stopped.
+        if refuses_connections(&socket) {
+            return Ok(None);
+        }
         // `version` only probes an existing daemon; unlike `start`, it cannot
         // bootstrap a daemon or start model work. Withhold all raw CLI output.
         let version = self.command(&["version"], PROBE_TIMEOUT)?;
@@ -453,6 +458,13 @@ impl OfficialDaemon<'_> {
         }
         command_json(command, deadline)
     }
+}
+
+fn refuses_connections(socket: &Path) -> bool {
+    matches!(
+        ControlStream::connect(socket),
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused
+    )
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -1038,6 +1050,23 @@ mod tests {
             );
         }
         result
+    }
+
+    #[test]
+    fn socket_left_by_a_stopped_daemon_counts_as_not_running() {
+        let home = tempfile::tempdir().unwrap();
+        let socket = home.path().join("daemon.sock");
+        let listener = ControlListener::bind(&socket).unwrap();
+        assert!(!refuses_connections(&socket));
+        drop(listener);
+        assert!(socket.exists());
+        assert!(refuses_connections(&socket));
+        // The full inspection then reports no daemon without running Codex.
+        let control = home.path().join("app-server-control");
+        fs::create_dir(&control).unwrap();
+        drop(ControlListener::bind(control.join("app-server-control.sock")).unwrap());
+        let daemon = OfficialDaemon { home: home.path() };
+        assert!(daemon.version_report().unwrap().is_none());
     }
 
     #[test]
