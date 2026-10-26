@@ -1146,14 +1146,16 @@ fn build_openai_websocket_rejection(
     // provably the complete identity body; otherwise send the status reason.
     let headers = upstream.headers();
     let buffered = upstream.body().as_deref().unwrap_or_default();
+    let mut lengths = headers.get_all("content-length").iter();
     let complete = headers.get("transfer-encoding").is_none()
         && headers.get("content-encoding").is_none()
         && buffered.len() <= MAX_WEBSOCKET_REJECTION_BODY
-        && headers
-            .get("content-length")
+        && lengths
+            .next()
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.trim().parse::<usize>().ok())
-            == Some(buffered.len());
+            == Some(buffered.len())
+        && lengths.next().is_none();
     let body = if complete {
         buffered
     } else {
@@ -1167,8 +1169,20 @@ fn build_openai_websocket_rejection(
     .into_bytes();
     let mut headers = headers.clone();
     if !complete {
-        headers.remove("content-type");
-        headers.remove("content-encoding");
+        // Drop metadata that described the replaced body.
+        for name in [
+            "content-type",
+            "content-encoding",
+            "content-range",
+            "content-md5",
+            "content-digest",
+            "repr-digest",
+            "digest",
+            "etag",
+            "last-modified",
+        ] {
+            headers.remove(name);
+        }
     }
     append_websocket_upstream_headers(&mut response, &headers);
     response.extend_from_slice(b"\r\n");
@@ -4604,11 +4618,18 @@ mod tests {
         server.await.unwrap();
         let wire = String::from_utf8(build_openai_websocket_rejection(&response)).unwrap();
         assert!(wire.starts_with("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n"));
-        assert!(wire.contains(&format!("Content-Length: {}\r\n", body.len())));
-        assert!(wire.contains("content-type: application/json\r\n"));
         assert!(wire.contains("x-request-id: mock_request\r\n"));
-        assert!(wire.ends_with(&format!("\r\n\r\n{body}")));
         assert!(!wire.contains("MOCK_ONLY_PRIVATE"));
+        // One write is not guaranteed to arrive in one read: the complete body
+        // or the reason fallback, each with an exact Content-Length.
+        let relayed = if wire.ends_with(&format!("\r\n\r\n{body}")) {
+            assert!(wire.contains("content-type: application/json\r\n"));
+            body
+        } else {
+            "Bad Request"
+        };
+        assert!(wire.contains(&format!("Content-Length: {}\r\n", relayed.len())));
+        assert!(wire.ends_with(&format!("\r\n\r\n{relayed}")));
     }
 
     #[test]
@@ -4673,6 +4694,15 @@ mod tests {
             (
                 vec![
                     ("content-type", "text/plain"),
+                    ("content-length", "2"),
+                    ("content-length", "2"),
+                    ("etag", "\"mock\""),
+                ],
+                b"{}".to_vec(),
+            ),
+            (
+                vec![
+                    ("content-type", "text/plain"),
                     ("content-length", length.as_str()),
                 ],
                 oversized,
@@ -4688,6 +4718,7 @@ mod tests {
             assert!(wire.ends_with("\r\n\r\nUpgrade Required"), "{wire}");
             assert!(!wire.contains("content-type"), "{wire}");
             assert!(!wire.contains("content-encoding"), "{wire}");
+            assert!(!wire.contains("etag"), "{wire}");
         }
     }
 
