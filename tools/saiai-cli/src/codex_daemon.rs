@@ -289,6 +289,13 @@ fn refresh(control: &impl DaemonControl) -> Result<Refresh, Failure> {
     };
     let versions = &running.versions;
     let update = versions.restart_launches_older_than_cli();
+    if let Some(app_server) = &versions.app_server
+        && order(versions.launched(update), Some(app_server)) == Some(Ordering::Less)
+    {
+        return Ok(Refresh::NewerRunning {
+            running: app_server.clone(),
+        });
+    }
     if running.snapshot.loaded_threads != 0 {
         return Ok(Refresh::Deferred {
             stale: update || versions.running_vs_cli() == Some(Ordering::Less),
@@ -296,13 +303,6 @@ fn refresh(control: &impl DaemonControl) -> Result<Refresh, Failure> {
     }
     if !running.managed {
         return Err(anyhow!("the app-server is not managed by the official daemon command").into());
-    }
-    if let Some(app_server) = &versions.app_server
-        && order(versions.launched(update), Some(app_server)) == Some(Ordering::Less)
-    {
-        return Ok(Refresh::NewerRunning {
-            running: app_server.clone(),
-        });
     }
     if update {
         control.update_from_cli().map_err(|error| Failure {
@@ -838,9 +838,9 @@ mod tests {
         assert_eq!((control.restarts.get(), control.updates.get()), (0, 1));
         // A daemon newer than both the CLI and its restart package is never
         // replaced, whichever replacement would be chosen.
-        for managed in ["0.160.0", "0.164.0"] {
+        for (managed, loaded_threads) in [("0.160.0", 0), ("0.164.0", 0), ("0.164.0", 1)] {
             let control = fake(vec![with_managed(
-                versioned(true, 0, true, Some(("0.164.0", "0.165.0"))),
+                versioned(true, loaded_threads, true, Some(("0.164.0", "0.165.0"))),
                 managed,
             )]);
             assert_eq!(
