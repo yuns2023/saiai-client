@@ -1069,12 +1069,24 @@ mod tests {
         assert!(!refuses_connections(&socket));
         drop(listener);
         assert!(socket.exists());
-        assert!(refuses_connections(&socket));
+        // Parallel tests fork child processes, which briefly inherit the
+        // listening descriptor until exec; wait for those copies to close.
+        let refused_eventually = |socket: &Path| {
+            (0..100).any(|_| {
+                refuses_connections(socket) || {
+                    std::thread::sleep(Duration::from_millis(20));
+                    false
+                }
+            })
+        };
+        assert!(refused_eventually(&socket));
         // The full inspection then reports no daemon: the official version
         // command fails (or Codex is absent) and the leftover socket refuses.
         let control = home.path().join("app-server-control");
         fs::create_dir(&control).unwrap();
-        drop(ControlListener::bind(control.join("app-server-control.sock")).unwrap());
+        let leftover = control.join("app-server-control.sock");
+        drop(ControlListener::bind(&leftover).unwrap());
+        assert!(refused_eventually(&leftover));
         let daemon = OfficialDaemon { home: home.path() };
         assert!(daemon.version_report().unwrap().is_none());
     }
