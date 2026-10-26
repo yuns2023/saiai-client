@@ -33,7 +33,8 @@ const MANUAL_UPDATE: &str = "finish Codex tasks, then run `codex app-server daem
 const PINNED_NOTE: &str = "the daemon now follows this CLI package instead of its own updater; re-run `saiai init-codex` after upgrading Codex, or run `codex app-server daemon update` to return to official daemon updates";
 // The official update copies the package, then stops the daemon with up to a
 // 300s shutdown grace and waits up to 30s for readiness. Killing the helper
-// mid-replacement is worse than waiting, so allow the whole lifecycle.
+// mid-replacement is worse than waiting, so cover at least those two phases;
+// a timeout is still reported as a possibly partial update.
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(330);
 
 pub(crate) fn after_initialization(home: &Path) {
@@ -48,6 +49,9 @@ pub(crate) fn after_initialization(home: &Path) {
         Ok(Refresh::Deferred { stale }) => println!(
             "WARNING: Codex daemon has loaded sessions; left running to preserve work. {}.",
             if stale { MANUAL_UPDATE } else { MANUAL_RESTART }
+        ),
+        Ok(Refresh::NewerRunning { running }) => println!(
+            "WARNING: Codex daemon runs app-server {running}, newer than this CLI and the package a restart would launch; left running to avoid a downgrade. To reload SAIAI settings, upgrade Codex, then run `saiai init-codex` again."
         ),
         Ok(Refresh::Restarted) => println!(
             "Codex daemon restarted and recognizes ChatGPT authentication; direct `codex` startup is ready."
@@ -160,6 +164,10 @@ enum Refresh {
     Deferred {
         stale: bool,
     },
+    /// Replacing the daemon would launch an older app-server than is running.
+    NewerRunning {
+        running: String,
+    },
     Restarted,
     Updated {
         from: String,
@@ -236,6 +244,25 @@ impl Versions {
         order(launched, self.cli.as_deref()) == Some(Ordering::Less)
     }
 
+    /// The version a refresh launches: this CLI's package for an update,
+    /// otherwise the managed package (the running version when unreported).
+    fn launched(&self, update: bool) -> Option<&str> {
+        if update {
+            self.cli.as_deref()
+        } else {
+            self.managed.as_deref().or(self.app_server.as_deref())
+        }
+    }
+
+    /// Parseable versions a refreshed daemon must not fall below.
+    fn floors(&self) -> Vec<&str> {
+        [self.cli.as_deref(), self.app_server.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter(|version| order(Some(version), Some(version)).is_some())
+            .collect()
+    }
+
     /// Postflight: the running app-server is a parseable version not older
     /// than `target`.
     fn runs_at_least(&self, target: &str) -> bool {
@@ -262,7 +289,6 @@ fn refresh(control: &impl DaemonControl) -> Result<Refresh, Failure> {
     };
     let versions = &running.versions;
     let update = versions.restart_launches_older_than_cli();
-    let compared = update || versions.running_vs_cli().is_some();
     if running.snapshot.loaded_threads != 0 {
         return Ok(Refresh::Deferred {
             stale: update || versions.running_vs_cli() == Some(Ordering::Less),
@@ -270,6 +296,13 @@ fn refresh(control: &impl DaemonControl) -> Result<Refresh, Failure> {
     }
     if !running.managed {
         return Err(anyhow!("the app-server is not managed by the official daemon command").into());
+    }
+    if let Some(app_server) = &versions.app_server
+        && order(versions.launched(update), Some(app_server)) == Some(Ordering::Less)
+    {
+        return Ok(Refresh::NewerRunning {
+            running: app_server.clone(),
+        });
     }
     if update {
         control.update_from_cli().map_err(|error| Failure {
@@ -297,10 +330,14 @@ fn refresh(control: &impl DaemonControl) -> Result<Refresh, Failure> {
         )));
     };
     // With comparable versions, never finish below the CLI version.
-    let cli = versions.cli.as_deref().unwrap_or_default();
-    if compared && !after.versions.runs_at_least(cli) {
+    // Never finish below the CLI or the previously running version.
+    if let Some(floor) = versions
+        .floors()
+        .into_iter()
+        .find(|floor| !after.versions.runs_at_least(floor))
+    {
         return Err(fail(anyhow!(
-            "the daemon did not report an app-server version at least {cli} afterwards"
+            "the daemon did not report an app-server version at least {floor} afterwards"
         )));
     }
     if !update {
@@ -772,26 +809,58 @@ mod tests {
         assert!(control.inspections.borrow().is_empty());
     }
 
+    fn with_managed(
+        mut daemon: Result<Option<RunningDaemon>>,
+        managed: &str,
+    ) -> Result<Option<RunningDaemon>> {
+        if let Ok(Some(running)) = &mut daemon {
+            running.versions.managed = Some(managed.into());
+        }
+        daemon
+    }
+
     #[test]
     fn restart_that_would_launch_an_older_managed_package_updates_instead() {
-        for running_version in ["0.164.0", "0.165.0"] {
-            let mut before = versioned(true, 0, true, Some(("0.164.0", running_version)));
-            if let Ok(Some(running)) = &mut before {
-                running.versions.managed = Some("0.160.0".into());
-            }
-            let control = fake(vec![
-                before,
+        let control = fake(vec![
+            with_managed(
                 versioned(true, 0, true, Some(("0.164.0", "0.164.0"))),
-            ]);
+                "0.160.0",
+            ),
+            versioned(true, 0, true, Some(("0.164.0", "0.164.0"))),
+        ]);
+        assert_eq!(
+            refresh(&control).unwrap(),
+            Refresh::Updated {
+                from: "0.164.0".into(),
+                to: "0.164.0".into()
+            }
+        );
+        assert_eq!((control.restarts.get(), control.updates.get()), (0, 1));
+        // A daemon newer than both the CLI and its restart package is never
+        // replaced, whichever replacement would be chosen.
+        for managed in ["0.160.0", "0.164.0"] {
+            let control = fake(vec![with_managed(
+                versioned(true, 0, true, Some(("0.164.0", "0.165.0"))),
+                managed,
+            )]);
             assert_eq!(
                 refresh(&control).unwrap(),
-                Refresh::Updated {
-                    from: running_version.into(),
-                    to: "0.164.0".into()
+                Refresh::NewerRunning {
+                    running: "0.165.0".into()
                 }
             );
-            assert_eq!((control.restarts.get(), control.updates.get()), (0, 1));
+            assert_eq!((control.restarts.get(), control.updates.get()), (0, 0));
         }
+        // An unknown running version does not hide a known-stale result.
+        let mut unknown = versioned(true, 0, true, Some(("0.164.0", "0.164.0")));
+        if let Ok(Some(running)) = &mut unknown {
+            running.versions.app_server = None;
+        }
+        let control = fake(vec![
+            unknown,
+            versioned(true, 0, true, Some(("0.164.0", "0.160.0"))),
+        ]);
+        assert_eq!(refresh(&control).unwrap_err().phase, Phase::Restart);
         // A plain restart that lands below the CLI is not reported as success.
         let control = fake(vec![
             versioned(true, 0, true, Some(("0.164.0", "0.164.0"))),
@@ -827,11 +896,7 @@ mod tests {
 
     #[test]
     fn newer_equal_or_unparseable_daemon_versions_are_only_restarted() {
-        for versions in [
-            ("0.160.0", "0.164.0"),
-            ("0.164.0", "0.164.0"),
-            ("0.164.0", "0.165.0-alpha.1"),
-        ] {
+        for versions in [("0.160.0", "0.164.0"), ("0.164.0", "0.164.0")] {
             let control = fake(vec![
                 versioned(true, 0, true, Some(versions)),
                 versioned(true, 0, true, Some(versions)),
@@ -839,6 +904,15 @@ mod tests {
             assert_eq!(refresh(&control).unwrap(), Refresh::Restarted);
             assert_eq!((control.restarts.get(), control.updates.get()), (1, 0));
         }
+        // A pre-release app-server is restarted as before, but its version
+        // cannot prove the CLI floor, so success is not claimed.
+        let prerelease = ("0.164.0", "0.165.0-alpha.1");
+        let control = fake(vec![
+            versioned(true, 0, true, Some(prerelease)),
+            versioned(true, 0, true, Some(prerelease)),
+        ]);
+        assert_eq!(refresh(&control).unwrap_err().phase, Phase::Restart);
+        assert_eq!((control.restarts.get(), control.updates.get()), (1, 0));
     }
 
     #[test]
