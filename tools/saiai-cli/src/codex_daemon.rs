@@ -1,10 +1,13 @@
 //! Codex caches authentication and network settings in its shared app-server.
 //! Only the official lifecycle command may replace that process. Treat any
 //! loaded thread (including an idle one) or failed probe as unsafe to restart.
+//! Model requests carry the daemon's own version, so an idle daemon older than
+//! the CLI is replaced with the CLI package instead of being restarted as-is.
 
 use crate::{DoctorReport, codex_config_dir, codex_process_command};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
+use std::cmp::Ordering;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,6 +29,8 @@ const RESTART_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_COMMAND_OUTPUT: u64 = 16 * 1024;
 const MANUAL_RESTART: &str =
     "finish Codex tasks, then run `codex app-server daemon restart`; meanwhile use `saiai codex`";
+const MANUAL_UPDATE: &str = "finish Codex tasks, then run `codex app-server daemon update --from-cli -y`; meanwhile use `saiai codex`";
+const PINNED_NOTE: &str = "the daemon now follows this CLI package instead of its own updater; re-run `saiai init-codex` after upgrading Codex, or run `codex app-server daemon update` to return to official daemon updates";
 
 pub(crate) fn after_initialization(home: &Path) {
     if crate::should_skip_initialization_proxy_start(
@@ -36,11 +41,15 @@ pub(crate) fn after_initialization(home: &Path) {
     }
     match refresh(&OfficialDaemon { home }) {
         Ok(Refresh::Absent) => println!("Codex daemon is not running; no restart needed."),
-        Ok(Refresh::Deferred) => println!(
-            "WARNING: Codex daemon has loaded sessions; left running to preserve work. {MANUAL_RESTART}."
+        Ok(Refresh::Deferred { stale }) => println!(
+            "WARNING: Codex daemon has loaded sessions; left running to preserve work. {}.",
+            if stale { MANUAL_UPDATE } else { MANUAL_RESTART }
         ),
         Ok(Refresh::Restarted) => println!(
             "Codex daemon restarted and recognizes ChatGPT authentication; direct `codex` startup is ready."
+        ),
+        Ok(Refresh::Updated { from, to }) => println!(
+            "Codex daemon updated from {from} to the CLI package {to} and recognizes ChatGPT authentication; direct `codex` startup is ready. Note: {PINNED_NOTE}."
         ),
         Err(error) => println!(
             "WARNING: Codex daemon refresh could not be verified: {error}. {MANUAL_RESTART}."
@@ -54,7 +63,12 @@ pub(crate) fn check(report: &mut DoctorReport) {
     if crate::validate_codex_oauth_auth(&home.join("auth.json")).is_err() {
         return;
     }
-    report_inspection(report, (OfficialDaemon { home: &home }).inspect());
+    let daemon = OfficialDaemon { home: &home };
+    // Report versions even when the account probe below fails.
+    if let Ok(Some((version, _))) = daemon.version_report() {
+        report_versions(report, &Versions::from_report(&version));
+    }
+    report_inspection(report, daemon.inspect());
 }
 
 fn report_inspection(report: &mut DoctorReport, inspection: Result<Option<RunningDaemon>>) {
@@ -75,17 +89,91 @@ fn report_inspection(report: &mut DoctorReport, inspection: Result<Option<Runnin
     }
 }
 
+fn report_versions(report: &mut DoctorReport, versions: &Versions) {
+    let Some(app_server) = &versions.app_server else {
+        return;
+    };
+    let cli = versions.cli.as_deref().unwrap_or("unknown");
+    let minimum = crate::codex_diagnostics::MIN_TIME_TOGGLE_VERSION_TEXT;
+    if versions.stale().is_some() {
+        report.warn(
+            "Codex daemon version",
+            format!("running app-server {app_server} is older than Codex CLI {cli}; direct `codex` model requests use the daemon's version and may be rejected. {MANUAL_UPDATE}."),
+        );
+    } else {
+        report.ok(
+            "Codex daemon version",
+            format!("app-server {app_server}; CLI {cli}"),
+        );
+    }
+    if crate::codex_diagnostics::supports_environment_context_time_toggle(app_server) == Some(false)
+    {
+        report.warn(
+            "Codex daemon time reporting support",
+            format!("running app-server {app_server} ignores include_environment_context_time; upgrade Codex to {minimum}+, then run `saiai init-codex`"),
+        );
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum Refresh {
     Absent,
-    Deferred,
+    Deferred { stale: bool },
     Restarted,
+    Updated { from: String, to: String },
 }
 
 #[derive(Debug)]
 struct RunningDaemon {
     managed: bool,
+    versions: Versions,
     snapshot: Snapshot,
+}
+
+/// Versions reported by `codex app-server daemon version`; older Codex
+/// releases omit them.
+#[derive(Debug, Default, PartialEq)]
+struct Versions {
+    cli: Option<String>,
+    app_server: Option<String>,
+    /// The selected managed package that `restart` would launch.
+    managed: Option<String>,
+}
+
+impl Versions {
+    fn from_report(report: &Value) -> Self {
+        let field = |name| report.get(name).and_then(Value::as_str).map(str::to_owned);
+        Self {
+            cli: field("cliVersion"),
+            app_server: field("appServerVersion"),
+            managed: field("managedCodexVersion"),
+        }
+    }
+
+    /// The running app-server is older than this CLI. Never downgrade a newer
+    /// daemon, and treat unparseable (pre-release) versions as current.
+    fn stale(&self) -> Option<(&str, &str)> {
+        let (cli, app_server) = (self.cli.as_deref()?, self.app_server.as_deref()?);
+        (crate::compare_versions(app_server, cli).ok()? == Ordering::Less)
+            .then_some((app_server, cli))
+    }
+
+    /// A plain restart already launches a package at least as new as the CLI,
+    /// so the daemon's own update selection need not be pinned.
+    fn restart_suffices(&self) -> bool {
+        let (Some(cli), Some(managed)) = (self.cli.as_deref(), self.managed.as_deref()) else {
+            return false;
+        };
+        crate::compare_versions(managed, cli).is_ok_and(|order| order != Ordering::Less)
+    }
+
+    /// Postflight: the running app-server is a parseable version not older
+    /// than `target`.
+    fn runs_at_least(&self, target: &str) -> bool {
+        self.app_server.as_deref().is_some_and(|app_server| {
+            crate::compare_versions(app_server, target).is_ok_and(|order| order != Ordering::Less)
+        })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -97,26 +185,49 @@ struct Snapshot {
 trait DaemonControl {
     fn inspect(&self) -> Result<Option<RunningDaemon>>;
     fn restart(&self) -> Result<()>;
+    /// Replace the daemon package with this CLI's package and restart it.
+    fn update_from_cli(&self) -> Result<()>;
 }
 
 fn refresh(control: &impl DaemonControl) -> Result<Refresh> {
     let Some(running) = control.inspect()? else {
         return Ok(Refresh::Absent);
     };
+    let stale = running
+        .versions
+        .stale()
+        .map(|(from, cli)| (from.to_owned(), cli.to_owned()));
     if running.snapshot.loaded_threads != 0 {
-        return Ok(Refresh::Deferred);
+        return Ok(Refresh::Deferred {
+            stale: stale.is_some(),
+        });
     }
     if !running.managed {
         bail!("the app-server is not managed by the official daemon command");
     }
-    control.restart()?;
-    let verified = control
-        .inspect()?
-        .is_some_and(|running| running.snapshot.signed_in);
-    if !verified {
-        bail!("the restarted daemon did not report ChatGPT authentication");
+    let update = stale.is_some() && !running.versions.restart_suffices();
+    if update {
+        control.update_from_cli()?;
+    } else {
+        control.restart()?;
     }
-    Ok(Refresh::Restarted)
+    let Some(after) = control
+        .inspect()?
+        .filter(|running| running.snapshot.signed_in)
+    else {
+        bail!("the restarted daemon did not report ChatGPT authentication");
+    };
+    let Some((from, cli)) = stale else {
+        return Ok(Refresh::Restarted);
+    };
+    if !after.versions.runs_at_least(&cli) {
+        bail!("the daemon did not report an app-server version at least {cli} after replacement");
+    }
+    if !update {
+        return Ok(Refresh::Restarted);
+    }
+    let to = after.versions.app_server.unwrap_or(cli);
+    Ok(Refresh::Updated { from, to })
 }
 
 struct OfficialDaemon<'a> {
@@ -125,6 +236,40 @@ struct OfficialDaemon<'a> {
 
 impl DaemonControl for OfficialDaemon<'_> {
     fn inspect(&self) -> Result<Option<RunningDaemon>> {
+        let Some((version, reported_socket)) = self.version_report()? else {
+            return Ok(None);
+        };
+        let home = fs::canonicalize(self.home)
+            .map_err(|_| anyhow!("could not resolve the current CODEX_HOME"))?;
+        let snapshot = probe(&reported_socket, &home)?;
+        Ok(Some(RunningDaemon {
+            managed: version.get("backend").and_then(Value::as_str) == Some("pid"),
+            versions: Versions::from_report(&version),
+            snapshot,
+        }))
+    }
+
+    fn restart(&self) -> Result<()> {
+        let result = self.command(&["restart"], RESTART_TIMEOUT)?;
+        if result.get("status").and_then(Value::as_str) != Some("restarted") {
+            bail!("the official daemon command did not confirm a restart");
+        }
+        Ok(())
+    }
+
+    fn update_from_cli(&self) -> Result<()> {
+        let result = self.command(&["update", "--from-cli", "-y"], RESTART_TIMEOUT)?;
+        if result.get("status").and_then(Value::as_str) != Some("updated") {
+            bail!("the official daemon command did not confirm an update");
+        }
+        Ok(())
+    }
+}
+
+impl OfficialDaemon<'_> {
+    /// The official version report of a daemon running for this CODEX_HOME,
+    /// with its verified control socket.
+    fn version_report(&self) -> Result<Option<(Value, PathBuf)>> {
         let socket = self.home.join("app-server-control/app-server-control.sock");
         match fs::symlink_metadata(&socket) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -133,7 +278,7 @@ impl DaemonControl for OfficialDaemon<'_> {
         }
         // `version` only probes an existing daemon; unlike `start`, it cannot
         // bootstrap a daemon or start model work. Withhold all raw CLI output.
-        let version = self.command("version", PROBE_TIMEOUT)?;
+        let version = self.command(&["version"], PROBE_TIMEOUT)?;
         if version.get("status").and_then(Value::as_str) != Some("running") {
             bail!("the official daemon command did not report a running app-server");
         }
@@ -145,32 +290,17 @@ impl DaemonControl for OfficialDaemon<'_> {
         if !same_path(&reported_socket, &socket) {
             bail!("the daemon command reported a socket outside the current CODEX_HOME");
         }
-        let home = fs::canonicalize(self.home)
-            .map_err(|_| anyhow!("could not resolve the current CODEX_HOME"))?;
-        let snapshot = probe(&reported_socket, &home)?;
-        Ok(Some(RunningDaemon {
-            managed: version.get("backend").and_then(Value::as_str) == Some("pid"),
-            snapshot,
-        }))
+        Ok(Some((version, reported_socket)))
     }
 
-    fn restart(&self) -> Result<()> {
-        let result = self.command("restart", RESTART_TIMEOUT)?;
-        if result.get("status").and_then(Value::as_str) != Some("restarted") {
-            bail!("the official daemon command did not confirm a restart");
-        }
-        Ok(())
-    }
-}
-
-impl OfficialDaemon<'_> {
-    fn command(&self, action: &str, deadline: Duration) -> Result<Value> {
+    fn command(&self, args: &[&str], deadline: Duration) -> Result<Value> {
         let mut command = codex_process_command()
             .map_err(|_| anyhow!("the official Codex executable was not found"))?;
         command
-            .args(["app-server", "daemon", action])
+            .args(["app-server", "daemon"])
+            .args(args)
             .env("CODEX_HOME", self.home);
-        if action == "restart" {
+        if args[0] != "version" {
             // Match the working launcher environment. A daemon started before
             // initialization also retains its old proxy/CA environment.
             let cfg = crate::read_saiai_config()
@@ -376,7 +506,7 @@ fn request<S: Read + Write>(
                     continue;
                 }
                 if response.get("error").is_some() {
-                    bail!("the daemon rejected a required control query; raw response withheld");
+                    bail!("the daemon rejected the {method} control query; raw response withheld");
                 }
                 return response
                     .get("result")
@@ -404,6 +534,7 @@ mod tests {
     struct FakeControl {
         inspections: RefCell<VecDeque<Result<Option<RunningDaemon>>>>,
         restarts: Cell<usize>,
+        updates: Cell<usize>,
         restart_fails: bool,
     }
 
@@ -421,6 +552,10 @@ mod tests {
             }
             Ok(())
         }
+        fn update_from_cli(&self) -> Result<()> {
+            self.updates.set(self.updates.get() + 1);
+            Ok(())
+        }
     }
 
     fn running(
@@ -428,8 +563,24 @@ mod tests {
         loaded_threads: usize,
         signed_in: bool,
     ) -> Result<Option<RunningDaemon>> {
+        versioned(managed, loaded_threads, signed_in, None)
+    }
+
+    fn versioned(
+        managed: bool,
+        loaded_threads: usize,
+        signed_in: bool,
+        versions: Option<(&str, &str)>,
+    ) -> Result<Option<RunningDaemon>> {
         Ok(Some(RunningDaemon {
             managed,
+            versions: versions
+                .map(|(cli, app_server)| Versions {
+                    cli: Some(cli.into()),
+                    app_server: Some(app_server.into()),
+                    managed: Some(app_server.into()),
+                })
+                .unwrap_or_default(),
             snapshot: Snapshot {
                 loaded_threads,
                 signed_in,
@@ -441,6 +592,7 @@ mod tests {
         FakeControl {
             inspections: RefCell::new(inspections.into()),
             restarts: Cell::new(0),
+            updates: Cell::new(0),
             restart_fails: false,
         }
     }
@@ -456,8 +608,18 @@ mod tests {
     fn absent_busy_unmanaged_and_unknown_daemons_are_never_restarted() {
         for (inspection, expected) in [
             (Ok(None), Some(Refresh::Absent)),
-            (running(true, 1, false), Some(Refresh::Deferred)),
-            (running(true, 2, true), Some(Refresh::Deferred)),
+            (
+                running(true, 1, false),
+                Some(Refresh::Deferred { stale: false }),
+            ),
+            (
+                running(true, 2, true),
+                Some(Refresh::Deferred { stale: false }),
+            ),
+            (
+                versioned(true, 1, true, Some(("0.164.0", "0.160.0"))),
+                Some(Refresh::Deferred { stale: true }),
+            ),
             (running(false, 0, false), None),
             (Err(anyhow!("query failed")), None),
         ] {
@@ -468,7 +630,114 @@ mod tests {
                 None => assert!(result.is_err()),
             }
             assert_eq!(control.restarts.get(), 0);
+            assert_eq!(control.updates.get(), 0);
         }
+    }
+
+    #[test]
+    fn idle_daemon_older_than_cli_is_updated_from_cli_package() {
+        let control = fake(vec![
+            versioned(true, 0, true, Some(("0.164.0", "0.160.0"))),
+            versioned(true, 0, true, Some(("0.164.0", "0.164.0"))),
+        ]);
+        assert_eq!(
+            refresh(&control).unwrap(),
+            Refresh::Updated {
+                from: "0.160.0".into(),
+                to: "0.164.0".into()
+            }
+        );
+        assert_eq!((control.restarts.get(), control.updates.get()), (0, 1));
+
+        // A still-stale or unverifiable result is never reported as success.
+        for postflight in [
+            versioned(true, 0, true, Some(("0.164.0", "0.160.0"))),
+            versioned(true, 0, false, Some(("0.164.0", "0.164.0"))),
+            running(true, 0, true),
+        ] {
+            let control = fake(vec![
+                versioned(true, 0, true, Some(("0.164.0", "0.160.0"))),
+                postflight,
+            ]);
+            assert!(refresh(&control).is_err());
+            assert_eq!(control.updates.get(), 1);
+        }
+    }
+
+    #[test]
+    fn stale_daemon_with_current_managed_package_is_restarted_without_pinning() {
+        let mut before = versioned(true, 0, true, Some(("0.164.0", "0.160.0")));
+        if let Ok(Some(running)) = &mut before {
+            running.versions.managed = Some("0.164.0".into());
+        }
+        let control = fake(vec![
+            before,
+            versioned(true, 0, true, Some(("0.164.0", "0.164.0"))),
+        ]);
+        assert_eq!(refresh(&control).unwrap(), Refresh::Restarted);
+        assert_eq!((control.restarts.get(), control.updates.get()), (1, 0));
+
+        let mut before = versioned(true, 0, true, Some(("0.164.0", "0.160.0")));
+        if let Ok(Some(running)) = &mut before {
+            running.versions.managed = Some("0.164.0".into());
+        }
+        let control = fake(vec![
+            before,
+            versioned(true, 0, true, Some(("0.164.0", "0.160.0"))),
+        ]);
+        assert!(refresh(&control).is_err());
+    }
+
+    #[test]
+    fn newer_equal_or_unparseable_daemon_versions_are_only_restarted() {
+        for versions in [
+            ("0.160.0", "0.164.0"),
+            ("0.164.0", "0.164.0"),
+            ("0.164.0", "0.165.0-alpha.1"),
+        ] {
+            let control = fake(vec![
+                versioned(true, 0, true, Some(versions)),
+                versioned(true, 0, true, Some(versions)),
+            ]);
+            assert_eq!(refresh(&control).unwrap(), Refresh::Restarted);
+            assert_eq!((control.restarts.get(), control.updates.get()), (1, 0));
+        }
+    }
+
+    #[test]
+    fn doctor_warns_only_when_daemon_is_older_than_cli() {
+        let versions = |cli: &str, app_server: &str| Versions {
+            cli: Some(cli.into()),
+            app_server: Some(app_server.into()),
+            managed: None,
+        };
+        let mut report = DoctorReport::new();
+        report_versions(&mut report, &versions("0.164.0", "0.164.0"));
+        report_versions(&mut report, &versions("0.160.0", "0.164.0"));
+        report_versions(&mut report, &Versions::default());
+        assert_eq!(report.warnings, 0);
+        report_versions(&mut report, &versions("0.164.0", "0.163.1"));
+        assert_eq!((report.warnings, report.errors), (1, 0));
+        // Older than the time-reporting toggle: a second, separate warning.
+        report_versions(&mut report, &versions("0.164.0", "0.160.0"));
+        assert_eq!((report.warnings, report.errors), (3, 0));
+        report_versions(&mut report, &versions("0.160.0", "0.160.0"));
+        assert_eq!((report.warnings, report.errors), (4, 0));
+    }
+
+    #[test]
+    fn version_report_fields_are_read_from_official_json() {
+        let versions = Versions::from_report(&json!({
+            "status": "running",
+            "cliVersion": "0.164.0",
+            "appServerVersion": "0.160.0"
+        }));
+        assert_eq!(versions.stale(), Some(("0.160.0", "0.164.0")));
+        assert!(!versions.restart_suffices());
+        assert_eq!(
+            Versions::from_report(&json!({"status": "running"})),
+            Versions::default()
+        );
     }
 
     #[test]
