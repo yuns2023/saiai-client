@@ -401,14 +401,15 @@ impl OfficialDaemon<'_> {
             Err(_) => bail!("the current CODEX_HOME control socket is not readable"),
             Ok(_) => {}
         }
-        // A stopped daemon can leave its socket behind (seen on Windows); the
-        // official command then fails instead of reporting it as stopped.
-        if refuses_connections(&socket) {
-            return Ok(None);
-        }
         // `version` only probes an existing daemon; unlike `start`, it cannot
         // bootstrap a daemon or start model work. Withhold all raw CLI output.
-        let version = self.command(&["version"], PROBE_TIMEOUT)?;
+        let version = match self.command(&["version"], PROBE_TIMEOUT) {
+            Ok(version) => version,
+            // A stopped daemon can leave its socket behind (seen on Windows);
+            // the official command then fails instead of reporting it stopped.
+            Err(_) if refuses_connections(&socket) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         if version.get("status").and_then(Value::as_str) != Some("running") {
             bail!("the official daemon command did not report a running app-server");
         }
@@ -460,11 +461,19 @@ impl OfficialDaemon<'_> {
     }
 }
 
+/// The socket actively refuses a connection within the probe deadline. A
+/// connect that blocks (full backlog) is unknown, not refused.
 fn refuses_connections(socket: &Path) -> bool {
-    matches!(
-        ControlStream::connect(socket),
-        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused
-    )
+    let socket = socket.to_path_buf();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let refused = matches!(
+            ControlStream::connect(&socket),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused
+        );
+        let _ = sender.send(refused);
+    });
+    receiver.recv_timeout(PROBE_TIMEOUT).unwrap_or(false)
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -1061,7 +1070,8 @@ mod tests {
         drop(listener);
         assert!(socket.exists());
         assert!(refuses_connections(&socket));
-        // The full inspection then reports no daemon without running Codex.
+        // The full inspection then reports no daemon: the official version
+        // command fails (or Codex is absent) and the leftover socket refuses.
         let control = home.path().join("app-server-control");
         fs::create_dir(&control).unwrap();
         drop(ControlListener::bind(control.join("app-server-control.sock")).unwrap());
