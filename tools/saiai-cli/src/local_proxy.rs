@@ -32,6 +32,8 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 use url::Url;
 use zeroize::Zeroizing;
 
+use crate::client_proof::{self, ClientProof};
+
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
 const OPENAI_HOST: &str = "api.openai.com";
 const CHATGPT_HOST: &str = "chatgpt.com";
@@ -103,6 +105,8 @@ pub struct Config {
     pub ca_key_pem: String,
     pub verbose: bool,
     pub chatgpt_chat_passthrough: bool,
+    /// Directory holding the client-proof device key; `None` disables proofs.
+    pub client_proof_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone)]
@@ -123,6 +127,7 @@ impl std::fmt::Debug for Config {
             .field("runtime_ca", &true)
             .field("verbose", &self.verbose)
             .field("chatgpt_chat_passthrough", &self.chatgpt_chat_passthrough)
+            .field("client_proof", &self.client_proof_dir.is_some())
             .finish()
     }
 }
@@ -139,6 +144,7 @@ struct State {
     client: Client,
     certs: Mutex<HashMap<String, ManagedCertificate>>,
     openai_trace: Option<Arc<OpenAITrace>>,
+    client_proof: Option<Arc<ClientProof>>,
 }
 
 struct UpstreamRoute {
@@ -263,6 +269,7 @@ type AccountSidecarResponse = (
 
 pub async fn run(cfg: Config) -> Result<()> {
     let state = Arc::new(State::new(cfg)?);
+    state.spawn_client_proof_enrollment();
     let listener = TcpListener::bind(&state.listen)
         .await
         .with_context(|| format!("failed to bind local proxy on {}", state.listen))?;
@@ -350,6 +357,16 @@ impl State {
         // process. It never enables body tracing; verbose records remain
         // limited to request metadata and response outcomes.
         let verbose = cfg.verbose || env::var("SAIAI_PROXY_VERBOSE").ok().as_deref() == Some("1");
+        // Client proof is best effort: without a usable device key the proxy
+        // forwards exactly as before, just without the proof header.
+        let client_proof = cfg.client_proof_dir.as_deref().and_then(|dir| {
+            ClientProof::load(dir)
+                .map(Arc::new)
+                .map_err(|err| {
+                    eprintln!("client proof disabled: {err:#}");
+                })
+                .ok()
+        });
 
         Ok(Self {
             listen: cfg.listen,
@@ -363,7 +380,43 @@ impl State {
             client,
             certs: Mutex::new(HashMap::new()),
             openai_trace,
+            client_proof,
         })
+    }
+
+    /// Starts one background enrollment per distinct Gateway actually used
+    /// by the Claude and Codex routes. Never blocks or fails the proxy.
+    fn spawn_client_proof_enrollment(&self) {
+        let Some(proof) = &self.client_proof else {
+            return;
+        };
+        let mut gateways = std::collections::HashSet::new();
+        for route in [
+            self.route_for_host(ANTHROPIC_HOST),
+            self.route_for_host(OPENAI_HOST),
+        ] {
+            if gateways.insert(route.base_url.clone()) {
+                tokio::spawn(Arc::clone(proof).enroll(
+                    self.client.clone(),
+                    route.base_url.clone(),
+                    route.api_key.clone(),
+                    &client_proof::ENROLL_BACKOFF,
+                ));
+            }
+        }
+    }
+
+    /// Proof header for one Gateway request attempt; `bearer` is the exact
+    /// API key carried in its `Authorization: Bearer` header.
+    fn client_proof_header(
+        &self,
+        route: &UpstreamRoute,
+        method: &str,
+        target: &str,
+        bearer: Option<&str>,
+    ) -> Option<String> {
+        let proof = self.client_proof.as_ref()?;
+        proof.sign_request(&route.base_url, method, target, bearer?)
     }
 
     fn tls_config_for_host(&self, host: &str) -> Result<Arc<ServerConfig>> {
@@ -977,6 +1030,7 @@ fn build_openai_websocket_request(
     upstream_url: &Url,
     incoming_headers: &[(String, String)],
     gateway_key: &str,
+    sign: impl FnOnce(&str, &str) -> Option<String>,
 ) -> Result<tungstenite::http::Request<()>> {
     let mut upstream_request = upstream_url
         .as_str()
@@ -1025,6 +1079,17 @@ fn build_openai_websocket_request(
         HeaderValue::from_str(upstream_url.authority())
             .context("invalid Gateway WebSocket host")?,
     );
+    // Only the handshake is signed, against the exact request-target sent.
+    let target = upstream_request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| "/".to_string(), |target| target.as_str().to_string());
+    if let Some(proof) = sign(upstream_request.method().as_str(), &target) {
+        upstream_request.headers_mut().insert(
+            HeaderName::from_static(client_proof::HEADER_NAME),
+            HeaderValue::from_str(&proof).context("invalid client proof header")?,
+        );
+    }
 
     Ok(upstream_request)
 }
@@ -1038,8 +1103,12 @@ async fn serve_openai_websocket(
         .context("OpenAI WebSocket request did not include Sec-WebSocket-Key")?;
     let route = state.route_for_host(CHATGPT_HOST);
     let upstream_url = state.websocket_upstream_url(&request.target, route)?;
-    let upstream_request =
-        build_openai_websocket_request(&upstream_url, &request.headers, &route.api_key)?;
+    let upstream_request = build_openai_websocket_request(
+        &upstream_url,
+        &request.headers,
+        &route.api_key,
+        |method, target| state.client_proof_header(route, method, target, Some(&route.api_key)),
+    )?;
 
     let (upstream_ws, upstream_response) = match connect_async(upstream_request).await {
         Ok(result) => result,
@@ -1445,6 +1514,7 @@ where
     let mut builder = state.client.request(method, &upstream_url);
 
     let mut has_authorization = false;
+    let mut forwarded_authorization = Vec::new();
     let nominated = connection_nominated_headers(&request.headers);
     for (name, value) in &request.headers {
         if nominated.contains(&name.to_ascii_lowercase()) {
@@ -1454,12 +1524,23 @@ where
             has_authorization = true;
         }
         if should_forward_request_header_to_gateway(name, replace_authorization) {
+            if name.eq_ignore_ascii_case("authorization") {
+                forwarded_authorization.push(value.as_str());
+            }
             builder = builder.header(name.as_str(), value.as_str());
         }
     }
-    if replace_authorization || !has_authorization {
+    // The proof binds the exact Bearer credential the Gateway receives:
+    // either the substituted Gateway key or a single client-supplied Bearer.
+    let proof_bearer = if replace_authorization || !has_authorization {
         builder = builder.bearer_auth(&*route.api_key);
-    }
+        Some(route.api_key.as_str())
+    } else {
+        match forwarded_authorization.as_slice() {
+            [value] => bearer_token(value),
+            _ => None,
+        }
+    };
 
     // Native Mac requires only the provider-issued device proof. The Gateway
     // verifies its scoped digest and original account before forwarding it.
@@ -1501,7 +1582,26 @@ where
         );
     }
     let started = Instant::now();
-    let response = builder.body(request.body).send().await.map_err(|error| {
+    let response = async {
+        let mut upstream_request = builder.body(request.body).build()?;
+        // Signed per attempt against the final URL, so ts/nonce are fresh.
+        let target = client_proof::wire_target(upstream_request.url());
+        if let Some(proof) = state.client_proof_header(
+            route,
+            upstream_request.method().as_str(),
+            &target,
+            proof_bearer,
+        ) && let Ok(value) = reqwest::header::HeaderValue::from_str(&proof)
+        {
+            upstream_request.headers_mut().insert(
+                reqwest::header::HeaderName::from_static(client_proof::HEADER_NAME),
+                value,
+            );
+        }
+        state.client.execute(upstream_request).await
+    }
+    .await
+    .map_err(|error| {
         if upload { error.without_url() } else { error }
     }).with_context(|| {
         format!(
@@ -1528,6 +1628,12 @@ where
         );
     }
     Ok(())
+}
+
+fn bearer_token(authorization: &str) -> Option<&str> {
+    let (scheme, token) = authorization.trim().split_once(' ')?;
+    let token = token.trim();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
 }
 
 fn is_fresh_chat_init(request: &IncomingRequest) -> bool {
@@ -2746,7 +2852,9 @@ fn is_websocket_handshake_header(name: &str) -> bool {
 }
 
 fn should_forward_request_header(name: &str) -> bool {
+    // Only the proxy itself may attach a client proof; never relay one.
     !is_hop_by_hop_header(name)
+        && !name.eq_ignore_ascii_case(client_proof::HEADER_NAME)
         && !name.eq_ignore_ascii_case("host")
         && !name.eq_ignore_ascii_case("content-length")
         && !name.eq_ignore_ascii_case("transfer-encoding")
@@ -3128,6 +3236,7 @@ mod tests {
                 ca_key_pem,
                 verbose: false,
                 chatgpt_chat_passthrough: false,
+                client_proof_dir: None,
             })
             .unwrap(),
         );
@@ -3559,6 +3668,7 @@ mod tests {
                 ca_key_pem: ca_key_pem.clone(),
                 verbose: false,
                 chatgpt_chat_passthrough: true,
+                client_proof_dir: None,
             })
             .unwrap();
             state.openai_trace = Some(Arc::new(OpenAITrace {
@@ -4094,6 +4204,7 @@ mod tests {
                 ca_key_pem,
                 verbose: false,
                 chatgpt_chat_passthrough: true,
+                client_proof_dir: None,
             })
             .unwrap(),
         );
@@ -4549,8 +4660,26 @@ mod tests {
                 "Sec-WebSocket-Extensions".into(),
                 "permessage-deflate".into(),
             ),
+            ("X-Saiai-Client-Proof".into(), "v1.MOCK_SPOOFED".into()),
         ];
-        let request = build_openai_websocket_request(&url, &incoming, "MOCK_ONLY_GATEWAY").unwrap();
+        let mut signed = None;
+        let request = build_openai_websocket_request(
+            &url,
+            &incoming,
+            "MOCK_ONLY_GATEWAY",
+            |method, target| {
+                signed = Some((method.to_string(), target.to_string()));
+                Some("v1.MOCK_SIGNED".to_string())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            signed,
+            Some((
+                "GET".to_string(),
+                "/v1/responses?future=a%2Fb&future=a+b".to_string()
+            ))
+        );
         let (client, _) = connect_async(request).await.unwrap();
         let outgoing = timeout(Duration::from_secs(3), captured_rx)
             .await
@@ -4582,6 +4711,13 @@ mod tests {
         assert!(headers.get("cookie").is_none());
         assert!(headers.get("sec-websocket-extensions").is_none());
         assert!(headers.get("x-mock-hop").is_none());
+        assert_eq!(
+            headers
+                .get_all("x-saiai-client-proof")
+                .iter()
+                .collect::<Vec<_>>(),
+            vec!["v1.MOCK_SIGNED"]
+        );
         drop(client);
         server.await.unwrap();
     }
@@ -4611,7 +4747,8 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let request = build_openai_websocket_request(&url, &[], "MOCK_ONLY_GATEWAY").unwrap();
+        let request =
+            build_openai_websocket_request(&url, &[], "MOCK_ONLY_GATEWAY", |_, _| None).unwrap();
         let Err(tungstenite::Error::Http(response)) = connect_async(request).await else {
             panic!("expected an HTTP handshake rejection");
         };
@@ -4891,6 +5028,7 @@ mod tests {
             ca_key_pem,
             verbose: false,
             chatgpt_chat_passthrough: true,
+            client_proof_dir: None,
         })
         .unwrap();
         let directory = tempfile::tempdir().unwrap();
@@ -4985,6 +5123,7 @@ mod tests {
             ca_key_pem,
             verbose: false,
             chatgpt_chat_passthrough: false,
+            client_proof_dir: None,
         })
         .unwrap();
         let body = b"{ \"model\":\"mock_native\",\"reasoning\":{\"effort\":\"high\"},\"future\":[null,true] }".to_vec();
@@ -5076,6 +5215,7 @@ mod tests {
                 ca_key_pem,
                 verbose: false,
                 chatgpt_chat_passthrough: true,
+                client_proof_dir: None,
             })
             .unwrap();
             let trace = tempfile::NamedTempFile::new().unwrap();
@@ -5202,6 +5342,7 @@ mod tests {
                 ca_key_pem,
                 verbose: false,
                 chatgpt_chat_passthrough: true,
+                client_proof_dir: None,
             })
             .unwrap();
             let request = IncomingRequest {
@@ -5341,6 +5482,7 @@ mod tests {
             ca_key_pem,
             verbose: false,
             chatgpt_chat_passthrough: true,
+            client_proof_dir: None,
         };
         let state = State::new(cfg.clone()).unwrap();
 
@@ -5724,6 +5866,7 @@ mod tests {
                 ca_key_pem,
                 verbose: false,
                 chatgpt_chat_passthrough: false,
+                client_proof_dir: None,
             })
             .unwrap(),
         );
@@ -5813,6 +5956,7 @@ mod tests {
             ca_key_pem,
             verbose: false,
             chatgpt_chat_passthrough: true,
+            client_proof_dir: None,
         })
         .err()
         .unwrap();
@@ -5836,5 +5980,208 @@ mod tests {
             "HTTP/1.0",
             Some("keep-alive")
         )));
+    }
+
+    fn verify_proof(proof: &ClientProof, header: &str, method: &str, target: &str, key: &str) {
+        use p256::ecdsa::signature::Verifier;
+        let parts = header.split('.').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 5, "{header}");
+        assert_eq!(parts[..2], ["v1", "cd_MOCKMOCKMOCKMOCKMOCK0"]);
+        let message =
+            client_proof::proof_message(method, target, parts[2].parse().unwrap(), parts[3], key);
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let public =
+            p256::ecdsa::VerifyingKey::from_sec1_bytes(&engine.decode(proof.public_key()).unwrap())
+                .unwrap();
+        let signature =
+            p256::ecdsa::Signature::from_slice(&engine.decode(parts[4]).unwrap()).unwrap();
+        public
+            .verify(message.as_bytes(), &signature)
+            .expect("client proof must verify");
+    }
+
+    async fn capture_gateway_requests(
+        count: usize,
+    ) -> (String, tokio::task::JoinHandle<Vec<IncomingRequest>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            for _ in 0..count {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                captured.push(read_http_request(&mut reader).await.unwrap());
+                reader
+                    .get_mut()
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await
+                    .unwrap();
+            }
+            captured
+        });
+        (base_url, server)
+    }
+
+    fn proof_test_state(
+        base_url: &str,
+        gateway: &str,
+        enrolled: bool,
+    ) -> (State, tempfile::TempDir) {
+        let (ca_cert_pem, ca_key_pem) = test_ca();
+        let directory = tempfile::tempdir().unwrap();
+        let state = State::new(Config {
+            listen: "127.0.0.1:0".into(),
+            base_url: base_url.to_string(),
+            api_key: "MOCK_ONLY_GATEWAY".into(),
+            claude: None,
+            codex: None,
+            ca_cert_pem,
+            ca_key_pem,
+            verbose: false,
+            chatgpt_chat_passthrough: true,
+            client_proof_dir: Some(directory.path().to_path_buf()),
+        })
+        .unwrap();
+        if enrolled {
+            let proof = state.client_proof.as_ref().unwrap();
+            proof
+                .record_device(gateway, "cd_MOCKMOCKMOCKMOCKMOCK0")
+                .unwrap();
+        }
+        (state, directory)
+    }
+
+    fn proof_request(target: &str, authorization: &str) -> IncomingRequest {
+        IncomingRequest {
+            method: "post".into(),
+            target: target.into(),
+            http_version: "HTTP/1.1".into(),
+            body: b"{}".to_vec(),
+            headers: vec![
+                ("Authorization".into(), authorization.into()),
+                ("X-Saiai-Client-Proof".into(), "v1.MOCK_SPOOFED".into()),
+                (
+                    "x-saiai-client-proof".into(),
+                    "v1.MOCK_SPOOFED_AGAIN".into(),
+                ),
+            ],
+        }
+    }
+
+    fn proof_headers(request: &IncomingRequest) -> Vec<&str> {
+        request
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(client_proof::HEADER_NAME))
+            .map(|(_, value)| value.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn gateway_http_requests_are_signed_fresh_for_every_attempt() {
+        let (base_url, server) = capture_gateway_requests(2).await;
+        // A path prefix in the Gateway base URL is part of the signed target.
+        let gateway = format!("{base_url}/prefix");
+        let (state, _directory) = proof_test_state(&gateway, &gateway, true);
+        for _ in 0..2 {
+            let (mut writer, mut output) = tokio::io::duplex(16_384);
+            forward_to_saiai(
+                &state,
+                &mut writer,
+                proof_request("/v1/responses?future=a%2Fb&x=", "Bearer MOCK_ONLY_CLIENT"),
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+            drop(writer);
+            output.read_to_end(&mut Vec::new()).await.unwrap();
+        }
+        let captured = server.await.unwrap();
+        let mut nonces = std::collections::HashSet::new();
+        for request in &captured {
+            assert_eq!(request.target, "/prefix/v1/responses?future=a%2Fb&x=");
+            let headers = proof_headers(request);
+            assert_eq!(headers.len(), 1, "client proof must not be relayed");
+            verify_proof(
+                state.client_proof.as_deref().unwrap(),
+                headers[0],
+                "POST",
+                &request.target,
+                "MOCK_ONLY_GATEWAY",
+            );
+            assert!(nonces.insert(headers[0].split('.').nth(3).unwrap().to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_client_bearer_is_the_signed_api_key() {
+        let (base_url, server) = capture_gateway_requests(1).await;
+        let (state, _directory) = proof_test_state(&base_url, &base_url, true);
+        let (mut writer, mut output) = tokio::io::duplex(16_384);
+        forward_to_saiai(
+            &state,
+            &mut writer,
+            proof_request("/v1/messages?beta=true", "Bearer MOCK_ONLY_CLAUDE_KEY"),
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        drop(writer);
+        output.read_to_end(&mut Vec::new()).await.unwrap();
+        let captured = server.await.unwrap();
+        assert_eq!(
+            header_value(&captured[0].headers, "authorization"),
+            Some("Bearer MOCK_ONLY_CLAUDE_KEY")
+        );
+        let headers = proof_headers(&captured[0]);
+        assert_eq!(headers.len(), 1);
+        verify_proof(
+            state.client_proof.as_deref().unwrap(),
+            headers[0],
+            "POST",
+            "/v1/messages?beta=true",
+            "MOCK_ONLY_CLAUDE_KEY",
+        );
+    }
+
+    #[tokio::test]
+    async fn unenrolled_gateway_requests_stay_unsigned_and_drop_client_proofs() {
+        for (enrolled, authorization) in [(false, "Bearer MOCK_ONLY_CLIENT"), (true, "Basic MOCK")]
+        {
+            let (base_url, server) = capture_gateway_requests(1).await;
+            let (state, _directory) = proof_test_state(&base_url, &base_url, enrolled);
+            let (mut writer, mut output) = tokio::io::duplex(16_384);
+            forward_to_saiai(
+                &state,
+                &mut writer,
+                proof_request("/v1/messages", authorization),
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+            drop(writer);
+            output.read_to_end(&mut Vec::new()).await.unwrap();
+            let captured = server.await.unwrap();
+            assert!(proof_headers(&captured[0]).is_empty());
+        }
+    }
+
+    #[test]
+    fn client_proof_is_never_relayed_on_any_outbound_path() {
+        for name in ["X-Saiai-Client-Proof", "x-saiai-client-proof"] {
+            assert!(!should_forward_request_header(name));
+            assert!(!should_forward_request_header_to_gateway(name, true));
+            assert!(!should_forward_request_header_to_gateway(name, false));
+            assert!(!should_forward_http_proxy_header(name));
+        }
+        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("bearer  abc "), Some("abc"));
+        assert_eq!(bearer_token("Basic abc"), None);
+        assert_eq!(bearer_token("Bearer"), None);
     }
 }

@@ -67,6 +67,21 @@ Windows/macOS 生命周期结果以对应 CI 为准。共享二进制更新不�
 此上限按请求计算，不代表整个进程的并发内存预算；超过 256 MiB 的上传尚不支持。
 合法请求的正文内容和原有转发协议保持不变，不截断、不改写 JSON。
 
+## 客户端校验（client proof v1，待发布）
+
+线协议见 [CLIENT_PROOF.md](CLIENT_PROOF.md)。本地代理在 SAIAI 配置目录保存一个
+ECDSA P-256 设备密钥（`client-device-key`，PKCS#8 PEM，unix 0600）和按 Gateway
+base URL 记录的设备状态（`client-device.json`），两者都原子写入；密钥损坏时生成
+新密钥（即新设备）并记录一次日志。代理启动后在后台向每个实际使用的 Gateway 注册
+一次（网络错误/404/5xx 按 1m、5m、30m 退避；429 本进程不再重试；403
+`client_device_revoked` 持久记录为已吊销并停止签名）。拿到 device_id 前及吊销后
+请求照常无签名转发；注册失败从不影响转发。
+
+发往 Gateway 的每次 HTTP 转发和 WebSocket 握手都按最终上游 URL 的 path+query
+重新签名（新的 ts/nonce），绑定实际发送的 Bearer 值；客户端自带的
+`X-Saiai-Client-Proof` 在所有出站路径上都会被丢弃。明文 HTTP 代理路径不发往
+Gateway，因此不签名。日志只包含 Gateway、device_id 和状态，不输出私钥或完整头。
+
 ## 当前 Desktop 和编辑器边界（1.1.49）
 
 启动入口仍是 `saiai desktop codex`；入口名称不等于内部只有一种协议。

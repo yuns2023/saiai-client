@@ -31,6 +31,7 @@ use url::Url;
 use uuid::Uuid;
 
 mod claude_launcher;
+mod client_proof;
 mod codex_daemon;
 mod codex_diagnostics;
 mod desktop_product;
@@ -3565,6 +3566,7 @@ fn run_local_proxy(verbose: bool) -> Result<()> {
         ca_key_pem,
         verbose,
         chatgpt_chat_passthrough: cfg.chatgpt_chat_passthrough,
+        client_proof_dir: saiai_config_dir().ok(),
     }))
 }
 

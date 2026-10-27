@@ -4,6 +4,8 @@ SAIAI Client `1.1.26` 使用托管本地代理模式。Claude Code 和 VSCode �
 级 `saiai` 代理访问 Gateway；`init-codex`、Codex CLI、Codex VSCode 扩展和
 Desktop 使用同一套 OAuth/local-proxy 配置。客户端不创建隔离 home 或 generation。
 
+SAIAI 服务仅支持通过官方客户端访问。绕过、伪造或复用客户端校验信息属于违规使用，可能导致账号被停用。
+
 ## 本分支的开发预览
 
 本分支用于生成测试站专用的 Actions 预览包，不代表当前正式版本已提供这些改动：
