@@ -515,13 +515,16 @@ impl ClientProof {
         // applies in memory for this process, but is not persisted.
         let file_lock = lock_state_dir(&self.dir);
         let device_path = self.dir.join(DEVICE_FILENAME);
+        // Disk IO happens before taking the in-memory lock: forwarding reads
+        // that lock and must never wait on a slow disk.
+        let on_disk = if file_lock.is_ok() {
+            read_device_file(&device_path, &self.public_key_sha256).unwrap_or_default()
+        } else {
+            Default::default()
+        };
         let gateways = {
             let mut gateways = self.lock();
-            if file_lock.is_ok() {
-                let on_disk =
-                    read_device_file(&device_path, &self.public_key_sha256).unwrap_or_default();
-                merge_devices(&mut gateways, on_disk);
-            }
+            merge_devices(&mut gateways, on_disk);
             change(gateways.entry(gateway.to_string()).or_default());
             gateways.clone()
         };
