@@ -300,6 +300,29 @@ fn create_key_file(path: &Path, key: &SigningKey) -> Result<bool> {
     }
 }
 
+/// Moves the corrupted key out of the way atomically. If another process
+/// replaced it with a valid key after we read it, that key is put back
+/// (no-replace) instead of being discarded.
+fn set_aside_corrupted_key(path: &Path, corrupted: &[u8]) -> Result<()> {
+    let aside = path.with_file_name(format!(
+        ".{KEY_FILENAME}.corrupt-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    match fs::rename(path, &aside) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to replace {}", path.display()));
+        }
+    }
+    if fs::read(&aside).is_ok_and(|moved| moved != corrupted) {
+        let _ = fs::hard_link(&aside, path);
+    }
+    let _ = fs::remove_file(&aside);
+    Ok(())
+}
+
 fn load_or_create_key(path: &Path) -> Result<SigningKey> {
     for _ in 0..3 {
         match fs::read(path) {
@@ -313,14 +336,7 @@ fn load_or_create_key(path: &Path) -> Result<SigningKey> {
                         "client proof: device key {} is unreadable ({err:#}); generating a new device key",
                         path.display()
                     );
-                    match fs::remove_file(path) {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(err) => {
-                            return Err(err)
-                                .with_context(|| format!("failed to replace {}", path.display()));
-                        }
-                    }
+                    set_aside_corrupted_key(path, &bytes)?;
                 }
             },
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -436,7 +452,13 @@ impl ClientProof {
     /// and process. On-demand claims (a Bearer not configured on any route)
     /// are bounded and skipped once a record exists.
     pub fn claim_enrollment(&self, gateway: &str, api_key: &str, on_demand: bool) -> bool {
-        if on_demand && self.device(gateway, api_key).is_some() {
+        // A cached active record is still re-checked once per process, so a
+        // revocation of an on-demand credential is noticed after restart.
+        if on_demand
+            && self
+                .device(gateway, api_key)
+                .is_some_and(|device| device.revoked)
+        {
             return false;
         }
         let mut claims = match self.enrollments.lock() {
@@ -900,6 +922,19 @@ mod tests {
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
+    #[test]
+    fn corrupted_recovery_keeps_a_valid_pem_written_meanwhile() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(KEY_FILENAME);
+        let valid = generate_signing_key().unwrap();
+        assert!(create_key_file(&path, &valid).unwrap());
+        // We read garbage earlier; the file now holds another process's key.
+        set_aside_corrupted_key(&path, b"garbage").unwrap();
+        let loaded = ClientProof::load(directory.path()).unwrap();
+        assert_eq!(loaded.public_key, public_key_b64url(&valid));
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn loose_device_pem_permissions_are_tightened() {
@@ -927,10 +962,17 @@ mod tests {
             assert!(proof.claim_enrollment(gateway, &format!("extra-{index}"), true));
         }
         assert!(!proof.claim_enrollment(gateway, "one-too-many", true));
-        proof
+        let fresh = ClientProof::load(tempfile::tempdir().unwrap().path()).unwrap();
+        fresh
             .record_device(gateway, "known", "cd_KNOWNKNOWNKNOWNKNOWN00")
             .unwrap();
-        assert!(!proof.claim_enrollment(gateway, "known", true));
+        fresh
+            .record_device(gateway, "gone", "cd_KNOWNKNOWNKNOWNKNOWN01")
+            .unwrap();
+        fresh.record_revoked(gateway, "gone").unwrap();
+        assert!(fresh.claim_enrollment(gateway, "known", true));
+        assert!(!fresh.claim_enrollment(gateway, "known", true));
+        assert!(!fresh.claim_enrollment(gateway, "gone", true));
     }
 
     #[test]

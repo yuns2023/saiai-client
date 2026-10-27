@@ -397,13 +397,15 @@ impl State {
                     return;
                 }
             };
-            let proof = Arc::clone(state.client_proof.get_or_init(|| proof));
+            // Claim the configured routes before publishing the key so they
+            // never count against the on-demand budget.
             for route in [
                 state.route_for_host(ANTHROPIC_HOST),
                 state.route_for_host(OPENAI_HOST),
             ] {
                 state.start_client_proof_enrollment(&proof, &route.base_url, &route.api_key, false);
             }
+            let _ = state.client_proof.set(proof);
         });
     }
 
@@ -429,9 +431,9 @@ impl State {
     }
 
     /// Proof header for one Gateway request attempt; `bearer` is the exact
-    /// API key carried in its `Authorization: Bearer` header. A Bearer with no
-    /// device record yet (e.g. a Claude credential that differs from the
-    /// configured route key) gets a bounded background enrollment.
+    /// API key carried in its `Authorization: Bearer` header. A Bearer not
+    /// enrolled by this process yet (e.g. a Claude credential that differs
+    /// from the configured route key) gets one bounded background enrollment.
     fn client_proof_header(
         &self,
         route: &UpstreamRoute,
@@ -441,11 +443,8 @@ impl State {
     ) -> Option<String> {
         let proof = self.client_proof.get()?;
         let bearer = bearer?;
-        let header = proof.sign_request(&route.base_url, method, target, bearer);
-        if header.is_none() && proof.device(&route.base_url, bearer).is_none() {
-            self.start_client_proof_enrollment(proof, &route.base_url, bearer, true);
-        }
-        header
+        self.start_client_proof_enrollment(proof, &route.base_url, bearer, true);
+        proof.sign_request(&route.base_url, method, target, bearer)
     }
 
     fn tls_config_for_host(&self, host: &str) -> Result<Arc<ServerConfig>> {
