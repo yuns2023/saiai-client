@@ -77,5 +77,12 @@ fail open, short timeout).
   `client-device-key` and `client-device.json`. The JSON is client-local; it records
   `gateways[<base url>][<sha256(api key)>] = { device_id, revoked }` so several gateways
   and several users of one gateway can coexist.
+- Key creation/recovery and every `client-device.json` read-merge-write happen under an
+  exclusive OS file lock on `client-device.lock` (background threads only; if locking
+  fails, proofs are disabled for that process). A corrupted key is kept as
+  `client-device-key.corrupt` and replaced by a new key (a new device).
+- Each Bearer is enrolled at most once per process. Bearers not configured on a route are
+  enrolled on demand; beyond 16 distinct unconfigured Bearers per process, later ones stay
+  unsigned until restart.
 - Recovery from revocation (or to start over as a new device): stop the local proxy,
   delete both files, and start it again. A new key is generated and enrolled.

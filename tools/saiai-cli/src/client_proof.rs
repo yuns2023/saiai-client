@@ -17,7 +17,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -33,12 +32,13 @@ macro_rules! eprintln {
 pub const HEADER_NAME: &str = "x-saiai-client-proof";
 const MESSAGE_DOMAIN: &str = "saiai-client-proof-v1";
 const KEY_FILENAME: &str = "client-device-key";
+const LOCK_FILENAME: &str = "client-device.lock";
 const DEVICE_FILENAME: &str = "client-device.json";
 const ENROLL_PATH: &str = "/api/v1/client/devices/enroll";
 const ENROLL_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_ENROLL_RESPONSE_BYTES: usize = 16 * 1024;
 /// Extra credentials (Bearers not configured on a route) enrolled on demand.
-const MAX_ON_DEMAND_ENROLLMENTS: usize = 4;
+const MAX_ON_DEMAND_ENROLLMENTS: usize = 16;
 const PEM_BEGIN: &str = "-----BEGIN PRIVATE KEY-----";
 const PEM_END: &str = "-----END PRIVATE KEY-----";
 /// Retry delays for network/5xx enrollment failures; the last value repeats.
@@ -267,90 +267,54 @@ fn parse_key_file(bytes: &[u8]) -> Result<SigningKey> {
         .and_then(decode_private_key_pem)
 }
 
-/// Creates `path` only if absent (temp file + hard link, which never replaces
-/// an existing key). Returns `false` when another process created it first.
-fn create_key_file(path: &Path, key: &SigningKey) -> Result<bool> {
-    let pem = encode_private_key_pem(key)?;
-    let parent = path
-        .parent()
-        .context("failed to resolve client device key directory")?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    let tmp = parent.join(format!(
-        ".{KEY_FILENAME}.saiai-tmp-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4().simple()
-    ));
+/// Exclusive cross-process lock (`File::lock`: flock / LockFileEx) on
+/// `<dir>/client-device.lock`, held around key creation/recovery and every
+/// device-file read-merge-write. Only taken on background threads; released
+/// when the returned file is dropped.
+fn lock_state_dir(dir: &Path) -> Result<fs::File> {
+    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let path = dir.join(LOCK_FILENAME);
     let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+    options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let written = options.open(&tmp).and_then(|mut file| {
-        file.write_all(pem.as_bytes())?;
-        file.sync_all()
-    });
-    let linked = written.and_then(|()| fs::hard_link(&tmp, path));
-    let _ = fs::remove_file(&tmp);
-    match linked {
-        Ok(()) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(err) => Err(err).with_context(|| format!("failed to create {}", path.display())),
-    }
+    let file = options
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("failed to lock {}", path.display()))?;
+    Ok(file)
 }
 
-/// Moves the corrupted key out of the way atomically. If another process
-/// replaced it with a valid key after we read it, that key is put back
-/// (no-replace) instead of being discarded.
-fn set_aside_corrupted_key(path: &Path, corrupted: &[u8]) -> Result<()> {
-    let aside = path.with_file_name(format!(
-        ".{KEY_FILENAME}.corrupt-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4().simple()
-    ));
-    match fs::rename(path, &aside) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to replace {}", path.display()));
-        }
-    }
-    if fs::read(&aside).is_ok_and(|moved| moved != corrupted) {
-        let _ = fs::hard_link(&aside, path);
-    }
-    let _ = fs::remove_file(&aside);
-    Ok(())
-}
-
+/// Caller holds `lock_state_dir`. A corrupted key is kept aside as
+/// `client-device-key.corrupt` and replaced by a new key (a new device).
 fn load_or_create_key(path: &Path) -> Result<SigningKey> {
-    for _ in 0..3 {
-        match fs::read(path) {
-            Ok(bytes) => match parse_key_file(&bytes) {
-                Ok(key) => {
-                    ensure_private_mode(path)?;
-                    return Ok(key);
-                }
-                Err(err) => {
-                    eprintln!(
-                        "client proof: device key {} is unreadable ({err:#}); generating a new device key",
-                        path.display()
-                    );
-                    set_aside_corrupted_key(path, &bytes)?;
-                }
-            },
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| format!("failed to read {}", path.display()));
+    match fs::read(path) {
+        Ok(bytes) => match parse_key_file(&bytes) {
+            Ok(key) => {
+                ensure_private_mode(path)?;
+                return Ok(key);
             }
-        }
-        let key = generate_signing_key()?;
-        if create_key_file(path, &key)? {
-            return Ok(key);
-        }
-        // Another process created the key first; use theirs.
+            Err(err) => {
+                eprintln!(
+                    "client proof: device key {} is unreadable ({err:#}); generating a new device key",
+                    path.display()
+                );
+                let aside = path.with_file_name(format!("{KEY_FILENAME}.corrupt"));
+                fs::rename(path, &aside)
+                    .with_context(|| format!("failed to set aside {}", path.display()))?;
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
     }
-    bail!("failed to create client device key {}", path.display())
+    let key = generate_signing_key()?;
+    let pem = encode_private_key_pem(&key)?;
+    super::write_bytes_atomic(path, pem.as_bytes(), 0o600)?;
+    Ok(key)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -404,9 +368,6 @@ pub struct ClientProof {
     public_key: String,
     public_key_sha256: String,
     gateways: Mutex<DeviceMap>,
-    // Serializes device-file writes without holding `gateways`, so signing
-    // never waits on disk I/O.
-    persist: Mutex<()>,
     enrollments: Mutex<EnrollmentClaims>,
 }
 
@@ -429,6 +390,7 @@ impl ClientProof {
     /// Loads (or creates) the device key and per-Gateway device records under
     /// `dir`. An unreadable key is replaced by a new one, i.e. a new device.
     pub fn load(dir: &Path) -> Result<Self> {
+        let _lock = lock_state_dir(dir)?;
         let key = load_or_create_key(&dir.join(KEY_FILENAME))?;
         let public_point = key.verifying_key().to_encoded_point(false);
         let public_key_sha256 = format!("{:x}", Sha256::digest(public_point.as_bytes()));
@@ -443,7 +405,6 @@ impl ClientProof {
             key,
             public_key_sha256,
             gateways: Mutex::new(gateways),
-            persist: Mutex::new(()),
             enrollments: Mutex::new(EnrollmentClaims::default()),
         })
     }
@@ -549,19 +510,22 @@ impl ClientProof {
         gateway: &str,
         change: impl FnOnce(&mut BTreeMap<String, GatewayDevice>),
     ) -> Result<()> {
-        let _persist = match self.persist.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        // Re-read first so records written by another proxy process survive.
+        // Read-merge-write under the cross-process lock so records written
+        // by another proxy process survive. Without the lock the change still
+        // applies in memory for this process, but is not persisted.
+        let file_lock = lock_state_dir(&self.dir);
         let device_path = self.dir.join(DEVICE_FILENAME);
-        let on_disk = read_device_file(&device_path, &self.public_key_sha256).unwrap_or_default();
         let gateways = {
             let mut gateways = self.lock();
-            merge_devices(&mut gateways, on_disk);
+            if file_lock.is_ok() {
+                let on_disk =
+                    read_device_file(&device_path, &self.public_key_sha256).unwrap_or_default();
+                merge_devices(&mut gateways, on_disk);
+            }
             change(gateways.entry(gateway.to_string()).or_default());
             gateways.clone()
         };
+        let _file_lock = file_lock?;
         let file = DeviceFile {
             public_key_sha256: self.public_key_sha256.clone(),
             gateways,
@@ -858,6 +822,10 @@ mod tests {
             .unwrap();
         fs::write(directory.path().join(KEY_FILENAME), "not a key").unwrap();
         let second = ClientProof::load(directory.path()).unwrap();
+        assert_eq!(
+            fs::read(directory.path().join(format!("{KEY_FILENAME}.corrupt"))).unwrap(),
+            b"not a key"
+        );
         assert_ne!(first.public_key, second.public_key);
         assert_eq!(second.device("https://gw.example", "k"), None);
         fs::write(directory.path().join(DEVICE_FILENAME), "{").unwrap();
@@ -910,29 +878,38 @@ mod tests {
     }
 
     #[test]
-    fn device_pem_creation_never_replaces_an_existing_file() {
+    fn concurrent_first_runs_converge_on_one_device_pem() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(KEY_FILENAME);
-        let first = generate_signing_key().unwrap();
-        let second = generate_signing_key().unwrap();
-        assert!(create_key_file(&path, &first).unwrap());
-        assert!(!create_key_file(&path, &second).unwrap());
+        let loaders = (0..8)
+            .map(|_| {
+                let dir = directory.path().to_path_buf();
+                std::thread::spawn(move || ClientProof::load(&dir).unwrap().public_key)
+            })
+            .collect::<Vec<_>>();
+        let keys = loaders
+            .into_iter()
+            .map(|loader| loader.join().unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(keys.len(), 1);
         let loaded = ClientProof::load(directory.path()).unwrap();
-        assert_eq!(loaded.public_key, public_key_b64url(&first));
-        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert!(keys.contains(&loaded.public_key));
     }
 
     #[test]
-    fn corrupted_recovery_keeps_a_valid_pem_written_meanwhile() {
+    fn state_lock_is_exclusive_across_handles() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(KEY_FILENAME);
-        let valid = generate_signing_key().unwrap();
-        assert!(create_key_file(&path, &valid).unwrap());
-        // We read garbage earlier; the file now holds another process's key.
-        set_aside_corrupted_key(&path, b"garbage").unwrap();
-        let loaded = ClientProof::load(directory.path()).unwrap();
-        assert_eq!(loaded.public_key, public_key_b64url(&valid));
-        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        let held = lock_state_dir(directory.path()).unwrap();
+        let dir = directory.path().to_path_buf();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let loader = std::thread::spawn(move || {
+            let proof = ClientProof::load(&dir).unwrap();
+            done_tx.send(()).unwrap();
+            proof.public_key
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(300)).is_err());
+        drop(held);
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        loader.join().unwrap();
     }
 
     #[cfg(unix)]
