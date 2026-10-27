@@ -15,9 +15,19 @@ import threading
 import time
 
 
+# Client-proof device enrollment (docs/CLIENT_PROOF.md) runs in the background
+# and is not part of the forwarded traffic this test inspects.
+ENROLL_PATH = "/api/v1/client/devices/enroll"
+
+
 class Gateway(BaseHTTPRequestHandler):
     def do_POST(self):
         self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        if self.path.split("?", 1)[0] == ENROLL_PATH:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.server.seen.append((self.path, self.headers.get("Authorization"), self.headers.get("x-api-key")))
         body = b'{"ok":true}'
         self.send_response(200)

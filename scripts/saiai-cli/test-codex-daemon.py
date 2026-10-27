@@ -18,6 +18,11 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# The local proxy's client-proof device enrollment (docs/CLIENT_PROOF.md) is
+# the only POST the fixture accepts; every other POST is a generation request.
+ENROLL_PATH = "/api/v1/client/devices/enroll"
+FIXTURE_DEVICE_ID = "cd_TESTONLYDAEMONFIXTURE0"
+
 
 class Control:
     def __init__(self, home):
@@ -185,7 +190,19 @@ def main():
             self.wfile.write(body)
 
         def do_POST(self):
-            requests.append(("POST", self.path.split("?", 1)[0]))
+            path = self.path.split("?", 1)[0]
+            requests.append(("POST", path))
+            if path == ENROLL_PATH:
+                # Enroll successfully so the official Codex traffic below
+                # also runs through the signing path.
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                body = json.dumps({"device_id": FIXTURE_DEVICE_ID, "status": "active"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             self.send_response(403)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -256,7 +273,8 @@ def main():
                 output = invoke(binary, setup, environment)
                 assert "Codex daemon has loaded sessions; left running" in output
                 assert control.call("thread/loaded/list", {})["data"]
-                assert not any(method == "POST" for method, _ in requests), "unexpected generation request reached fixture"
+                generation = [path for method, path in requests if method == "POST" and path != ENROLL_PATH]
+                assert not generation, f"unexpected generation request reached fixture: {generation}"
                 print("Official Codex 0.162.1: stale auth detected, idle daemon refreshed, plain TUI passed, loaded session preserved; model requests=0")
             finally:
                 if control:
