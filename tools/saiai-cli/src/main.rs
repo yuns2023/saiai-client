@@ -3649,12 +3649,43 @@ fn run_service_start() -> Result<()> {
     }
     run_launchctl(&["enable", &target])?;
     run_launchctl(&["kickstart", "-k", &target])?;
+    // kickstart can return before the restarted proxy binds. Report "started"
+    // only once it listens, so an immediately following init sees the managed
+    // listener instead of racing it and reallocating the port.
+    if !wait_for_local_listener(&cfg.listen, MACOS_LISTENER_READY_TIMEOUT) {
+        eprintln!(
+            "SAIAI LaunchAgent was started but is not listening on {} yet; check `saiai logs`.",
+            cfg.listen
+        );
+    }
     println!("SAIAI LaunchAgent started.");
     println!("Service: {}", plist_path.display());
     println!("Listening: http://{}", cfg.listen);
     println!("Status: saiai status");
     println!("Logs: saiai logs");
     Ok(())
+}
+
+// launchd may hold a respawn for its 10 s throttle interval after a recent
+// start; allow for that plus process startup.
+#[cfg(target_os = "macos")]
+const MACOS_LISTENER_READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[cfg(target_os = "macos")]
+fn wait_for_local_listener(listen: &str, wait: Duration) -> bool {
+    let Ok(addr) = listen.parse::<SocketAddr>() else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[cfg(target_os = "windows")]
