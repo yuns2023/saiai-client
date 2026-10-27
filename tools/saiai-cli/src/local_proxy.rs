@@ -144,7 +144,9 @@ struct State {
     client: Client,
     certs: Mutex<HashMap<String, ManagedCertificate>>,
     openai_trace: Option<Arc<OpenAITrace>>,
-    client_proof: Option<Arc<ClientProof>>,
+    client_proof_dir: Option<std::path::PathBuf>,
+    // Set by the background loader; until then requests are sent unsigned.
+    client_proof: std::sync::OnceLock<Arc<ClientProof>>,
 }
 
 struct UpstreamRoute {
@@ -357,16 +359,6 @@ impl State {
         // process. It never enables body tracing; verbose records remain
         // limited to request metadata and response outcomes.
         let verbose = cfg.verbose || env::var("SAIAI_PROXY_VERBOSE").ok().as_deref() == Some("1");
-        // Client proof is best effort: without a usable device key the proxy
-        // forwards exactly as before, just without the proof header.
-        let client_proof = cfg.client_proof_dir.as_deref().and_then(|dir| {
-            ClientProof::load(dir)
-                .map(Arc::new)
-                .map_err(|err| {
-                    eprintln!("client proof disabled: {err:#}");
-                })
-                .ok()
-        });
 
         Ok(Self {
             listen: cfg.listen,
@@ -380,34 +372,66 @@ impl State {
             client,
             certs: Mutex::new(HashMap::new()),
             openai_trace,
-            client_proof,
+            client_proof_dir: cfg.client_proof_dir,
+            client_proof: std::sync::OnceLock::new(),
         })
     }
 
-    /// Starts one background enrollment per distinct Gateway actually used
-    /// by the Claude and Codex routes. Never blocks or fails the proxy.
-    fn spawn_client_proof_enrollment(&self) {
-        let Some(proof) = &self.client_proof else {
+    /// Loads the device key and enrolls with each Gateway used by the Claude
+    /// and Codex routes, all in the background. Client proof is best effort:
+    /// until the key is ready, or if it is unusable, requests go unsigned.
+    fn spawn_client_proof_enrollment(self: &Arc<Self>) {
+        let Some(dir) = self.client_proof_dir.clone() else {
             return;
         };
-        let mut gateways = std::collections::HashSet::new();
-        for route in [
-            self.route_for_host(ANTHROPIC_HOST),
-            self.route_for_host(OPENAI_HOST),
-        ] {
-            if gateways.insert((route.base_url.as_str(), route.api_key.as_str())) {
-                tokio::spawn(Arc::clone(proof).enroll(
-                    self.client.clone(),
-                    route.base_url.clone(),
-                    route.api_key.clone(),
-                    &client_proof::ENROLL_BACKOFF,
-                ));
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let proof = match tokio::task::spawn_blocking(move || ClientProof::load(&dir)).await {
+                Ok(Ok(proof)) => Arc::new(proof),
+                Ok(Err(err)) => {
+                    eprintln!("client proof disabled: {err:#}");
+                    return;
+                }
+                Err(err) => {
+                    eprintln!("client proof disabled: {err}");
+                    return;
+                }
+            };
+            let proof = Arc::clone(state.client_proof.get_or_init(|| proof));
+            for route in [
+                state.route_for_host(ANTHROPIC_HOST),
+                state.route_for_host(OPENAI_HOST),
+            ] {
+                state.start_client_proof_enrollment(&proof, &route.base_url, &route.api_key, false);
             }
+        });
+    }
+
+    fn start_client_proof_enrollment(
+        &self,
+        proof: &Arc<ClientProof>,
+        gateway: &str,
+        api_key: &str,
+        on_demand: bool,
+    ) {
+        if !proof.claim_enrollment(gateway, api_key, on_demand) {
+            return;
         }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(Arc::clone(proof).enroll(
+            self.client.clone(),
+            gateway.to_string(),
+            Zeroizing::new(api_key.to_string()),
+            &client_proof::ENROLL_BACKOFF,
+        ));
     }
 
     /// Proof header for one Gateway request attempt; `bearer` is the exact
-    /// API key carried in its `Authorization: Bearer` header.
+    /// API key carried in its `Authorization: Bearer` header. A Bearer with no
+    /// device record yet (e.g. a Claude credential that differs from the
+    /// configured route key) gets a bounded background enrollment.
     fn client_proof_header(
         &self,
         route: &UpstreamRoute,
@@ -415,8 +439,13 @@ impl State {
         target: &str,
         bearer: Option<&str>,
     ) -> Option<String> {
-        let proof = self.client_proof.as_ref()?;
-        proof.sign_request(&route.base_url, method, target, bearer?)
+        let proof = self.client_proof.get()?;
+        let bearer = bearer?;
+        let header = proof.sign_request(&route.base_url, method, target, bearer);
+        if header.is_none() && proof.device(&route.base_url, bearer).is_none() {
+            self.start_client_proof_enrollment(proof, &route.base_url, bearer, true);
+        }
+        header
     }
 
     fn tls_config_for_host(&self, host: &str) -> Result<Arc<ServerConfig>> {
@@ -1084,11 +1113,13 @@ fn build_openai_websocket_request(
         .uri()
         .path_and_query()
         .map_or_else(|| "/".to_string(), |target| target.as_str().to_string());
-    if let Some(proof) = sign(upstream_request.method().as_str(), &target) {
-        upstream_request.headers_mut().insert(
-            HeaderName::from_static(client_proof::HEADER_NAME),
-            HeaderValue::from_str(&proof).context("invalid client proof header")?,
-        );
+    // Like HTTP, a proof that cannot be encoded is skipped, never fatal.
+    if let Some(proof) = sign(upstream_request.method().as_str(), &target)
+        && let Ok(value) = HeaderValue::from_str(&proof)
+    {
+        upstream_request
+            .headers_mut()
+            .insert(HeaderName::from_static(client_proof::HEADER_NAME), value);
     }
 
     Ok(upstream_request)
@@ -5986,7 +6017,7 @@ mod tests {
         use p256::ecdsa::signature::Verifier;
         let parts = header.split('.').collect::<Vec<_>>();
         assert_eq!(parts.len(), 5, "{header}");
-        assert_eq!(parts[..2], ["v1", "cd_MOCKMOCKMOCKMOCKMOCK0"]);
+        assert_eq!(parts[..2], ["v1", "cd_MOCKMOCKMOCKMOCKMOCK00"]);
         let message =
             client_proof::proof_message(method, target, parts[2].parse().unwrap(), parts[3], key);
         let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -6000,26 +6031,33 @@ mod tests {
             .expect("client proof must verify");
     }
 
+    /// Captures `count` forwarded requests and at least `enrolls` device
+    /// enrollments (answered 429 so they stop); returns (forwarded, enrolls).
     async fn capture_gateway_requests(
         count: usize,
-    ) -> (String, tokio::task::JoinHandle<Vec<IncomingRequest>>) {
+        enrolls: usize,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<(Vec<IncomingRequest>, Vec<IncomingRequest>)>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            let mut captured = Vec::new();
-            for _ in 0..count {
+            let (mut captured, mut enrollments) = (Vec::new(), Vec::new());
+            while captured.len() < count || enrollments.len() < enrolls {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut reader = BufReader::new(stream);
-                captured.push(read_http_request(&mut reader).await.unwrap());
-                reader
-                    .get_mut()
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-                    )
-                    .await
-                    .unwrap();
+                let request = read_http_request(&mut reader).await.unwrap();
+                let response: &[u8] = if request.target.ends_with("/client/devices/enroll") {
+                    enrollments.push(request);
+                    b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                } else {
+                    captured.push(request);
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                };
+                reader.get_mut().write_all(response).await.unwrap();
             }
-            captured
+            (captured, enrollments)
         });
         (base_url, server)
     }
@@ -6044,10 +6082,11 @@ mod tests {
             client_proof_dir: Some(directory.path().to_path_buf()),
         })
         .unwrap();
+        let proof = Arc::new(ClientProof::load(directory.path()).unwrap());
+        state.client_proof.set(Arc::clone(&proof)).unwrap();
         if let Some(key) = enrolled_key {
-            let proof = state.client_proof.as_ref().unwrap();
             proof
-                .record_device(gateway, key, "cd_MOCKMOCKMOCKMOCKMOCK0")
+                .record_device(gateway, key, "cd_MOCKMOCKMOCKMOCKMOCK00")
                 .unwrap();
         }
         (state, directory)
@@ -6081,7 +6120,7 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_http_requests_are_signed_fresh_for_every_attempt() {
-        let (base_url, server) = capture_gateway_requests(2).await;
+        let (base_url, server) = capture_gateway_requests(2, 0).await;
         // A path prefix in the Gateway base URL is part of the signed target.
         let gateway = format!("{base_url}/prefix");
         let (state, _directory) = proof_test_state(&gateway, &gateway, Some("MOCK_ONLY_GATEWAY"));
@@ -6100,14 +6139,14 @@ mod tests {
             drop(writer);
             output.read_to_end(&mut Vec::new()).await.unwrap();
         }
-        let captured = server.await.unwrap();
+        let (captured, _) = server.await.unwrap();
         let mut nonces = std::collections::HashSet::new();
         for (request, target) in captured.iter().zip(targets) {
             assert_eq!(request.target, format!("/prefix{target}"));
             let headers = proof_headers(request);
             assert_eq!(headers.len(), 1, "client proof must not be relayed");
             verify_proof(
-                state.client_proof.as_deref().unwrap(),
+                state.client_proof.get().unwrap(),
                 headers[0],
                 "POST",
                 &request.target,
@@ -6119,7 +6158,7 @@ mod tests {
 
     #[tokio::test]
     async fn claude_client_bearer_is_the_signed_api_key() {
-        let (base_url, server) = capture_gateway_requests(1).await;
+        let (base_url, server) = capture_gateway_requests(1, 0).await;
         let (state, _directory) =
             proof_test_state(&base_url, &base_url, Some("MOCK_ONLY_CLAUDE_KEY"));
         let (mut writer, mut output) = tokio::io::duplex(16_384);
@@ -6134,7 +6173,7 @@ mod tests {
         .unwrap();
         drop(writer);
         output.read_to_end(&mut Vec::new()).await.unwrap();
-        let captured = server.await.unwrap();
+        let (captured, _) = server.await.unwrap();
         assert_eq!(
             header_value(&captured[0].headers, "authorization"),
             Some("Bearer MOCK_ONLY_CLAUDE_KEY")
@@ -6142,7 +6181,7 @@ mod tests {
         let headers = proof_headers(&captured[0]);
         assert_eq!(headers.len(), 1);
         verify_proof(
-            state.client_proof.as_deref().unwrap(),
+            state.client_proof.get().unwrap(),
             headers[0],
             "POST",
             "/v1/messages?beta=true",
@@ -6154,12 +6193,13 @@ mod tests {
     async fn unenrolled_gateway_requests_stay_unsigned_and_drop_client_proofs() {
         // Not enrolled; a non-Bearer credential; a Bearer of another
         // (unenrolled) user on the same Gateway.
-        for (enrolled, authorization) in [
-            (None, "Bearer MOCK_ONLY_CLIENT"),
-            (Some("MOCK_ONLY_GATEWAY"), "Basic MOCK"),
-            (Some("MOCK_ONLY_GATEWAY"), "Bearer MOCK_ONLY_OTHER_USER"),
+        // An unknown Bearer is enrolled on demand in the background.
+        for (enrolled, authorization, enrolls) in [
+            (None, "Bearer MOCK_ONLY_CLIENT", 1),
+            (Some("MOCK_ONLY_GATEWAY"), "Basic MOCK", 0),
+            (Some("MOCK_ONLY_GATEWAY"), "Bearer MOCK_ONLY_OTHER_USER", 1),
         ] {
-            let (base_url, server) = capture_gateway_requests(1).await;
+            let (base_url, server) = capture_gateway_requests(1, enrolls).await;
             let (state, _directory) = proof_test_state(&base_url, &base_url, enrolled);
             let (mut writer, mut output) = tokio::io::duplex(16_384);
             forward_to_saiai(
@@ -6173,9 +6213,55 @@ mod tests {
             .unwrap();
             drop(writer);
             output.read_to_end(&mut Vec::new()).await.unwrap();
-            let captured = server.await.unwrap();
+            let (captured, enrollments) = timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
             assert!(proof_headers(&captured[0]).is_empty());
+            assert_eq!(enrollments.len(), enrolls);
+            for enrollment in enrollments {
+                assert_eq!(
+                    header_value(&enrollment.headers, "authorization"),
+                    Some(authorization)
+                );
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn device_pem_loads_in_background_after_state_creation() {
+        let (base_url, server) = capture_gateway_requests(0, 1).await;
+        let (ca_cert_pem, ca_key_pem) = test_ca();
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            State::new(Config {
+                listen: "127.0.0.1:0".into(),
+                base_url,
+                api_key: "MOCK_ONLY_GATEWAY".into(),
+                claude: None,
+                codex: None,
+                ca_cert_pem,
+                ca_key_pem,
+                verbose: false,
+                chatgpt_chat_passthrough: true,
+                client_proof_dir: Some(directory.path().to_path_buf()),
+            })
+            .unwrap(),
+        );
+        // No disk work happens before the listener starts.
+        assert!(state.client_proof.get().is_none());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+        state.spawn_client_proof_enrollment();
+        let (_, enrollments) = timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            header_value(&enrollments[0].headers, "authorization"),
+            Some("Bearer MOCK_ONLY_GATEWAY")
+        );
+        assert!(state.client_proof.get().is_some());
+        assert!(directory.path().join("client-device-key").exists());
     }
 
     #[test]

@@ -15,8 +15,9 @@ use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
-use std::fs;
+use std::collections::{BTreeMap, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -36,7 +37,8 @@ const DEVICE_FILENAME: &str = "client-device.json";
 const ENROLL_PATH: &str = "/api/v1/client/devices/enroll";
 const ENROLL_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_ENROLL_RESPONSE_BYTES: usize = 16 * 1024;
-const MAX_DEVICE_ID_LEN: usize = 64;
+/// Extra credentials (Bearers not configured on a route) enrolled on demand.
+const MAX_ON_DEMAND_ENROLLMENTS: usize = 4;
 const PEM_BEGIN: &str = "-----BEGIN PRIVATE KEY-----";
 const PEM_END: &str = "-----END PRIVATE KEY-----";
 /// Retry delays for network/5xx enrollment failures; the last value repeats.
@@ -96,10 +98,16 @@ pub fn wire_target(url: &Url) -> String {
     target
 }
 
-fn random_nonce() -> String {
+/// Fallible OS randomness: an RNG failure means "no signature", never a
+/// panic inside a forwarding task.
+fn os_random(dest: &mut [u8]) -> bool {
+    use rand::TryRng;
+    rand::rngs::SysRng.try_fill_bytes(dest).is_ok()
+}
+
+fn random_nonce() -> Option<String> {
     let mut bytes = [0_u8; 16];
-    rand::fill(&mut bytes);
-    b64url(&bytes)
+    os_random(&mut bytes).then(|| b64url(&bytes))
 }
 
 fn now_unix() -> u64 {
@@ -109,15 +117,18 @@ fn now_unix() -> u64 {
         .unwrap_or_default()
 }
 
-fn generate_signing_key() -> SigningKey {
-    loop {
+fn generate_signing_key() -> Result<SigningKey> {
+    for _ in 0..16 {
         let mut seed = Zeroizing::new([0_u8; 32]);
-        rand::fill(seed.as_mut_slice());
+        if !os_random(seed.as_mut_slice()) {
+            bail!("operating system random number generator failed");
+        }
         // Rejects the negligible zero/out-of-range scalar.
         if let Ok(key) = SigningKey::from_slice(seed.as_slice()) {
-            return key;
+            return Ok(key);
         }
     }
+    bail!("failed to generate a client device key")
 }
 
 fn encode_private_key_pem(key: &SigningKey) -> Result<Zeroizing<String>> {
@@ -158,12 +169,14 @@ pub fn decode_private_key_pem(pem: &str) -> Result<SigningKey> {
     Ok(SigningKey::from(&secret))
 }
 
+/// `cd_` + base64url(16 bytes) (contract §2).
 fn valid_device_id(device_id: &str) -> bool {
-    !device_id.is_empty()
-        && device_id.len() <= MAX_DEVICE_ID_LEN
-        && device_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    device_id.strip_prefix("cd_").is_some_and(|id| {
+        id.len() == 22
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +202,139 @@ struct DeviceFile {
 
 fn credential_id(api_key: &str) -> String {
     format!("{:x}", Sha256::digest(api_key.as_bytes()))
+}
+
+/// Reads persisted records for `public_key_sha256`, dropping malformed ones.
+fn read_device_file(path: &Path, public_key_sha256: &str) -> Result<DeviceMap> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(DeviceMap::new()),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let file: DeviceFile = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    // Device ids belong to one public key; a new key is a new device.
+    if file.public_key_sha256 != public_key_sha256 {
+        return Ok(DeviceMap::new());
+    }
+    let mut gateways = file.gateways;
+    for records in gateways.values_mut() {
+        records.retain(|_, device| match device.device_id.as_deref() {
+            Some(device_id) => valid_device_id(device_id),
+            None => device.revoked,
+        });
+    }
+    gateways.retain(|_, records| !records.is_empty());
+    Ok(gateways)
+}
+
+/// Adds records written by another process; revocation is sticky.
+fn merge_devices(target: &mut DeviceMap, other: DeviceMap) {
+    for (gateway, records) in other {
+        let current = target.entry(gateway).or_default();
+        for (credential, device) in records {
+            let entry = current.entry(credential).or_insert_with(|| device.clone());
+            entry.revoked |= device.revoked;
+            if entry.device_id.is_none() {
+                entry.device_id = device.device_id;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn ensure_private_mode(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?
+        .permissions()
+        .mode();
+    if mode & 0o077 != 0 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to protect {}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_mode(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn parse_key_file(bytes: &[u8]) -> Result<SigningKey> {
+    std::str::from_utf8(bytes)
+        .context("client device key is not UTF-8")
+        .and_then(decode_private_key_pem)
+}
+
+/// Creates `path` only if absent (temp file + hard link, which never replaces
+/// an existing key). Returns `false` when another process created it first.
+fn create_key_file(path: &Path, key: &SigningKey) -> Result<bool> {
+    let pem = encode_private_key_pem(key)?;
+    let parent = path
+        .parent()
+        .context("failed to resolve client device key directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let tmp = parent.join(format!(
+        ".{KEY_FILENAME}.saiai-tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let written = options.open(&tmp).and_then(|mut file| {
+        file.write_all(pem.as_bytes())?;
+        file.sync_all()
+    });
+    let linked = written.and_then(|()| fs::hard_link(&tmp, path));
+    let _ = fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("failed to create {}", path.display())),
+    }
+}
+
+fn load_or_create_key(path: &Path) -> Result<SigningKey> {
+    for _ in 0..3 {
+        match fs::read(path) {
+            Ok(bytes) => match parse_key_file(&bytes) {
+                Ok(key) => {
+                    ensure_private_mode(path)?;
+                    return Ok(key);
+                }
+                Err(err) => {
+                    eprintln!(
+                        "client proof: device key {} is unreadable ({err:#}); generating a new device key",
+                        path.display()
+                    );
+                    match fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => {
+                            return Err(err)
+                                .with_context(|| format!("failed to replace {}", path.display()));
+                        }
+                    }
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to read {}", path.display()));
+            }
+        }
+        let key = generate_signing_key()?;
+        if create_key_file(path, &key)? {
+            return Ok(key);
+        }
+        // Another process created the key first; use theirs.
+    }
+    bail!("failed to create client device key {}", path.display())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -245,6 +391,13 @@ pub struct ClientProof {
     // Serializes device-file writes without holding `gateways`, so signing
     // never waits on disk I/O.
     persist: Mutex<()>,
+    enrollments: Mutex<EnrollmentClaims>,
+}
+
+#[derive(Default)]
+struct EnrollmentClaims {
+    claimed: HashSet<(String, String)>,
+    on_demand: usize,
 }
 
 impl std::fmt::Debug for ClientProof {
@@ -260,44 +413,14 @@ impl ClientProof {
     /// Loads (or creates) the device key and per-Gateway device records under
     /// `dir`. An unreadable key is replaced by a new one, i.e. a new device.
     pub fn load(dir: &Path) -> Result<Self> {
-        let key_path = dir.join(KEY_FILENAME);
-        let key = match fs::read(&key_path) {
-            Ok(pem) => match std::str::from_utf8(&pem)
-                .context("client device key is not UTF-8")
-                .and_then(decode_private_key_pem)
-            {
-                Ok(key) => key,
-                Err(err) => {
-                    eprintln!(
-                        "client proof: device key {} is unreadable ({err:#}); generating a new device key",
-                        key_path.display()
-                    );
-                    write_new_key(&key_path)?
-                }
-            },
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => write_new_key(&key_path)?,
-            Err(err) => {
-                return Err(err).with_context(|| format!("failed to read {}", key_path.display()));
-            }
-        };
+        let key = load_or_create_key(&dir.join(KEY_FILENAME))?;
         let public_point = key.verifying_key().to_encoded_point(false);
         let public_key_sha256 = format!("{:x}", Sha256::digest(public_point.as_bytes()));
         let device_path = dir.join(DEVICE_FILENAME);
-        let gateways = match fs::read(&device_path) {
-            Ok(bytes) => match serde_json::from_slice::<DeviceFile>(&bytes) {
-                // Device ids belong to one public key; a new key is a new device.
-                Ok(file) if file.public_key_sha256 == public_key_sha256 => file.gateways,
-                Ok(_) => BTreeMap::new(),
-                Err(err) => {
-                    eprintln!(
-                        "client proof: device file {} is unreadable ({err}); re-enrolling",
-                        device_path.display()
-                    );
-                    BTreeMap::new()
-                }
-            },
-            Err(_) => BTreeMap::new(),
-        };
+        let gateways = read_device_file(&device_path, &public_key_sha256).unwrap_or_else(|err| {
+            eprintln!("client proof: device file is unreadable ({err:#}); re-enrolling");
+            DeviceMap::new()
+        });
         Ok(Self {
             dir: dir.to_path_buf(),
             public_key: public_key_b64url(&key),
@@ -305,7 +428,32 @@ impl ClientProof {
             public_key_sha256,
             gateways: Mutex::new(gateways),
             persist: Mutex::new(()),
+            enrollments: Mutex::new(EnrollmentClaims::default()),
         })
+    }
+
+    /// Claims the single enrollment attempt allowed per (Gateway, credential)
+    /// and process. On-demand claims (a Bearer not configured on any route)
+    /// are bounded and skipped once a record exists.
+    pub fn claim_enrollment(&self, gateway: &str, api_key: &str, on_demand: bool) -> bool {
+        if on_demand && self.device(gateway, api_key).is_some() {
+            return false;
+        }
+        let mut claims = match self.enrollments.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let claim = (gateway.to_string(), credential_id(api_key));
+        if claims.claimed.contains(&claim)
+            || (on_demand && claims.on_demand >= MAX_ON_DEMAND_ENROLLMENTS)
+        {
+            return false;
+        }
+        claims.claimed.insert(claim);
+        if on_demand {
+            claims.on_demand += 1;
+        }
+        true
     }
 
     #[cfg(test)]
@@ -341,11 +489,14 @@ impl ClientProof {
             target,
             api_key,
             now_unix(),
-            &random_nonce(),
+            &random_nonce()?,
         ))
     }
 
     pub fn record_device(&self, gateway: &str, api_key: &str, device_id: &str) -> Result<()> {
+        if !valid_device_id(device_id) {
+            bail!("invalid client device id");
+        }
         let credential = credential_id(api_key);
         self.update(gateway, |records| {
             let device = records.entry(credential).or_default();
@@ -380,8 +531,12 @@ impl ClientProof {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        // Re-read first so records written by another proxy process survive.
+        let device_path = self.dir.join(DEVICE_FILENAME);
+        let on_disk = read_device_file(&device_path, &self.public_key_sha256).unwrap_or_default();
         let gateways = {
             let mut gateways = self.lock();
+            merge_devices(&mut gateways, on_disk);
             change(gateways.entry(gateway.to_string()).or_default());
             gateways.clone()
         };
@@ -391,7 +546,7 @@ impl ClientProof {
         };
         let mut bytes = serde_json::to_vec_pretty(&file)?;
         bytes.push(b'\n');
-        super::write_bytes_atomic(&self.dir.join(DEVICE_FILENAME), &bytes, 0o600)
+        super::write_bytes_atomic(&device_path, &bytes, 0o600)
     }
 
     fn lock(&self) -> MutexGuard<'_, DeviceMap> {
@@ -528,13 +683,6 @@ impl ClientProof {
             }
         }
     }
-}
-
-fn write_new_key(path: &Path) -> Result<SigningKey> {
-    let key = generate_signing_key();
-    let pem = encode_private_key_pem(&key)?;
-    super::write_bytes_atomic(path, pem.as_bytes(), 0o600)?;
-    Ok(key)
 }
 
 #[cfg(test)]
@@ -684,7 +832,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let first = ClientProof::load(directory.path()).unwrap();
         first
-            .record_device("https://gw.example", "k", "cd_old")
+            .record_device("https://gw.example", "k", "cd_OLDOLDOLDOLDOLDOLDOLD0")
             .unwrap();
         fs::write(directory.path().join(KEY_FILENAME), "not a key").unwrap();
         let second = ClientProof::load(directory.path()).unwrap();
@@ -697,6 +845,92 @@ mod tests {
         fs::write(directory.path().join(KEY_FILENAME), [0xff, 0xfe, 0x00]).unwrap();
         let fourth = ClientProof::load(directory.path()).unwrap();
         assert_ne!(fourth.public_key, second.public_key);
+    }
+
+    #[test]
+    fn invalid_persisted_records_are_dropped_and_other_process_records_merge() {
+        let directory = tempfile::tempdir().unwrap();
+        let proof = ClientProof::load(directory.path()).unwrap();
+        let path = directory.path().join(DEVICE_FILENAME);
+        let file = json!({
+            "public_key_sha256": proof.public_key_sha256,
+            "gateways": { "https://gw.example": {
+                credential_id("bad"): { "device_id": "cd_bad.id" },
+                credential_id("empty"): {},
+                credential_id("good"): { "device_id": "cd_GOODGOODGOODGOODGOOD00" },
+                credential_id("gone"): { "revoked": true },
+            }},
+        });
+        fs::write(&path, file.to_string()).unwrap();
+        let loaded = ClientProof::load(directory.path()).unwrap();
+        assert_eq!(loaded.device("https://gw.example", "bad"), None);
+        assert_eq!(loaded.device("https://gw.example", "empty"), None);
+        assert!(loaded.device("https://gw.example", "gone").unwrap().revoked);
+        assert!(
+            loaded
+                .sign_request("https://gw.example", "GET", "/", "good")
+                .is_some()
+        );
+        assert!(
+            loaded
+                .record_device("https://gw.example", "k", "cd_bad")
+                .is_err()
+        );
+        // A record written meanwhile by another process survives our write.
+        let other = ClientProof::load(directory.path()).unwrap();
+        other
+            .record_device("https://other.example", "k", "cd_OTHEROTHEROTHEROTHER00")
+            .unwrap();
+        loaded.record_revoked("https://gw.example", "good").unwrap();
+        let merged = ClientProof::load(directory.path()).unwrap();
+        assert!(merged.device("https://other.example", "k").is_some());
+        assert!(merged.device("https://gw.example", "good").unwrap().revoked);
+    }
+
+    #[test]
+    fn device_pem_creation_never_replaces_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(KEY_FILENAME);
+        let first = generate_signing_key().unwrap();
+        let second = generate_signing_key().unwrap();
+        assert!(create_key_file(&path, &first).unwrap());
+        assert!(!create_key_file(&path, &second).unwrap());
+        let loaded = ClientProof::load(directory.path()).unwrap();
+        assert_eq!(loaded.public_key, public_key_b64url(&first));
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loose_device_pem_permissions_are_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(KEY_FILENAME);
+        ClientProof::load(directory.path()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        ClientProof::load(directory.path()).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn enrollment_claims_are_deduped_and_on_demand_is_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let proof = ClientProof::load(directory.path()).unwrap();
+        let gateway = "https://gw.example";
+        assert!(proof.claim_enrollment(gateway, "route", false));
+        assert!(!proof.claim_enrollment(gateway, "route", false));
+        assert!(!proof.claim_enrollment(gateway, "route", true));
+        for index in 0..MAX_ON_DEMAND_ENROLLMENTS {
+            assert!(proof.claim_enrollment(gateway, &format!("extra-{index}"), true));
+        }
+        assert!(!proof.claim_enrollment(gateway, "one-too-many", true));
+        proof
+            .record_device(gateway, "known", "cd_KNOWNKNOWNKNOWNKNOWN00")
+            .unwrap();
+        assert!(!proof.claim_enrollment(gateway, "known", true));
     }
 
     #[test]
@@ -742,13 +976,24 @@ mod tests {
     #[test]
     fn classifies_enrollment_responses() {
         assert_eq!(
-            classify_enroll_response(200, br#"{"device_id":"cd_x","status":"active"}"#),
-            EnrollOutcome::Enrolled("cd_x".into())
+            classify_enroll_response(
+                200,
+                br#"{"device_id":"cd_XXXXXXXXXXXXXXXXXXXXXX","status":"active"}"#
+            ),
+            EnrollOutcome::Enrolled("cd_XXXXXXXXXXXXXXXXXXXXXX".into())
         );
-        assert!(matches!(
-            classify_enroll_response(200, br#"{"device_id":"bad.id"}"#),
-            EnrollOutcome::Stop(_)
-        ));
+        for invalid in [
+            "bad.id",
+            "cd_x",
+            "xx_AAAAAAAAAAAAAAAAAAAAAA",
+            "cd_AAAAAAAAAAAAAAAAAAAAA.",
+        ] {
+            let body = json!({ "device_id": invalid }).to_string();
+            assert!(matches!(
+                classify_enroll_response(200, body.as_bytes()),
+                EnrollOutcome::Stop(_)
+            ));
+        }
         assert_eq!(
             classify_enroll_response(403, br#"{"code":"client_device_revoked"}"#),
             EnrollOutcome::Revoked
@@ -874,7 +1119,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let proof = Arc::new(ClientProof::load(directory.path()).unwrap());
         proof
-            .record_device(&gateway, "MOCK_ONLY_KEY", "cd_old")
+            .record_device(&gateway, "MOCK_ONLY_KEY", "cd_OLDOLDOLDOLDOLDOLDOLD0")
             .unwrap();
         let device = Arc::clone(&proof)
             .enroll(

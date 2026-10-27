@@ -71,3 +71,11 @@ fail open, short timeout).
 - Group edit: `client_attestation_policy` select (off / observe).
 - Neutral wording everywhere (no "逆向/作弊"). Labels: 通过 / 未携带 / 校验失败 / 时间偏差 /
   重复请求 / 设备未知 / 设备已吊销 / 未校验 / 未采集.
+
+## 6. Client notes (local proxy)
+- Files live in the SAIAI config directory (`SAIAI_HOME`, default `~/.saiai`):
+  `client-device-key` and `client-device.json`. The JSON is client-local; it records
+  `gateways[<base url>][<sha256(api key)>] = { device_id, revoked }` so several gateways
+  and several users of one gateway can coexist.
+- Recovery from revocation (or to start over as a new device): stop the local proxy,
+  delete both files, and start it again. A new key is generated and enrolled.
