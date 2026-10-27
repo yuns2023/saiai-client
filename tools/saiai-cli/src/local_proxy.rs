@@ -395,7 +395,7 @@ impl State {
             self.route_for_host(ANTHROPIC_HOST),
             self.route_for_host(OPENAI_HOST),
         ] {
-            if gateways.insert(route.base_url.clone()) {
+            if gateways.insert((route.base_url.as_str(), route.api_key.as_str())) {
                 tokio::spawn(Arc::clone(proof).enroll(
                     self.client.clone(),
                     route.base_url.clone(),
@@ -6027,7 +6027,7 @@ mod tests {
     fn proof_test_state(
         base_url: &str,
         gateway: &str,
-        enrolled: bool,
+        enrolled_key: Option<&str>,
     ) -> (State, tempfile::TempDir) {
         let (ca_cert_pem, ca_key_pem) = test_ca();
         let directory = tempfile::tempdir().unwrap();
@@ -6044,10 +6044,10 @@ mod tests {
             client_proof_dir: Some(directory.path().to_path_buf()),
         })
         .unwrap();
-        if enrolled {
+        if let Some(key) = enrolled_key {
             let proof = state.client_proof.as_ref().unwrap();
             proof
-                .record_device(gateway, "cd_MOCKMOCKMOCKMOCKMOCK0")
+                .record_device(gateway, key, "cd_MOCKMOCKMOCKMOCKMOCK0")
                 .unwrap();
         }
         (state, directory)
@@ -6084,13 +6084,14 @@ mod tests {
         let (base_url, server) = capture_gateway_requests(2).await;
         // A path prefix in the Gateway base URL is part of the signed target.
         let gateway = format!("{base_url}/prefix");
-        let (state, _directory) = proof_test_state(&gateway, &gateway, true);
-        for _ in 0..2 {
+        let (state, _directory) = proof_test_state(&gateway, &gateway, Some("MOCK_ONLY_GATEWAY"));
+        let targets = ["/v1/responses?future=a%2Fb&x=", "/v1/responses?"];
+        for target in targets {
             let (mut writer, mut output) = tokio::io::duplex(16_384);
             forward_to_saiai(
                 &state,
                 &mut writer,
-                proof_request("/v1/responses?future=a%2Fb&x=", "Bearer MOCK_ONLY_CLIENT"),
+                proof_request(target, "Bearer MOCK_ONLY_CLIENT"),
                 true,
                 true,
             )
@@ -6101,8 +6102,8 @@ mod tests {
         }
         let captured = server.await.unwrap();
         let mut nonces = std::collections::HashSet::new();
-        for request in &captured {
-            assert_eq!(request.target, "/prefix/v1/responses?future=a%2Fb&x=");
+        for (request, target) in captured.iter().zip(targets) {
+            assert_eq!(request.target, format!("/prefix{target}"));
             let headers = proof_headers(request);
             assert_eq!(headers.len(), 1, "client proof must not be relayed");
             verify_proof(
@@ -6119,7 +6120,8 @@ mod tests {
     #[tokio::test]
     async fn claude_client_bearer_is_the_signed_api_key() {
         let (base_url, server) = capture_gateway_requests(1).await;
-        let (state, _directory) = proof_test_state(&base_url, &base_url, true);
+        let (state, _directory) =
+            proof_test_state(&base_url, &base_url, Some("MOCK_ONLY_CLAUDE_KEY"));
         let (mut writer, mut output) = tokio::io::duplex(16_384);
         forward_to_saiai(
             &state,
@@ -6150,8 +6152,13 @@ mod tests {
 
     #[tokio::test]
     async fn unenrolled_gateway_requests_stay_unsigned_and_drop_client_proofs() {
-        for (enrolled, authorization) in [(false, "Bearer MOCK_ONLY_CLIENT"), (true, "Basic MOCK")]
-        {
+        // Not enrolled; a non-Bearer credential; a Bearer of another
+        // (unenrolled) user on the same Gateway.
+        for (enrolled, authorization) in [
+            (None, "Bearer MOCK_ONLY_CLIENT"),
+            (Some("MOCK_ONLY_GATEWAY"), "Basic MOCK"),
+            (Some("MOCK_ONLY_GATEWAY"), "Bearer MOCK_ONLY_OTHER_USER"),
+        ] {
             let (base_url, server) = capture_gateway_requests(1).await;
             let (state, _directory) = proof_test_state(&base_url, &base_url, enrolled);
             let (mut writer, mut output) = tokio::io::duplex(16_384);

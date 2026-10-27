@@ -174,11 +174,21 @@ pub struct GatewayDevice {
     pub revoked: bool,
 }
 
+/// Gateway base URL -> sha256 hex of the enrolling API key -> device.
+/// Devices belong to (user, public key) on the Gateway, so records are kept
+/// per credential: two keys of different users on one Gateway must not share
+/// a device id.
+type DeviceMap = BTreeMap<String, BTreeMap<String, GatewayDevice>>;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct DeviceFile {
     public_key_sha256: String,
     #[serde(default)]
-    gateways: BTreeMap<String, GatewayDevice>,
+    gateways: DeviceMap,
+}
+
+fn credential_id(api_key: &str) -> String {
+    format!("{:x}", Sha256::digest(api_key.as_bytes()))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -231,7 +241,10 @@ pub struct ClientProof {
     key: SigningKey,
     public_key: String,
     public_key_sha256: String,
-    gateways: Mutex<BTreeMap<String, GatewayDevice>>,
+    gateways: Mutex<DeviceMap>,
+    // Serializes device-file writes without holding `gateways`, so signing
+    // never waits on disk I/O.
+    persist: Mutex<()>,
 }
 
 impl std::fmt::Debug for ClientProof {
@@ -248,8 +261,11 @@ impl ClientProof {
     /// `dir`. An unreadable key is replaced by a new one, i.e. a new device.
     pub fn load(dir: &Path) -> Result<Self> {
         let key_path = dir.join(KEY_FILENAME);
-        let key = match fs::read_to_string(&key_path) {
-            Ok(pem) => match decode_private_key_pem(&pem) {
+        let key = match fs::read(&key_path) {
+            Ok(pem) => match std::str::from_utf8(&pem)
+                .context("client device key is not UTF-8")
+                .and_then(decode_private_key_pem)
+            {
                 Ok(key) => key,
                 Err(err) => {
                     eprintln!(
@@ -288,6 +304,7 @@ impl ClientProof {
             key,
             public_key_sha256,
             gateways: Mutex::new(gateways),
+            persist: Mutex::new(()),
         })
     }
 
@@ -296,8 +313,11 @@ impl ClientProof {
         &self.public_key
     }
 
-    pub fn device(&self, gateway: &str) -> Option<GatewayDevice> {
-        self.lock().get(gateway).cloned()
+    pub fn device(&self, gateway: &str, api_key: &str) -> Option<GatewayDevice> {
+        self.lock()
+            .get(gateway)?
+            .get(&credential_id(api_key))
+            .cloned()
     }
 
     /// Fresh `X-Saiai-Client-Proof` value for one request attempt, or `None`
@@ -309,14 +329,11 @@ impl ClientProof {
         target: &str,
         api_key: &str,
     ) -> Option<String> {
-        let device_id = {
-            let gateways = self.lock();
-            let device = gateways.get(gateway)?;
-            if device.revoked {
-                return None;
-            }
-            device.device_id.clone()?
-        };
+        let device = self.device(gateway, api_key)?;
+        if device.revoked {
+            return None;
+        }
+        let device_id = device.device_id?;
         Some(proof_header(
             &self.key,
             &device_id,
@@ -328,30 +345,48 @@ impl ClientProof {
         ))
     }
 
-    pub fn record_device(&self, gateway: &str, device_id: &str) -> Result<()> {
-        self.update(gateway, |device| {
+    pub fn record_device(&self, gateway: &str, api_key: &str, device_id: &str) -> Result<()> {
+        self.update(gateway, api_key, |device| {
             device.device_id = Some(device_id.to_string());
             device.revoked = false;
         })
     }
 
-    pub fn record_revoked(&self, gateway: &str) -> Result<()> {
-        self.update(gateway, |device| device.revoked = true)
+    pub fn record_revoked(&self, gateway: &str, api_key: &str) -> Result<()> {
+        self.update(gateway, api_key, |device| device.revoked = true)
     }
 
-    fn update(&self, gateway: &str, change: impl FnOnce(&mut GatewayDevice)) -> Result<()> {
-        let mut gateways = self.lock();
-        change(gateways.entry(gateway.to_string()).or_default());
+    fn update(
+        &self,
+        gateway: &str,
+        api_key: &str,
+        change: impl FnOnce(&mut GatewayDevice),
+    ) -> Result<()> {
+        let _persist = match self.persist.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let gateways = {
+            let mut gateways = self.lock();
+            change(
+                gateways
+                    .entry(gateway.to_string())
+                    .or_default()
+                    .entry(credential_id(api_key))
+                    .or_default(),
+            );
+            gateways.clone()
+        };
         let file = DeviceFile {
             public_key_sha256: self.public_key_sha256.clone(),
-            gateways: gateways.clone(),
+            gateways,
         };
         let mut bytes = serde_json::to_vec_pretty(&file)?;
         bytes.push(b'\n');
         super::write_bytes_atomic(&self.dir.join(DEVICE_FILENAME), &bytes, 0o600)
     }
 
-    fn lock(&self) -> MutexGuard<'_, BTreeMap<String, GatewayDevice>> {
+    fn lock(&self) -> MutexGuard<'_, DeviceMap> {
         match self.gateways.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -393,8 +428,14 @@ impl ClientProof {
                     bytes.extend_from_slice(&chunk);
                 }
                 Ok(None) => break,
-                Err(err) => {
+                // Only success and 403 need the body; other statuses are
+                // classified by status alone, so 429 still stops here.
+                Err(err) if matches!(status, 200..=299 | 403) => {
                     return EnrollOutcome::Retry(format!("status={status} body failed: {err}"));
+                }
+                Err(_) => {
+                    bytes.clear();
+                    break;
                 }
             }
         }
@@ -410,41 +451,44 @@ impl ClientProof {
         api_key: Zeroizing<String>,
         backoff: &'static [Duration],
     ) -> Option<GatewayDevice> {
-        if self.device(&gateway).is_some_and(|device| device.revoked) {
+        if self
+            .device(&gateway, &api_key)
+            .is_some_and(|device| device.revoked)
+        {
             eprintln!("client proof: device revoked by gateway={gateway}; requests stay unsigned");
-            return self.device(&gateway);
+            return self.device(&gateway, &api_key);
         }
         let mut attempt = 0usize;
         loop {
             match self.enroll_once(&client, &gateway, &api_key).await {
                 EnrollOutcome::Enrolled(device_id) => {
-                    if let Err(err) = self.record_device(&gateway, &device_id) {
+                    if let Err(err) = self.record_device(&gateway, &api_key, &device_id) {
                         eprintln!("client proof: failed to persist device record: {err:#}");
                     }
                     eprintln!(
                         "client proof: device active gateway={gateway} device_id={device_id}"
                     );
-                    return self.device(&gateway);
+                    return self.device(&gateway, &api_key);
                 }
                 EnrollOutcome::Revoked => {
-                    if let Err(err) = self.record_revoked(&gateway) {
+                    if let Err(err) = self.record_revoked(&gateway, &api_key) {
                         eprintln!("client proof: failed to persist device record: {err:#}");
                     }
                     eprintln!(
                         "client proof: device revoked by gateway={gateway}; requests stay unsigned"
                     );
-                    return self.device(&gateway);
+                    return self.device(&gateway, &api_key);
                 }
                 EnrollOutcome::Stop(reason) => {
                     eprintln!(
                         "client proof: enrollment stopped gateway={gateway} {reason}; requests stay unsigned"
                     );
-                    return self.device(&gateway);
+                    return self.device(&gateway, &api_key);
                 }
                 EnrollOutcome::Retry(reason) => {
                     let Some(delay) = backoff.get(attempt).or_else(|| backoff.last()).copied()
                     else {
-                        return self.device(&gateway);
+                        return self.device(&gateway, &api_key);
                     };
                     eprintln!(
                         "client proof: enrollment deferred gateway={gateway} {reason}; retry_in_s={}",
@@ -611,15 +655,20 @@ mod tests {
     fn corrupted_device_pem_becomes_new_device_and_drops_old_records() {
         let directory = tempfile::tempdir().unwrap();
         let first = ClientProof::load(directory.path()).unwrap();
-        first.record_device("https://gw.example", "cd_old").unwrap();
+        first
+            .record_device("https://gw.example", "k", "cd_old")
+            .unwrap();
         fs::write(directory.path().join(KEY_FILENAME), "not a key").unwrap();
         let second = ClientProof::load(directory.path()).unwrap();
         assert_ne!(first.public_key, second.public_key);
-        assert_eq!(second.device("https://gw.example"), None);
+        assert_eq!(second.device("https://gw.example", "k"), None);
         fs::write(directory.path().join(DEVICE_FILENAME), "{").unwrap();
         let third = ClientProof::load(directory.path()).unwrap();
         assert_eq!(third.public_key, second.public_key);
-        assert_eq!(third.device("https://gw.example"), None);
+        assert_eq!(third.device("https://gw.example", "k"), None);
+        fs::write(directory.path().join(KEY_FILENAME), [0xff, 0xfe, 0x00]).unwrap();
+        let fourth = ClientProof::load(directory.path()).unwrap();
+        assert_ne!(fourth.public_key, second.public_key);
     }
 
     #[test]
@@ -629,7 +678,7 @@ mod tests {
         let gateway = "https://gw.example";
         assert_eq!(proof.sign_request(gateway, "POST", "/v1/x", "k"), None);
         proof
-            .record_device(gateway, "cd_AAAAAAAAAAAAAAAAAAAAAA")
+            .record_device(gateway, "k", "cd_AAAAAAAAAAAAAAAAAAAAAA")
             .unwrap();
         let first = proof.sign_request(gateway, "POST", "/v1/x", "k").unwrap();
         let second = proof.sign_request(gateway, "POST", "/v1/x", "k").unwrap();
@@ -646,10 +695,12 @@ mod tests {
             proof.sign_request("https://other.example", "POST", "/v1/x", "k"),
             None
         );
-        proof.record_revoked(gateway).unwrap();
+        // A different credential on the same Gateway has its own device record.
+        assert_eq!(proof.sign_request(gateway, "POST", "/v1/x", "other"), None);
+        proof.record_revoked(gateway, "k").unwrap();
         assert_eq!(proof.sign_request(gateway, "POST", "/v1/x", "k"), None);
         let reloaded = ClientProof::load(directory.path()).unwrap();
-        assert!(reloaded.device(gateway).unwrap().revoked);
+        assert!(reloaded.device(gateway, "k").unwrap().revoked);
         assert_eq!(reloaded.sign_request(gateway, "POST", "/v1/x", "k"), None);
     }
 
@@ -721,9 +772,10 @@ mod tests {
                     }
                 }
                 requests.push(String::from_utf8_lossy(&buffer[..read]).into_owned());
+                // An empty body is announced as 64 bytes and then cut off.
+                let declared = if body.is_empty() { 64 } else { body.len() };
                 let response = format!(
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n{body}"
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
@@ -786,7 +838,9 @@ mod tests {
             mock_gateway(vec![(403, r#"{"code":"client_device_revoked"}"#)]).await;
         let directory = tempfile::tempdir().unwrap();
         let proof = Arc::new(ClientProof::load(directory.path()).unwrap());
-        proof.record_device(&gateway, "cd_old").unwrap();
+        proof
+            .record_device(&gateway, "MOCK_ONLY_KEY", "cd_old")
+            .unwrap();
         let device = Arc::clone(&proof)
             .enroll(
                 reqwest::Client::new(),
@@ -798,7 +852,10 @@ mod tests {
             .unwrap();
         assert!(device.revoked);
         assert_eq!(server.await.unwrap().len(), 1);
-        assert_eq!(proof.sign_request(&gateway, "GET", "/", "k"), None);
+        assert_eq!(
+            proof.sign_request(&gateway, "GET", "/", "MOCK_ONLY_KEY"),
+            None
+        );
         // A restarted process neither re-enrolls nor signs for this Gateway.
         let restarted = Arc::new(ClientProof::load(directory.path()).unwrap());
         let device = Arc::clone(&restarted)
@@ -811,7 +868,27 @@ mod tests {
             .await
             .unwrap();
         assert!(device.revoked);
-        assert_eq!(restarted.sign_request(&gateway, "GET", "/", "k"), None);
+        assert_eq!(
+            restarted.sign_request(&gateway, "GET", "/", "MOCK_ONLY_KEY"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn enrollment_device_limit_with_truncated_body_still_stops() {
+        let (gateway, server) = mock_gateway(vec![(429, "")]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let proof = Arc::new(ClientProof::load(directory.path()).unwrap());
+        let device = Arc::clone(&proof)
+            .enroll(
+                reqwest::Client::new(),
+                gateway,
+                Zeroizing::new("MOCK_ONLY_KEY".into()),
+                &FAST_RETRY,
+            )
+            .await;
+        assert_eq!(device, None);
+        assert_eq!(server.await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -830,7 +907,10 @@ mod tests {
             .await;
         assert_eq!(device, None);
         assert_eq!(server.await.unwrap().len(), 1);
-        assert_eq!(proof.sign_request(&gateway, "GET", "/", "k"), None);
+        assert_eq!(
+            proof.sign_request(&gateway, "GET", "/", "MOCK_ONLY_KEY"),
+            None
+        );
     }
 
     #[tokio::test]

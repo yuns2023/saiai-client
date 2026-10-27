@@ -71,7 +71,7 @@ Windows/macOS 生命周期结果以对应 CI 为准。共享二进制更新不�
 
 线协议见 [CLIENT_PROOF.md](CLIENT_PROOF.md)。本地代理在 SAIAI 配置目录保存一个
 ECDSA P-256 设备密钥（`client-device-key`，PKCS#8 PEM，unix 0600）和按 Gateway
-base URL 记录的设备状态（`client-device.json`），两者都原子写入；密钥损坏时生成
+base URL 及注册所用 API Key 的 SHA-256 记录的设备状态（`client-device.json`，同一 Gateway 的不同用户 Key 各自注册），两者都原子写入；密钥损坏时生成
 新密钥（即新设备）并记录一次日志。代理启动后在后台向每个实际使用的 Gateway 注册
 一次（网络错误/404/5xx 按 1m、5m、30m 退避；429 本进程不再重试；403
 `client_device_revoked` 持久记录为已吊销并停止签名）。拿到 device_id 前及吊销后
