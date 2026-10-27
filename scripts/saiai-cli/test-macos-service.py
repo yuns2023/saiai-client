@@ -270,9 +270,18 @@ Path(os.environ["SAIAI_DESKTOP_CAPTURE"]).write_text(
             environment,
         )
         if "left running; binary and runtime configuration are unchanged" not in unchanged_codex.stdout:
+            # Diagnostics only: which refresh condition fired (listen port
+            # reallocated vs. proxy not reachable) and what the proxy logged.
+            listen_after = json.loads((saiai_home / "config.json").read_text(encoding="utf-8"))["listen"]
+            proxy_logs = "\n".join(
+                f"--- {log.name}\n" + "\n".join(log.read_text(encoding="utf-8", errors="replace").splitlines()[-40:])
+                for log in sorted(saiai_home.rglob("*.log"))
+            )
             raise AssertionError(
                 "unchanged init-codex did not preserve the LaunchAgent:\n"
-                f"{unchanged_codex.stdout}"
+                f"{unchanged_codex.stdout}\n"
+                f"listen before={LISTEN_HOST}:{LISTEN_PORT} after={listen_after}\n"
+                f"{proxy_logs}"
             )
 
         plist = home / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"

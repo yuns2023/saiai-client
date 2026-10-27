@@ -1,0 +1,13 @@
+{
+  "private_key_pkcs8_pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgTNduuZ8e5tRlWha+\nifw9iV2+W/826ZNOlT3NQn+c6CChRANCAAQgXARONqNCFGucmEyABN314THvs6dQ\nv73AUZPBckPtKqf1HxX52CpLxYp88z7iEeTWt2rI9b7qzeiv6swqK8ct\n-----END PRIVATE KEY-----\n",
+  "public_key": "BCBcBE42o0IUa5yYTIAE3fXhMe-zp1C_vcBRk8FyQ-0qp_UfFfnYKkvFinzzPuIR5Na3asj1vurN6K_qzCorxy0",
+  "api_key": "sk-test-0123456789abcdef",
+  "device_id": "cd_AAAAAAAAAAAAAAAAAAAAAA",
+  "method": "POST",
+  "target": "/v1/messages?beta=true",
+  "ts": 1793000000,
+  "nonce": "AAECAwQFBgcICQoLDA0ODw",
+  "message": "saiai-client-proof-v1\nPOST\n/v1/messages?beta=true\n1793000000\nAAECAwQFBgcICQoLDA0ODw\nc871f067542d565c57ebb8b54f99afe326644dceeb5c05fc2209a8161a52875e",
+  "signature": "TR__wNG117mgCuC5mggRTbVXouKQ8NtlrlmzlKsw0GkpBPB6kOuBStKikDOJxRn390C9fzJfVPLWakbP-5Tj6Q",
+  "header": "v1.cd_AAAAAAAAAAAAAAAAAAAAAA.1793000000.AAECAwQFBgcICQoLDA0ODw.TR__wNG117mgCuC5mggRTbVXouKQ8NtlrlmzlKsw0GkpBPB6kOuBStKikDOJxRn390C9fzJfVPLWakbP-5Tj6Q"
+}

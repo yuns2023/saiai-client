@@ -40,6 +40,10 @@ class ProbeError(RuntimeError):
     pass
 
 
+# Client-proof device enrollment is the only POST that is not a model request.
+ENROLL_PATH = "/api/v1/client/devices/enroll"
+
+
 class LoopbackGateway(http.server.BaseHTTPRequestHandler):
     requests: list[tuple[str, str]] = []
 
@@ -63,10 +67,15 @@ class LoopbackGateway(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
-        self._path()
+        path = self._path()
         length = int(self.headers.get("Content-Length", "0"))
         if length:
             self.rfile.read(length)
+        if path == ENROLL_PATH:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         body = b'{"error":{"type":"test_only","message":"model requests are forbidden"}}'
         self.send_response(403)
         self.send_header("Content-Type", "application/json")
@@ -713,7 +722,8 @@ def probe(
             if "chatgpt account sidecar response" not in proxy_log:
                 raise ProbeError("candidate proxy did not record an account sidecar response")
             model_requests = sum(
-                method == "POST" for method, _path in LoopbackGateway.requests
+                method == "POST" and _path != ENROLL_PATH
+                for method, _path in LoopbackGateway.requests
             )
             if model_requests:
                 raise ProbeError("field probe unexpectedly attempted a model request")
@@ -764,7 +774,8 @@ def probe(
         gateway_thread.join(timeout=5)
         observations["loopback_gateway_requests"] = len(LoopbackGateway.requests)
         observations["mock_model_requests_attempted"] = sum(
-            method == "POST" for method, _path in LoopbackGateway.requests
+            method == "POST" and _path != ENROLL_PATH
+                for method, _path in LoopbackGateway.requests
         )
         observations["temporary_state_removed"] = (
             temporary_root is not None and not temporary_root.exists()
