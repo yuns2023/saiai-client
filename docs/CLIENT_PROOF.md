@@ -55,8 +55,10 @@ Status enum (stored as smallint in `usage_logs.client_attestation`, NULL = not c
 5 replay (nonce seen; Redis `SET NX` TTL 900s), 6 unknown_device (no such device, or device
 belongs to another user than the API key's user), 7 revoked, 8 unverified (Redis/DB error —
 fail open, short timeout).
-- Computed only when the request's group has `client_attestation_policy = observe`; `off` →
-  NULL. Never rejects in v1 (`enforce` reserved, not selectable yet).
+- Verified whenever the header is present, whatever the group's policy (requests without the
+  header do no I/O). Stored in `usage_logs` only when the request's final group has
+  `client_attestation_policy = observe` (without a header that is `missing`); `off` → NULL.
+  Never rejects in v1 (`enforce` reserved, not selectable yet).
 - Device lookups cached in-process ≤ 60s; revocation invalidates the local cache entry
   immediately (other instances converge within the TTL).
 - On `valid`: update device `last_seen_at`, `last_ip`, and `last_claude_at` or `last_codex_at`
