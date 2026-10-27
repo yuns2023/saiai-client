@@ -346,21 +346,35 @@ impl ClientProof {
     }
 
     pub fn record_device(&self, gateway: &str, api_key: &str, device_id: &str) -> Result<()> {
-        self.update(gateway, api_key, |device| {
+        let credential = credential_id(api_key);
+        self.update(gateway, |records| {
+            let device = records.entry(credential).or_default();
             device.device_id = Some(device_id.to_string());
             device.revoked = false;
         })
     }
 
+    /// Revocation applies to the device, so every credential of the same user
+    /// already known to map to that device id stops signing too.
     pub fn record_revoked(&self, gateway: &str, api_key: &str) -> Result<()> {
-        self.update(gateway, api_key, |device| device.revoked = true)
+        let credential = credential_id(api_key);
+        self.update(gateway, |records| {
+            let device = records.entry(credential).or_default();
+            device.revoked = true;
+            if let Some(device_id) = device.device_id.clone() {
+                for other in records.values_mut() {
+                    if other.device_id.as_deref() == Some(device_id.as_str()) {
+                        other.revoked = true;
+                    }
+                }
+            }
+        })
     }
 
     fn update(
         &self,
         gateway: &str,
-        api_key: &str,
-        change: impl FnOnce(&mut GatewayDevice),
+        change: impl FnOnce(&mut BTreeMap<String, GatewayDevice>),
     ) -> Result<()> {
         let _persist = match self.persist.lock() {
             Ok(guard) => guard,
@@ -368,13 +382,7 @@ impl ClientProof {
         };
         let gateways = {
             let mut gateways = self.lock();
-            change(
-                gateways
-                    .entry(gateway.to_string())
-                    .or_default()
-                    .entry(credential_id(api_key))
-                    .or_default(),
-            );
+            change(gateways.entry(gateway.to_string()).or_default());
             gateways.clone()
         };
         let file = DeviceFile {
@@ -442,6 +450,24 @@ impl ClientProof {
         classify_enroll_response(status, &bytes)
     }
 
+    /// Device-file writes (and their lock) run off the async workers so a slow
+    /// disk cannot stall forwarding.
+    async fn persist_blocking(
+        self: &Arc<Self>,
+        write: impl FnOnce(&ClientProof) -> Result<()> + Send + 'static,
+    ) {
+        let proof = Arc::clone(self);
+        match tokio::task::spawn_blocking(move || write(&proof)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                eprintln!("client proof: failed to persist device record: {err:#}");
+            }
+            Err(err) => {
+                eprintln!("client proof: device record task failed: {err}");
+            }
+        }
+    }
+
     /// Enrolls this device with `gateway` once per process. Runs in the
     /// background; failures only leave the requests unsigned.
     pub async fn enroll(
@@ -462,18 +488,20 @@ impl ClientProof {
         loop {
             match self.enroll_once(&client, &gateway, &api_key).await {
                 EnrollOutcome::Enrolled(device_id) => {
-                    if let Err(err) = self.record_device(&gateway, &api_key, &device_id) {
-                        eprintln!("client proof: failed to persist device record: {err:#}");
-                    }
+                    let record = (gateway.clone(), api_key.clone(), device_id.clone());
+                    self.persist_blocking(move |proof| {
+                        proof.record_device(&record.0, &record.1, &record.2)
+                    })
+                    .await;
                     eprintln!(
                         "client proof: device active gateway={gateway} device_id={device_id}"
                     );
                     return self.device(&gateway, &api_key);
                 }
                 EnrollOutcome::Revoked => {
-                    if let Err(err) = self.record_revoked(&gateway, &api_key) {
-                        eprintln!("client proof: failed to persist device record: {err:#}");
-                    }
+                    let record = (gateway.clone(), api_key.clone());
+                    self.persist_blocking(move |proof| proof.record_revoked(&record.0, &record.1))
+                        .await;
                     eprintln!(
                         "client proof: device revoked by gateway={gateway}; requests stay unsigned"
                     );
@@ -697,7 +725,14 @@ mod tests {
         );
         // A different credential on the same Gateway has its own device record.
         assert_eq!(proof.sign_request(gateway, "POST", "/v1/x", "other"), None);
+        proof
+            .record_device(gateway, "same-user-key", "cd_AAAAAAAAAAAAAAAAAAAAAA")
+            .unwrap();
         proof.record_revoked(gateway, "k").unwrap();
+        assert_eq!(
+            proof.sign_request(gateway, "POST", "/v1/x", "same-user-key"),
+            None
+        );
         assert_eq!(proof.sign_request(gateway, "POST", "/v1/x", "k"), None);
         let reloaded = ClientProof::load(directory.path()).unwrap();
         assert!(reloaded.device(gateway, "k").unwrap().revoked);
