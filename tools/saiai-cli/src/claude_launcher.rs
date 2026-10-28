@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 
 use crate::{
     CLAUDE_STREAM_IDLE_TIMEOUT_MS, SaiaiConfig, ensure_local_proxy_running_with_start, home_dir,
-    read_runtime_ca, read_saiai_config,
+    read_runtime_ca, read_saiai_config, warn_claude_settings_overrides,
 };
 
 const LOCAL_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local";
@@ -61,6 +61,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     validate_listen(&config.listen)?;
     let _runtime_ca = read_runtime_ca(&config)
         .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
+    // Shared proxy startup is product-neutral; check Claude's own settings on
+    // every Claude launch, whether or not the proxy is already listening.
+    warn_claude_settings_overrides();
     ensure_local_proxy_running_with_start(&config.listen, || {
         let mut start =
             Command::new(env::current_exe().context("failed to resolve SAIAI executable")?);
@@ -249,6 +252,22 @@ mod tests {
             chatgpt_chat_passthrough: false,
             providers: ProviderCredentials::default(),
         }
+    }
+
+    #[test]
+    fn launcher_checks_claude_settings_whether_or_not_proxy_is_running() {
+        let source = include_str!("claude_launcher.rs");
+        let run = source
+            .split("pub(crate) fn run(")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let warning = run.find("warn_claude_settings_overrides();").unwrap();
+        // Source-order guard: the check precedes the start callback, so an
+        // already-listening proxy does not skip it.
+        assert!(warning < run.find("ensure_local_proxy_running_with_start(").unwrap());
     }
 
     fn assert_child_environment(command: &Command, name: &str, expected: Option<&str>) {

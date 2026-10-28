@@ -736,7 +736,6 @@ fn init_codex(args: InitArgs) -> Result<()> {
     println!(
         "SAIAI local-proxy OAuth configuration is ready; run `saiai codex`. Fully quit and reopen VSCode after its editor setup succeeds."
     );
-    warn_claude_settings_overrides();
     start_managed_service_after_initialization(proxy_init.config_changed)?;
     codex_daemon::after_initialization(&codex_dir);
 
@@ -886,7 +885,7 @@ fn run_codex(args: &[String]) -> Result<()> {
     // Command cannot execute directly.
     let mut command = codex_process_command().context("failed to resolve Codex executable")?;
     let cfg = read_saiai_config()
-        .context("SAIAI local proxy is not configured; run the SAIAI Claude setup first")?;
+        .context("SAIAI local proxy is not configured; run `saiai init-codex` first")?;
     let _runtime_ca = read_runtime_ca(&cfg)
         .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
     let files = prepare_codex_oauth_files(&codex_dir, false)?;
@@ -3531,8 +3530,6 @@ fn print_version() -> Result<()> {
 }
 
 fn run_local_proxy(verbose: bool) -> Result<()> {
-    warn_process_env_conflicts();
-    warn_claude_settings_overrides();
     let cfg = read_saiai_config()?;
     let (ca_cert_pem, ca_key_pem) = read_runtime_ca(&cfg)?;
     ensure_listen_available(&cfg.listen)?;
@@ -3586,13 +3583,10 @@ fn read_runtime_ca(cfg: &SaiaiConfig) -> Result<(String, String)> {
 #[cfg(target_os = "linux")]
 fn run_service_start() -> Result<()> {
     let _service_lock = acquire_linux_service_lock()?;
-    warn_process_env_conflicts();
-    warn_claude_settings_overrides();
     let cfg = read_saiai_config()?;
     match ensure_systemd_user_available() {
         Ok(()) => {
             stop_linux_background_proxy()?;
-            warn_systemd_user_env_conflicts();
             let was_active = service_is_active().unwrap_or(false);
             if !was_active {
                 ensure_listen_available(&cfg.listen)?;
@@ -3626,8 +3620,6 @@ fn run_service_start() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn run_service_start() -> Result<()> {
-    warn_process_env_conflicts();
-    warn_claude_settings_overrides();
     let cfg = read_saiai_config()?;
     let domain = launchctl_gui_domain()?;
     let target = launchctl_service_target(&domain);
@@ -3691,8 +3683,6 @@ fn wait_for_local_listener(listen: &str, wait: Duration) -> bool {
 #[cfg(target_os = "windows")]
 fn run_service_start() -> Result<()> {
     let _service_lock = lock_windows_service()?;
-    warn_process_env_conflicts();
-    warn_claude_settings_overrides();
     let cfg = read_saiai_config()?;
     if let Some(pid) = windows_background_pid()? {
         if windows_pid_is_running(pid).unwrap_or(false) {
@@ -4244,9 +4234,13 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
         format!("saiai {} ({target:?})", env!("CARGO_PKG_VERSION")),
     );
     check_current_binary(&mut report);
-    check_process_env_conflicts(&mut report);
-    check_systemd_user_env_conflicts(&mut report);
-    check_persistent_env_conflicts(&mut report);
+    // These checks apply Claude Code's conflict rules; SAIAI-managed Codex
+    // launchers set their own child-only routing environment.
+    if check_claude {
+        check_process_env_conflicts(&mut report);
+        check_systemd_user_env_conflicts(&mut report);
+        check_persistent_env_conflicts(&mut report);
+    }
 
     let config_path = saiai_config_path().context("failed to resolve SAIAI config path")?;
     let cfg = match read_saiai_config() {
@@ -4268,16 +4262,14 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
         if check_codex {
             check_provider_route(&mut report, cfg, ProviderKind::Codex);
         }
-        check_process_proxy_env_conflicts(&mut report, &cfg.listen);
-        check_persistent_proxy_env_conflicts(&mut report);
-        check_systemd_user_proxy_env_conflicts(&mut report);
-    } else {
-        check_process_proxy_env_conflicts(&mut report, DEFAULT_LOCAL_PROXY_LISTEN);
-        check_persistent_proxy_env_conflicts(&mut report);
-        check_systemd_user_proxy_env_conflicts(&mut report);
     }
-
     if check_claude {
+        let listen = cfg
+            .as_ref()
+            .map_or(DEFAULT_LOCAL_PROXY_LISTEN, |cfg| cfg.listen.as_str());
+        check_process_proxy_env_conflicts(&mut report, listen);
+        check_persistent_proxy_env_conflicts(&mut report);
+        check_systemd_user_proxy_env_conflicts(&mut report);
         match resolve_claude_config_paths() {
             Ok(paths) => check_claude_config(&mut report, cfg.as_ref(), &paths),
             Err(err) => report.error("Claude config", err.to_string()),
@@ -4847,20 +4839,6 @@ fn print_systemd_user_env_conflicts_for_status() {
 
 #[cfg(not(target_os = "linux"))]
 fn print_systemd_user_env_conflicts_for_status() {}
-
-#[cfg(target_os = "linux")]
-fn warn_systemd_user_env_conflicts() {
-    match systemd_user_env_conflicts() {
-        Ok(conflicts) if conflicts.is_empty() => {}
-        Ok(conflicts) => eprintln!(
-            "WARN systemd environment: {} set in systemd --user manager. For SAIAI local proxy mode, clear it before launching Claude Code: systemctl --user unset-environment {CONFLICTING_ENV_UNSET_KEYS}",
-            conflicts.join(", ")
-        ),
-        Err(err) => eprintln!(
-            "WARN systemd environment: could not inspect systemd --user environment ({err})"
-        ),
-    }
-}
 
 #[cfg(target_os = "linux")]
 fn check_systemd_user_env_conflicts(report: &mut DoctorReport) {
@@ -9354,6 +9332,82 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             json_str(&env_obj, "NODE_EXTRA_CA_CERTS"),
             "/tmp/saiai-ca.crt"
         );
+    }
+
+    fn top_level_fn_bodies<'a>(source: &'a str, signature: &str) -> Vec<&'a str> {
+        let needle = format!("\nfn {signature}");
+        source
+            .match_indices(&needle)
+            .map(|(start, _)| {
+                let body = &source[start + 1..];
+                &body[..body.find("\n}\n").unwrap()]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shared_proxy_and_codex_paths_do_not_emit_claude_only_warnings() {
+        let main = include_str!("main.rs");
+        let claude_only = [
+            "warn_process_env_conflicts(",
+            "warn_claude_settings_overrides(",
+            "warn_claude_settings_overrides_for_paths(",
+            "warn_systemd_user_env_conflicts(",
+        ];
+        let start_bodies = top_level_fn_bodies(main, "run_service_start(");
+        assert_eq!(start_bodies.len(), 4, "one per platform plus the fallback");
+        let mut bodies = start_bodies;
+        for signature in [
+            "run_local_proxy(",
+            "ensure_local_proxy_running(",
+            "init_codex(",
+            "run_codex(",
+            "run_desktop(",
+            "run_linux_desktop(",
+            "run_macos_desktop(",
+            "run_windows_desktop(",
+            "run_windows_packaged_desktop(",
+        ] {
+            let found = top_level_fn_bodies(main, signature);
+            assert_eq!(found.len(), 1, "{signature}");
+            bodies.extend(found);
+        }
+        for body in bodies {
+            for call in claude_only {
+                assert!(!body.contains(call), "{call} in:\n{body}");
+            }
+        }
+        // `saiai init` remains the Claude setup path that reports both kinds.
+        let init_claude = top_level_fn_bodies(main, "init_claude(")[0];
+        assert!(init_claude.contains("warn_process_env_conflicts();"));
+        assert!(init_claude.contains("warn_claude_settings_overrides_for_paths("));
+    }
+
+    #[test]
+    fn doctor_runs_claude_environment_checks_only_for_claude_targets() {
+        let main = include_str!("main.rs");
+        let doctor = top_level_fn_bodies(main, "run_doctor(")[0];
+        let first_claude_gate = doctor.find("if check_claude {").unwrap();
+        for check in [
+            "check_process_env_conflicts(",
+            "check_systemd_user_env_conflicts(",
+            "check_persistent_env_conflicts(",
+            "check_process_proxy_env_conflicts(",
+            "check_persistent_proxy_env_conflicts(",
+            "check_systemd_user_proxy_env_conflicts(",
+        ] {
+            assert_eq!(doctor.matches(check).count(), 1, "{check}");
+            let position = doctor.find(check).unwrap();
+            assert!(
+                position > first_claude_gate,
+                "{check} runs before the Claude gate"
+            );
+            let gate = doctor[..position].rfind("if check_claude {").unwrap();
+            assert!(
+                !doctor[gate..position].contains("\n    }\n"),
+                "{check} is outside a Claude-only block"
+            );
+        }
     }
 
     #[test]
