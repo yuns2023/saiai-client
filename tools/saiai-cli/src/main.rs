@@ -51,7 +51,7 @@ const SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME: &str = "saiai-local-proxy";
 const USAGE: &str = "\
 Usage:
   saiai --environment claude|codex|default <command>              # select a proxy environment
-  saiai                                                           # run local Claude Code proxy
+  saiai                                                           # run the local proxy (Claude Code and Codex)
   saiai --verbose                                                 # run local proxy with request logs
   saiai start                                                     # install and start user service
   saiai stop                                                      # stop and disable user service

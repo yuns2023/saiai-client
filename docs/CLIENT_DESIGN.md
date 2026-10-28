@@ -343,6 +343,17 @@ Claude 路径解析遵守 `CLAUDE_CONFIG_DIR`。未设置时使用：
 大写或其他值（包括 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 和对应小写键）
 可能覆盖本地代理时会明确提示用户清理后再启动 Claude Code。
 
+这些 Claude 冲突检查（当前 shell、启动文件、`systemd --user` 环境和
+`settings.json` 中的旧模型/超时等覆盖项）只在 Claude 入口运行：`saiai init`、
+`saiai claude`（每次启动都检查 settings，无论本地代理是否已在运行）、`saiai doctor`
+/ `doctor claude` 与 `status`。`start`/`restart`、前台与后台代理进程、`init-codex`、
+`saiai codex` 和 `saiai desktop codex` 共用同一个代理，不输出 Claude 专属警告，
+`doctor codex` 也不包含这些检查（待发布）。原因：这些路径同时服务 Codex 用户；
+Windows PowerShell 5.1 包装脚本用 `2>&1` 捕获输出时，任何一行 stderr 都会变成
+终止性的 NativeCommandError。`saiai claude` 拉起代理时传给 `saiai start` 的子进程
+环境本身含 `ANTHROPIC_BASE_URL` 与 `CLAUDE_CODE_OAUTH_TOKEN`，因此不能在共享的
+启动路径上按当前环境报警。
+
 本地代理终止 `api.anthropic.com` 和 Codex 使用的 `api.openai.com` 本机 TLS，
 分别把允许的请求转发到配置的 Gateway；其他 `CONNECT` 请求作为任意目标和任意
 TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出站规则接管实际流量。
