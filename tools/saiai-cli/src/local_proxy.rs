@@ -1209,11 +1209,13 @@ where
                     Some(Err(error)) => {
                         if matches!(error, tungstenite::Error::Capacity(_)) {
                             // A Codex message over the frame limit (base64 screenshots) never
-                            // reaches the Gateway. Say why on both sides instead of dropping the
-                            // Gateway connection without a close frame; Codex then retries and
-                            // falls back to HTTPS as before.
-                            let _ = timeout(WEBSOCKET_CLOSE_TIMEOUT, upstream_sink.send(message_too_big_close())).await;
-                            let _ = timeout(WEBSOCKET_CLOSE_TIMEOUT, client_sink.send(message_too_big_close())).await;
+                            // reaches the Gateway. Say why on both sides, best effort, instead of
+                            // dropping the Gateway connection without a close frame; Codex then
+                            // retries and falls back to HTTPS as before.
+                            let _ = tokio::join!(
+                                timeout(WEBSOCKET_CLOSE_TIMEOUT, upstream_sink.send(message_too_big_close())),
+                                timeout(WEBSOCKET_CLOSE_TIMEOUT, client_sink.send(message_too_big_close())),
+                            );
                         }
                         return Err(error).context("Codex WebSocket read failed");
                     }
@@ -4677,8 +4679,10 @@ mod tests {
 
     #[tokio::test]
     async fn openai_websocket_oversized_codex_message_closes_both_sides_with_1009() {
-        let (codex_io, proxy_codex_io) = tokio::io::duplex(1 << 16);
-        let (proxy_gateway_io, gateway_io) = tokio::io::duplex(1 << 16);
+        // Small pipes: Codex is still blocked writing the oversized frame when
+        // the relay gives up, as with a real 16 MiB+ request.
+        let (codex_io, proxy_codex_io) = tokio::io::duplex(4096);
+        let (proxy_gateway_io, gateway_io) = tokio::io::duplex(4096);
         let small = tungstenite::protocol::WebSocketConfig::default()
             .max_frame_size(Some(1024))
             .max_message_size(Some(1024));
@@ -4686,7 +4690,7 @@ mod tests {
             WebSocketStream::from_raw_socket(proxy_codex_io, Role::Server, Some(small)).await;
         let proxy_gateway =
             WebSocketStream::from_raw_socket(proxy_gateway_io, Role::Client, None).await;
-        let mut codex = WebSocketStream::from_raw_socket(codex_io, Role::Client, None).await;
+        let codex = WebSocketStream::from_raw_socket(codex_io, Role::Client, None).await;
         let mut gateway = WebSocketStream::from_raw_socket(gateway_io, Role::Server, None).await;
         let relay = tokio::spawn(relay_openai_websocket(
             proxy_codex,
@@ -4694,12 +4698,20 @@ mod tests {
             |_, _| {},
         ));
 
-        codex
-            .send(Message::Text("x".repeat(4096).into()))
+        let (mut codex_sink, mut codex_source) = codex.split();
+        let writer = tokio::spawn(async move {
+            codex_sink
+                .send(Message::Text("x".repeat(64 * 1024).into()))
+                .await
+        });
+        let gateway_close = timeout(Duration::from_secs(3), gateway.next())
             .await
             .unwrap();
-        for side in [&mut gateway, &mut codex] {
-            match timeout(Duration::from_secs(3), side.next()).await.unwrap() {
+        let codex_close = timeout(Duration::from_secs(3), codex_source.next())
+            .await
+            .unwrap();
+        for close in [gateway_close, codex_close] {
+            match close {
                 Some(Ok(Message::Close(Some(frame)))) => {
                     assert_eq!(
                         frame.code,
@@ -4716,6 +4728,7 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(format!("{error:#}").contains("Codex WebSocket read failed"));
+        writer.abort();
     }
 
     #[tokio::test]
