@@ -57,6 +57,46 @@ manifest 中的当前版本，就跳过二进制下载，但仍会重新应用�
 配置文件并保留现有代理进程。配置变化、二进制替换、服务未运行或监听不可达时才会
 启动或刷新服务。
 
+## 卸载
+
+macOS / Linux：
+
+```bash
+curl -fsSL https://api.saiai.top/saiai-cli/setup.sh | bash -s -- uninstall
+```
+
+PowerShell：
+
+```powershell
+irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai uninstall
+```
+
+已安装的客户端也可以直接运行 `saiai uninstall`。命令先列出完整计划（API Key
+只显示末 4 位），在终端里输入 `y`/`yes` 才会执行；`--dry-run` 只打印计划，
+`--yes` 跳过确认。wrapper 只负责找到支持卸载的客户端（找不到时按 manifest 和
+SHA-256 校验下载一个临时副本），真正的删除都由客户端完成。
+
+会删除或还原：
+
+- 所有 SAIAI 环境的本地代理（systemd 用户服务、LaunchAgent、后台进程）；
+- `~/.claude/settings.json` 里与 SAIAI 写入值完全相同的 `CLAUDE_CODE_OAUTH_TOKEN`、
+  代理变量和 `NODE_EXTRA_CA_CERTS`；
+- Codex `.env` 中 `# BEGIN SAIAI CODEX IDE (managed)` 受管块，以及 `auth.json` 里的
+  SAIAI 占位登录；
+- 带 SAIAI 标记、且值未被改动的 VSCode `http.*` 设置；
+- SAIAI 导入的 CA（Windows CurrentUser\Root、Linux `~/.pki/nssdb` 中的
+  `saiai-local-proxy`，指纹匹配时才删）；
+- `~/.saiai`（或 `SAIAI_HOME`）中的 SAIAI 文件、`~/.claude/saiai-ca.*`，以及安装目录中的
+  `saiai`、`saiai-previous` 和更新残留；Windows 默认安装目录被删除后，同时移除用户
+  PATH 中的该目录。
+
+不会改动：用户自己修改过的值、通用设置（如 `ENABLE_TOOL_SEARCH`、Codex
+`model_provider = "openai"`）、`config.toml`、`~/.claude.json`、`.credentials.json`
+以及所有 `.bak-*` 备份（结束时会列出）。卸载后需要重新登录 Claude Code，并运行
+`codex login`。项目级环境需要在卸载时设置对应的 `CLAUDE_CONFIG_DIR` / `CODEX_HOME`
+才会清理其配置目录；否则只停止服务、删除 SAIAI 数据，并提示手动处理。任何一步失败时，
+SAIAI 数据和程序会保留，修复后重新运行 `saiai uninstall` 即可（可重复执行）。
+
 ## Claude Code 本地代理
 
 Claude 初始化写入用户级 `settings.json`：

@@ -30,12 +30,55 @@ impl Scope {
 
     #[cfg(any(target_os = "linux", target_os = "macos", test))]
     fn service_suffix(&self) -> String {
-        if self.isolated {
-            format!("-{}", digest(&self.directory))
-        } else {
-            String::new()
-        }
+        service_suffix_for(&self.root, &self.directory)
     }
+}
+
+/// Service suffix of any environment directory, independent of the active scope.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) fn service_suffix_for(root: &Path, directory: &Path) -> String {
+    if root != directory {
+        format!("-{}", digest(directory))
+    } else {
+        String::new()
+    }
+}
+
+/// `<product>-<digest>` for an already normalized product directory.
+pub(crate) fn environment_name(product: &str, directory: &Path) -> String {
+    format!("{product}-{}", digest(directory))
+}
+
+/// Product of an `environments/<name>` directory created by SAIAI.
+pub(crate) fn environment_product(name: &str) -> Option<&'static str> {
+    let (product, hash) = name.split_once('-')?;
+    let product = match product {
+        "claude" => "claude",
+        "codex" => "codex",
+        _ => return None,
+    };
+    (hash.len() == 24
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(product)
+}
+
+/// Normalized user home and SAIAI root, resolved exactly like `initialize`.
+pub(crate) fn layout() -> Result<(PathBuf, PathBuf)> {
+    let home = normalize(&crate::home_dir().context("failed to resolve home directory")?)?;
+    let root = match override_dir("SAIAI_HOME")? {
+        Some(directory) => directory,
+        None => normalize(&home.join(".saiai"))?,
+    };
+    Ok((home, root))
+}
+
+pub(crate) fn product_override(product: &str) -> Result<Option<PathBuf>> {
+    override_dir(match product {
+        "claude" => "CLAUDE_CONFIG_DIR",
+        _ => "CODEX_HOME",
+    })
 }
 
 fn digest(path: &Path) -> String {
@@ -118,7 +161,7 @@ fn product_directory(root: &Path, home: &Path, product: &str) -> Result<PathBuf>
     }
     Ok(root
         .join("environments")
-        .join(format!("{product}-{}", digest(&directory))))
+        .join(environment_name(product, &directory)))
 }
 
 /// Leading selector is deliberately separate from forwarded product arguments.
@@ -138,14 +181,14 @@ pub(crate) fn parse_selector(args: &mut Vec<String>) -> Result<Option<(String, S
 }
 
 pub(crate) fn initialize(command: &Command, selector: Option<(String, String)>) -> Result<()> {
-    if matches!(command, Command::Help | Command::Version) {
+    // Uninstall enumerates every environment itself and never uses a scope.
+    if matches!(
+        command,
+        Command::Help | Command::Version | Command::Uninstall(_)
+    ) {
         return Ok(());
     }
-    let home = normalize(&crate::home_dir().context("failed to resolve home directory")?)?;
-    let root = match override_dir("SAIAI_HOME")? {
-        Some(directory) => directory,
-        None => normalize(&home.join(".saiai"))?,
-    };
+    let (home, root) = layout()?;
     let product = match command {
         Command::Init(_) | Command::Claude(_) | Command::Doctor(DoctorTarget::Claude) => {
             Some("claude")
@@ -301,5 +344,27 @@ mod tests {
         assert!(default.service_suffix().is_empty());
         assert!(a.isolated && b.isolated);
         assert_ne!(a.service_suffix(), b.service_suffix());
+        assert_eq!(
+            a.service_suffix(),
+            service_suffix_for(&root, &root.join("environments/a"))
+        );
+    }
+    #[test]
+    fn environment_names_round_trip_and_reject_foreign_directories() {
+        let name = environment_name("codex", Path::new("/work/project/codex"));
+        assert_eq!(environment_product(&name), Some("codex"));
+        assert_eq!(
+            environment_product("claude-0123456789abcdef01234567"),
+            Some("claude")
+        );
+        for foreign in [
+            "codex",
+            "codex-0123",
+            "codex-0123456789ABCDEF01234567",
+            "other-0123456789abcdef01234567",
+            "codex-0123456789abcdef012345678",
+        ] {
+            assert_eq!(environment_product(foreign), None, "{foreign}");
+        }
     }
 }

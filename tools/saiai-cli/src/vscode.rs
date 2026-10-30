@@ -268,6 +268,8 @@ struct Document {
     tokens: Vec<Range<usize>>,
     comments: Vec<Range<usize>>,
     values: HashMap<String, Range<usize>>,
+    /// Top-level key token index and the index of its last value token.
+    members: Vec<(String, usize, usize)>,
     parsed: Value,
 }
 
@@ -615,6 +617,7 @@ fn parse_document(raw: &str) -> Result<Document> {
         bail!("VSCode settings must contain a JSONC object");
     }
     let mut values = HashMap::new();
+    let mut members = Vec::new();
     let mut seen = HashSet::new();
     let mut index = 1;
     while index < tokens.len() - 1 {
@@ -622,6 +625,7 @@ fn parse_document(raw: &str) -> Result<Document> {
         if !seen.insert(key.clone()) {
             bail!("VSCode settings contain duplicate top-level keys");
         }
+        let key_index = index;
         index += 2;
         let start = tokens[index].start;
         let mut depth = 0_usize;
@@ -636,7 +640,8 @@ fn parse_document(raw: &str) -> Result<Document> {
                 break;
             }
         }
-        values.insert(key, start..tokens[index - 1].end);
+        values.insert(key.clone(), start..tokens[index - 1].end);
+        members.push((key, key_index, index - 1));
         if &raw[tokens[index].clone()] == "," {
             index += 1;
         }
@@ -645,8 +650,141 @@ fn parse_document(raw: &str) -> Result<Document> {
         tokens,
         comments,
         values,
+        members,
         parsed,
     })
+}
+
+const MANAGED_NO_PROXY: [&str; 3] = ["localhost", "127.0.0.1", ".local"];
+
+/// The editor proxy URL SAIAI writes for a listen address, if it is valid.
+pub fn managed_proxy_url(listen: &str) -> Option<String> {
+    proxy_url(listen).ok()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ManagedRemoval {
+    NotManaged,
+    /// The SAIAI marker names a proxy that is not one of the given instances.
+    OtherProxy(String),
+    Owned {
+        content: String,
+        removed: Vec<&'static str>,
+        kept: Vec<&'static str>,
+    },
+}
+
+/// Remove only values identical to what SAIAI writes for the marker's proxy,
+/// plus the marker itself. Other text, comments and formatting are preserved.
+pub fn remove_managed_proxy(raw: &str, proxies: &[String]) -> Result<ManagedRemoval> {
+    let document = match parse_document(raw) {
+        Ok(document) => document,
+        Err(error) if has_managed_proxy(raw) => return Err(error),
+        Err(_) => return Ok(ManagedRemoval::NotManaged),
+    };
+    let markers: Vec<_> = document
+        .comments
+        .iter()
+        .filter(|span| raw[(*span).clone()].starts_with(MARKER))
+        .collect();
+    let Some(marker) = markers.first() else {
+        return Ok(ManagedRemoval::NotManaged);
+    };
+    if markers.len() > 1 {
+        bail!("VSCode settings contain multiple SAIAI ownership markers");
+    }
+    let proxy = raw[(marker.start + MARKER.len())..marker.end].trim();
+    if !proxies.iter().any(|candidate| candidate == proxy) {
+        return Ok(ManagedRemoval::OtherProxy(proxy.to_string()));
+    }
+    let mut owned = managed_settings(proxy);
+    owned.push(("http.noProxy", json!(MANAGED_NO_PROXY)));
+    let mut expected = document.parsed.clone();
+    let mut removed = Vec::new();
+    let mut kept = Vec::new();
+    let mut content = raw.to_owned();
+    for (key, value) in owned {
+        match document.parsed.get(key) {
+            Some(current) if *current == value => {
+                content = remove_member(&content, key)?;
+                expected.as_object_mut().unwrap().remove(key);
+                removed.push(key);
+            }
+            // SAIAI writes http.noProxy only when the user had none.
+            Some(_) if key != "http.noProxy" => kept.push(key),
+            Some(_) => {}
+            None => {}
+        }
+    }
+    let updated = parse_document(&content)?;
+    let marker = updated
+        .comments
+        .iter()
+        .find(|span| content[(*span).clone()].starts_with(MARKER))
+        .cloned()
+        .context("SAIAI ownership marker disappeared during removal")?;
+    // `merge_settings` inserts "\n  <marker>\n" directly after the brace.
+    let span =
+        if content[..marker.start].ends_with("{\n  ") && content[marker.end..].starts_with('\n') {
+            marker.start - 3..marker.end + 1
+        } else {
+            whole_line(&content, marker)
+        };
+    content.replace_range(span, "");
+    if parse_document(&content)?.parsed != expected {
+        bail!("VSCode settings could not be edited without changing other values");
+    }
+    Ok(ManagedRemoval::Owned {
+        content,
+        removed,
+        kept,
+    })
+}
+
+fn remove_member(raw: &str, key: &str) -> Result<String> {
+    let document = parse_document(raw)?;
+    let (_, key_index, last) = document
+        .members
+        .iter()
+        .find(|(name, _, _)| name == key)
+        .cloned()
+        .context("VSCode setting disappeared during removal")?;
+    let tokens = &document.tokens;
+    let mut end = tokens[last].end;
+    let mut separator = None;
+    if &raw[tokens[last + 1].clone()] == "," {
+        end = tokens[last + 1].end;
+    } else if &raw[tokens[key_index - 1].clone()] == "," {
+        // Last member: drop the comma that separated it from the previous one.
+        separator = Some(tokens[key_index - 1].clone());
+    }
+    let mut output = raw.to_owned();
+    let mut member = whole_line(raw, tokens[key_index].start..end);
+    // The block `merge_settings` appends starts with a blank separator line.
+    if separator.is_some()
+        && member.start >= 2
+        && raw.as_bytes()[member.start - 2..member.start] == *b"\n\n"
+    {
+        member.start -= 1;
+    }
+    output.replace_range(member, "");
+    if let Some(comma) = separator {
+        output.replace_range(comma, "");
+    }
+    Ok(output)
+}
+
+// Extend a span to its whole line when nothing else shares that line.
+fn whole_line(raw: &str, span: Range<usize>) -> Range<usize> {
+    let line_start = raw[..span.start].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = raw[span.end..]
+        .find('\n')
+        .map_or(raw.len(), |index| span.end + index + 1);
+    if raw[line_start..span.start].trim().is_empty() && raw[span.end..line_end].trim().is_empty() {
+        line_start..line_end
+    } else {
+        span
+    }
 }
 
 #[cfg(test)]
@@ -868,6 +1006,109 @@ mod tests {
         let merged = merge_settings(raw, LISTEN).unwrap();
         assert!(merged.contains("\"http.noProxy\": [\"example.test\", \".com:80\"]"));
         validate_settings(&merged, LISTEN).unwrap();
+    }
+
+    fn proxies() -> Vec<String> {
+        vec![managed_proxy_url(LISTEN).unwrap()]
+    }
+
+    fn removal(raw: &str) -> (String, Vec<&'static str>, Vec<&'static str>) {
+        match remove_managed_proxy(raw, &proxies()).unwrap() {
+            ManagedRemoval::Owned {
+                content,
+                removed,
+                kept,
+            } => (content, removed, kept),
+            other => panic!("unexpected removal result {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vscode_uninstall_restores_the_original_document() {
+        for original in [
+            "{}",
+            "{}\n",
+            "{\n // 保留用户设置\n \"editor.fontSize\": 16,\n \"nested\": {\"url\": \"https://example.test//path\",},\n}\n",
+            "{\r\n  \"editor.tabSize\": 2\r\n}\r\n",
+            "{ /* user */ \"a\": [1, 2,], }",
+            "\u{feff}{\n  \"a\": true // keep me\n}\n",
+        ] {
+            let merged = merge_settings(original, LISTEN).unwrap();
+            let (content, removed, kept) = removal(&merged);
+            assert_eq!(removed.len(), 7, "{merged}");
+            assert!(kept.is_empty());
+            assert_eq!(
+                parse_document(&content).unwrap().parsed,
+                parse_document(original).unwrap().parsed
+            );
+            assert!(!content.contains("SAIAI"));
+            assert!(!content.contains("http."));
+            for comment in ["保留用户设置", "/* user */", "// keep me"] {
+                assert_eq!(content.contains(comment), original.contains(comment));
+            }
+        }
+        let merged = merge_settings("{\n  \"editor.fontSize\": 16\n}\n", LISTEN).unwrap();
+        assert_eq!(removal(&merged).0, "{\n  \"editor.fontSize\": 16\n}\n");
+    }
+
+    #[test]
+    fn vscode_uninstall_keeps_user_modified_values_and_preexisting_no_proxy() {
+        let merged = merge_settings("{\"http.noProxy\": [\"example.test\"]}", LISTEN).unwrap();
+        let edited = merged
+            .replace(
+                "\"http.proxyStrictSSL\": true",
+                "\"http.proxyStrictSSL\": \"user\"",
+            )
+            .replace("\"override\"", "\"fallback\"");
+        let (content, removed, kept) = removal(&edited);
+        assert_eq!(kept, vec!["http.proxySupport", "http.proxyStrictSSL"]);
+        assert!(!removed.contains(&"http.noProxy"));
+        let parsed = parse_document(&content).unwrap().parsed;
+        assert_eq!(parsed["http.proxySupport"], json!("fallback"));
+        assert_eq!(parsed["http.proxyStrictSSL"], json!("user"));
+        assert_eq!(parsed["http.noProxy"], json!(["example.test"]));
+        assert!(parsed.get("http.proxy").is_none());
+        assert!(!content.contains(MARKER));
+    }
+
+    #[test]
+    fn vscode_uninstall_leaves_other_proxies_and_unmanaged_files_alone() {
+        let other = merge_settings("{}", "127.0.0.1:7890").unwrap();
+        assert_eq!(
+            remove_managed_proxy(&other, &proxies()).unwrap(),
+            ManagedRemoval::OtherProxy("http://127.0.0.1:7890".into())
+        );
+        for raw in [
+            "{\"http.proxy\": \"http://127.0.0.1:53940\"}",
+            "{\"description\": \"// SAIAI managed VSCode proxy: http://127.0.0.1:53940\"}",
+            "not json at all",
+        ] {
+            assert_eq!(
+                remove_managed_proxy(raw, &proxies()).unwrap(),
+                ManagedRemoval::NotManaged
+            );
+        }
+        let broken = format!("{}\n broken", merge_settings("{}", LISTEN).unwrap());
+        assert!(remove_managed_proxy(&broken, &proxies()).is_err());
+        let twice = merge_settings("{}", LISTEN).unwrap().replacen(
+            '{',
+            "{\n // SAIAI managed VSCode proxy: http://127.0.0.1:53940",
+            1,
+        );
+        assert!(remove_managed_proxy(&twice, &proxies()).is_err());
+    }
+
+    #[test]
+    fn vscode_uninstall_handles_members_on_shared_lines() {
+        let raw = "{\"a\": 1, \"http.proxy\": \"http://127.0.0.1:53940\", \"b\": 2 // SAIAI managed VSCode proxy: http://127.0.0.1:53940\n}";
+        let (content, removed, _) = removal(raw);
+        assert_eq!(removed, vec!["http.proxy"]);
+        assert_eq!(
+            parse_document(&content).unwrap().parsed,
+            json!({"a": 1, "b": 2})
+        );
+        let last = "{\"a\": 1,\n // SAIAI managed VSCode proxy: http://127.0.0.1:53940\n \"http.proxy\": \"http://127.0.0.1:53940\"\n}\n";
+        assert_eq!(removal(last).0, "{\"a\": 1\n}\n");
     }
 
     #[cfg(windows)]

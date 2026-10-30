@@ -37,6 +37,7 @@ mod codex_diagnostics;
 mod desktop_product;
 mod environment_scope;
 mod local_proxy;
+mod uninstall;
 mod upstream_tls;
 mod vscode;
 #[cfg(target_os = "windows")]
@@ -68,6 +69,7 @@ Usage:
   saiai codex [-- <codex arguments>]                              # launch Codex through SAIAI local proxy
   saiai vscode                                                    # configure the Codex VSCode extension for SAIAI
   saiai desktop [codex] [-- <Desktop arguments>]                # launch Codex Desktop through SAIAI
+  saiai uninstall [--yes] [--dry-run]                             # remove SAIAI services, settings, data and program
   saiai init       --base-url <base_url> --api-key <api_key>      # initialize Claude Code
   saiai init-codex --base-url <base_url> --api-key <api_key> [--websockets]
 Initialization uses provider-specific CA files and preserves VSCode editor settings.
@@ -248,6 +250,11 @@ fn main() -> Result<()> {
     let mut args = env::args().skip(1).collect::<Vec<_>>();
     let selector = environment_scope::parse_selector(&mut args)?;
     let command = parse_command(&args)?;
+    if matches!(command, Command::Uninstall(_)) && selector.is_some() {
+        bail!(
+            "`saiai uninstall` covers every SAIAI environment; remove the environment selector\n\n{USAGE}"
+        );
+    }
     environment_scope::initialize(&command, selector)?;
     #[cfg(target_os = "windows")]
     if matches!(
@@ -276,6 +283,7 @@ fn main() -> Result<()> {
         Command::Codex(args) => run_codex(&args),
         Command::VSCode => configure_vscode(),
         Command::Desktop { product, args } => run_desktop(product, &args),
+        Command::Uninstall(args) => uninstall::run(args),
         #[cfg(target_os = "linux")]
         Command::RunLinuxBackgroundProxy => run_linux_background_proxy_worker(),
         #[cfg(target_os = "windows")]
@@ -306,6 +314,7 @@ enum Command {
         product: DesktopProduct,
         args: Vec<String>,
     },
+    Uninstall(uninstall::Args),
     #[cfg(target_os = "linux")]
     RunLinuxBackgroundProxy,
     #[cfg(target_os = "windows")]
@@ -379,6 +388,7 @@ fn parse_command(args: &[String]) -> Result<Command> {
             return Ok(Command::Codex(codex_args));
         }
         "vscode" => return parse_no_arg_command("vscode", &args[1..], Command::VSCode),
+        "uninstall" => return Ok(Command::Uninstall(uninstall::parse_args(&args[1..])?)),
         "desktop" | "chatgpt" => {
             let (product, start) = if args[0] == "chatgpt" {
                 (DesktopProduct::ChatGPT, 1)
@@ -1163,20 +1173,63 @@ fn write_codex_ide_env(path: &Path, listen: &str, ca_cert_path: &str) -> Result<
     write_bytes_atomic(path, merged.as_bytes(), 0o600)
 }
 
-fn merge_codex_ide_env(raw: &str, listen: &str, ca_cert_path: &str) -> String {
-    let mut kept = Vec::new();
+struct StrippedCodexIdeEnv {
+    content: String,
+    /// Every BEGIN marker had a matching END marker.
+    complete: bool,
+}
+
+/// Remove only the managed BEGIN/END block lines, byte-for-byte preserving the
+/// rest. The blank separator SAIAI writes before a trailing block goes too.
+fn strip_codex_ide_env_block(raw: &str) -> StrippedCodexIdeEnv {
+    let lines = raw.split_inclusive('\n').collect::<Vec<_>>();
+    let mut keep = vec![true; lines.len()];
     let mut in_managed_block = false;
-    for line in raw.lines() {
+    let mut last_begin = None;
+    let mut last_end = None;
+    for (index, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         if trimmed == CODEX_IDE_ENV_BEGIN {
             in_managed_block = true;
-            continue;
-        }
-        if trimmed == CODEX_IDE_ENV_END {
+            last_begin = Some(index);
+            keep[index] = false;
+        } else if trimmed == CODEX_IDE_ENV_END {
             in_managed_block = false;
-            continue;
+            last_end = Some(index);
+            keep[index] = false;
+        } else if in_managed_block {
+            keep[index] = false;
         }
-        if in_managed_block || dotenv_assignment_key(line).is_some_and(is_managed_codex_env) {
+    }
+    let trailing_block = match (last_begin, last_end) {
+        (Some(_), _) if in_managed_block => last_begin,
+        (Some(begin), Some(end)) if lines[end + 1..].iter().all(|l| l.trim().is_empty()) => {
+            Some(begin)
+        }
+        _ => None,
+    };
+    if let Some(begin) = trailing_block
+        && begin > 0
+        && keep[begin - 1]
+        && lines[begin - 1].trim().is_empty()
+    {
+        keep[begin - 1] = false;
+    }
+    StrippedCodexIdeEnv {
+        content: lines
+            .iter()
+            .zip(keep)
+            .filter_map(|(line, keep)| keep.then_some(*line))
+            .collect(),
+        complete: !in_managed_block,
+    }
+}
+
+fn merge_codex_ide_env(raw: &str, listen: &str, ca_cert_path: &str) -> String {
+    let stripped = strip_codex_ide_env_block(raw).content;
+    let mut kept = Vec::new();
+    for line in stripped.lines() {
+        if dotenv_assignment_key(line).is_some_and(is_managed_codex_env) {
             continue;
         }
         kept.push(line);
@@ -2308,8 +2361,12 @@ struct LegacyWindowsPackagedProxyLeaseMarker {
 
 #[cfg(target_os = "windows")]
 fn restore_legacy_windows_packaged_proxy_lease() -> Result<()> {
-    let marker_path = windows_packaged_proxy_lease_marker_path()?;
-    let Some(marker) = read_legacy_windows_packaged_proxy_lease_marker(&marker_path)? else {
+    restore_legacy_windows_packaged_proxy_lease_at(&windows_packaged_proxy_lease_marker_path()?)
+}
+
+#[cfg(target_os = "windows")]
+fn restore_legacy_windows_packaged_proxy_lease_at(marker_path: &Path) -> Result<()> {
+    let Some(marker) = read_legacy_windows_packaged_proxy_lease_marker(marker_path)? else {
         return Ok(());
     };
 
@@ -2325,7 +2382,7 @@ fn restore_legacy_windows_packaged_proxy_lease() -> Result<()> {
     for thumbprint in &marker.added_ca_thumbprints {
         windows_remove_user_ca(Some(thumbprint))?;
     }
-    remove_windows_packaged_proxy_lease_marker(&marker_path)
+    remove_windows_packaged_proxy_lease_marker(marker_path)
 }
 
 #[cfg(target_os = "windows")]
@@ -6776,20 +6833,26 @@ fn start_linux_background_proxy(cfg: &SaiaiConfig) -> Result<u32> {
 
 #[cfg(target_os = "linux")]
 fn stop_linux_background_proxy() -> Result<bool> {
-    let Some(state) = linux_background_state()? else {
+    stop_linux_background_proxy_at(&saiai_config_dir()?, environment_scope::isolated())
+}
+
+#[cfg(target_os = "linux")]
+fn stop_linux_background_proxy_at(dir: &Path, isolated: bool) -> Result<bool> {
+    let state_path = dir.join(SAIAI_LINUX_PID_FILENAME);
+    let Some(state) = linux_background_state_at(dir)? else {
         return Ok(false);
     };
-    if !linux_background_state_matches(&state)? {
-        fs::remove_file(linux_background_state_path()?)
+    if !linux_background_state_matches_at(&state, dir, isolated)? {
+        fs::remove_file(&state_path)
             .with_context(|| format!("failed to remove stale SAIAI state for pid {}", state.pid))?;
         return Ok(false);
     }
 
-    signal_linux_background_process(&state, libc::SIGTERM)?;
+    signal_linux_background_process(&state, dir, isolated, libc::SIGTERM)?;
     let term_deadline = std::time::Instant::now() + Duration::from_secs(3);
     while std::time::Instant::now() < term_deadline {
-        if !linux_background_state_matches(&state)? {
-            let _ = fs::remove_file(linux_background_state_path()?);
+        if !linux_background_state_matches_at(&state, dir, isolated)? {
+            let _ = fs::remove_file(&state_path);
             return Ok(true);
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -6797,13 +6860,13 @@ fn stop_linux_background_proxy() -> Result<bool> {
 
     // Revalidate the original process identity immediately before escalation;
     // never signal a PID that has been reused or exec'd into another command.
-    if linux_background_state_matches(&state)? {
-        signal_linux_background_process(&state, libc::SIGKILL)?;
+    if linux_background_state_matches_at(&state, dir, isolated)? {
+        signal_linux_background_process(&state, dir, isolated, libc::SIGKILL)?;
     }
     let kill_deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < kill_deadline {
-        if !linux_background_state_matches(&state)? {
-            let _ = fs::remove_file(linux_background_state_path()?);
+        if !linux_background_state_matches_at(&state, dir, isolated)? {
+            let _ = fs::remove_file(&state_path);
             return Ok(true);
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -6815,8 +6878,13 @@ fn stop_linux_background_proxy() -> Result<bool> {
 }
 
 #[cfg(target_os = "linux")]
-fn signal_linux_background_process(state: &LinuxBackgroundState, signal: i32) -> Result<()> {
-    if !linux_background_state_matches(state)? {
+fn signal_linux_background_process(
+    state: &LinuxBackgroundState,
+    dir: &Path,
+    isolated: bool,
+    signal: i32,
+) -> Result<()> {
+    if !linux_background_state_matches_at(state, dir, isolated)? {
         return Ok(());
     }
     let pid = i32::try_from(state.pid).context("SAIAI background pid is out of range")?;
@@ -6831,7 +6899,12 @@ fn signal_linux_background_process(state: &LinuxBackgroundState, signal: i32) ->
 
 #[cfg(target_os = "linux")]
 fn linux_background_state() -> Result<Option<LinuxBackgroundState>> {
-    let path = linux_background_state_path()?;
+    linux_background_state_at(&saiai_config_dir()?)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_background_state_at(dir: &Path) -> Result<Option<LinuxBackgroundState>> {
+    let path = dir.join(SAIAI_LINUX_PID_FILENAME);
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
@@ -6864,11 +6937,20 @@ fn write_linux_background_state(state: &LinuxBackgroundState) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn linux_background_state_matches(state: &LinuxBackgroundState) -> Result<bool> {
+    linux_background_state_matches_at(state, &saiai_config_dir()?, environment_scope::isolated())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_background_state_matches_at(
+    state: &LinuxBackgroundState,
+    dir: &Path,
+    isolated: bool,
+) -> Result<bool> {
     if let Some(instance) = &state.instance {
-        if instance != &saiai_config_dir()?.display().to_string() {
+        if instance != &dir.display().to_string() {
             return Ok(false);
         }
-    } else if environment_scope::isolated() {
+    } else if isolated {
         return Ok(false);
     }
     let Some(identity) = linux_process_identity(state.pid)? else {
@@ -6940,11 +7022,15 @@ fn linux_process_has_background_marker(pid: u32) -> Result<bool> {
 
 #[cfg(target_os = "linux")]
 fn acquire_linux_service_lock() -> Result<LinuxServiceLock> {
+    acquire_linux_service_lock_at(&saiai_config_dir()?)
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_linux_service_lock_at(dir: &Path) -> Result<LinuxServiceLock> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    let dir = saiai_config_dir()?;
-    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let path = dir.join(SAIAI_LINUX_LOCK_FILENAME);
     match fs::symlink_metadata(&path) {
         Ok(metadata) if !metadata.file_type().is_file() => {
@@ -7084,11 +7170,24 @@ fn start_windows_background_proxy() -> Result<u32> {
 
 #[cfg(target_os = "windows")]
 fn stop_windows_background_proxy() -> Result<()> {
-    if let Some(process) = windows_background_process(true)? {
+    stop_windows_background_proxy_at(
+        &saiai_config_dir()?,
+        environment_scope::isolated(),
+        &[env::current_exe()?],
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn stop_windows_background_proxy_at(
+    dir: &Path,
+    isolated: bool,
+    legacy_executables: &[PathBuf],
+) -> Result<()> {
+    if let Some(process) = windows_background_process_at(dir, isolated, true, legacy_executables)? {
         process.stop()?;
     }
-    stop_windows_log_followers()?;
-    let _ = fs::remove_file(windows_pid_path()?);
+    stop_windows_log_followers_at(dir)?;
+    let _ = fs::remove_file(dir.join(SAIAI_WINDOWS_PID_FILENAME));
     Ok(())
 }
 
@@ -7103,14 +7202,29 @@ struct WindowsBackgroundState {
 
 #[cfg(target_os = "windows")]
 fn windows_background_process(terminate: bool) -> Result<Option<windows_background::Process>> {
-    let path = windows_pid_path()?;
+    windows_background_process_at(
+        &saiai_config_dir()?,
+        environment_scope::isolated(),
+        terminate,
+        &[env::current_exe()?],
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn windows_background_process_at(
+    dir: &Path,
+    isolated: bool,
+    terminate: bool,
+    legacy_executables: &[PathBuf],
+) -> Result<Option<windows_background::Process>> {
+    let path = dir.join(SAIAI_WINDOWS_PID_FILENAME);
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("cannot read background process state"),
     };
     if let Ok(state) = serde_json::from_str::<WindowsBackgroundState>(&raw) {
-        if state.version != 2 || state.instance != saiai_config_dir()?.display().to_string() {
+        if state.version != 2 || state.instance != dir.display().to_string() {
             bail!("background process state belongs to a different environment");
         }
         let Some(process) = windows_background::Process::open(state.pid, terminate)? else {
@@ -7124,7 +7238,7 @@ fn windows_background_process(terminate: bool) -> Result<Option<windows_backgrou
         .trim()
         .parse::<u32>()
         .context("invalid background process state")?;
-    if environment_scope::isolated() {
+    if isolated {
         bail!("isolated environment has unverified legacy process state");
     }
     let Some(process) = windows_background::Process::open(pid, terminate)? else {
@@ -7133,20 +7247,24 @@ fn windows_background_process(terminate: bool) -> Result<Option<windows_backgrou
     if !process.running() {
         return Ok(None);
     }
-    if !legacy_windows_worker_matches(pid)? {
+    if !legacy_windows_worker_matches(pid, legacy_executables)? {
         return Ok(None);
     }
     Ok(Some(process))
 }
 
 #[cfg(target_os = "windows")]
-fn legacy_windows_worker_matches(pid: u32) -> Result<bool> {
-    let executable = env::current_exe()?;
+fn legacy_windows_worker_matches(pid: u32, executables: &[PathBuf]) -> Result<bool> {
+    let executables = executables
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
     let output = ProcessCommand::new("powershell")
         .env("SAIAI_CHECK_PID", pid.to_string())
-        .env("SAIAI_CHECK_EXE", executable)
+        .env("SAIAI_CHECK_EXE", executables)
         .args(["-NoProfile", "-NonInteractive", "-Command",
-            r#"$ErrorActionPreference='Stop'; $p=Get-CimInstance Win32_Process -Filter ('ProcessId = '+$env:SAIAI_CHECK_PID); if (!$p) { exit 1 }; $expected=$env:SAIAI_CHECK_EXE -replace '^\\\\\?\\',''; $actual=$p.ExecutablePath -replace '^\\\\\?\\',''; if ($actual -ieq $expected -and $p.CommandLine -match '\s__run-background-proxy\s*$') { exit 0 }; exit 1"#])
+            r#"$ErrorActionPreference='Stop'; $p=Get-CimInstance Win32_Process -Filter ('ProcessId = '+$env:SAIAI_CHECK_PID); if (!$p) { exit 1 }; $actual=$p.ExecutablePath -replace '^\\\\\?\\',''; $expected=@($env:SAIAI_CHECK_EXE -split "`n" | Where-Object { ($_ -replace '^\\\\\?\\','') -ieq $actual }); if ($expected.Count -gt 0 -and $p.CommandLine -match '\s__run-background-proxy\s*$') { exit 0 }; exit 1"#])
         .stdout(Stdio::null()).stderr(Stdio::null()).status()
         .context("cannot verify legacy SAIAI worker identity")?;
     Ok(output.success())
@@ -7186,8 +7304,7 @@ fn register_windows_log_follower(child: u32) -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
-fn stop_windows_log_followers() -> Result<()> {
-    let directory = saiai_config_dir()?;
+fn stop_windows_log_followers_at(directory: &Path) -> Result<()> {
     let entries = match fs::read_dir(directory.join("log-followers")) {
         Ok(entries) => entries,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
@@ -7216,8 +7333,12 @@ fn stop_windows_log_followers() -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn lock_windows_service() -> Result<fs::File> {
-    let dir = saiai_config_dir()?;
-    fs::create_dir_all(&dir)?;
+    lock_windows_service_at(&saiai_config_dir()?)
+}
+
+#[cfg(target_os = "windows")]
+fn lock_windows_service_at(dir: &Path) -> Result<fs::File> {
+    fs::create_dir_all(dir)?;
     let file = OpenOptions::new()
         .create(true)
         .read(true)

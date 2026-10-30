@@ -233,6 +233,140 @@ function Invoke-SaiaiNative {
     }
 }
 
+function Get-SaiaiRelease {
+    param(
+        [Parameter(Mandatory = $true)][Net.WebClient]$Client,
+        [Parameter(Mandatory = $true)][string]$DownloadBase,
+        [Parameter(Mandatory = $true)][string]$Asset,
+        [Parameter(Mandatory = $true)][string]$ManifestPath
+    )
+
+    Write-Host "Checking SAIAI client release metadata..." -ForegroundColor Cyan
+    $Client.DownloadFile("$DownloadBase/manifest.json", $ManifestPath)
+    $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+    if ([int]$manifest.manifest_schema -ne 1) {
+        throw "Unsupported SAIAI manifest schema."
+    }
+    if ([string]$manifest.client_mode -cne "local-proxy") {
+        throw "Release is not a SAIAI local-proxy client."
+    }
+    if ([int]$manifest.configuration_schema_version -ne 1) {
+        throw "Unsupported SAIAI configuration schema."
+    }
+    $entry = $manifest.assets.PSObject.Properties[$Asset]
+    if ($null -eq $entry) {
+        throw "Manifest does not contain $Asset."
+    }
+    $release = [pscustomobject]@{
+        Sha256 = [string]$entry.Value.sha256
+        Size = [long]$entry.Value.size
+        Version = [string]$manifest.version
+    }
+    if ($release.Sha256 -notmatch '^[0-9a-f]{64}$' -or $release.Size -le 0) {
+        throw "Manifest metadata is invalid for $Asset."
+    }
+    return $release
+}
+
+function Save-SaiaiReleaseAsset {
+    param(
+        [Parameter(Mandatory = $true)][Net.WebClient]$Client,
+        [Parameter(Mandatory = $true)][string]$DownloadBase,
+        [Parameter(Mandatory = $true)][string]$Asset,
+        [Parameter(Mandatory = $true)]$Release,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    Write-Host "Downloading $Asset..." -ForegroundColor Cyan
+    $Client.DownloadFile("$DownloadBase/$Asset", $Destination)
+    if ((Get-Item -LiteralPath $Destination).Length -ne $Release.Size) {
+        throw "Size mismatch for $Asset."
+    }
+    if ((Get-SaiaiSha256 -Path $Destination) -cne $Release.Sha256) {
+        throw "SHA-256 mismatch for $Asset."
+    }
+}
+
+function Get-SaiaiDownloadBase {
+    if ([string]::IsNullOrWhiteSpace($env:SAIAI_DOWNLOAD_BASE)) {
+        return "https://api.saiai.top/saiai-cli"
+    }
+    return $env:SAIAI_DOWNLOAD_BASE.TrimEnd('/')
+}
+
+function Test-SaiaiUninstallSupport {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $false
+    }
+    $ErrorActionPreference = "Continue"
+    try {
+        $probe = @(& $Path uninstall --dry-run --yes 2>$null)
+        return ($LASTEXITCODE -eq 0) -and ($probe -ccontains "SAIAI uninstall plan")
+    }
+    catch {
+        return $false
+    }
+}
+
+# The native client is the only uninstall executor: find or download a capable
+# client; this wrapper never deletes files itself.
+function Invoke-SaiaiUninstall {
+    param([string[]]$Arguments)
+
+    foreach ($argument in $Arguments) {
+        if ($argument -cne "--yes" -and $argument -cne "--dry-run") {
+            [Console]::Error.WriteLine("Usage: Invoke-Saiai uninstall [--yes] [--dry-run]")
+            return 2
+        }
+    }
+    $candidates = @()
+    try { $candidates += Get-SaiaiInstallPath } catch {}
+    $command = Get-Command saiai -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $command) { $candidates += $command.Source }
+    $executor = $null
+    foreach ($candidate in $candidates) {
+        if (Test-SaiaiUninstallSupport -Path $candidate) {
+            $executor = $candidate
+            break
+        }
+    }
+    $temporary = Join-Path ([System.IO.Path]::GetTempPath()) ("saiai-uninstall-" + [guid]::NewGuid().ToString("N"))
+    try {
+        if ($null -eq $executor) {
+            Write-Host "No installed SAIAI client supports uninstall; downloading the current release to a temporary directory." -ForegroundColor DarkGray
+            try {
+                $null = New-Item -ItemType Directory -Path $temporary -Force
+                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                $progressBefore = $ProgressPreference
+                $ProgressPreference = "SilentlyContinue"
+                $client = New-Object Net.WebClient
+                try {
+                    $asset = Get-SaiaiAssetName
+                    $downloadBase = Get-SaiaiDownloadBase
+                    $release = Get-SaiaiRelease -Client $client -DownloadBase $downloadBase -Asset $asset -ManifestPath (Join-Path $temporary "manifest.json")
+                    $executor = Join-Path $temporary "saiai-uninstall.exe"
+                    Save-SaiaiReleaseAsset -Client $client -DownloadBase $downloadBase -Asset $asset -Release $release -Destination $executor
+                }
+                finally {
+                    $client.Dispose()
+                    $ProgressPreference = $progressBefore
+                }
+            }
+            catch {
+                [Console]::Error.WriteLine("Could not download a SAIAI client that supports uninstall ($($_.Exception.Message)). Nothing was changed.")
+                [Console]::Error.WriteLine("Retry when the network is available, or remove SAIAI manually: run ``saiai stop``, delete %USERPROFILE%\.saiai and %LOCALAPPDATA%\SAIAI, remove the SAIAI env entries from %USERPROFILE%\.claude\settings.json and the `"# BEGIN SAIAI CODEX IDE (managed)`" block from %USERPROFILE%\.codex\.env, then run ``codex login``.")
+                return 1
+            }
+        }
+        return Invoke-SaiaiNative -Path $executor -Arguments (@("uninstall") + $Arguments)
+    }
+    finally {
+        Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-Saiai {
     param(
         [Parameter(ValueFromRemainingArguments = $true)]
@@ -240,20 +374,16 @@ function Invoke-Saiai {
     )
 
     $provided = @($Arguments)
+    if ($provided.Count -ge 1 -and $provided[0] -ceq "uninstall") {
+        return Invoke-SaiaiUninstall -Arguments @($provided | Select-Object -Skip 1)
+    }
     if ($provided.Count -lt 2) {
-        Write-Error "Usage: Invoke-Saiai <base_url> <api_key> OR Invoke-Saiai init-codex <base_url> <api_key> [--websockets]"
+        Write-Error "Usage: Invoke-Saiai <base_url> <api_key> OR Invoke-Saiai init-codex <base_url> <api_key> [--websockets] OR Invoke-Saiai uninstall [--yes] [--dry-run]"
         return 2
     }
 
     $asset = Get-SaiaiAssetName
-    $downloadBase = if ([string]::IsNullOrWhiteSpace($env:SAIAI_DOWNLOAD_BASE)) {
-        "https://api.saiai.top/saiai-cli"
-    }
-    else {
-        $env:SAIAI_DOWNLOAD_BASE.TrimEnd('/')
-    }
-    $manifestUrl = "$downloadBase/manifest.json"
-    $assetUrl = "$downloadBase/$asset"
+    $downloadBase = Get-SaiaiDownloadBase
     $installPath = Get-SaiaiInstallPath
     $installDirectory = Split-Path -Parent $installPath
     $backupPath = Join-Path $installDirectory "saiai-previous.exe"
@@ -268,28 +398,9 @@ function Invoke-Saiai {
         $ProgressPreference = "SilentlyContinue"
         $client = New-Object Net.WebClient
         try {
-            Write-Host "Checking SAIAI client release metadata..." -ForegroundColor Cyan
-            $client.DownloadFile($manifestUrl, $manifestPath)
-            $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-            if ([int]$manifest.manifest_schema -ne 1) {
-                throw "Unsupported SAIAI manifest schema."
-            }
-            if ([string]$manifest.client_mode -cne "local-proxy") {
-                throw "Release is not a SAIAI local-proxy client."
-            }
-            if ([int]$manifest.configuration_schema_version -ne 1) {
-                throw "Unsupported SAIAI configuration schema."
-            }
-            $entry = $manifest.assets.PSObject.Properties[$asset]
-            if ($null -eq $entry) {
-                throw "Manifest does not contain $asset."
-            }
-            $expectedSha256 = [string]$entry.Value.sha256
-            $expectedSize = [long]$entry.Value.size
-            $releaseVersion = [string]$manifest.version
-            if ($expectedSha256 -notmatch '^[0-9a-f]{64}$' -or $expectedSize -le 0) {
-                throw "Manifest metadata is invalid for $asset."
-            }
+            $release = Get-SaiaiRelease -Client $client -DownloadBase $downloadBase -Asset $asset -ManifestPath $manifestPath
+            $expectedSha256 = $release.Sha256
+            $releaseVersion = $release.Version
 
             $null = New-Item -ItemType Directory -Path $installDirectory -Force
             if (Test-Path -LiteralPath $installPath -PathType Container) {
@@ -310,14 +421,7 @@ function Invoke-Saiai {
             }
             else {
                 $binaryUpdated = $true
-                Write-Host "Downloading $asset..." -ForegroundColor Cyan
-                $client.DownloadFile($assetUrl, $candidatePath)
-                if ((Get-Item -LiteralPath $candidatePath).Length -ne $expectedSize) {
-                    throw "Size mismatch for $asset."
-                }
-                if ((Get-SaiaiSha256 -Path $candidatePath) -cne $expectedSha256) {
-                    throw "SHA-256 mismatch for $asset."
-                }
+                Save-SaiaiReleaseAsset -Client $client -DownloadBase $downloadBase -Asset $asset -Release $release -Destination $candidatePath
 
                 $installedExists = Test-Path -LiteralPath $installPath -PathType Leaf
                 if ($installedExists) {
