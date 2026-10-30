@@ -18,9 +18,14 @@ mkdir -p "${fixtures}" "${fake_bin}" "${home}" "${install_dir}"
 asset="${fixtures}/saiai-linux-x86_64"
 cat >"${asset}" <<'SH'
 #!/usr/bin/env bash
+if [ "${1:-}" = "uninstall" ] && [ "${2:-}" = "--dry-run" ] && [ "${3:-}" = "--yes" ]; then
+  printf 'SAIAI uninstall plan\nSAIAI home: test\n'
+  exit 0
+fi
 printf 'UPDATED=%s\n' "${SAIAI_BINARY_UPDATED:-}" >>"${SAIAI_TEST_BINARY_INVOKED:?}"
 printf 'CALL\n' >>"${SAIAI_TEST_BINARY_INVOKED:?}"
 printf '%s\n' "$@" >>"${SAIAI_TEST_BINARY_INVOKED:?}"
+exit "${SAIAI_TEST_EXIT:-0}"
 SH
 chmod +x "${asset}"
 sha256="$(sha256sum "${asset}" | awk '{print $1}')"
@@ -52,6 +57,9 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 printf '%s\n' "${url}" >>"${SAIAI_TEST_CURL_LOG:?}"
+if [ "${SAIAI_TEST_CURL_FAIL:-}" = 1 ]; then
+  exit 22
+fi
 case "${url}" in
   */manifest.json) cp "${SAIAI_TEST_FIXTURES:?}/manifest.json" "${destination}" ;;
   */saiai-linux-x86_64) cp "${SAIAI_TEST_FIXTURES:?}/saiai-linux-x86_64" "${destination}" ;;
@@ -174,5 +182,60 @@ if grep -Fq 'TEST_ONLY_DEFAULT_SCOPE_KEY' "${invoked}"; then
   echo "interactive project setup reused the default Key" >&2
   exit 1
 fi
+
+# Uninstall: the wrapper only selects a capable native executor.
+curl_before="$(wc -l <"${curl_log}")"
+export SAIAI_TEST_EXIT=3
+if run_setup uninstall --yes --forget-unknown-environments; then
+  echo "wrapper did not pass the uninstall exit code through" >&2
+  exit 1
+fi
+unset SAIAI_TEST_EXIT
+mapfile -t uninstall_invocation <"${invoked}"
+test "${uninstall_invocation[1]}" = "CALL"
+test "${uninstall_invocation[2]}" = "uninstall"
+test "${uninstall_invocation[3]}" = "--yes"
+test "${uninstall_invocation[4]}" = "--forget-unknown-environments"
+test "${#uninstall_invocation[@]}" -eq 5
+test "$(wc -l <"${curl_log}")" -eq "${curl_before}"
+test -x "${install_dir}/saiai"
+
+if run_setup uninstall --force; then
+  echo "wrapper accepted an unknown uninstall option" >&2
+  exit 1
+fi
+test ! -e "${invoked}"
+grep -Fq 'uninstall [--yes] [--dry-run] [--forget-unknown-environments]' "${output}"
+
+# An installed client that does not know a requested option is not chosen.
+printf '#!/usr/bin/env bash\nfor a in "$@"; do [ "$a" = --forget-unknown-environments ] && exit 1; done\nprintf "SAIAI uninstall plan\\n"\n' >"${install_dir}/saiai"
+chmod +x "${install_dir}/saiai"
+curl_before="$(wc -l <"${curl_log}")"
+run_setup uninstall --yes --forget-unknown-environments
+mapfile -t option_invocation <"${invoked}"
+test "${option_invocation[2]}" = "uninstall"
+test "${option_invocation[4]}" = "--forget-unknown-environments"
+test "$(wc -l <"${curl_log}")" -eq "$((curl_before + 2))"
+
+# An installed client without uninstall support: use a verified temporary copy.
+curl_before="$(wc -l <"${curl_log}")"
+printf '#!/usr/bin/env bash\necho "Unknown command: $1" >&2\nexit 1\n' >"${install_dir}/saiai"
+cp "${install_dir}/saiai" "${temporary}/old-client"
+run_setup uninstall --dry-run
+mapfile -t temporary_invocation <"${invoked}"
+test "${temporary_invocation[2]}" = "uninstall"
+test "${temporary_invocation[3]}" = "--dry-run"
+test "$(wc -l <"${curl_log}")" -eq "$((curl_before + 2))"
+cmp -s "${install_dir}/saiai" "${temporary}/old-client"
+
+export SAIAI_TEST_CURL_FAIL=1
+if run_setup uninstall --yes; then
+  echo "wrapper reported success without an uninstall executor" >&2
+  exit 1
+fi
+unset SAIAI_TEST_CURL_FAIL
+test ! -e "${invoked}"
+grep -Fq 'Could not download a SAIAI client that supports uninstall' "${output}"
+cmp -s "${install_dir}/saiai" "${temporary}/old-client"
 
 echo "SAIAI local-proxy wrapper checks passed"

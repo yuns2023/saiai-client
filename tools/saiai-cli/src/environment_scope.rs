@@ -11,11 +11,15 @@ use std::{
 
 static ACTIVE: OnceLock<Scope> = OnceLock::new();
 
+/// Records which product directory an isolated environment serves.
+pub(crate) const PRODUCT_DIR_FILENAME: &str = "product-dir";
+
 #[derive(Debug)]
 pub(crate) struct Scope {
     pub root: PathBuf,
     pub directory: PathBuf,
     pub isolated: bool,
+    product_dir: Option<PathBuf>,
 }
 
 impl Scope {
@@ -25,17 +29,61 @@ impl Scope {
             root,
             directory,
             isolated,
+            product_dir: None,
         }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", test))]
     fn service_suffix(&self) -> String {
-        if self.isolated {
-            format!("-{}", digest(&self.directory))
-        } else {
-            String::new()
-        }
+        service_suffix_for(&self.root, &self.directory)
     }
+}
+
+/// Service suffix of any environment directory, independent of the active scope.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) fn service_suffix_for(root: &Path, directory: &Path) -> String {
+    if root != directory {
+        format!("-{}", digest(directory))
+    } else {
+        String::new()
+    }
+}
+
+/// `<product>-<digest>` for an already normalized product directory.
+pub(crate) fn environment_name(product: &str, directory: &Path) -> String {
+    format!("{product}-{}", digest(directory))
+}
+
+/// Product of an `environments/<name>` directory created by SAIAI.
+pub(crate) fn environment_product(name: &str) -> Option<&'static str> {
+    let (product, hash) = name.split_once('-')?;
+    let product = match product {
+        "claude" => "claude",
+        "codex" => "codex",
+        _ => return None,
+    };
+    (hash.len() == 24
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(product)
+}
+
+/// Normalized user home and SAIAI root, resolved exactly like `initialize`.
+pub(crate) fn layout() -> Result<(PathBuf, PathBuf)> {
+    let home = normalize(&crate::home_dir().context("failed to resolve home directory")?)?;
+    let root = match override_dir("SAIAI_HOME")? {
+        Some(directory) => directory,
+        None => normalize(&home.join(".saiai"))?,
+    };
+    Ok((home, root))
+}
+
+pub(crate) fn product_override(product: &str) -> Result<Option<PathBuf>> {
+    override_dir(match product {
+        "claude" => "CLAUDE_CONFIG_DIR",
+        _ => "CODEX_HOME",
+    })
 }
 
 fn digest(path: &Path) -> String {
@@ -104,21 +152,27 @@ fn override_dir(name: &str) -> Result<Option<PathBuf>> {
     Ok(Some(normalize(Path::new(&raw))?))
 }
 
-fn product_directory(root: &Path, home: &Path, product: &str) -> Result<PathBuf> {
+/// Environment directory and, when isolated, the product directory it serves.
+fn product_directory(
+    root: &Path,
+    home: &Path,
+    product: &str,
+) -> Result<(PathBuf, Option<PathBuf>)> {
     let (variable, default) = match product {
         "claude" => ("CLAUDE_CONFIG_DIR", ".claude"),
         "codex" => ("CODEX_HOME", ".codex"),
         _ => bail!("unknown environment: {product}; expected default, claude, or codex"),
     };
     let Some(directory) = override_dir(variable)? else {
-        return Ok(root.to_path_buf());
+        return Ok((root.to_path_buf(), None));
     };
     if normalize(&home.join(default)).ok().as_ref() == Some(&directory) {
-        return Ok(root.to_path_buf());
+        return Ok((root.to_path_buf(), None));
     }
-    Ok(root
+    let environment = root
         .join("environments")
-        .join(format!("{product}-{}", digest(&directory))))
+        .join(environment_name(product, &directory));
+    Ok((environment, Some(directory)))
 }
 
 /// Leading selector is deliberately separate from forwarded product arguments.
@@ -138,14 +192,14 @@ pub(crate) fn parse_selector(args: &mut Vec<String>) -> Result<Option<(String, S
 }
 
 pub(crate) fn initialize(command: &Command, selector: Option<(String, String)>) -> Result<()> {
-    if matches!(command, Command::Help | Command::Version) {
+    // Uninstall enumerates every environment itself and never uses a scope.
+    if matches!(
+        command,
+        Command::Help | Command::Version | Command::Uninstall(_)
+    ) {
         return Ok(());
     }
-    let home = normalize(&crate::home_dir().context("failed to resolve home directory")?)?;
-    let root = match override_dir("SAIAI_HOME")? {
-        Some(directory) => directory,
-        None => normalize(&home.join(".saiai"))?,
-    };
+    let (home, root) = layout()?;
     let product = match command {
         Command::Init(_) | Command::Claude(_) | Command::Doctor(DoctorTarget::Claude) => {
             Some("claude")
@@ -157,19 +211,19 @@ pub(crate) fn initialize(command: &Command, selector: Option<(String, String)>) 
         | Command::Doctor(DoctorTarget::Codex) => Some("codex"),
         _ => None,
     };
-    let selected = match selector.as_ref() {
+    let (selected, product_dir) = match selector.as_ref() {
         Some((flag, value)) if flag == "--instance-dir" => {
             if product.is_some() {
                 bail!("--instance-dir is only for proxy service commands");
             }
-            normalize(Path::new(value))?
+            (normalize(Path::new(value))?, None)
         }
         Some((_, value)) => {
             if product.is_some_and(|p| p != value) {
                 bail!("environment selector conflicts with the product command");
             }
             if value == "default" {
-                root.clone()
+                (root.clone(), None)
             } else {
                 product_directory(&root, &home, value)?
             }
@@ -179,18 +233,19 @@ pub(crate) fn initialize(command: &Command, selector: Option<(String, String)>) 
             None => {
                 let claude = product_directory(&root, &home, "claude")?;
                 let codex = product_directory(&root, &home, "codex")?;
-                match (claude != root, codex != root) {
+                match (claude.0 != root, codex.0 != root) {
                     (true, true) => bail!(
                         "both Claude and Codex environments are selected; use saiai --environment claude|codex|default <command>"
                     ),
                     (true, false) => claude,
                     (false, true) => codex,
-                    _ => root.clone(),
+                    _ => (root.clone(), None),
                 }
             }
         },
     };
     let mut scope = Scope::new(root, selected);
+    scope.product_dir = product_dir;
     // Keep an already configured legacy launcher route until explicit init.
     // Never silently fall back for start/stop/restart or a fresh project.
     if scope.isolated
@@ -237,6 +292,29 @@ fn legacy_route_matches(root: &Path, product: &str) -> Result<bool> {
     // Match the exact managed block, not unrelated text/comments in the file.
     let expected = crate::merge_codex_ide_env("", &config.listen, &config.ca_cert_path);
     Ok(raw.contains(expected.trim()))
+}
+
+/// Let `saiai uninstall` map this isolated environment to its product
+/// directory later. Only initialization creates a missing environment.
+pub(crate) fn record_product_dir(create: bool) -> Result<()> {
+    let Some(scope) = active().filter(|scope| scope.isolated) else {
+        return Ok(());
+    };
+    let Some(product_dir) = &scope.product_dir else {
+        return Ok(());
+    };
+    if !create && !scope.directory.is_dir() {
+        return Ok(());
+    }
+    let path = scope.directory.join(PRODUCT_DIR_FILENAME);
+    let text = product_dir
+        .to_str()
+        .context("product directory must be valid UTF-8")?;
+    if fs::read_to_string(&path).ok().as_deref() == Some(text) {
+        return Ok(());
+    }
+    crate::write_bytes_atomic(&path, text.as_bytes(), 0o600)
+        .with_context(|| format!("failed to record {}", path.display()))
 }
 
 pub(crate) fn active() -> Option<&'static Scope> {
@@ -301,5 +379,27 @@ mod tests {
         assert!(default.service_suffix().is_empty());
         assert!(a.isolated && b.isolated);
         assert_ne!(a.service_suffix(), b.service_suffix());
+        assert_eq!(
+            a.service_suffix(),
+            service_suffix_for(&root, &root.join("environments/a"))
+        );
+    }
+    #[test]
+    fn environment_names_round_trip_and_reject_foreign_directories() {
+        let name = environment_name("codex", Path::new("/work/project/codex"));
+        assert_eq!(environment_product(&name), Some("codex"));
+        assert_eq!(
+            environment_product("claude-0123456789abcdef01234567"),
+            Some("claude")
+        );
+        for foreign in [
+            "codex",
+            "codex-0123",
+            "codex-0123456789ABCDEF01234567",
+            "other-0123456789abcdef01234567",
+            "codex-0123456789abcdef012345678",
+        ] {
+            assert_eq!(environment_product(foreign), None, "{foreign}");
+        }
     }
 }

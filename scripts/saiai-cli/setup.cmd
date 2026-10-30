@@ -2,6 +2,7 @@
 setlocal EnableExtensions DisableDelayedExpansion
 
 rem Install or reuse SAIAI, apply config, and start the Claude local proxy.
+if /I "%~1"=="uninstall" goto uninstall
 if "%~2"=="" goto usage
 
 set "ARCH=%PROCESSOR_ARCHITECTURE%"
@@ -114,7 +115,28 @@ exit /b %SAIAI_EXIT%
 :usage
 echo Usage: setup.cmd ^<base_url^> ^<api_key^> 1>&2
 echo    or: setup.cmd init-codex ^<base_url^> ^<api_key^> [--websockets] 1>&2
+echo    or: setup.cmd uninstall [--yes] [--dry-run] [--forget-unknown-environments] 1>&2
 exit /b 2
+
+rem The installed client is the only uninstall executor.
+:uninstall
+set "UNINSTALL_EXE="
+if not "%SAIAI_INSTALL_DIR%"=="" (
+  set "UNINSTALL_EXE=%SAIAI_INSTALL_DIR%\saiai.exe"
+) else if not "%LOCALAPPDATA%"=="" (
+  set "UNINSTALL_EXE=%LOCALAPPDATA%\SAIAI\bin\saiai.exe"
+) else if not "%USERPROFILE%"=="" (
+  set "UNINSTALL_EXE=%USERPROFILE%\AppData\Local\SAIAI\bin\saiai.exe"
+)
+if not defined UNINSTALL_EXE goto uninstall_missing
+if not exist "%UNINSTALL_EXE%" goto uninstall_missing
+"%UNINSTALL_EXE%" %*
+exit /b %ERRORLEVEL%
+
+:uninstall_missing
+echo SAIAI is not installed in the default location. Uninstall from PowerShell instead: 1>&2
+echo   irm https://api.saiai.top/saiai-cli/setup.ps1 ^| iex; Invoke-Saiai uninstall 1>&2
+exit /b 1
 
 :failed
 del /F /Q "%STAGED_PATH%" >nul 2>nul
