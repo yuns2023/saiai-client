@@ -95,7 +95,11 @@ launcher 会提示先运行 `saiai init-codex`，否则 Codex 0.163+ 仍会上�
 Windows 系统环境或 `CurrentUser\Root`；升级时如发现旧版本遗留的 proxy lease，
 只执行一次有所有权校验的恢复和清理。
 
-Desktop launcher 在普通权限终端中使用，无需以管理员身份运行。其私有 runtime
+商店版 Desktop 请从普通权限终端启动，无需以管理员身份运行。基于 Chromium 的商店版
+Desktop（如 26.1027）在 UAC 提权令牌下会尝试经 Explorer 降权重启自身并退出，该重启
+对包激活无效，结果是不出现窗口；因此 launcher 检测到 UAC 提权令牌
+（`TokenElevationTypeFull`）时会在激活前直接拒绝（包括复用已有实例），而不是等到
+启动超时。UAC 关闭或内置 Administrator 的令牌不会被 Chromium 降权，也不拒绝。其私有 runtime
 目录只允许当前用户访问，目录初始化失败与运行中 Desktop 的复用拒绝分别报告；
 只有确实无法安全复用已有实例时，才应按提示正常 `File > Quit` 后重试。
 

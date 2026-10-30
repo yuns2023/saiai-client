@@ -547,6 +547,56 @@ pub(crate) fn powershell(script: &str, variables: &[(&str, &std::ffi::OsStr)]) -
     powershell_with_failure(script, variables, helper_failure)
 }
 
+/// Chromium-based Desktop builds relaunch themselves through Explorer when the
+/// browser process holds a UAC-elevated token, then exit. That relaunch does
+/// not survive packaged activation, so the Desktop exits without a window.
+/// Mirror Chromium's `UserAccountIsUnnecessarilyElevated` (TokenElevationTypeFull);
+/// UAC-off and built-in Administrator tokens are not de-elevated by Chromium.
+/// An unreadable token keeps the previous launch behaviour.
+#[cfg(windows)]
+pub(crate) fn uac_elevated() -> bool {
+    use std::ffi::c_void;
+    type Handle = *mut c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> Handle;
+        fn CloseHandle(handle: Handle) -> i32;
+    }
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenProcessToken(process: Handle, access: u32, token: *mut Handle) -> i32;
+        fn GetTokenInformation(
+            token: Handle,
+            class: u32,
+            information: *mut c_void,
+            length: u32,
+            returned: *mut u32,
+        ) -> i32;
+    }
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_ELEVATION_TYPE_CLASS: u32 = 18;
+    const TOKEN_ELEVATION_TYPE_FULL: u32 = 2;
+    let mut token: Handle = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return false;
+    }
+    let mut elevation_type = 0u32;
+    let mut returned = 0u32;
+    let read = unsafe {
+        GetTokenInformation(
+            token,
+            TOKEN_ELEVATION_TYPE_CLASS,
+            (&mut elevation_type as *mut u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+            &mut returned,
+        )
+    };
+    unsafe {
+        CloseHandle(token);
+    }
+    read != 0 && elevation_type == TOKEN_ELEVATION_TYPE_FULL
+}
+
 #[cfg(windows)]
 fn helper_failure() -> anyhow::Error {
     anyhow::anyhow!("Windows Desktop helper failed. No Desktop process was stopped.")

@@ -2026,6 +2026,11 @@ fn run_windows_packaged_desktop(
             codex_home.join("config.toml").display()
         );
     }
+    if windows_desktop_runtime::uac_elevated() {
+        bail!(
+            "packaged Windows Desktop cannot be activated from an administrator (UAC-elevated) terminal: the Chromium-based Desktop relaunches itself without administrator rights, which fails for the Store package and leaves no window. Open a normal terminal and retry `saiai desktop codex`"
+        );
+    }
     let session_id = command_output(
         "powershell",
         &[
