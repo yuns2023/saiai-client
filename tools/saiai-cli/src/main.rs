@@ -37,6 +37,7 @@ mod codex_diagnostics;
 mod desktop_product;
 mod environment_scope;
 mod local_proxy;
+mod upstream_tls;
 mod vscode;
 #[cfg(target_os = "windows")]
 mod windows_background;
@@ -3567,6 +3568,12 @@ fn run_local_proxy(verbose: bool) -> Result<()> {
     }))
 }
 
+/// The installation CA certificate, excluded from upstream trust. Empty when
+/// unreadable, which limits upstream trust to the bundled roots.
+fn installation_ca_pem(cfg: &SaiaiConfig) -> String {
+    fs::read_to_string(&cfg.ca_cert_path).unwrap_or_default()
+}
+
 fn read_runtime_ca(cfg: &SaiaiConfig) -> Result<(String, String)> {
     if cfg.version != SAIAI_CONFIG_VERSION || cfg.ca_key_path.trim().is_empty() {
         bail!("SAIAI local proxy configuration is obsolete; rerun the one-command SAIAI setup");
@@ -4110,7 +4117,8 @@ fn run_update() -> Result<()> {
         .context("failed to start async runtime")?;
 
     println!("Checking: {manifest_url}");
-    let manifest = runtime.block_on(download_update_manifest(&manifest_url))?;
+    let installation_ca = installation_ca_pem(&cfg);
+    let manifest = runtime.block_on(download_update_manifest(&manifest_url, &installation_ca))?;
     let expected_sha256 = if let Some(manifest) = manifest {
         let remote_version = manifest.version.trim();
         let ordering = compare_versions(remote_version, env!("CARGO_PKG_VERSION"))
@@ -4146,7 +4154,7 @@ fn run_update() -> Result<()> {
     };
 
     println!("Downloading: {url}");
-    let bytes = runtime.block_on(download_update_asset(&url))?;
+    let bytes = runtime.block_on(download_update_asset(&url, &installation_ca))?;
     validate_update_asset(&bytes, asset)?;
     if let Some(expected) = &expected_sha256 {
         let actual = sha256_hex(&bytes);
@@ -4327,7 +4335,8 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
             DoctorTarget::Codex => provider_route(cfg, ProviderKind::Codex).0,
             DoctorTarget::All => cfg.base_url.as_str(),
         };
-        match runtime.block_on(check_gateway_health(health_base)) {
+        let installation_ca = installation_ca_pem(cfg);
+        match runtime.block_on(check_gateway_health(health_base, &installation_ca)) {
             Ok(status) => report.ok("SAIAI health", status),
             Err(err) => report.error("SAIAI health", format!("{err:#}")),
         }
@@ -5637,9 +5646,9 @@ fn process_name(pid: u32) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-async fn check_gateway_health(base_url: &str) -> Result<String> {
+async fn check_gateway_health(base_url: &str, installation_ca_pem: &str) -> Result<String> {
     let health_url = format!("{}/health", base_url.trim().trim_end_matches('/'));
-    let response = reqwest::Client::builder()
+    let response = upstream_tls::upstream_http_client_builder(installation_ca_pem)
         .no_proxy()
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
@@ -5902,8 +5911,11 @@ fn check_service_config(report: &mut DoctorReport) {
 fn check_service_config(_report: &mut DoctorReport) {}
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-async fn download_update_manifest(url: &str) -> Result<Option<UpdateManifest>> {
-    let response = reqwest::Client::builder()
+async fn download_update_manifest(
+    url: &str,
+    installation_ca_pem: &str,
+) -> Result<Option<UpdateManifest>> {
+    let response = upstream_tls::upstream_http_client_builder(installation_ca_pem)
         .no_proxy()
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
@@ -5930,8 +5942,8 @@ async fn download_update_manifest(url: &str) -> Result<Option<UpdateManifest>> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-async fn download_update_asset(url: &str) -> Result<Vec<u8>> {
-    let response = reqwest::Client::builder()
+async fn download_update_asset(url: &str, installation_ca_pem: &str) -> Result<Vec<u8>> {
+    let response = upstream_tls::upstream_http_client_builder(installation_ca_pem)
         .no_proxy()
         .timeout(Duration::from_secs(60))
         .redirect(reqwest::redirect::Policy::none())
@@ -8892,7 +8904,10 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             .build()
             .unwrap();
         let err = runtime
-            .block_on(check_gateway_health(&format!("http://127.0.0.1:{port}")))
+            .block_on(check_gateway_health(
+                &format!("http://127.0.0.1:{port}"),
+                "",
+            ))
             .unwrap_err();
         let outer = err.to_string();
         let full = format!("{err:#}");
