@@ -13,7 +13,7 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
@@ -55,9 +55,19 @@ const SAIAI_DESKTOP_EMAIL: &str = "saiai-local-proxy@example.invalid";
 const DESKTOP_STATSIG_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 // Codex Desktop 26.908.4834.0 / Statsig JS 3.33.4 gates bundled locale
 // messages behind layer 72216192. Keep this local bootstrap deliberately
-// narrow: it enables only i18n and does not opt the synthetic SAIAI identity
-// into unrelated hosted experiments or send it to the Statsig control plane.
-const DESKTOP_STATSIG_I18N_PAYLOAD: &str = r#"{"feature_gates":{},"dynamic_configs":{},"layer_configs":{"72216192":{"name":"72216192","value":{"enable_i18n":true},"rule_id":"saiai-local-i18n","secondary_exposures":[],"is_user_in_experiment":false,"is_experiment_active":false,"allocated_experiment_name":"","explicit_parameters":["enable_i18n"],"undelegated_secondary_exposures":[]}},"has_updates":true,"time":0,"user":{"userID":"saiai-local-proxy-user","customIDs":{"stableID":"saiai-local-proxy"}}}"#;
+// narrow: it enables i18n and, unless disabled, Desktop browser control. It
+// does not opt the synthetic SAIAI identity into unrelated hosted experiments
+// or send it to the Statsig control plane.
+const DESKTOP_STATSIG_LOCAL_PAYLOAD: &str = r#"{"feature_gates":{},"dynamic_configs":{},"layer_configs":{"72216192":{"name":"72216192","value":{"enable_i18n":true},"rule_id":"saiai-local-i18n","secondary_exposures":[],"is_user_in_experiment":false,"is_experiment_active":false,"allocated_experiment_name":"","explicit_parameters":["enable_i18n"],"undelegated_secondary_exposures":[]}},"has_updates":true,"time":0,"user":{"userID":"saiai-local-proxy-user","customIDs":{"stableID":"saiai-local-proxy"}}}"#;
+// Desktop 26.1021/26.1027 greys out @Chrome/@Edge ("disabled by your
+// organization or unavailable in your region") unless this Statsig gate is on.
+// The browser extension reaches Desktop over native messaging, so model
+// traffic stays on the proxied app-server and needs no ChatGPT browser login.
+// The Computer Use gate (1506311413) is intentionally left off.
+const DESKTOP_BROWSER_USE_GATE: &str = "410065390";
+const DESKTOP_BROWSER_USE_ENV: &str = "SAIAI_DESKTOP_BROWSER_USE";
+static DESKTOP_STATSIG_BROWSER_PAYLOAD: LazyLock<String> =
+    LazyLock::new(|| desktop_statsig_base(DesktopFeatures { browser_use: true }).to_string());
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(600);
 // Match the Gateway's default ingress ceiling. Buffer only bytes received,
@@ -106,6 +116,8 @@ pub struct Config {
     pub ca_key_pem: String,
     pub verbose: bool,
     pub chatgpt_chat_passthrough: bool,
+    /// Lets Desktop control the user's browser through the official extension.
+    pub desktop_browser_use: bool,
     /// Directory holding the client-proof device key; `None` disables proofs.
     pub client_proof_dir: Option<std::path::PathBuf>,
 }
@@ -128,6 +140,7 @@ impl std::fmt::Debug for Config {
             .field("runtime_ca", &true)
             .field("verbose", &self.verbose)
             .field("chatgpt_chat_passthrough", &self.chatgpt_chat_passthrough)
+            .field("desktop_browser_use", &self.desktop_browser_use)
             .field("client_proof", &self.client_proof_dir.is_some())
             .finish()
     }
@@ -142,6 +155,7 @@ struct State {
     ca_key_pem: Zeroizing<String>,
     verbose: bool,
     chatgpt_chat_passthrough: bool,
+    desktop_features: DesktopFeatures,
     client: Client,
     websocket_tls: rustls::ClientConfig,
     certs: Mutex<HashMap<String, ManagedCertificate>>,
@@ -362,6 +376,10 @@ impl State {
         // process. It never enables body tracing; verbose records remain
         // limited to request metadata and response outcomes.
         let verbose = cfg.verbose || env::var("SAIAI_PROXY_VERBOSE").ok().as_deref() == Some("1");
+        let browser_use = desktop_browser_use_setting(
+            env::var(DESKTOP_BROWSER_USE_ENV).ok().as_deref(),
+            cfg.desktop_browser_use,
+        );
 
         Ok(Self {
             listen: cfg.listen,
@@ -372,6 +390,7 @@ impl State {
             ca_key_pem: Zeroizing::new(cfg.ca_key_pem),
             verbose,
             chatgpt_chat_passthrough,
+            desktop_features: DesktopFeatures { browser_use },
             client,
             websocket_tls,
             certs: Mutex::new(HashMap::new()),
@@ -974,7 +993,10 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                                 continue;
                             }
                             if let Some((status, body, reason, headers)) =
-                                chatgpt_account_sidecar_response(&request)
+                                chatgpt_account_sidecar_response_with(
+                                    &request,
+                                    state.desktop_features,
+                                )
                             {
                                 if state.verbose {
                                     eprintln!(
@@ -996,7 +1018,9 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                                 }
                                 continue;
                             }
-                            if let Some(resp) = chatgpt_sidecar_response(&request) {
+                            if let Some(resp) =
+                                chatgpt_sidecar_response_with(&request, state.desktop_features)
+                            {
                                 if state.verbose {
                                     eprintln!(
                                         "chatgpt sidecar response method={} target={} status={} reason={} close_after={}",
@@ -2327,7 +2351,31 @@ fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
     Ok(target.replacen("/backend-api/", "/chatgpt/backend-api/", 1))
 }
 
+/// `SAIAI_DESKTOP_BROWSER_USE=0/1` overrides the configured value; any other
+/// value keeps the configuration so a typo cannot silently flip the default.
+fn desktop_browser_use_setting(env_value: Option<&str>, configured: bool) -> bool {
+    match env_value {
+        Some("0") => false,
+        Some("1") => true,
+        _ => configured,
+    }
+}
+
+/// Local Desktop capabilities that change the synthetic identity's responses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DesktopFeatures {
+    browser_use: bool,
+}
+
+#[cfg(test)]
 fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse> {
+    chatgpt_sidecar_response_with(request, DesktopFeatures { browser_use: true })
+}
+
+fn chatgpt_sidecar_response_with(
+    request: &IncomingRequest,
+    features: DesktopFeatures,
+) -> Option<StaticResponse> {
     let path = request_path(&request.target).ok()?;
     if matches!(
         path.as_str(),
@@ -2368,8 +2416,12 @@ fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse>
         "/v1/initialize" => Some(StaticResponse {
             status: StatusCode::OK,
             content_type: "application/json",
-            body: DESKTOP_STATSIG_I18N_PAYLOAD.as_bytes(),
-            reason: "desktop_statsig_i18n_bootstrap",
+            body: if features.browser_use {
+                DESKTOP_STATSIG_BROWSER_PAYLOAD.as_bytes()
+            } else {
+                DESKTOP_STATSIG_LOCAL_PAYLOAD.as_bytes()
+            },
+            reason: "desktop_statsig_local_bootstrap",
         }),
         "/ces/statsc/flush" if request.method.eq_ignore_ascii_case("POST") => {
             Some(StaticResponse {
@@ -2473,7 +2525,15 @@ fn chatgpt_chat_disabled_response(request: &IncomingRequest) -> Option<StaticRes
     })
 }
 
+#[cfg(test)]
 fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<AccountSidecarResponse> {
+    chatgpt_account_sidecar_response_with(request, DesktopFeatures { browser_use: true })
+}
+
+fn chatgpt_account_sidecar_response_with(
+    request: &IncomingRequest,
+    features: DesktopFeatures,
+) -> Option<AccountSidecarResponse> {
     let path = request_path(&request.target).ok()?;
     // These are local identity reads, not hosted account APIs. A write must
     // never receive a synthetic success or be sent to a pooled account.
@@ -2502,7 +2562,7 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         let user = desktop_statsig_user(body.get("user")?)?;
         return Some((
             StatusCode::OK,
-            serde_json::to_vec(&desktop_statsig_payload(user)?).ok()?,
+            serde_json::to_vec(&desktop_statsig_payload(user, features)?).ok()?,
             "desktop_statsig_identity_bootstrap",
             &[],
         ));
@@ -2638,7 +2698,7 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
             {
                 user["customIDs"]["stableID"] = Value::String(stable_id.to_owned());
             }
-            json!({"statsigPayload": serde_json::to_string(&desktop_statsig_payload(user)?).ok()?})
+            json!({"statsigPayload": serde_json::to_string(&desktop_statsig_payload(user, features)?).ok()?})
         }
         "/conversations" => json!({
             "items": [],
@@ -2703,6 +2763,11 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
         // /backend-api. Both spellings refer to the same local identity;
         // hosted account settings and writes remain unavailable.
         "/settings/user" => json!({}),
+        // Desktop reads Work settings before every local browser connection
+        // ("read Work browser access") and refuses Chrome control unless the
+        // read succeeds. `settings: null` means no hosted Work policy, so the
+        // local `localBrowserUse` default applies; writes stay unsupported.
+        "/wham/work/settings" if features.browser_use => json!({"settings": null}),
         _ if desktop_settings_account_id(&path).is_some() => {
             if desktop_settings_account_id(&path) != Some(account_id.as_str()) {
                 return None;
@@ -2748,6 +2813,7 @@ fn is_desktop_identity_read_path(path: &str) -> bool {
             | "/me"
             | "/payments/payment_methods"
             | "/settings/user"
+            | "/wham/work/settings"
     ) || is_desktop_full_account_path(path)
         || desktop_settings_account_id(path).is_some()
 }
@@ -2850,8 +2916,23 @@ fn desktop_statsig_user(input: &Value) -> Option<Value> {
     Some(user)
 }
 
-fn desktop_statsig_payload(user: Value) -> Option<Value> {
-    let mut payload: Value = serde_json::from_str(DESKTOP_STATSIG_I18N_PAYLOAD).ok()?;
+fn desktop_statsig_base(features: DesktopFeatures) -> Value {
+    let mut payload: Value =
+        serde_json::from_str(DESKTOP_STATSIG_LOCAL_PAYLOAD).expect("valid local Statsig payload");
+    if features.browser_use {
+        payload["feature_gates"][DESKTOP_BROWSER_USE_GATE] = json!({
+            "name": DESKTOP_BROWSER_USE_GATE,
+            "value": true,
+            "rule_id": "saiai-local-browser-use",
+            "id_type": "userID",
+            "secondary_exposures": []
+        });
+    }
+    payload
+}
+
+fn desktop_statsig_payload(user: Value, features: DesktopFeatures) -> Option<Value> {
+    let mut payload = desktop_statsig_base(features);
     payload["user"] = user;
     Some(payload)
 }
@@ -3313,6 +3394,7 @@ mod tests {
                 ca_key_pem,
                 verbose: false,
                 chatgpt_chat_passthrough: false,
+                desktop_browser_use: true,
                 client_proof_dir: None,
             })
             .unwrap(),
@@ -3745,6 +3827,7 @@ mod tests {
                 ca_key_pem: ca_key_pem.clone(),
                 verbose: false,
                 chatgpt_chat_passthrough: true,
+                desktop_browser_use: true,
                 client_proof_dir: None,
             })
             .unwrap();
@@ -4281,6 +4364,7 @@ mod tests {
                 ca_key_pem,
                 verbose: false,
                 chatgpt_chat_passthrough: true,
+                desktop_browser_use: true,
                 client_proof_dir: None,
             })
             .unwrap(),
@@ -4291,6 +4375,10 @@ mod tests {
             ("GET", "/backend-api/settings/user?extension=MOCK_ONLY", 200),
             ("PATCH", "/settings/user", 501),
             ("PATCH", "/backend-api/settings/user", 501),
+            ("GET", "/backend-api/wham/work/settings", 200),
+            ("GET", "/wham/work/settings", 200),
+            ("PATCH", "/backend-api/wham/work/settings", 501),
+            ("GET", "/backend-api/wham/work/settings/future", 501),
             (
                 "POST",
                 "/backend-api/settings/user?extension=MOCK_ONLY",
@@ -4350,7 +4438,12 @@ mod tests {
             if expected_status == 200 {
                 // The official settings schema accepts the neutral local
                 // identity's empty optional settings, without hosted flags.
-                assert_eq!(body, json!({}));
+                let expected = if path.contains("/wham/work/settings") {
+                    json!({"settings": null})
+                } else {
+                    json!({})
+                };
+                assert_eq!(body, expected);
             } else {
                 assert!(body.get("error").is_some());
             }
@@ -4541,7 +4634,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_statsig_bootstrap_tracks_authenticated_identity_without_enabling_gates() {
+    fn desktop_statsig_bootstrap_tracks_authenticated_identity_and_local_gates() {
         for (account, user) in [("account-one", "user-one"), ("account-two", "user-two")] {
             let claims = json!({"https://api.openai.com/auth": {
                 "chatgpt_account_id": account, "chatgpt_user_id": user
@@ -4567,7 +4660,7 @@ mod tests {
                     "customIDs": {"account_id": account, "workspace_id": account, "stableID": "stable-test"}
                 })
             );
-            assert_eq!(payload["feature_gates"], json!({}));
+            assert_eq!(payload["feature_gates"], desktop_statsig_expected_gates());
             assert_eq!(payload["dynamic_configs"], json!({}));
             assert_eq!(payload["layer_configs"].as_object().unwrap().len(), 1);
             assert!(!String::from_utf8(body).unwrap().contains("must-not-echo"));
@@ -4580,7 +4673,104 @@ mod tests {
             let (_, body, _, _) = chatgpt_account_sidecar_response(&initialize).unwrap();
             let evaluated: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(evaluated["user"], payload["user"]);
-            assert_eq!(evaluated["feature_gates"], json!({}));
+            assert_eq!(evaluated["feature_gates"], desktop_statsig_expected_gates());
+        }
+    }
+
+    fn desktop_statsig_expected_gates() -> Value {
+        json!({"410065390": {"name": "410065390", "value": true,
+            "rule_id": "saiai-local-browser-use", "id_type": "userID", "secondary_exposures": []}})
+    }
+
+    #[test]
+    fn desktop_browser_use_off_restores_empty_gates_and_unsupported_work_settings() {
+        let off = DesktopFeatures { browser_use: false };
+        let initialize = IncomingRequest {
+            method: "POST".to_string(),
+            target: "/v1/initialize".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(&json!({"user": {"userID": "user"}})).unwrap(),
+        };
+        let (_, body, _, _) = chatgpt_account_sidecar_response_with(&initialize, off).unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["feature_gates"], json!({}));
+        assert_eq!(payload["layer_configs"].as_object().unwrap().len(), 1);
+
+        let bootstrap = IncomingRequest {
+            method: "GET".to_string(),
+            target: "/backend-api/wham/statsig/bootstrap".to_string(),
+            body: vec![],
+            ..initialize.clone()
+        };
+        let (_, body, _, _) = chatgpt_account_sidecar_response_with(&bootstrap, off).unwrap();
+        let envelope: Value = serde_json::from_slice(&body).unwrap();
+        let payload: Value =
+            serde_json::from_str(envelope["statsigPayload"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["feature_gates"], json!({}));
+
+        // An identity body that cannot be projected falls back to the static
+        // bootstrap, which must honor the same switch.
+        let unprojected = IncomingRequest {
+            body: b"not json".to_vec(),
+            ..initialize
+        };
+        assert!(chatgpt_account_sidecar_response_with(&unprojected, off).is_none());
+        let fallback = chatgpt_sidecar_response_with(&unprojected, off).unwrap();
+        let payload: Value = serde_json::from_slice(fallback.body).unwrap();
+        assert_eq!(payload["feature_gates"], json!({}));
+        let on = chatgpt_sidecar_response(&unprojected).unwrap();
+        let payload: Value = serde_json::from_slice(on.body).unwrap();
+        assert_eq!(payload["feature_gates"], desktop_statsig_expected_gates());
+
+        let work_settings = IncomingRequest {
+            method: "GET".to_string(),
+            target: "/backend-api/wham/work/settings".to_string(),
+            http_version: "HTTP/1.1".to_string(),
+            headers: vec![],
+            body: vec![],
+        };
+        assert!(chatgpt_account_sidecar_response_with(&work_settings, off).is_none());
+        assert_eq!(
+            chatgpt_sidecar_response_with(&work_settings, off)
+                .unwrap()
+                .status,
+            StatusCode::NOT_IMPLEMENTED
+        );
+    }
+
+    #[test]
+    fn desktop_browser_use_env_overrides_only_with_exact_values() {
+        for configured in [true, false] {
+            assert_eq!(desktop_browser_use_setting(None, configured), configured);
+            assert!(!desktop_browser_use_setting(Some("0"), configured));
+            assert!(desktop_browser_use_setting(Some("1"), configured));
+            for other in ["", "false", "true", "off", " 0"] {
+                assert_eq!(
+                    desktop_browser_use_setting(Some(other), configured),
+                    configured
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn desktop_work_settings_read_reports_no_hosted_policy() {
+        for target in ["/backend-api/wham/work/settings", "/wham/work/settings"] {
+            let request = IncomingRequest {
+                method: "GET".to_string(),
+                target: target.to_string(),
+                http_version: "HTTP/1.1".to_string(),
+                headers: vec![],
+                body: vec![],
+            };
+            let (status, body, reason, _) = chatgpt_account_sidecar_response(&request).unwrap();
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(reason, "desktop_account_identity");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                json!({"settings": null})
+            );
         }
     }
 
@@ -4635,7 +4825,7 @@ mod tests {
         let (_, body, _, _) = chatgpt_account_sidecar_response(&request).unwrap();
         let payload: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["user"], user);
-        assert_eq!(payload["feature_gates"], json!({}));
+        assert_eq!(payload["feature_gates"], desktop_statsig_expected_gates());
         assert!(!String::from_utf8(body).unwrap().contains("must-not-echo"));
         for target in [
             "/v1/initialize?se=2",
@@ -4666,7 +4856,7 @@ mod tests {
         };
         let response = chatgpt_sidecar_response(&request).unwrap();
         assert_eq!(response.status, StatusCode::OK);
-        assert_eq!(response.reason, "desktop_statsig_i18n_bootstrap");
+        assert_eq!(response.reason, "desktop_statsig_local_bootstrap");
         let payload: Value = serde_json::from_slice(response.body).unwrap();
         assert_eq!(
             payload["layer_configs"]["72216192"]["value"]["enable_i18n"],
@@ -5159,6 +5349,7 @@ mod tests {
             ca_key_pem,
             verbose: false,
             chatgpt_chat_passthrough: true,
+            desktop_browser_use: true,
             client_proof_dir: None,
         })
         .unwrap();
@@ -5254,6 +5445,7 @@ mod tests {
             ca_key_pem,
             verbose: false,
             chatgpt_chat_passthrough: false,
+            desktop_browser_use: true,
             client_proof_dir: None,
         })
         .unwrap();
@@ -5346,6 +5538,7 @@ mod tests {
                 ca_key_pem,
                 verbose: false,
                 chatgpt_chat_passthrough: true,
+                desktop_browser_use: true,
                 client_proof_dir: None,
             })
             .unwrap();
@@ -5473,6 +5666,7 @@ mod tests {
                 ca_key_pem,
                 verbose: false,
                 chatgpt_chat_passthrough: true,
+                desktop_browser_use: true,
                 client_proof_dir: None,
             })
             .unwrap();
@@ -5613,6 +5807,7 @@ mod tests {
             ca_key_pem,
             verbose: false,
             chatgpt_chat_passthrough: true,
+            desktop_browser_use: true,
             client_proof_dir: None,
         };
         let state = State::new(cfg.clone()).unwrap();
@@ -5997,6 +6192,7 @@ mod tests {
                 ca_key_pem,
                 verbose: false,
                 chatgpt_chat_passthrough: false,
+                desktop_browser_use: true,
                 client_proof_dir: None,
             })
             .unwrap(),
@@ -6087,6 +6283,7 @@ mod tests {
             ca_key_pem,
             verbose: false,
             chatgpt_chat_passthrough: true,
+            desktop_browser_use: true,
             client_proof_dir: None,
         })
         .err()
@@ -6179,6 +6376,7 @@ mod tests {
             ca_key_pem,
             verbose: false,
             chatgpt_chat_passthrough: true,
+            desktop_browser_use: true,
             client_proof_dir: Some(directory.path().to_path_buf()),
         })
         .unwrap();
@@ -6344,6 +6542,7 @@ mod tests {
                 ca_key_pem,
                 verbose: false,
                 chatgpt_chat_passthrough: true,
+                desktop_browser_use: true,
                 client_proof_dir: Some(directory.path().to_path_buf()),
             })
             .unwrap(),

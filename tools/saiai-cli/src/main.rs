@@ -845,6 +845,13 @@ fn initialize_codex_local_proxy_at(
         });
     }
 
+    // A missing CA or an obsolete layout forces a rebuild, but an explicit
+    // choice to turn off Desktop browser control must survive it.
+    let desktop_browser_use = fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|existing| existing.get("desktop_browser_use")?.as_bool())
+        .unwrap_or(true);
     backup_if_exists(&config_path, timestamp)?;
     let ca_cert_path = config_dir.join(SAIAI_CA_FILENAME);
     let ca_key_path = config_dir.join(SAIAI_CA_KEY_FILENAME);
@@ -857,6 +864,7 @@ fn initialize_codex_local_proxy_at(
         ca_cert_path: ca_cert_path.display().to_string(),
         ca_key_path: ca_key_path.display().to_string(),
         chatgpt_chat_passthrough: true,
+        desktop_browser_use,
         providers: ProviderCredentials::default(),
     };
     config.providers.codex = Some(ProviderCredential {
@@ -3468,6 +3476,8 @@ struct SaiaiConfig {
     ca_key_path: String,
     #[serde(default = "default_true")]
     chatgpt_chat_passthrough: bool,
+    #[serde(default = "default_true")]
+    desktop_browser_use: bool,
     #[serde(default)]
     providers: ProviderCredentials,
 }
@@ -3640,6 +3650,7 @@ fn update_saiai_provider_config_at(
             .map(|(_, key)| key.display().to_string())
             .unwrap_or_default(),
         chatgpt_chat_passthrough: true,
+        desktop_browser_use: true,
         providers: ProviderCredentials::default(),
     });
     let existing_listen = (!config.listen.trim().is_empty()).then_some(config.listen.as_str());
@@ -3703,6 +3714,7 @@ fn proxy_runtime_config_changed(previous: Option<&SaiaiConfig>, current: &SaiaiC
         || previous.ca_cert_path != current.ca_cert_path
         || previous.ca_key_path != current.ca_key_path
         || previous.chatgpt_chat_passthrough != current.chatgpt_chat_passthrough
+        || previous.desktop_browser_use != current.desktop_browser_use
         || previous.providers != current.providers
         || (previous.providers.is_empty()
             && (previous.base_url != current.base_url || previous.api_key != current.api_key))
@@ -3788,6 +3800,7 @@ fn run_local_proxy(verbose: bool) -> Result<()> {
         ca_key_pem,
         verbose,
         chatgpt_chat_passthrough: cfg.chatgpt_chat_passthrough,
+        desktop_browser_use: cfg.desktop_browser_use,
         client_proof_dir: saiai_config_dir().ok(),
     }))
 }
@@ -9003,6 +9016,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         }))
         .unwrap();
         assert!(config.chatgpt_chat_passthrough);
+        assert!(config.desktop_browser_use);
     }
 
     #[test]
@@ -9057,6 +9071,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             ca_cert_path: "/tmp/saiai-ca.crt".to_string(),
             ca_key_path: "/tmp/saiai-ca.key".to_string(),
             chatgpt_chat_passthrough: true,
+            desktop_browser_use: true,
             providers: providers.clone(),
         };
         let current = SaiaiConfig {
@@ -9123,6 +9138,32 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     }
 
     #[test]
+    fn init_codex_rebuild_keeps_desktop_browser_use_off() {
+        let temporary = tempfile::tempdir().unwrap();
+        let args = InitArgs {
+            base_url: "https://first.example.test".to_string(),
+            api_key: "TEST_ONLY_CODEX_PROXY_KEY".to_string(),
+            websockets: false,
+            configure_vscode_editor: false,
+            trust_vscode_ca: false,
+        };
+        let first = initialize_codex_local_proxy_at(temporary.path(), &args, "test-first").unwrap();
+        let mut config: SaiaiConfig =
+            serde_json::from_slice(&fs::read(&first.config_path).unwrap()).unwrap();
+        config.desktop_browser_use = false;
+        write_saiai_config_at(&first.config_path, &config).unwrap();
+        // An unreadable CA sends init down the rebuild branch.
+        fs::remove_file(&first.ca_cert_path).unwrap();
+
+        let second =
+            initialize_codex_local_proxy_at(temporary.path(), &args, "test-second").unwrap();
+        let rebuilt: SaiaiConfig =
+            serde_json::from_slice(&fs::read(&second.config_path).unwrap()).unwrap();
+        assert!(read_runtime_ca(&rebuilt).is_ok());
+        assert!(!rebuilt.desktop_browser_use);
+    }
+
+    #[test]
     fn init_codex_reuses_existing_proxy_ca_and_local_preferences() {
         let temporary = tempfile::tempdir().unwrap();
         let first_args = InitArgs {
@@ -9144,6 +9185,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         });
         config.listen = "127.0.0.1:29908".to_string();
         config.chatgpt_chat_passthrough = false;
+        config.desktop_browser_use = false;
         write_saiai_config_at(&first.config_path, &config).unwrap();
 
         let second_args = InitArgs {
@@ -9179,6 +9221,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         );
         assert_eq!(updated.listen, "127.0.0.1:29908");
         assert!(!updated.chatgpt_chat_passthrough);
+        assert!(!updated.desktop_browser_use);
     }
 
     #[test]

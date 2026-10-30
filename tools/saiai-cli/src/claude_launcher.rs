@@ -250,6 +250,7 @@ mod tests {
             ca_cert_path: "/synthetic/ca.crt".to_string(),
             ca_key_path: "/synthetic/ca.key".to_string(),
             chatgpt_chat_passthrough: false,
+            desktop_browser_use: false,
             providers: ProviderCredentials::default(),
         }
     }
