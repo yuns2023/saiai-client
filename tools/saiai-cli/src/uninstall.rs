@@ -2201,9 +2201,6 @@ static PARKED: std::sync::Mutex<Vec<(PathBuf, bool)>> = std::sync::Mutex::new(Ve
 
 #[cfg(windows)]
 fn schedule_temporary_copy_removal() {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
     let Some(directory) = env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
@@ -2254,7 +2251,6 @@ Remove-Item -LiteralPath $env:SAIAI_CLEANUP_DIR -Recurse -Force -ErrorAction Sil
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
         .spawn();
 }
 
