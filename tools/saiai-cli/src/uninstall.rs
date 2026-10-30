@@ -2467,9 +2467,15 @@ fn execute_item(action: &Action, args: &Args) -> Result<Outcome> {
             let mut file = options
                 .open(&path)
                 .with_context(|| format!("failed to create {}", path.display()))?;
-            file.write_all(text.as_bytes())
+            if let Err(error) = file
+                .write_all(text.as_bytes())
                 .and_then(|_| file.sync_all())
-                .with_context(|| format!("failed to write {}", path.display()))?;
+            {
+                // A partial record would never be rewritten; drop the file we created.
+                drop(file);
+                let _ = fs::remove_file(&path);
+                return Err(error).with_context(|| format!("failed to write {}", path.display()));
+            }
             Ok(Outcome::Done)
         }
         #[cfg(target_os = "linux")]

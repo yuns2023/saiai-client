@@ -73,7 +73,8 @@ irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai uninstall
 
 已安装的客户端也可以直接运行 `saiai uninstall`。命令先列出完整计划（API Key
 只显示末 4 位），在终端里输入 `y`/`yes` 才会执行；`--dry-run` 只打印计划，
-`--yes` 跳过确认。wrapper 只负责找到支持卸载的客户端（找不到时按 manifest 和
+`--yes` 跳过确认（无人值守或 Windows ssh 等没有人输入的场景必须加 `--yes`，
+否则会一直等待确认）。wrapper 只负责找到支持卸载的客户端（找不到时按 manifest 和
 SHA-256 校验下载一个临时副本），真正的删除都由客户端完成。
 
 会删除或还原：
