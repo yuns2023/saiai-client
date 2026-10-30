@@ -4329,7 +4329,7 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
         };
         match runtime.block_on(check_gateway_health(health_base)) {
             Ok(status) => report.ok("SAIAI health", status),
-            Err(err) => report.error("SAIAI health", err.to_string()),
+            Err(err) => report.error("SAIAI health", format!("{err:#}")),
         }
     }
 
@@ -8878,6 +8878,27 @@ HTTPS_PROXY="http://127.0.0.1:1111"
 
         let tls = anyhow::anyhow!("local proxy MITM TLS handshake failed");
         assert!(!is_local_proxy_connect_error(&tls));
+    }
+
+    #[test]
+    fn gateway_health_error_keeps_root_cause() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = runtime
+            .block_on(check_gateway_health(&format!("http://127.0.0.1:{port}")))
+            .unwrap_err();
+        let outer = err.to_string();
+        let full = format!("{err:#}");
+        assert!(outer.starts_with("failed to GET"));
+        assert!(full.starts_with(&outer));
+        assert!(full.len() > outer.len(), "{full}");
     }
 
     #[test]
