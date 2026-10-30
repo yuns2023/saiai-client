@@ -176,6 +176,14 @@ bus 时，`saiai start` 会自动改用脱离终端的托管后台进程。后�
 saiai doctor
 ```
 
+本地代理连接 SAIAI Gateway（HTTPS 与 WebSocket）、`saiai doctor` 的健康检查和
+`saiai update` 下载同时信任内置根证书和操作系统证书库：Windows 当前用户可见的受信任
+根证书（含组策略下发的公司 CA）、macOS 钥匙串信任设置、Linux 发行版 CA bundle，以及已设置的
+`SSL_CERT_FILE`/`SSL_CERT_DIR`。因此公司网络做 SSL 解密（如 Palo Alto）时，只要
+公司 CA 已由 IT 部署到系统证书库即可连接，无需额外配置。SAIAI 自己安装的本地代理
+CA 永远不会被用来验证 Gateway。若健康检查仍失败，`saiai doctor` 会显示完整错误
+原因（例如 `UnknownIssuer` 表示系统证书库里没有该代理的 CA）。
+
 ## Codex CLI
 
 OAuth/local-proxy 模式（第一阶段）使用：
