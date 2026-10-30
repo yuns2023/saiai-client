@@ -23,16 +23,17 @@ use tokio::time::{timeout, timeout_at};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_tungstenite::{Connector, connect_async_tls_with_config};
 use url::Url;
 use zeroize::Zeroizing;
 
 use crate::client_proof::{self, ClientProof};
+use crate::upstream_tls;
 
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
 const OPENAI_HOST: &str = "api.openai.com";
@@ -142,6 +143,7 @@ struct State {
     verbose: bool,
     chatgpt_chat_passthrough: bool,
     client: Client,
+    websocket_tls: rustls::ClientConfig,
     certs: Mutex<HashMap<String, ManagedCertificate>>,
     openai_trace: Option<Arc<OpenAITrace>>,
     client_proof_dir: Option<std::path::PathBuf>,
@@ -342,12 +344,13 @@ impl State {
         build_leaf_server_config(ANTHROPIC_HOST, &cfg.ca_cert_pem, &cfg.ca_key_pem)
             .context("failed to validate installation-specific SAIAI CA")?;
 
-        let client = Client::builder()
+        let client = upstream_tls::upstream_http_client_builder(&cfg.ca_cert_pem)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .pool_idle_timeout(Duration::from_secs(90))
             .build()
             .context("failed to build upstream HTTP client")?;
+        let websocket_tls = upstream_tls::upstream_websocket_tls_config(&cfg.ca_cert_pem);
         let openai_trace = OpenAITrace::from_env()?;
         let chatgpt_chat_passthrough = match env::var(CHATGPT_CHAT_PASSTHROUGH_ENV).ok().as_deref()
         {
@@ -370,6 +373,7 @@ impl State {
             verbose,
             chatgpt_chat_passthrough,
             client,
+            websocket_tls,
             certs: Mutex::new(HashMap::new()),
             openai_trace,
             client_proof_dir: cfg.client_proof_dir,
@@ -1140,22 +1144,28 @@ async fn serve_openai_websocket(
         |method, target| state.client_proof_header(route, method, target, Some(&route.api_key)),
     )?;
 
-    let (upstream_ws, upstream_response) = match connect_async(upstream_request).await {
-        Ok(result) => result,
-        Err(tungstenite::Error::Http(response))
-            if relays_websocket_rejection(response.status().as_u16()) =>
-        {
-            let _ = client_stream
-                .write_all(&build_openai_websocket_rejection(&response))
-                .await;
-            let _ = client_stream.flush().await;
-            bail!("Gateway WebSocket handshake returned {}", response.status());
-        }
-        Err(error) => {
-            let _ = write_plain_error(&mut client_stream, StatusCode::BAD_GATEWAY).await;
-            return Err(error).context("failed to establish Gateway WebSocket");
-        }
-    };
+    // A fresh session cache per connection, as tokio-tungstenite's own
+    // connector builds, so Gateway WebSocket handshakes never resume.
+    let mut websocket_tls = state.websocket_tls.clone();
+    websocket_tls.resumption = rustls::client::Resumption::default();
+    let connector = Connector::Rustls(Arc::new(websocket_tls));
+    let (upstream_ws, upstream_response) =
+        match connect_async_tls_with_config(upstream_request, None, false, Some(connector)).await {
+            Ok(result) => result,
+            Err(tungstenite::Error::Http(response))
+                if relays_websocket_rejection(response.status().as_u16()) =>
+            {
+                let _ = client_stream
+                    .write_all(&build_openai_websocket_rejection(&response))
+                    .await;
+                let _ = client_stream.flush().await;
+                bail!("Gateway WebSocket handshake returned {}", response.status());
+            }
+            Err(error) => {
+                let _ = write_plain_error(&mut client_stream, StatusCode::BAD_GATEWAY).await;
+                return Err(error).context("failed to establish Gateway WebSocket");
+            }
+        };
     if upstream_response.status().as_u16() != 101 {
         let _ = write_plain_error(&mut client_stream, StatusCode::BAD_GATEWAY).await;
         bail!(
@@ -3188,6 +3198,7 @@ mod tests {
     use super::*;
     use rcgen::{BasicConstraints, IsCa};
     use tokio::time::timeout;
+    use tokio_tungstenite::connect_async;
 
     #[tokio::test]
     async fn bounded_upload_rejects_declared_and_cumulative_oversize_before_reading() {
