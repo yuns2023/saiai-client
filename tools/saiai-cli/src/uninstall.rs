@@ -163,6 +163,12 @@ enum Action {
         db: String,
         known: BTreeSet<String>,
     },
+    /// Write `<env>/product-dir` once the steps in `after` succeeded.
+    RecordProductDir {
+        environment: PathBuf,
+        product_dir: PathBuf,
+        after: std::ops::Range<usize>,
+    },
     #[cfg(target_os = "macos")]
     Launchd {
         target: String,
@@ -618,6 +624,39 @@ fn build_plan(discovery: &Discovery, args: &Args) -> Result<Plan> {
         match product.product {
             "claude" => plan_claude(discovery, product, &mut plan),
             _ => plan_codex(discovery, product, &mut plan),
+        }
+        // A legacy environment mapped through the current variable is recorded,
+        // so later runs find it without that variable.
+        if let [index] = product.candidates[..]
+            && let Some(instance) = discovery.instances.get(index)
+            && !product.default
+            && instance.env_name.as_deref()
+                == Some(environment_scope::environment_name(product.product, &product.dir).as_str())
+            && instance.has_config
+            && fs::symlink_metadata(instance.dir.join(environment_scope::PRODUCT_DIR_FILENAME))
+                .is_err_and(|error| error.kind() == ErrorKind::NotFound)
+            && fs::symlink_metadata(&instance.dir).is_ok_and(|meta| meta.is_dir())
+        {
+            // Every earlier step, including edits shared with another product
+            // directory, must have succeeded.
+            let after = 0..plan.items.len();
+            plan.act(
+                if product.product == "claude" {
+                    Area::Claude
+                } else {
+                    Area::Codex
+                },
+                format!(
+                    "record {} as the project directory of {}",
+                    product.dir.display(),
+                    instance.dir.display()
+                ),
+                Action::RecordProductDir {
+                    environment: instance.dir.clone(),
+                    product_dir: product.dir.clone(),
+                    after,
+                },
+            );
         }
     }
     // Its config.json is the only evidence of what SAIAI wrote into that
@@ -1548,43 +1587,47 @@ fn same_file(left: &Path, right: &Path) -> bool {
                 .map(|name| name.to_string_lossy().to_lowercase())
 }
 
+fn is_main_program(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == "saiai" || name == "saiai.exe")
+}
+
+/// Auxiliary files go first and the main program last, so any failure keeps
+/// a runnable client, its directory and its PATH entry.
 fn plan_program(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
     let default = &discovery.default_install_dir;
-    // A stale default-bin PATH entry is cleaned even for custom installs.
-    #[cfg(windows)]
-    if let Some(default) = default
-        && !discovery
-            .install_dirs
-            .iter()
-            .any(|dir| same_directory(dir, default))
-    {
-        plan_windows_user_path(default, plan)?;
+    let mut files = Vec::new();
+    for dir in &discovery.install_dirs {
+        files.extend(matching_files(dir, is_program_file)?);
+    }
+    let (main, auxiliary): (Vec<_>, Vec<_>) =
+        files.into_iter().partition(|path| is_main_program(path));
+    for path in auxiliary.into_iter().chain(main) {
+        plan.remove_file(Area::Program, path);
     }
     for dir in &discovery.install_dirs {
-        for path in matching_files(dir, is_program_file)? {
-            plan.remove_file(Area::Program, path);
-        }
         let windows_default = cfg!(windows)
             && default
                 .as_ref()
                 .is_some_and(|default| same_directory(default, dir));
-        if windows_default {
-            if dir.is_dir() {
-                plan.remove_empty_dir(Area::Program, dir.clone());
-                if let Some(parent) = dir.parent() {
-                    plan.remove_empty_dir(Area::Program, parent.to_path_buf());
-                }
+        if windows_default && dir.is_dir() {
+            plan.remove_empty_dir(Area::Program, dir.clone());
+            if let Some(parent) = dir.parent() {
+                plan.remove_empty_dir(Area::Program, parent.to_path_buf());
             }
-            // Also after the directory is gone, so a rerun converges.
-            #[cfg(windows)]
-            plan_windows_user_path(dir, plan)?;
-        } else if cfg!(windows) && dir.is_dir() {
+        } else if cfg!(windows) && !windows_default && dir.is_dir() {
             plan.note(
                 Area::Program,
                 format!("user PATH entry for {}", dir.display()),
                 Outcome::Kept("custom install directory; PATH is not changed".into()),
             );
         }
+    }
+    // Also when the directory is already gone or the install is custom, so
+    // a rerun converges.
+    #[cfg(windows)]
+    if let Some(default) = default {
+        plan_windows_user_path(default, plan)?;
     }
     Ok(())
 }
@@ -2405,6 +2448,34 @@ fn execute_item(action: &Action, args: &Args) -> Result<Outcome> {
             }
         },
         Action::RemoveEmptyDir(path) => execute_remove_empty_dir(path),
+        Action::RecordProductDir {
+            environment,
+            product_dir,
+            ..
+        } => {
+            if !fs::symlink_metadata(environment).is_ok_and(|meta| meta.is_dir()) {
+                bail!("{} is not a directory", environment.display());
+            }
+            let text = product_dir
+                .to_str()
+                .context("project directory is not valid UTF-8")?;
+            let path = environment.join(environment_scope::PRODUCT_DIR_FILENAME);
+            let mut options = fs::OpenOptions::new();
+            // Never replace a record that appeared since discovery.
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&path)
+                .with_context(|| format!("failed to create {}", path.display()))?;
+            file.write_all(text.as_bytes())
+                .and_then(|_| file.sync_all())
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            Ok(Outcome::Done)
+        }
         #[cfg(target_os = "linux")]
         Action::StopBackground { dir, isolated } => {
             let _lock = crate::acquire_linux_service_lock_at(dir)?;
@@ -2456,16 +2527,16 @@ fn execute_item(action: &Action, args: &Args) -> Result<Outcome> {
     }
 }
 
-/// Data and program steps run only while nothing outside the executed
-/// program steps is failed or skipped; the program also needs all data gone.
+/// Data and program steps run only while nothing at all has failed or been
+/// skipped; the program also needs every data step done.
 fn gate_blocked(items: &[Item], area: Area) -> bool {
-    items.iter().any(|other| {
-        let executed_program = other.area == Area::Program && !matches!(other.action, Action::None);
-        !executed_program && other.outcome != Outcome::Pending && !other.outcome.succeeded()
-    }) || (area == Area::Program
-        && items
-            .iter()
-            .any(|other| other.area == Area::Data && !other.outcome.succeeded()))
+    items
+        .iter()
+        .any(|other| other.outcome != Outcome::Pending && !other.outcome.succeeded())
+        || (area == Area::Program
+            && items
+                .iter()
+                .any(|other| other.area == Area::Data && !other.outcome.succeeded()))
 }
 
 fn execute(plan: &mut Plan, args: &Args) {
@@ -2476,7 +2547,9 @@ fn execute(plan: &mut Plan, args: &Args) {
             if item.area.gated() != gated || item.outcome != Outcome::Pending {
                 continue;
             }
-            let outcome = if gated && gate_blocked(&plan.items, item.area) {
+            let dependency_failed = matches!(&item.action, Action::RecordProductDir { after, .. }
+                if plan.items[after.clone()].iter().any(|other| !other.outcome.succeeded()));
+            let outcome = if dependency_failed || (gated && gate_blocked(&plan.items, item.area)) {
                 Outcome::Skipped
             } else {
                 match execute_item(&item.action, args) {
@@ -2971,10 +3044,10 @@ mod tests {
         ] {
             assert!(gate_blocked(&[done(), failure], Area::Data));
         }
-        // A failed program step does not block other program steps, but any
-        // unfinished data step blocks the program.
+        // Any failure, including an earlier program step, blocks the rest;
+        // an unfinished data step blocks the program.
         let program_failure = item(Area::Program, true, Outcome::Failed("locked".into()));
-        assert!(!gate_blocked(&[done(), program_failure], Area::Program));
+        assert!(gate_blocked(&[done(), program_failure], Area::Program));
         assert!(gate_blocked(
             &[done(), item(Area::Data, true, Outcome::Pending)],
             Area::Program

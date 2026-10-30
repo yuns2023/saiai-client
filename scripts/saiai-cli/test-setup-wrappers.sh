@@ -18,7 +18,7 @@ mkdir -p "${fixtures}" "${fake_bin}" "${home}" "${install_dir}"
 asset="${fixtures}/saiai-linux-x86_64"
 cat >"${asset}" <<'SH'
 #!/usr/bin/env bash
-if [ "$*" = "uninstall --dry-run --yes" ]; then
+if [ "${1:-}" = "uninstall" ] && [ "${2:-}" = "--dry-run" ] && [ "${3:-}" = "--yes" ]; then
   printf 'SAIAI uninstall plan\nSAIAI home: test\n'
   exit 0
 fi
@@ -207,7 +207,18 @@ fi
 test ! -e "${invoked}"
 grep -Fq 'uninstall [--yes] [--dry-run] [--forget-unknown-environments]' "${output}"
 
+# An installed client that does not know a requested option is not chosen.
+printf '#!/usr/bin/env bash\nfor a in "$@"; do [ "$a" = --forget-unknown-environments ] && exit 1; done\nprintf "SAIAI uninstall plan\\n"\n' >"${install_dir}/saiai"
+chmod +x "${install_dir}/saiai"
+curl_before="$(wc -l <"${curl_log}")"
+run_setup uninstall --yes --forget-unknown-environments
+mapfile -t option_invocation <"${invoked}"
+test "${option_invocation[2]}" = "uninstall"
+test "${option_invocation[4]}" = "--forget-unknown-environments"
+test "$(wc -l <"${curl_log}")" -eq "$((curl_before + 2))"
+
 # An installed client without uninstall support: use a verified temporary copy.
+curl_before="$(wc -l <"${curl_log}")"
 printf '#!/usr/bin/env bash\necho "Unknown command: $1" >&2\nexit 1\n' >"${install_dir}/saiai"
 cp "${install_dir}/saiai" "${temporary}/old-client"
 run_setup uninstall --dry-run

@@ -295,14 +295,14 @@ function Get-SaiaiDownloadBase {
 }
 
 function Test-SaiaiUninstallSupport {
-    param([string]$Path)
+    param([string]$Path, [string[]]$Arguments = @())
 
     if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return $false
     }
     $ErrorActionPreference = "Continue"
     try {
-        $probe = @(& $Path uninstall --dry-run --yes 2>$null)
+        $probe = @(& $Path uninstall --dry-run --yes @Arguments 2>$null)
         return ($LASTEXITCODE -eq 0) -and ($probe -ccontains "SAIAI uninstall plan")
     }
     catch {
@@ -327,7 +327,7 @@ function Invoke-SaiaiUninstall {
     if ($null -ne $command) { $candidates += $command.Source }
     $executor = $null
     foreach ($candidate in $candidates) {
-        if (Test-SaiaiUninstallSupport -Path $candidate) {
+        if (Test-SaiaiUninstallSupport -Path $candidate -Arguments $Arguments) {
             $executor = $candidate
             break
         }

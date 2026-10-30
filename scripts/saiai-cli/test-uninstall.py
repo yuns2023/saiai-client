@@ -254,7 +254,36 @@ def main():
             assert "Nothing to remove." in output, output
             assert env_a.name not in output
             assert snapshot(*roots) == after, "repeated uninstall changed files"
-            print("PASS: uninstall dry-run, refusals, product-dir mapping, unknown-environment block, owned-value removal, idempotent rerun")
+
+            # Two legacy projects without product-dir records: each run with
+            # one project's CODEX_HOME cleans and records it, then completes.
+            home2, install2 = root / "home2", root / "install2"
+            home2.mkdir()
+            install2.mkdir()
+            binary2 = install2 / "saiai"
+            shutil.copy2(source, binary2)
+            second = {**environment, "HOME": str(home2), "USERPROFILE": str(home2),
+                      "XDG_CONFIG_HOME": str(home2 / ".config"), "SAIAI_INSTALL_DIR": str(install2)}
+            legacy_a = {**second, "CODEX_HOME": str(root / "legacy-a/codex")}
+            legacy_b = {**second, "CODEX_HOME": str(root / "legacy-b/codex")}
+            invoke(legacy_a, "init-codex", url, KEY_PREFIX + "LEGACY_A", program=binary2)
+            invoke(legacy_b, "init-codex", url, KEY_PREFIX + "LEGACY_B", program=binary2)
+            legacy_envs = sorted((home2 / ".saiai/environments").iterdir())
+            for env_dir in legacy_envs:
+                pids.append(json.loads((env_dir / "saiai.pid").read_text())["pid"])
+                (env_dir / "product-dir").unlink()
+            output = invoke(legacy_a, "uninstall", "--yes", program=binary2, success=False)
+            assert not (root / "legacy-a/codex/.env").exists(), output
+            assert (root / "legacy-b/codex/.env").exists()
+            recorded = [e for e in legacy_envs if (e / "product-dir").exists()]
+            assert [(e / "product-dir").read_text() for e in recorded] == [
+                str((root / "legacy-a/codex").resolve())
+            ], output
+            assert binary2.exists() and (home2 / ".saiai").exists()
+            output = invoke(legacy_b, "uninstall", "--yes", program=binary2)
+            assert not (root / "legacy-b/codex/.env").exists(), output
+            assert not (home2 / ".saiai").exists() and not binary2.exists(), output
+            print("PASS: uninstall dry-run, refusals, product-dir mapping and recording, unknown-environment block, owned-value removal, idempotent rerun")
         finally:
             for pid in pids:
                 if alive(pid):

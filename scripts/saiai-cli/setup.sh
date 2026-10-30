@@ -165,7 +165,7 @@ if [ "${1:-}" = "uninstall" ]; then
   executor=""
   for candidate in ${SAIAI_INSTALL_DIR:+"${SAIAI_INSTALL_DIR}/saiai"} "${HOME}/.local/bin/saiai" "$(command -v saiai 2>/dev/null || true)"; do
     if [ -n "${candidate}" ] && [ -f "${candidate}" ] && [ -x "${candidate}" ] &&
-      probe="$("${candidate}" uninstall --dry-run --yes 2>/dev/null </dev/null)"; then
+      probe="$("${candidate}" uninstall --dry-run --yes "$@" 2>/dev/null </dev/null)"; then
       case $'\n'"${probe}"$'\n' in
         *$'\nSAIAI uninstall plan\n'*)
           executor="${candidate}"
