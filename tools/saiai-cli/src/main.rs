@@ -69,7 +69,7 @@ Usage:
   saiai codex [-- <codex arguments>]                              # launch Codex through SAIAI local proxy
   saiai vscode                                                    # configure the Codex VSCode extension for SAIAI
   saiai desktop [codex] [-- <Desktop arguments>]                # launch Codex Desktop through SAIAI
-  saiai uninstall [--yes] [--dry-run]                             # remove SAIAI services, settings, data and program
+  saiai uninstall [--yes] [--dry-run] [--forget-unknown-environments]  # remove SAIAI services, settings, data and program
   saiai init       --base-url <base_url> --api-key <api_key>      # initialize Claude Code
   saiai init-codex --base-url <base_url> --api-key <api_key> [--websockets]
 Initialization uses provider-specific CA files and preserves VSCode editor settings.
@@ -256,6 +256,11 @@ fn main() -> Result<()> {
         );
     }
     environment_scope::initialize(&command, selector)?;
+    match &command {
+        Command::Init(_) | Command::InitCodex(_) => environment_scope::record_product_dir(true)?,
+        Command::Start | Command::Restart => environment_scope::record_product_dir(false)?,
+        _ => {}
+    }
     #[cfg(target_os = "windows")]
     if matches!(
         &command,

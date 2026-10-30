@@ -138,6 +138,12 @@ def main():
                 pids.append(json.loads(state.read_text())["pid"])
             assert all(alive(pid) for pid in pids)
             default = json.loads((saiai / "config.json").read_text())
+            # Isolated environments record the project directory they serve.
+            recorded = {(e / "product-dir").read_text(): e for e in environments}
+            env_a = recorded[str((root / "project-a/codex").resolve())]
+            env_b = recorded[str((root / "project-b/codex").resolve())]
+            # Simulate an environment created before that record existed.
+            (env_b / "product-dir").unlink()
             nss = home / ".pki/nssdb"
             assert (nss / "fake-saiai-local-proxy.pem").exists(), "init-codex did not import the NSS CA"
             (nss / "fake-user-ca.pem").write_text("user certificate\n")
@@ -177,7 +183,7 @@ def main():
 
             roots = (home, install, root / "project-a", root / "project-b", root / "dotfiles")
             before = snapshot(*roots)
-            output = invoke(project_a, "uninstall", "--dry-run", "--yes")
+            output = invoke(environment, "uninstall", "--dry-run", "--yes")
             assert output.startswith("SAIAI uninstall plan\n"), output
             assert "Dry run: nothing was changed." in output
             assert "CODEX_HOME=<that project's directory>" in output, output
@@ -188,23 +194,25 @@ def main():
             master, slave = pty.openpty()
             try:
                 os.write(master, b"n\n")
-                output = invoke(project_a, "uninstall", stdin=slave, success=False)
+                output = invoke(environment, "uninstall", stdin=slave, success=False)
             finally:
                 os.close(slave)
                 os.close(master)
             assert "cancelled" in output, output
-            output = invoke(project_a, "uninstall", success=False, start_new_session=True)
+            output = invoke(environment, "uninstall", success=False, start_new_session=True)
             assert "no terminal" in output, output
-            assert invoke(project_a, "uninstall", "--bogus", success=False)
-            assert invoke(project_a, "--environment", "codex", "uninstall", success=False)
+            assert invoke(environment, "uninstall", "--bogus", success=False)
+            assert invoke(environment, "--environment", "codex", "uninstall", success=False)
             assert snapshot(*roots) == before, "refused uninstall changed files"
             assert all(alive(pid) for pid in pids)
 
-            output = invoke(project_a, "uninstall", "--yes")
+            # The unknown project blocks data and program removal.
+            output = invoke(environment, "uninstall", "--yes", success=False)
             assert "codex login" in output and "codex app-server daemon update" in output, output
+            assert "--forget-unknown-environments" in output, output
             assert not any(alive(pid) for pid in pids), "background proxies are still running"
-            assert not saiai.exists(), sorted(saiai.rglob("*"))
-            assert sorted(p.name for p in install.iterdir()) == ["other-tool"]
+            assert (env_b / "config.json").exists() and (saiai / "config.json").exists()
+            assert binary.exists(), "program removed although a step was blocked"
             settings = json.loads(claude_settings.read_text())
             assert settings["theme"] == "dark"
             assert settings["env"] == {
@@ -215,7 +223,7 @@ def main():
                 "ENABLE_TOOL_SEARCH": "true",
                 "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "600000",
             }, settings["env"]
-            assert not list((home / ".claude").glob("saiai-ca*"))
+            assert list((home / ".claude").glob("saiai-ca*")), "data removed although a step was blocked"
             assert list((home / ".claude").glob("settings.json.bak-*")), "Claude backups were removed"
             assert codex_env.read_text() == "# user\nUSER_LINE=1\n"
             assert json.loads(codex_auth.read_text()) == {"user_field": "keep"}
@@ -230,15 +238,23 @@ def main():
             assert not (nss / "fake-saiai-local-proxy.pem").exists(), "NSS CA was kept"
             assert (nss / "fake-user-ca.pem").exists()
 
+            output = invoke(environment, "uninstall", "--yes", "--forget-unknown-environments")
+            assert not saiai.exists(), sorted(saiai.rglob("*"))
+            assert not list((home / ".claude").glob("saiai-ca*"))
+            assert sorted(p.name for p in install.iterdir()) == ["other-tool"]
+            for name in (".env", "auth.json"):
+                assert (root / "project-b/codex" / name).exists(), "unknown project was edited"
+
             # Rerun from a copy outside the install directory, as setup.sh does.
             after = snapshot(*roots)
             rerun = root / "rerun/saiai-executor"
             rerun.parent.mkdir()
             shutil.copy2(source, rerun)
-            output = invoke(project_a, "uninstall", "--yes", program=rerun)
+            output = invoke(environment, "uninstall", "--yes", program=rerun)
             assert "Nothing to remove." in output, output
+            assert env_a.name not in output
             assert snapshot(*roots) == after, "repeated uninstall changed files"
-            print("PASS: uninstall dry-run, refusals, owned-value removal, user values kept, idempotent rerun")
+            print("PASS: uninstall dry-run, refusals, product-dir mapping, unknown-environment block, owned-value removal, idempotent rerun")
         finally:
             for pid in pids:
                 if alive(pid):

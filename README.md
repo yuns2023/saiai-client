@@ -93,9 +93,11 @@ SHA-256 校验下载一个临时副本），真正的删除都由客户端完成
 不会改动：用户自己修改过的值、通用设置（如 `ENABLE_TOOL_SEARCH`、Codex
 `model_provider = "openai"`）、`config.toml`、`~/.claude.json`、`.credentials.json`
 以及所有 `.bak-*` 备份（结束时会列出）。卸载后需要重新登录 Claude Code，并运行
-`codex login`。项目级环境需要在卸载时设置对应的 `CLAUDE_CONFIG_DIR` / `CODEX_HOME`
-才会清理其配置目录；否则只停止服务、删除 SAIAI 数据，并提示手动处理。任何一步失败时，
-SAIAI 数据和程序会保留，修复后重新运行 `saiai uninstall` 即可（可重复执行）。
+`codex login`。项目级环境会记录它对应的项目目录，卸载时自动清理；更早版本创建、
+没有该记录的项目环境会阻止删除 SAIAI 数据和程序，请设置对应的 `CLAUDE_CONFIG_DIR` /
+`CODEX_HOME` 后重新运行，或加 `--forget-unknown-environments` 放弃清理那个项目的配置。
+任何一步失败时，SAIAI 数据和程序会保留，修复后重新运行 `saiai uninstall` 即可（可重复
+执行）。
 
 ## Claude Code 本地代理
 

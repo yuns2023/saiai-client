@@ -11,11 +11,15 @@ use std::{
 
 static ACTIVE: OnceLock<Scope> = OnceLock::new();
 
+/// Records which product directory an isolated environment serves.
+pub(crate) const PRODUCT_DIR_FILENAME: &str = "product-dir";
+
 #[derive(Debug)]
 pub(crate) struct Scope {
     pub root: PathBuf,
     pub directory: PathBuf,
     pub isolated: bool,
+    product_dir: Option<PathBuf>,
 }
 
 impl Scope {
@@ -25,6 +29,7 @@ impl Scope {
             root,
             directory,
             isolated,
+            product_dir: None,
         }
     }
 
@@ -147,21 +152,27 @@ fn override_dir(name: &str) -> Result<Option<PathBuf>> {
     Ok(Some(normalize(Path::new(&raw))?))
 }
 
-fn product_directory(root: &Path, home: &Path, product: &str) -> Result<PathBuf> {
+/// Environment directory and, when isolated, the product directory it serves.
+fn product_directory(
+    root: &Path,
+    home: &Path,
+    product: &str,
+) -> Result<(PathBuf, Option<PathBuf>)> {
     let (variable, default) = match product {
         "claude" => ("CLAUDE_CONFIG_DIR", ".claude"),
         "codex" => ("CODEX_HOME", ".codex"),
         _ => bail!("unknown environment: {product}; expected default, claude, or codex"),
     };
     let Some(directory) = override_dir(variable)? else {
-        return Ok(root.to_path_buf());
+        return Ok((root.to_path_buf(), None));
     };
     if normalize(&home.join(default)).ok().as_ref() == Some(&directory) {
-        return Ok(root.to_path_buf());
+        return Ok((root.to_path_buf(), None));
     }
-    Ok(root
+    let environment = root
         .join("environments")
-        .join(environment_name(product, &directory)))
+        .join(environment_name(product, &directory));
+    Ok((environment, Some(directory)))
 }
 
 /// Leading selector is deliberately separate from forwarded product arguments.
@@ -200,19 +211,19 @@ pub(crate) fn initialize(command: &Command, selector: Option<(String, String)>) 
         | Command::Doctor(DoctorTarget::Codex) => Some("codex"),
         _ => None,
     };
-    let selected = match selector.as_ref() {
+    let (selected, product_dir) = match selector.as_ref() {
         Some((flag, value)) if flag == "--instance-dir" => {
             if product.is_some() {
                 bail!("--instance-dir is only for proxy service commands");
             }
-            normalize(Path::new(value))?
+            (normalize(Path::new(value))?, None)
         }
         Some((_, value)) => {
             if product.is_some_and(|p| p != value) {
                 bail!("environment selector conflicts with the product command");
             }
             if value == "default" {
-                root.clone()
+                (root.clone(), None)
             } else {
                 product_directory(&root, &home, value)?
             }
@@ -222,18 +233,19 @@ pub(crate) fn initialize(command: &Command, selector: Option<(String, String)>) 
             None => {
                 let claude = product_directory(&root, &home, "claude")?;
                 let codex = product_directory(&root, &home, "codex")?;
-                match (claude != root, codex != root) {
+                match (claude.0 != root, codex.0 != root) {
                     (true, true) => bail!(
                         "both Claude and Codex environments are selected; use saiai --environment claude|codex|default <command>"
                     ),
                     (true, false) => claude,
                     (false, true) => codex,
-                    _ => root.clone(),
+                    _ => (root.clone(), None),
                 }
             }
         },
     };
     let mut scope = Scope::new(root, selected);
+    scope.product_dir = product_dir;
     // Keep an already configured legacy launcher route until explicit init.
     // Never silently fall back for start/stop/restart or a fresh project.
     if scope.isolated
@@ -280,6 +292,29 @@ fn legacy_route_matches(root: &Path, product: &str) -> Result<bool> {
     // Match the exact managed block, not unrelated text/comments in the file.
     let expected = crate::merge_codex_ide_env("", &config.listen, &config.ca_cert_path);
     Ok(raw.contains(expected.trim()))
+}
+
+/// Let `saiai uninstall` map this isolated environment to its product
+/// directory later. Only initialization creates a missing environment.
+pub(crate) fn record_product_dir(create: bool) -> Result<()> {
+    let Some(scope) = active().filter(|scope| scope.isolated) else {
+        return Ok(());
+    };
+    let Some(product_dir) = &scope.product_dir else {
+        return Ok(());
+    };
+    if !create && !scope.directory.is_dir() {
+        return Ok(());
+    }
+    let path = scope.directory.join(PRODUCT_DIR_FILENAME);
+    let text = product_dir
+        .to_str()
+        .context("product directory must be valid UTF-8")?;
+    if fs::read_to_string(&path).ok().as_deref() == Some(text) {
+        return Ok(());
+    }
+    crate::write_bytes_atomic(&path, text.as_bytes(), 0o600)
+        .with_context(|| format!("failed to record {}", path.display()))
 }
 
 pub(crate) fn active() -> Option<&'static Scope> {

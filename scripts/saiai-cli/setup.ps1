@@ -316,8 +316,8 @@ function Invoke-SaiaiUninstall {
     param([string[]]$Arguments)
 
     foreach ($argument in $Arguments) {
-        if ($argument -cne "--yes" -and $argument -cne "--dry-run") {
-            [Console]::Error.WriteLine("Usage: Invoke-Saiai uninstall [--yes] [--dry-run]")
+        if (@("--yes", "--dry-run", "--forget-unknown-environments") -cnotcontains $argument) {
+            [Console]::Error.WriteLine("Usage: Invoke-Saiai uninstall [--yes] [--dry-run] [--forget-unknown-environments]")
             return 2
         }
     }
@@ -378,7 +378,7 @@ function Invoke-Saiai {
         return Invoke-SaiaiUninstall -Arguments @($provided | Select-Object -Skip 1)
     }
     if ($provided.Count -lt 2) {
-        Write-Error "Usage: Invoke-Saiai <base_url> <api_key> OR Invoke-Saiai init-codex <base_url> <api_key> [--websockets] OR Invoke-Saiai uninstall [--yes] [--dry-run]"
+        Write-Error "Usage: Invoke-Saiai <base_url> <api_key> OR Invoke-Saiai init-codex <base_url> <api_key> [--websockets] OR Invoke-Saiai uninstall [--yes] [--dry-run] [--forget-unknown-environments]"
         return 2
     }
 

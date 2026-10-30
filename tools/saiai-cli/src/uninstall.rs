@@ -45,6 +45,7 @@ const CLAUDE_PROXY_ENV: &[&str] = &["http_proxy", "https_proxy", "all_proxy"];
 pub(crate) struct Args {
     yes: bool,
     dry_run: bool,
+    forget_unknown: bool,
     #[cfg(windows)]
     relaunched_from: Option<PathBuf>,
 }
@@ -56,6 +57,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Args> {
         match args[index].as_str() {
             "--yes" | "-y" => parsed.yes = true,
             "--dry-run" => parsed.dry_run = true,
+            "--forget-unknown-environments" => parsed.forget_unknown = true,
             #[cfg(windows)]
             RELAUNCH_FLAG => {
                 index += 1;
@@ -287,6 +289,10 @@ struct Instance {
     ca_cert: Option<String>,
     claude_keys: Vec<String>,
     matched: bool,
+    /// config.json exists; `has_config` when it is a SAIAI configuration.
+    config_present: bool,
+    has_config: bool,
+    product_dir: Option<PathBuf>,
 }
 
 struct ProductDir {
@@ -299,6 +305,8 @@ struct ProductDir {
 struct Discovery {
     home: PathBuf,
     root: PathBuf,
+    home_is_link: bool,
+    linked_environments: Vec<PathBuf>,
     instances: Vec<Instance>,
     products: Vec<ProductDir>,
     install_dirs: Vec<PathBuf>,
@@ -309,7 +317,7 @@ struct Discovery {
 
 pub(crate) fn run(args: Args) -> Result<()> {
     let discovery = discover_layout(&args)?;
-    let mut plan = build_plan(&discovery)?;
+    let mut plan = build_plan(&discovery, &args)?;
     print_plan(&discovery, &plan);
     if args.dry_run {
         println!();
@@ -326,7 +334,7 @@ pub(crate) fn run(args: Args) -> Result<()> {
     }
     #[cfg(windows)]
     if args.relaunched_from.is_none()
-        && let Some(code) = relaunch_outside_install_dir(&plan)?
+        && let Some(code) = relaunch_outside_install_dir(&plan, &args)?
     {
         std::process::exit(code);
     }
@@ -344,6 +352,7 @@ fn discover_layout(args: &Args) -> Result<Discovery> {
     let _ = args;
     let (home, root) = environment_scope::layout()?;
     let mut instances = Vec::new();
+    let mut linked_environments = Vec::new();
     if root.is_dir() {
         instances.push(read_instance(root.clone(), false, None, None));
         let environments = root.join(ENVIRONMENTS_DIR);
@@ -356,10 +365,13 @@ fn discover_layout(args: &Args) -> Result<Discovery> {
                     let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                         continue;
                     };
-                    if let Some(product) = environment_scope::environment_product(&name)
-                        && entry.file_type().is_ok_and(|kind| kind.is_dir())
-                    {
+                    let Some(product) = environment_scope::environment_product(&name) else {
+                        continue;
+                    };
+                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                         found.push((name, product));
+                    } else if entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                        linked_environments.push(entry.path());
                     }
                 }
                 found.sort();
@@ -411,6 +423,22 @@ fn discover_layout(args: &Args) -> Result<Discovery> {
             });
         }
     }
+    for (index, instance) in instances.iter().enumerate() {
+        let (Some(product), Some(dir)) = (instance.product, &instance.product_dir) else {
+            continue;
+        };
+        if !products
+            .iter()
+            .any(|known| known.product == product && known.dir == *dir)
+        {
+            products.push(ProductDir {
+                product,
+                dir: dir.clone(),
+                default: false,
+                candidates: vec![index],
+            });
+        }
+    }
     for product in &products {
         for index in &product.candidates {
             instances[*index].matched = true;
@@ -453,9 +481,16 @@ fn discover_layout(args: &Args) -> Result<Discovery> {
         .chain(exe)
         .chain(env::current_exe().ok())
         .collect();
+    let raw_home = crate::env_dir_override("SAIAI_HOME")
+        .or_else(|| crate::home_dir().map(|home| home.join(".saiai")));
+    let home_is_link = raw_home.is_some_and(|path| {
+        fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+    });
     Ok(Discovery {
         home,
         root,
+        home_is_link,
+        linked_environments,
         instances,
         products,
         install_dirs,
@@ -480,13 +515,35 @@ fn read_instance(
         ca_cert: None,
         claude_keys: Vec::new(),
         matched: false,
+        config_present: false,
+        has_config: false,
+        product_dir: None,
     };
-    let Ok(raw) = fs::read(instance.dir.join(crate::SAIAI_CONFIG_FILENAME)) else {
-        return instance;
+    if let (Some(product), Some(name)) = (instance.product, &instance.env_name)
+        && let Ok(raw) =
+            fs::read_to_string(instance.dir.join(environment_scope::PRODUCT_DIR_FILENAME))
+    {
+        let dir = PathBuf::from(raw.trim_end_matches(['\r', '\n']));
+        // Trust the record only when it names exactly this environment.
+        if dir.is_absolute() && environment_scope::environment_name(product, &dir) == *name {
+            instance.product_dir = Some(dir);
+        }
+    }
+    let raw = match fs::read(instance.dir.join(crate::SAIAI_CONFIG_FILENAME)) {
+        Ok(raw) => raw,
+        Err(error) => {
+            instance.config_present = error.kind() != ErrorKind::NotFound;
+            return instance;
+        }
     };
+    instance.config_present = true;
     let Ok(config) = serde_json::from_slice::<Value>(&raw) else {
         return instance;
     };
+    instance.has_config = is_saiai_config(&config);
+    if !instance.has_config {
+        return instance;
+    }
     let text = |value: &Value| {
         value
             .as_str()
@@ -502,7 +559,59 @@ fn read_instance(
     instance
 }
 
-fn build_plan(discovery: &Discovery) -> Result<Plan> {
+/// Fields every SAIAI config.json carries (version 2, or the version-less v1 shape).
+fn is_saiai_config(config: &Value) -> bool {
+    let text = |key: &str| config.get(key).is_some_and(Value::is_string);
+    config.is_object()
+        && text("listen")
+        && text("ca_cert_path")
+        && match config.get("version") {
+            Some(version) => {
+                version.as_u64() == Some(u64::from(crate::SAIAI_CONFIG_VERSION))
+                    || version.as_u64() == Some(1)
+            }
+            None => text("base_url") && text("api_key"),
+        }
+}
+
+/// An `environments/<name>` directory SAIAI created: a real directory holding
+/// a SAIAI config.json, or only the product-dir record.
+fn owned_environment(instance: &Instance) -> bool {
+    if !fs::symlink_metadata(&instance.dir).is_ok_and(|meta| meta.is_dir()) {
+        return false;
+    }
+    if instance.has_config {
+        return true;
+    }
+    // Without a config, only an environment holding nothing but SAIAI files.
+    let Ok(entries) = fs::read_dir(&instance.dir) else {
+        return false;
+    };
+    let mut record = false;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        if name == environment_scope::PRODUCT_DIR_FILENAME {
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                return false;
+            }
+            record = true;
+        } else if name == crate::SAIAI_CONFIG_FILENAME
+            || !is_saiai_home_file(name)
+            || !entry.file_type().is_ok_and(|kind| kind.is_file())
+        {
+            return false;
+        }
+    }
+    record && !instance.config_present
+}
+
+fn build_plan(discovery: &Discovery, args: &Args) -> Result<Plan> {
     let mut plan = Plan::default();
     plan_services(discovery, &mut plan)?;
     for product in &discovery.products {
@@ -511,21 +620,39 @@ fn build_plan(discovery: &Discovery) -> Result<Plan> {
             _ => plan_codex(discovery, product, &mut plan),
         }
     }
-    for instance in discovery.instances.iter().filter(|i| !i.matched) {
+    // Its config.json is the only evidence of what SAIAI wrote into that
+    // project, so keep it unless the user explicitly gives up on the project.
+    for instance in discovery
+        .instances
+        .iter()
+        .filter(|i| !i.matched && i.has_config)
+    {
         let (area, variable) = match instance.product {
             Some("claude") => (Area::Claude, "CLAUDE_CONFIG_DIR"),
             _ => (Area::Codex, "CODEX_HOME"),
         };
-        plan.note(
-            area,
-            format!(
-                "environment {}: its Claude/Codex configuration directory is unknown and was not cleaned",
-                instance.dir.display()
-            ),
-            Outcome::Manual(format!(
-                "cancel and rerun with {variable}=<that project's directory> set to clean it; its service is still stopped and its data deleted"
-            )),
+        let text = format!(
+            "environment {}: its project configuration directory is unknown",
+            instance.dir.display()
         );
+        if args.forget_unknown {
+            plan.note(
+                area,
+                text,
+                Outcome::Manual(
+                    "not cleaned (--forget-unknown-environments); its service is stopped and its data deleted"
+                        .into(),
+                ),
+            );
+        } else {
+            plan.note(
+                area,
+                text,
+                Outcome::Failed(format!(
+                    "rerun with {variable}=<that project's directory> set to clean it, or add --forget-unknown-environments to leave that project's settings as they are"
+                )),
+            );
+        }
     }
     plan_vscode(discovery, &mut plan);
     plan_certificates(discovery, &mut plan)?;
@@ -1292,21 +1419,63 @@ fn matching_files(dir: &Path, filter: fn(&str) -> bool) -> Result<Vec<PathBuf>> 
 
 fn plan_data(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
     let root = &discovery.root;
-    if root.is_dir() {
+    let is_link =
+        |path: &Path| fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
+    let link_kept = || Outcome::Kept("symbolic link; nothing is removed through it".into());
+    if root.is_dir() && discovery.home_is_link {
+        plan.note(
+            Area::Data,
+            root.display().to_string(),
+            Outcome::Kept(
+                "SAIAI home is reached through a symbolic link; no SAIAI data inside it is deleted (its services are still stopped), delete it yourself"
+                    .into(),
+            ),
+        );
+    } else if root.is_dir() {
+        let saiai_config = discovery.instances.first().is_some_and(|i| i.has_config);
         for path in matching_files(root, is_saiai_home_file)? {
+            if path
+                .file_name()
+                .is_some_and(|name| name == crate::SAIAI_CONFIG_FILENAME)
+                && !saiai_config
+            {
+                plan.note(
+                    Area::Data,
+                    path.display().to_string(),
+                    Outcome::Kept("not a SAIAI configuration".into()),
+                );
+                continue;
+            }
             plan.remove_file(Area::Data, path);
         }
         for name in SAIAI_HOME_DIRS {
             let path = root.join(name);
-            if fs::symlink_metadata(&path).is_ok() {
-                plan.remove_tree(Area::Data, path);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_dir() => plan.remove_tree(Area::Data, path),
+                Ok(_) => plan.note(Area::Data, path.display().to_string(), link_kept()),
+                Err(_) => {}
             }
         }
-        for instance in discovery.instances.iter().filter(|i| i.isolated) {
-            plan.remove_tree(Area::Data, instance.dir.clone());
-        }
         let environments = root.join(ENVIRONMENTS_DIR);
-        if environments.is_dir() {
+        let environments_linked = is_link(&environments);
+        for instance in discovery.instances.iter().filter(|i| i.isolated) {
+            let label = instance.dir.display().to_string();
+            if environments_linked {
+                plan.note(Area::Data, label, link_kept());
+            } else if owned_environment(instance) {
+                plan.remove_tree(Area::Data, instance.dir.clone());
+            } else {
+                plan.note(
+                    Area::Data,
+                    label,
+                    Outcome::Kept("not a SAIAI environment (no SAIAI config.json)".into()),
+                );
+            }
+        }
+        for path in &discovery.linked_environments {
+            plan.note(Area::Data, path.display().to_string(), link_kept());
+        }
+        if environments.is_dir() && !environments_linked {
             plan.remove_empty_dir(Area::Data, environments);
         }
         plan.remove_empty_dir(Area::Data, root.clone());
@@ -1381,6 +1550,16 @@ fn same_file(left: &Path, right: &Path) -> bool {
 
 fn plan_program(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
     let default = &discovery.default_install_dir;
+    // A stale default-bin PATH entry is cleaned even for custom installs.
+    #[cfg(windows)]
+    if let Some(default) = default
+        && !discovery
+            .install_dirs
+            .iter()
+            .any(|dir| same_directory(dir, default))
+    {
+        plan_windows_user_path(default, plan)?;
+    }
     for dir in &discovery.install_dirs {
         for path in matching_files(dir, is_program_file)? {
             plan.remove_file(Area::Program, path);
@@ -1389,11 +1568,14 @@ fn plan_program(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
             && default
                 .as_ref()
                 .is_some_and(|default| same_directory(default, dir));
-        if windows_default && dir.is_dir() {
-            plan.remove_empty_dir(Area::Program, dir.clone());
-            if let Some(parent) = dir.parent() {
-                plan.remove_empty_dir(Area::Program, parent.to_path_buf());
+        if windows_default {
+            if dir.is_dir() {
+                plan.remove_empty_dir(Area::Program, dir.clone());
+                if let Some(parent) = dir.parent() {
+                    plan.remove_empty_dir(Area::Program, parent.to_path_buf());
+                }
             }
+            // Also after the directory is gone, so a rerun converges.
             #[cfg(windows)]
             plan_windows_user_path(dir, plan)?;
         } else if cfg!(windows) && dir.is_dir() {
@@ -1469,8 +1651,8 @@ fn plan_services(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
             Err(error) => plan.note(
                 Area::Services,
                 format!("background proxy state of {}", instance.dir.display()),
-                Outcome::Manual(format!(
-                    "{error:#}; it cannot identify a process. Stop any remaining SAIAI proxy yourself"
+                Outcome::Failed(format!(
+                    "{error:#}; it cannot identify a process. Stop any remaining SAIAI proxy, delete the state file, then rerun"
                 )),
             ),
         }
@@ -1597,8 +1779,20 @@ fn plan_services(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
 #[cfg(windows)]
 fn plan_services(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
     for instance in &discovery.instances {
-        let followers = fs::read_dir(instance.dir.join("log-followers"))
-            .is_ok_and(|mut entries| entries.next().is_some());
+        let followers_dir = instance.dir.join("log-followers");
+        if fs::symlink_metadata(&followers_dir).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            plan.note(
+                Area::Services,
+                followers_dir.display().to_string(),
+                Outcome::Failed(
+                    "is a symbolic link; SAIAI does not follow it. Remove the link and rerun"
+                        .into(),
+                ),
+            );
+            continue;
+        }
+        let followers =
+            fs::read_dir(&followers_dir).is_ok_and(|mut entries| entries.next().is_some());
         match crate::windows_background_process_at(
             &instance.dir,
             instance.isolated,
@@ -1626,8 +1820,8 @@ fn plan_services(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
             Err(error) => plan.note(
                 Area::Services,
                 format!("background proxy state of {}", instance.dir.display()),
-                Outcome::Manual(format!(
-                    "{error:#}; it cannot identify a process. Close any remaining SAIAI proxy yourself"
+                Outcome::Failed(format!(
+                    "{error:#}; it cannot identify a process. Close any remaining SAIAI proxy, delete the state file, then rerun"
                 )),
             ),
         }
@@ -1706,6 +1900,27 @@ fn plan_windows_certificates(
                 .dir
                 .join(crate::WINDOWS_PACKAGED_PROXY_LEASE_FILENAME),
         ] {
+            // The lease's directories below SAIAI home must not be links.
+            if lease
+                .ancestors()
+                .skip(1)
+                .take_while(|parent| {
+                    parent.starts_with(&discovery.root) && *parent != discovery.root
+                })
+                .any(|parent| {
+                    fs::symlink_metadata(parent).is_ok_and(|meta| meta.file_type().is_symlink())
+                })
+            {
+                plan.note(
+                    Area::Certificates,
+                    lease.display().to_string(),
+                    Outcome::Failed(
+                        "its directory is a symbolic link; SAIAI does not follow it. Remove the link and rerun"
+                            .into(),
+                    ),
+                );
+                continue;
+            }
             match crate::read_legacy_windows_packaged_proxy_lease_marker(&lease) {
                 Ok(Some(marker)) => {
                     thumbprints.extend(marker.added_ca_thumbprints.iter().cloned());
@@ -1851,7 +2066,7 @@ fn execute_user_path(
 ) -> Result<Outcome> {
     if directory.exists() {
         return Ok(Outcome::Kept(format!(
-            "{} was not removed",
+            "{} still exists (a running copy is removed a few seconds after this window's command exits). Rerun after a few seconds: `irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai uninstall` (it downloads a temporary client, since the installed one is gone)",
             directory.display()
         )));
     }
@@ -1860,7 +2075,7 @@ $ErrorActionPreference='Stop'
 $k=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment',$true)
 try{
   $current=[string]$k.GetValue('Path',$null,'DoNotExpandEnvironmentNames')
-  if($current -cne $env:SAIAI_PATH_OLD){throw 'the user PATH changed since the plan was shown'}
+  if($current -cne $env:SAIAI_PATH_OLD -or [string]$k.GetValueKind('Path') -cne $env:SAIAI_PATH_KIND){throw 'the user PATH changed since the plan was shown'}
   if([string]::IsNullOrEmpty($env:SAIAI_PATH_NEW)){$k.DeleteValue('Path',$false)}
   else{$k.SetValue('Path',$env:SAIAI_PATH_NEW,[Microsoft.Win32.RegistryValueKind]$env:SAIAI_PATH_KIND)}
 }finally{$k.Close()}
@@ -1902,7 +2117,7 @@ if(Test-Path -LiteralPath $p){ throw 'the certificate is still trusted' }
 }
 
 #[cfg(windows)]
-fn relaunch_outside_install_dir(plan: &Plan) -> Result<Option<i32>> {
+fn relaunch_outside_install_dir(plan: &Plan, args: &Args) -> Result<Option<i32>> {
     let exe = env::current_exe().context("failed to resolve the current executable")?;
     let locked = plan
         .items
@@ -1920,7 +2135,12 @@ fn relaunch_outside_install_dir(plan: &Plan) -> Result<Option<i32>> {
     println!();
     println!("Continuing from a temporary copy so the installed program can be removed.");
     let status = std::process::Command::new(&copy)
-        .args(["uninstall", "--yes", RELAUNCH_FLAG])
+        .args(["uninstall", "--yes"])
+        .args(
+            args.forget_unknown
+                .then_some("--forget-unknown-environments"),
+        )
+        .arg(RELAUNCH_FLAG)
         .arg(&exe)
         .status();
     match status {
@@ -2236,24 +2456,27 @@ fn execute_item(action: &Action, args: &Args) -> Result<Outcome> {
     }
 }
 
+/// Data and program steps run only while nothing outside the executed
+/// program steps is failed or skipped; the program also needs all data gone.
+fn gate_blocked(items: &[Item], area: Area) -> bool {
+    items.iter().any(|other| {
+        let executed_program = other.area == Area::Program && !matches!(other.action, Action::None);
+        !executed_program && other.outcome != Outcome::Pending && !other.outcome.succeeded()
+    }) || (area == Area::Program
+        && items
+            .iter()
+            .any(|other| other.area == Area::Data && !other.outcome.succeeded()))
+}
+
 fn execute(plan: &mut Plan, args: &Args) {
     println!();
-    // Keep the program whenever anything else failed, so a rerun is possible.
-    let phases: [fn(Area) -> bool; 3] = [
-        |area| !area.gated(),
-        |area| area == Area::Data,
-        |area| area == Area::Program,
-    ];
-    for (index, phase) in phases.iter().enumerate() {
-        let blocked = plan.items.iter().any(|item| {
-            phases[..index].iter().any(|earlier| earlier(item.area)) && !item.outcome.succeeded()
-        });
-        for item in plan
-            .items
-            .iter_mut()
-            .filter(|item| phase(item.area) && item.outcome == Outcome::Pending)
-        {
-            item.outcome = if blocked {
+    for gated in [false, true] {
+        for index in 0..plan.items.len() {
+            let item = &plan.items[index];
+            if item.area.gated() != gated || item.outcome != Outcome::Pending {
+                continue;
+            }
+            let outcome = if gated && gate_blocked(&plan.items, item.area) {
                 Outcome::Skipped
             } else {
                 match execute_item(&item.action, args) {
@@ -2261,7 +2484,8 @@ fn execute(plan: &mut Plan, args: &Args) {
                     Err(error) => Outcome::Failed(format!("{error:#}")),
                 }
             };
-            print_result(item);
+            plan.items[index].outcome = outcome;
+            print_result(&plan.items[index]);
         }
     }
 }
@@ -2693,6 +2917,78 @@ mod tests {
     }
 
     #[test]
+    fn saiai_configuration_shapes_are_recognized() {
+        for config in [
+            json!({"version": 2, "listen": "127.0.0.1:1", "ca_cert_path": "/ca", "base_url": "u", "api_key": "k"}),
+            json!({"version": 1, "listen": "127.0.0.1:1", "ca_cert_path": "/ca"}),
+            json!({"listen": "127.0.0.1:1", "ca_cert_path": "/ca", "base_url": "u", "api_key": "k"}),
+        ] {
+            assert!(is_saiai_config(&config), "{config}");
+        }
+        for config in [
+            json!({"theme": "dark"}),
+            json!({"version": 2, "listen": "127.0.0.1:1"}),
+            json!({"version": 3, "listen": "127.0.0.1:1", "ca_cert_path": "/ca"}),
+            json!({"listen": "127.0.0.1:1", "ca_cert_path": "/ca"}),
+            json!([1]),
+        ] {
+            assert!(!is_saiai_config(&config), "{config}");
+        }
+    }
+
+    fn item(area: Area, executed: bool, outcome: Outcome) -> Item {
+        Item {
+            area,
+            text: String::new(),
+            action: if executed {
+                Action::RemoveFile(PathBuf::from("/unused"))
+            } else {
+                Action::None
+            },
+            outcome,
+        }
+    }
+
+    #[test]
+    fn data_and_program_are_gated_on_every_earlier_failure() {
+        let done = || item(Area::Claude, true, Outcome::Done);
+        assert!(!gate_blocked(
+            &[
+                done(),
+                item(Area::Codex, false, Outcome::Manual("forget".into()))
+            ],
+            Area::Data
+        ));
+        for failure in [
+            item(Area::Codex, false, Outcome::Failed("plan".into())),
+            item(
+                Area::Program,
+                false,
+                Outcome::Failed("PATH inspection".into()),
+            ),
+            item(Area::Data, true, Outcome::Failed("earlier data".into())),
+            item(Area::Data, true, Outcome::Skipped),
+        ] {
+            assert!(gate_blocked(&[done(), failure], Area::Data));
+        }
+        // A failed program step does not block other program steps, but any
+        // unfinished data step blocks the program.
+        let program_failure = item(Area::Program, true, Outcome::Failed("locked".into()));
+        assert!(!gate_blocked(&[done(), program_failure], Area::Program));
+        assert!(gate_blocked(
+            &[done(), item(Area::Data, true, Outcome::Pending)],
+            Area::Program
+        ));
+        assert!(!gate_blocked(
+            &[
+                done(),
+                item(Area::Data, true, Outcome::Kept("not empty".into()))
+            ],
+            Area::Program
+        ));
+    }
+
+    #[test]
     fn secrets_are_masked() {
         assert_eq!(mask_secret("TEST_ONLY_SECRET_VALUE_1234"), "****1234");
         assert_eq!(mask_secret("short"), "****");
@@ -2700,8 +2996,13 @@ mod tests {
 
     #[test]
     fn arguments_reject_unknown_flags() {
-        let parsed = parse_args(&["--yes".into(), "--dry-run".into()]).unwrap();
-        assert!(parsed.yes && parsed.dry_run);
+        let parsed = parse_args(&[
+            "--yes".into(),
+            "--dry-run".into(),
+            "--forget-unknown-environments".into(),
+        ])
+        .unwrap();
+        assert!(parsed.yes && parsed.dry_run && parsed.forget_unknown);
         assert!(parse_args(&["--force".into()]).is_err());
         assert!(parse_args(&["extra".into()]).is_err());
     }

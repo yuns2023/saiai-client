@@ -115,7 +115,7 @@ exit /b %SAIAI_EXIT%
 :usage
 echo Usage: setup.cmd ^<base_url^> ^<api_key^> 1>&2
 echo    or: setup.cmd init-codex ^<base_url^> ^<api_key^> [--websockets] 1>&2
-echo    or: setup.cmd uninstall [--yes] [--dry-run] 1>&2
+echo    or: setup.cmd uninstall [--yes] [--dry-run] [--forget-unknown-environments] 1>&2
 exit /b 2
 
 rem The installed client is the only uninstall executor.

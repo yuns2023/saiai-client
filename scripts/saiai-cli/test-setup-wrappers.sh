@@ -186,7 +186,7 @@ fi
 # Uninstall: the wrapper only selects a capable native executor.
 curl_before="$(wc -l <"${curl_log}")"
 export SAIAI_TEST_EXIT=3
-if run_setup uninstall --yes; then
+if run_setup uninstall --yes --forget-unknown-environments; then
   echo "wrapper did not pass the uninstall exit code through" >&2
   exit 1
 fi
@@ -195,7 +195,8 @@ mapfile -t uninstall_invocation <"${invoked}"
 test "${uninstall_invocation[1]}" = "CALL"
 test "${uninstall_invocation[2]}" = "uninstall"
 test "${uninstall_invocation[3]}" = "--yes"
-test "${#uninstall_invocation[@]}" -eq 4
+test "${uninstall_invocation[4]}" = "--forget-unknown-environments"
+test "${#uninstall_invocation[@]}" -eq 5
 test "$(wc -l <"${curl_log}")" -eq "${curl_before}"
 test -x "${install_dir}/saiai"
 
@@ -204,7 +205,7 @@ if run_setup uninstall --force; then
   exit 1
 fi
 test ! -e "${invoked}"
-grep -Fq 'uninstall [--yes] [--dry-run]' "${output}"
+grep -Fq 'uninstall [--yes] [--dry-run] [--forget-unknown-environments]' "${output}"
 
 # An installed client without uninstall support: use a verified temporary copy.
 printf '#!/usr/bin/env bash\necho "Unknown command: $1" >&2\nexit 1\n' >"${install_dir}/saiai"

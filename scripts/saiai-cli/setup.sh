@@ -10,7 +10,7 @@ Usage:
   setup.sh <base_url> <api_key>
   setup.sh init-codex
   setup.sh init-codex <base_url> <api_key> [--websockets]
-  setup.sh uninstall [--yes] [--dry-run]
+  setup.sh uninstall [--yes] [--dry-run] [--forget-unknown-environments]
 
 The wrapper checks the release manifest on every run. It downloads the binary
 only when the installed binary differs, then always applies the supplied config.
@@ -149,23 +149,13 @@ download_release_asset() {
   chmod 0755 "${destination}"
 }
 
-temporary="$(mktemp -d)"
-staged_path=""
-cleanup() {
-  rm -rf -- "${temporary}"
-  if [ -n "${staged_path}" ]; then
-    rm -f -- "${staged_path}"
-  fi
-}
-trap cleanup EXIT
-
 # The native client is the only uninstall executor: this wrapper finds or
 # downloads a capable client and never deletes files itself.
 if [ "${1:-}" = "uninstall" ]; then
   shift
   for argument in "$@"; do
     case "${argument}" in
-      --yes|--dry-run) ;;
+      --yes|--dry-run|--forget-unknown-environments) ;;
       *)
         usage
         exit 2
@@ -186,11 +176,13 @@ if [ "${1:-}" = "uninstall" ]; then
   done
   if [ -z "${executor}" ]; then
     echo "No installed SAIAI client supports uninstall; downloading the current release to a temporary directory." >&2
+    uninstall_temporary="$(mktemp -d)"
+    trap 'rm -rf -- "${uninstall_temporary}"' EXIT
     set +e
     (
       set -e
-      fetch_release_metadata "${temporary}"
-      download_release_asset "${temporary}/saiai-uninstall"
+      fetch_release_metadata "${uninstall_temporary}"
+      download_release_asset "${uninstall_temporary}/saiai-uninstall"
     )
     download_status=$?
     set -e
@@ -206,7 +198,7 @@ Retry when the network is available, or remove SAIAI manually:
 EOF
       exit 1
     fi
-    executor="${temporary}/saiai-uninstall"
+    executor="${uninstall_temporary}/saiai-uninstall"
   fi
   # The client confirms through the terminal, never through this script's stdin.
   set +e
@@ -259,6 +251,16 @@ elif [ "$#" -lt 2 ]; then
   usage
   exit 2
 fi
+
+temporary="$(mktemp -d)"
+staged_path=""
+cleanup() {
+  rm -rf -- "${temporary}"
+  if [ -n "${staged_path}" ]; then
+    rm -f -- "${staged_path}"
+  fi
+}
+trap cleanup EXIT
 
 install_path="${INSTALL_DIR}/saiai"
 backup_path="${INSTALL_DIR}/saiai-previous"
