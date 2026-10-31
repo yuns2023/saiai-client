@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, bail};
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use base64::Engine;
 use chrono::Utc;
 use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
@@ -782,7 +781,7 @@ fn configure_codex_oauth_local_proxy(
     proxy_init: &CodexLocalProxyInit,
 ) -> Result<CodexOAuthInitialization> {
     let auth_path = codex_dir.join("auth.json");
-    ensure_codex_local_proxy_auth(&auth_path)?;
+    migrate_codex_local_proxy_auth(&auth_path)?;
     validate_codex_oauth_auth(&auth_path)?;
     let files = prepare_codex_oauth_files(codex_dir, true)?;
     let env_path = codex_dir.join(".env");
@@ -1399,34 +1398,83 @@ fn codex_args_override_config_key(args: &[String], expected_key: &str) -> bool {
     false
 }
 
+/// What to do with a real ChatGPT login already present in auth.json.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExistingCodexAuth {
+    /// Keep it; warn when its access token has expired.
+    Keep,
+    /// `saiai init-codex`: back up and replace it once its access token has
+    /// expired. Desktop shows its sign-in page when the refresh token behind
+    /// an expired login has been revoked, and SAIAI cannot check that offline.
+    ReplaceExpired,
+    /// Always write the SAIAI placeholder.
+    Replace,
+}
+
 fn ensure_codex_local_proxy_auth(path: &Path) -> Result<()> {
-    write_codex_local_proxy_auth(path, false)
+    write_codex_local_proxy_auth(path, ExistingCodexAuth::Keep)
+}
+
+fn migrate_codex_local_proxy_auth(path: &Path) -> Result<()> {
+    write_codex_local_proxy_auth(path, ExistingCodexAuth::ReplaceExpired)
 }
 
 fn replace_codex_local_proxy_auth(path: &Path) -> Result<()> {
-    write_codex_local_proxy_auth(path, true)
+    write_codex_local_proxy_auth(path, ExistingCodexAuth::Replace)
 }
 
-fn write_codex_local_proxy_auth(path: &Path, replace_existing: bool) -> Result<()> {
+fn write_codex_local_proxy_auth(path: &Path, existing: ExistingCodexAuth) -> Result<()> {
+    write_codex_local_proxy_auth_at(path, existing, Utc::now().timestamp())
+}
+
+fn write_codex_local_proxy_auth_at(
+    path: &Path,
+    existing: ExistingCodexAuth,
+    now_epoch_seconds: i64,
+) -> Result<()> {
     let existed = path.exists();
-    let mut auth = if existed {
-        load_json_object(path)?
+    let original = if existed {
+        Some(fs::read(path).with_context(|| format!("failed to read {}", path.display()))?)
     } else {
-        Map::new()
+        None
     };
-    if existed && !replace_existing {
-        let existing_access = auth
-            .get("tokens")
-            .and_then(Value::as_object)
-            .and_then(|tokens| tokens.get("access_token"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let existing_auth_mode = auth.get("auth_mode").and_then(Value::as_str).unwrap_or("");
-        let has_real_oauth = matches!(existing_auth_mode, "chatgpt" | "chatgptAuthTokens")
-            && !existing_access.trim().is_empty()
-            && !is_codex_placeholder_access_token(existing_access);
-        if has_real_oauth {
-            return Ok(());
+    let mut auth = match &original {
+        Some(bytes) => parse_json_object_bytes(path, bytes)?,
+        None => Map::new(),
+    };
+    let mut expired_backup = None;
+    if existing != ExistingCodexAuth::Replace {
+        match real_codex_oauth_expiry(&auth) {
+            None => {}
+            Some(Some(expires_at)) if expires_at <= now_epoch_seconds => {
+                let expired = format_epoch_seconds(expires_at);
+                if existing == ExistingCodexAuth::Keep {
+                    eprintln!(
+                        "WARN {}: the ChatGPT access token expired at {expired}; if Codex asks you to sign in, quit it and run `saiai init-codex` to switch to the SAIAI local-proxy login.",
+                        path.display()
+                    );
+                    return Ok(());
+                }
+                let original = original.as_deref().unwrap_or_default();
+                let backup = write_expired_login_backup(path, original, now_epoch_seconds)?;
+                println!(
+                    "The ChatGPT access token in {} expired at {expired}; saved the original login to {}.",
+                    path.display(),
+                    backup.display()
+                );
+                // Skip the replacement when Codex rewrote the login after it
+                // was read. This narrows, but cannot close, the race window.
+                let current = fs::read(path)
+                    .with_context(|| format!("failed to re-read {}", path.display()))?;
+                if current != original {
+                    bail!(
+                        "{} changed while SAIAI was replacing its expired login and was left unchanged; quit Codex and rerun `saiai init-codex`",
+                        path.display()
+                    );
+                }
+                expired_backup = Some(backup);
+            }
+            Some(_) => return Ok(()),
         }
     }
 
@@ -1463,11 +1511,120 @@ fn write_codex_local_proxy_auth(path: &Path, replace_existing: bool) -> Result<(
         "{verb} local-proxy OAuth auth placeholder at {} (no provider login required).",
         path.display()
     );
+    if let Some(backup) = expired_backup {
+        println!(
+            "To use your own ChatGPT login again, quit Codex, copy {} back to {} and sign in again if Codex asks.",
+            backup.display(),
+            path.display()
+        );
+    }
     Ok(())
 }
 
 fn is_codex_placeholder_access_token(token: &str) -> bool {
     token.starts_with("saiai-local-proxy-placeholder-") || token == CODEX_PLACEHOLDER_ACCESS_TOKEN
+}
+
+/// `None` when auth.json holds no real ChatGPT login; otherwise the access
+/// token's `exp`, which is `None` when the token is not a readable JWT.
+fn real_codex_oauth_expiry(auth: &Map<String, Value>) -> Option<Option<i64>> {
+    let auth_mode = auth.get("auth_mode").and_then(Value::as_str).unwrap_or("");
+    let access_token = auth
+        .get("tokens")
+        .and_then(Value::as_object)
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !matches!(auth_mode, "chatgpt" | "chatgptAuthTokens")
+        || access_token.trim().is_empty()
+        || is_codex_placeholder_access_token(access_token)
+    {
+        return None;
+    }
+    Some(codex_jwt_expiry(access_token))
+}
+
+/// Reads `exp` from a three-part JWT without verifying it.
+fn codex_jwt_expiry(token: &str) -> Option<i64> {
+    let mut parts = token.split('.');
+    let (Some(_), Some(payload), Some(_), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    serde_json::from_slice::<Value>(&decoded)
+        .ok()?
+        .get("exp")?
+        .as_i64()
+}
+
+fn format_epoch_seconds(epoch_seconds: i64) -> String {
+    chrono::DateTime::<Utc>::from_timestamp(epoch_seconds, 0)
+        .map(|time| time.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| format!("epoch {epoch_seconds}"))
+}
+
+/// Writes `data` to a new `<path>.bak-expired-login-<timestamp>[-n]` and
+/// returns its path. The `expired-login` infix keeps it out of the names
+/// `backup_if_exists` overwrites, and an existing file is never replaced.
+fn write_expired_login_backup(path: &Path, data: &[u8], now_epoch_seconds: i64) -> Result<PathBuf> {
+    let timestamp = chrono::DateTime::<Utc>::from_timestamp(now_epoch_seconds, 0)
+        .unwrap_or_default()
+        .format("%Y%m%d-%H%M%S");
+    for attempt in 0..100 {
+        let suffix = if attempt == 0 {
+            String::new()
+        } else {
+            format!("-{attempt}")
+        };
+        let backup = PathBuf::from(format!(
+            "{}.bak-expired-login-{timestamp}{suffix}",
+            path.display()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&backup) {
+            Ok(file) => file,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to create backup {}", backup.display()));
+            }
+        };
+        if let Err(err) = file.write_all(data).and_then(|()| file.sync_all()) {
+            drop(file);
+            let _ = fs::remove_file(&backup);
+            return Err(err)
+                .with_context(|| format!("failed to write backup {}", backup.display()));
+        }
+        return Ok(backup);
+    }
+    bail!("could not find a free backup name for {}", path.display())
+}
+
+/// A warning when auth.json holds a real ChatGPT login whose access token has
+/// expired. Read-only; used by the Desktop launcher and doctor.
+fn codex_auth_expiry_warning(path: &Path) -> Result<Option<String>> {
+    let raw = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let auth = parse_json_object_bytes(path, &raw)?;
+    let Some(Some(expires_at)) = real_codex_oauth_expiry(&auth) else {
+        return Ok(None);
+    };
+    Ok((expires_at <= Utc::now().timestamp()).then(|| {
+        format!(
+            "the ChatGPT access token in {} expired at {}; Codex shows its sign-in page if the login can no longer be refreshed. Quit Codex and run `saiai init-codex` to switch to the SAIAI local-proxy login.",
+            path.display(),
+            format_epoch_seconds(expires_at)
+        )
+    }))
 }
 
 fn run_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
@@ -2073,6 +2230,11 @@ fn run_windows_packaged_desktop(
     validate_codex_oauth_auth(&codex_home.join("auth.json")).context(
         "packaged Windows Desktop needs a configured Codex account; run `saiai init-codex` first",
     )?;
+    match codex_auth_expiry_warning(&codex_home.join("auth.json")) {
+        Ok(None) => {}
+        Ok(Some(warning)) => eprintln!("WARN {warning}"),
+        Err(err) => eprintln!("WARN could not check the Codex login expiry: {err:#}"),
+    }
     // The packaged Desktop reads the standard profile that `saiai init-codex`
     // and `saiai vscode` prepare; this launcher never rewrites it. Point at the
     // fix instead of silently launching with Codex time reporting enabled.
@@ -5327,7 +5489,11 @@ fn check_codex_config(report: &mut DoctorReport, cfg: Option<&SaiaiConfig>, requ
         }
     } else {
         match validate_codex_oauth_auth(&auth_path) {
-            Ok(()) => report.ok("Codex auth", "ChatGPT OAuth token mode configured"),
+            Ok(()) => match codex_auth_expiry_warning(&auth_path) {
+                Ok(None) => report.ok("Codex auth", "ChatGPT OAuth token mode configured"),
+                Ok(Some(warning)) => report.warn("Codex auth", warning),
+                Err(err) => report.error("Codex auth", format!("{err:#}")),
+            },
             Err(err) => report.error("Codex auth", format!("{err:#}")),
         }
     }
@@ -7769,14 +7935,19 @@ fn load_json_object(path: &Path) -> Result<Map<String, Value>> {
         return Ok(Map::new());
     }
 
+    let raw = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    parse_json_object_bytes(path, &raw)
+}
+
+fn parse_json_object_bytes(path: &Path, raw: &[u8]) -> Result<Map<String, Value>> {
     let raw =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+        std::str::from_utf8(raw).with_context(|| format!("failed to read {}", path.display()))?;
     if raw.trim().is_empty() {
         return Ok(Map::new());
     }
 
-    let value: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let value: Value =
+        serde_json::from_str(raw).with_context(|| format!("failed to parse {}", path.display()))?;
     value
         .as_object()
         .cloned()
@@ -8388,6 +8559,201 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         ensure_codex_local_proxy_auth(&path).unwrap();
 
         assert_eq!(read_str(&path), real);
+    }
+
+    fn test_jwt_with_payload(payload: &str) -> String {
+        format!(
+            "e30.{}.signature",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+        )
+    }
+
+    fn real_auth_json(auth_mode: &str, access_token: &str) -> String {
+        // Odd spacing and an unknown field prove the backup is byte-exact.
+        format!(
+            "{{ \"auth_mode\":\"{auth_mode}\",\n  \"tokens\":{{\"id_token\":\"real.id.token\",\"access_token\":\"{access_token}\",\"refresh_token\":\"real-refresh\",\"account_id\":\"real-account\"}},\"unrelated\":\"keep\"}}"
+        )
+    }
+
+    fn backup_files(dir: &Path) -> Vec<PathBuf> {
+        let mut backups: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.to_string_lossy().contains("auth.json.bak-"))
+            .collect();
+        backups.sort();
+        backups
+    }
+
+    const TEST_NOW: i64 = 1_800_000_000;
+
+    fn test_jwt_expiring_at(exp: i64) -> String {
+        test_jwt_with_payload(&format!(r#"{{"exp":{exp}}}"#))
+    }
+
+    #[test]
+    fn init_replaces_expired_real_codex_oauth_after_exact_backup() {
+        for auth_mode in ["chatgpt", "chatgptAuthTokens"] {
+            for exp in [TEST_NOW, TEST_NOW - 1, 0, -5] {
+                let dir = TempDir::new().unwrap();
+                let path = dir.path().join("auth.json");
+                let real = real_auth_json(auth_mode, &test_jwt_expiring_at(exp));
+                write_str(&path, &real);
+
+                write_codex_local_proxy_auth_at(&path, ExistingCodexAuth::ReplaceExpired, TEST_NOW)
+                    .unwrap();
+
+                let backups = backup_files(dir.path());
+                assert_eq!(backups.len(), 1, "{auth_mode} exp={exp}");
+                assert!(
+                    backups[0]
+                        .to_string_lossy()
+                        .ends_with("auth.json.bak-expired-login-20270115-080000"),
+                    "{}",
+                    backups[0].display()
+                );
+                assert_eq!(read_str(&backups[0]), real);
+                let auth = load_json_object(&path).unwrap();
+                assert_eq!(auth["auth_mode"].as_str(), Some("chatgptAuthTokens"));
+                assert_eq!(
+                    auth["tokens"]["access_token"].as_str(),
+                    Some(CODEX_PLACEHOLDER_ACCESS_TOKEN)
+                );
+                assert_eq!(auth["tokens"]["refresh_token"].as_str(), Some(""));
+                assert_eq!(
+                    auth["tokens"]["account_id"].as_str(),
+                    Some(CODEX_PLACEHOLDER_ACCOUNT_ID)
+                );
+                validate_codex_oauth_auth(&path).unwrap();
+
+                // The placeholder is not a real login, so a rerun makes no backup.
+                write_codex_local_proxy_auth_at(&path, ExistingCodexAuth::ReplaceExpired, TEST_NOW)
+                    .unwrap();
+                assert_eq!(backup_files(dir.path()).len(), 1);
+                assert_eq!(codex_auth_expiry_warning(&path).unwrap(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn init_keeps_unexpired_or_unreadable_real_codex_oauth() {
+        for auth_mode in ["chatgpt", "chatgptAuthTokens"] {
+            for access_token in [
+                test_jwt_expiring_at(TEST_NOW + 1),
+                // Replacement has no early window, unlike the Desktop copy check.
+                test_jwt_expiring_at(TEST_NOW + 60),
+                "opaque-real-access".to_string(),
+                test_jwt_with_payload(r#"{"sub":"no-exp"}"#),
+                test_jwt_with_payload(r#"{"exp":"100"}"#),
+                test_jwt_with_payload(r#"{"exp":100.5}"#),
+                format!("{}.extra", test_jwt_expiring_at(100)),
+            ] {
+                let dir = TempDir::new().unwrap();
+                let path = dir.path().join("auth.json");
+                let real = real_auth_json(auth_mode, &access_token);
+                write_str(&path, &real);
+
+                write_codex_local_proxy_auth_at(&path, ExistingCodexAuth::ReplaceExpired, TEST_NOW)
+                    .unwrap();
+
+                assert_eq!(read_str(&path), real, "{auth_mode} {access_token}");
+                assert!(backup_files(dir.path()).is_empty(), "{access_token}");
+            }
+        }
+    }
+
+    #[test]
+    fn keep_mode_leaves_expired_real_codex_oauth_and_warning_names_the_fix() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        let real = real_auth_json("chatgpt", &test_jwt_expiring_at(0));
+        write_str(&path, &real);
+
+        ensure_codex_local_proxy_auth(&path).unwrap();
+
+        assert_eq!(read_str(&path), real);
+        assert!(backup_files(dir.path()).is_empty());
+        let warning = codex_auth_expiry_warning(&path).unwrap().unwrap();
+        assert!(warning.contains("1970-01-01 00:00:00 UTC"), "{warning}");
+        assert!(warning.contains("saiai init-codex"), "{warning}");
+
+        write_str(&path, "not json");
+        assert!(codex_auth_expiry_warning(&path).is_err());
+    }
+
+    #[test]
+    fn reads_jwt_expiry_only_from_three_part_tokens() {
+        assert_eq!(codex_jwt_expiry(&test_jwt_expiring_at(0)), Some(0));
+        assert_eq!(codex_jwt_expiry(&test_jwt_expiring_at(-5)), Some(-5));
+        assert_eq!(codex_jwt_expiry("e30.eyJleHAiOjEwMH0"), None);
+        assert_eq!(codex_jwt_expiry("e30.eyJleHAiOjEwMH0.sig.extra"), None);
+        assert_eq!(codex_jwt_expiry("e30.not base64.sig"), None);
+        assert_eq!(codex_jwt_expiry("opaque"), None);
+    }
+
+    #[test]
+    fn expired_login_backups_survive_name_collisions_and_init_backups() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        let taken = dir
+            .path()
+            .join("auth.json.bak-expired-login-20270115-080000");
+        write_str(&taken, "earlier");
+        let real = real_auth_json("chatgpt", &test_jwt_expiring_at(TEST_NOW));
+        write_str(&path, &real);
+
+        write_codex_local_proxy_auth_at(&path, ExistingCodexAuth::ReplaceExpired, TEST_NOW)
+            .unwrap();
+        // `init_codex` backs up auth.json with the same timestamp format
+        // before every run; it must not reach the expired-login backups.
+        backup_if_exists(&path, "20270115-080000").unwrap();
+
+        let suffixed = dir
+            .path()
+            .join("auth.json.bak-expired-login-20270115-080000-1");
+        assert_eq!(read_str(&taken), "earlier");
+        assert_eq!(read_str(&suffixed), real);
+        assert_eq!(backup_files(dir.path()).len(), 3);
+    }
+
+    #[test]
+    fn init_keeps_expired_login_when_no_backup_name_is_free() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        for attempt in 0..100 {
+            let suffix = if attempt == 0 {
+                String::new()
+            } else {
+                format!("-{attempt}")
+            };
+            write_str(
+                &dir.path().join(format!(
+                    "auth.json.bak-expired-login-20270115-080000{suffix}"
+                )),
+                "taken",
+            );
+        }
+        let real = real_auth_json("chatgpt", &test_jwt_expiring_at(0));
+        write_str(&path, &real);
+
+        assert!(
+            write_codex_local_proxy_auth_at(&path, ExistingCodexAuth::ReplaceExpired, TEST_NOW)
+                .is_err()
+        );
+        assert_eq!(read_str(&path), real);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_login_backup_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let backup =
+            write_expired_login_backup(&dir.path().join("auth.json"), b"login", TEST_NOW).unwrap();
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
