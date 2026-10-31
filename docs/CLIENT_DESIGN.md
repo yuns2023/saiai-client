@@ -82,6 +82,99 @@ base URL 及注册所用 API Key 的 SHA-256 记录的设备状态（`client-dev
 `X-Saiai-Client-Proof` 在所有出站路径上都会被丢弃。明文 HTTP 代理路径不发往
 Gateway，因此不签名。日志只包含 Gateway、device_id 和状态，不输出私钥或完整头。
 
+## Desktop 浏览器与电脑操控（待发布）
+
+官方 Desktop 有三种由模型操控的本机能力：内置浏览器（右侧浏览器面板）、通过 ChatGPT
+浏览器扩展（Chrome Web Store id `hehggadaopoacecdllhhajmbjkdcmajg`）操控用户的
+Chrome/Edge，以及 Computer Use（操控 Windows/macOS 上的其他应用）。三者都由 Desktop
+主进程给会话挂上本机 `node_repl`/`cua_repl` MCP 工具来执行，走本机 native messaging
+host `com.openai.codexextension` 或命名管道，模型请求仍由已代理的 app-server 发出；
+扩展连接本机通道时不检查 chatgpt.com 登录。扩展自身的侧边对话和云端 browser-use
+tunnel 使用浏览器里真实的 ChatGPT 登录，SAIAI 不代管、不伪造这部分登录，也不把池中
+账号的 Cookie 交给用户浏览器。
+
+Desktop 26.1023/26.1027 按 Statsig gate 判断每项能力是否可用（另需配置要求未禁止
+`allowBrowserAndComputerUse`、对应实验功能未被关闭）：
+
+| gate | 能力 |
+| --- | --- |
+| `410262010` | 内置浏览器操控（`browser_use`） |
+| `410065390` | 通过扩展操控 Chrome/Edge（`browser_use_external`） |
+| `1506311413` | Computer Use（`computer_use`） |
+| `1892382740` | Computer Use 与浏览器共用的 `cua_repl` 运行时（tinysky） |
+| `1146407612` | 内置浏览器中的 MCP App 页面（`mcpapps` 后端） |
+
+旧版本地 Statsig bootstrap 没有任何 gate：三项能力都不可用，Desktop 不给会话挂上
+`node_repl`，模型的工具列表里没有任何浏览器或电脑操控工具；设置页把 Chrome 显示为
+“已被你的组织停用，或在你所在地区不可用”。2026-10-31 MiniPi（Win11，Desktop
+26.1023.6621.0）用户报告“内置浏览器和 Computer Use 都用不了”即此原因。同一台机器
+10-13 用真实 ChatGPT（Plus）登录时，Desktop 26.1013 写入的配置为
+`BROWSER_USE_AVAILABLE_BACKENDS="chrome,iab,mcpapps"`、`BROWSER_USE_TINYSKY_ENABLED="1"`，
+即消费者账号启用了上表对应的后端与运行时（这证明的是配置结果，不是逐个读到的 gate 值）；其余 gate（如 `dot` 后端、语音、云端同步、Deep Research 等）未见于消费者
+账号或依赖 SAIAI 不提供的云端接口，不开启。连接浏览器前，Desktop 主进程还会读取
+`/wham/work/settings`（Work browser access），读取失败即拒绝连接。
+
+本地代理默认：
+
+- 在本地 Statsig bootstrap（`/v1/initialize`、`/wham/statsig/bootstrap` 及静态兜底）
+  中加入上表五个 gate；
+- 对 GET `/wham/work/settings`（含 `/backend-api` 前缀）返回 `{"settings":null}`，
+  表示 SAIAI 本地身份没有托管 Work 策略，`localBrowserUse` 采用官方默认值；它不是对
+  真实组织策略的查询结论。写入和未知子路径仍返回 501，不伪造保存成功。
+
+这是 SAIAI 本地身份对官方内置能力的开启，不代表 OpenAI 将任何账号纳入灰度或授予
+权益。Computer Use 的设计用途是让模型读取屏幕并操作本机应用；授权与确认行为由
+Desktop 决定，本次未验证逐应用确认机制，也只验证了只读的窗口枚举。在已验证的 Win11 /
+Desktop 26.1023 上，内置浏览器和 Computer Use 升级并重启 Desktop 后即可使用（仍受
+Desktop 自身的设置、策略、运行时和系统权限约束）；macOS 与 Linux Desktop 会收到同样的
+gate，但未验证；
+Chrome 操控须在 Desktop 设置中安装扩展并在浏览器确认扩展权限后才生效，此前已装好
+扩展、已授权站点的用户升级后可能直接恢复浏览器操控，不会再次确认。发布说明须写明
+默认开启和关闭方式。官方的逐站确认与允许/阻止列表由 Desktop 执行，SAIAI 未单独
+验证其每项行为。开启后模型可读取并操作该浏览器 profile 中的页面，包括其他网站的
+已登录会话；建议使用独立 profile。
+
+关闭方式：在 SAIAI 配置目录的 `config.json` 中设置 `"desktop_browser_use": false`
+（重新初始化、包括 CA 损坏后的重建都会保留该值），然后重启后台代理和 Desktop。
+环境变量 `SAIAI_DESKTOP_BROWSER_USE=0`（`1` 强制开启，其他值忽略）只在代理进程实际
+继承时生效：Windows 后台进程和无 systemd 的 Linux 后台进程会继承启动环境，systemd
+和 macOS launchd 服务不会，服务模式请改用 `config.json`。关闭后
+gate 恢复为空、Work settings 恢复 501，Desktop 重新显示浏览器与 Computer Use 不可用；已建立的
+扩展连接和运行中的任务以 Desktop 重启为准，不承诺即时撤销。开关只撤回 gate，不删除
+`config.toml` 里已写入的 MCP 配置，也不拦截工具调用，不能当作强制撤权边界。同一开关
+同时控制浏览器操控和 Computer Use，名称沿用 `desktop_browser_use`。
+
+当前请求不携带可靠的 Desktop 版本（版本只出现在 `/models` 的 User-Agent），共享
+代理也无法把启动器解析的包版本绑定到具体请求，因此不做按版本开启。将来 Desktop
+若改变 gate 编号，功能会退回不可用；若改变 gate 含义或 Work settings 结构，可能
+读取失败，也可能仍接受 `null` 但采用不同默认值，须随 Desktop 版本监控复核。本改动
+不修改模型转发路径，但不保证未来客户端的任务流程不受影响。
+
+gate 全关时 Desktop 不改写 `~/.codex/config.toml` 中的 `[mcp_servers.node_repl]`；
+若该段是早期真实登录时写入的，其中 `cua_node\<hash>` 路径会随 Desktop 升级失效，
+新会话日志出现 `MCP client for node_repl failed to start ... os error 3`。开启 gate 后
+MiniPi 上 Desktop 26.1023 启动时按当前运行时重写了该段；其他版本或其他旧配置是否
+同样自动修复未验证。
+
+内置浏览器与 Computer Use 验证（2026-10-31，MiniPi Win11，Desktop 26.1023.6621.0，
+release 交叉编译替换已安装的 1.1.55）：Desktop 日志 `browser_use_availability_resolved
+available=true`；新会话中模型通过 `mcp__cua_repl.js` 在内置浏览器打开
+`https://example.com` 并读到标题 “Example Domain”，通过 `mcp__node_repl__js` 调用
+`sky.list_windows()` 正确列出本机 7 个窗口（只读，未点击或输入）。
+
+Chrome 扩展验证范围（Windows Desktop 26.1027.3384.0，debug 交叉编译替换已安装客户端，测后
+还原）：
+
+- 原型（与最终实现语义相同、无关闭开关）：扩展 1.26.1020.11845 装在独立 Chrome
+  profile 且未登录 ChatGPT，Desktop 在 Chrome 新标签打开 `https://example.com` 并读回
+  标题；三轮任务共 15 次模型调用经生产 Gateway。
+- 最终实现：默认状态设置页显示扩展已安装且可开关；`SAIAI_DESKTOP_BROWSER_USE=0`
+  重启后恢复“已被你的组织停用”。最终实现未再发模型请求。
+
+未覆盖：macOS、Edge 等其他浏览器、正式发布包、Work 设置页/云编排偏好在
+`settings:null` 下的完整 UI 验收。轻量模型可能跳过 `chrome:control-chrome` 技能而
+误用接口，这属于模型行为，不是本地代理故障。
+
 ## 当前 Desktop 和编辑器边界（1.1.49）
 
 启动入口仍是 `saiai desktop codex`；入口名称不等于内部只有一种协议。
@@ -590,8 +683,9 @@ Codex app-server 0.153.4 已实测：用户 NSS 导入后账户控制面从 CA �
 还会向 `ab.chatgpt.com/v1/initialize` 发送 Statsig beta-eligibility 请求；它不是
 Gateway 的 OpenAI `/v1/initialize`（包括 SDK 的 `se=1` 编码请求） 契约，也不是模型流量。本地代理只对精确的
 `POST /v1/initialize` 返回版本化的本地 Statsig bootstrap，并在
-`/backend-api/wham/statsig/bootstrap` 返回同一 payload。该 payload 只启用 Codex
-已内置消息包所需的 `72216192.enable_i18n`，不启用其他 hosted experiment，不携带
+`/backend-api/wham/statsig/bootstrap` 返回同一 payload。该 payload 启用 Codex
+已内置消息包所需的 `72216192.enable_i18n`，以及默认开启、可关闭的浏览器与电脑操控
+gate（见“Desktop 浏览器与电脑操控”），不启用其他 hosted experiment，不携带
 SAIAI Key，也不把合成账户、Cookie 或请求体发往 Statsig/Gateway；非 POST 和超过
 1 MiB 的请求会被拒绝。账户 sidecar 同时覆盖带 `/backend-api` 前缀和新版 Electron
 直接请求的 `/accounts/optimized/check`、`/wham/accounts/check` 与
