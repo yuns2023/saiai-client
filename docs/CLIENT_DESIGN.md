@@ -110,7 +110,7 @@ Desktop 26.1023/26.1027 按 Statsig gate 判断每项能力是否可用（另需
 26.1023.6621.0）用户报告“内置浏览器和 Computer Use 都用不了”即此原因。同一台机器
 10-13 用真实 ChatGPT（Plus）登录时，Desktop 26.1013 写入的配置为
 `BROWSER_USE_AVAILABLE_BACKENDS="chrome,iab,mcpapps"`、`BROWSER_USE_TINYSKY_ENABLED="1"`，
-与上表一致；其余 gate（如 `dot` 后端、语音、云端同步、Deep Research 等）未见于消费者
+即消费者账号启用了上表对应的后端与运行时（这证明的是配置结果，不是逐个读到的 gate 值）；其余 gate（如 `dot` 后端、语音、云端同步、Deep Research 等）未见于消费者
 账号或依赖 SAIAI 不提供的云端接口，不开启。连接浏览器前，Desktop 主进程还会读取
 `/wham/work/settings`（Work browser access），读取失败即拒绝连接。
 
@@ -123,8 +123,11 @@ Desktop 26.1023/26.1027 按 Statsig gate 判断每项能力是否可用（另需
   真实组织策略的查询结论。写入和未知子路径仍返回 501，不伪造保存成功。
 
 这是 SAIAI 本地身份对官方内置能力的开启，不代表 OpenAI 将任何账号纳入灰度或授予
-权益。Computer Use 开启后模型可以读取屏幕并操作本机任意应用；官方的逐应用确认由
-Desktop 执行，SAIAI 未单独验证其每项行为。内置浏览器和 Computer Use 升级后即可使用；
+权益。Computer Use 的设计用途是让模型读取屏幕并操作本机应用；授权与确认行为由
+Desktop 决定，本次未验证逐应用确认机制，也只验证了只读的窗口枚举。在已验证的 Win11 /
+Desktop 26.1023 上，内置浏览器和 Computer Use 升级并重启 Desktop 后即可使用（仍受
+Desktop 自身的设置、策略、运行时和系统权限约束）；macOS 与 Linux Desktop 会收到同样的
+gate，但未验证；
 Chrome 操控须在 Desktop 设置中安装扩展并在浏览器确认扩展权限后才生效，此前已装好
 扩展、已授权站点的用户升级后可能直接恢复浏览器操控，不会再次确认。发布说明须写明
 默认开启和关闭方式。官方的逐站确认与允许/阻止列表由 Desktop 执行，SAIAI 未单独
@@ -137,7 +140,9 @@ Chrome 操控须在 Desktop 设置中安装扩展并在浏览器确认扩展权�
 继承时生效：Windows 后台进程和无 systemd 的 Linux 后台进程会继承启动环境，systemd
 和 macOS launchd 服务不会，服务模式请改用 `config.json`。关闭后
 gate 恢复为空、Work settings 恢复 501，Desktop 重新显示浏览器与 Computer Use 不可用；已建立的
-扩展连接和运行中的任务以 Desktop 重启为准，不承诺即时撤销。
+扩展连接和运行中的任务以 Desktop 重启为准，不承诺即时撤销。开关只撤回 gate，不删除
+`config.toml` 里已写入的 MCP 配置，也不拦截工具调用，不能当作强制撤权边界。同一开关
+同时控制浏览器操控和 Computer Use，名称沿用 `desktop_browser_use`。
 
 当前请求不携带可靠的 Desktop 版本（版本只出现在 `/models` 的 User-Agent），共享
 代理也无法把启动器解析的包版本绑定到具体请求，因此不做按版本开启。将来 Desktop
@@ -148,7 +153,8 @@ gate 恢复为空、Work settings 恢复 501，Desktop 重新显示浏览器与 
 gate 全关时 Desktop 不改写 `~/.codex/config.toml` 中的 `[mcp_servers.node_repl]`；
 若该段是早期真实登录时写入的，其中 `cua_node\<hash>` 路径会随 Desktop 升级失效，
 新会话日志出现 `MCP client for node_repl failed to start ... os error 3`。开启 gate 后
-Desktop 启动时按当前运行时重写该段，无需手动清理。
+MiniPi 上 Desktop 26.1023 启动时按当前运行时重写了该段；其他版本或其他旧配置是否
+同样自动修复未验证。
 
 内置浏览器与 Computer Use 验证（2026-10-31，MiniPi Win11，Desktop 26.1023.6621.0，
 release 交叉编译替换已安装的 1.1.55）：Desktop 日志 `browser_use_availability_resolved

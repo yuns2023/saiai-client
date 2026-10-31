@@ -66,9 +66,10 @@ const DESKTOP_STATSIG_LOCAL_PAYLOAD: &str = r#"{"feature_gates":{},"dynamic_conf
 // organization or unavailable in your region"), 1506311413 = Computer Use,
 // 1892382740 = the cua_repl runtime ("tinysky") that Windows Computer Use
 // runs on, 1146407612 = MCP-app pages in the in-app browser. A real consumer
-// login on Desktop 26.1013 had the same set (backends chrome,iab,mcpapps plus
-// tinysky). All of them run locally (native messaging / pipes), so model
-// traffic stays on the proxied app-server and needs no ChatGPT browser login.
+// login on Desktop 26.1013 ended up with the matching backends
+// (chrome,iab,mcpapps) and tinysky on. All of them run locally (native
+// messaging / pipes), so model traffic stays on the proxied app-server and
+// needs no ChatGPT browser login.
 const DESKTOP_CONTROL_GATES: [&str; 5] = [
     "410262010",
     "410065390",
