@@ -72,7 +72,29 @@ Windows 区分商店 AppX 与普通 exe；通过签名包信息定位实际安�
 Gateway 与上游归因必须有对应 hop 的证据；客户端一个错误页不足以定责。
 不向客户索要管理员密钥、后台数据库或私有 Ops。
 
-## 4. 安全提取与下一步
+## 4. 内置浏览器、Chrome 或 Computer Use 不可用
+
+典型表现：模型说“技能说明存在，但执行工具没出现在当前会话中”，或设置页把
+Chrome/电脑操作显示为“已被你的组织停用，或在你所在地区不可用”。
+这三项都要 Desktop 给会话挂上本机 `node_repl`/`cua_repl` 工具才能执行。
+
+按顺序查已有证据：
+
+1. SAIAI 版本是否包含 Client PR #141（main `b6ea474` 之后的版本）？更早的版本
+   本地 Statsig 应答不含操控 gate，Desktop 不会为会话挂上这些工具，属于已知限制，
+   不是客户配置错误。
+2. `config.json` 的 `desktop_browser_use` 是否为 `false`，或代理进程继承了
+   `SAIAI_DESKTOP_BROWSER_USE=0`？只记录取值，不改配置。
+3. Desktop 日志中 `browser_use_availability_resolved` 的 `available`/`reason`
+   （`statsig-disabled` 表示 gate 未开启）。
+4. 新会话日志是否出现 `MCP client for node_repl failed to start ... os error 3`？
+   这通常是 `<CODEX_HOME>/config.toml` 里早期写入的 `cua_node\<hash>` 路径已失效；
+   gate 开启后 Desktop 重启时会按当前运行时重写，诊断阶段不手动修改。
+
+不要为了验证而让模型实际操作浏览器或桌面；Chrome 操控还需要客户自己装好扩展并在
+浏览器中授权。
+
+## 5. 安全提取与下一步
 
 使用平台已有的 JSON/TOML 解析能力在本地生成允许字段；没有可靠解析器就跳过，
 不要用宽泛正则抽取 token、执行未知脚本或把源文件发给模型解析。

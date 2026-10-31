@@ -276,8 +276,10 @@ NSS 数据库并导入本地 CA，避免修改系统信任库；首次使用需�
 数据库的应用，命令会明确说明该操作。没有 `certutil` 时，CLI/VSCode 仍可使用，
 Desktop 请使用 `saiai desktop codex`。`saiai doctor codex` 会报告该条目是否存在。
 Desktop 的 Statsig `/v1/initialize` 和登录后 bootstrap 由本地 sidecar 以同一最小
-payload 闭环，只启用 Codex 内置翻译消息所需的 i18n layer；它们不发送到 Gateway 或
-Statsig，也不携带 SAIAI Key、合成账户、Cookie 或请求体。macOS 不会写入 Keychain：官方
+payload 闭环，只启用 Codex 内置翻译消息所需的 i18n layer，以及默认开启的内置浏览器、
+Chrome 扩展和 Computer Use 操控 gate（`config.json` 设 `"desktop_browser_use": false`
+后重启代理和 Desktop 即全部关闭，见 `docs/CLIENT_DESIGN.md`“Desktop 浏览器与电脑操控”）；
+它们不发送到 Gateway 或 Statsig，也不携带 SAIAI Key、合成账户、Cookie 或请求体。macOS 不会写入 Keychain：官方
 App 从 Dock、Finder 或 `open -a` 直接启动时不能继承 launcher 的叶证书 SPKI pin，若要让它
 信任 SAIAI 本地 CA，必须由当前用户通过 macOS 的授权交互把该 CA 设为登录 Keychain 的信任根。
 这不是可由 `init-codex` 静默完成的操作。未完成该用户授权时，使用无 Keychain、无系统代理修改的
