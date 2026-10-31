@@ -229,6 +229,12 @@ access-token 形状的状态；若用户从未登录，launcher 会创建只对�
 token 由外部宿主提供，Codex 不得拿合成状态访问 OpenAI OAuth refresh endpoint。
 占位状态包含供本地 app-server 展示登录态所需的无签名 ID token 形状，但不能通过
 OpenAI 校验；绕过本地代理时不会成为可用凭证。
+已有的真实 ChatGPT 登录默认保留。`saiai init-codex` 发现其 access token 已过期（JWT
+`exp` 不晚于当前时间）时，会先把原文件完整备份为 `auth.json.bak-expired-login-<时间>`，
+再改用上述占位状态，避免 refresh token 已被撤销时 Desktop 停在登录页；无法读出 `exp`
+的 token 不会被替换。`saiai codex`、`saiai vscode`、Windows 商店版 Desktop launcher
+和 `saiai doctor codex` 只提示过期、不改文件。想继续用自己的登录时，退出 Codex 后
+把备份复制回 `auth.json` 并按提示重新登录。
 `OPENAI_API_KEY` 不参与认证。代理转发 Codex 的 Responses HTTP/WebSocket 请求时
 保留原始路径、请求体、帧和客户端标识头，只在发往 SAIAI Gateway 的边界替换
 Gateway 认证。
