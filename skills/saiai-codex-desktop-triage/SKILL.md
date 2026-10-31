@@ -1,6 +1,6 @@
 ---
 name: saiai-codex-desktop-triage
-description: Diagnose SAIAI-managed Codex Desktop startup login prompts, native Chat failures, and Work/Codex connectivity on customer Windows, macOS, or Linux computers. Produce a sanitized maintainer handoff without changing customer configuration or sending model requests.
+description: Diagnose SAIAI-managed Codex Desktop startup login prompts, native Chat failures, missing browser or Computer Use tools, and Work/Codex connectivity on customer Windows, macOS, or Linux computers. Produce a sanitized maintainer handoff without changing customer configuration or sending model requests.
 ---
 
 # SAIAI Codex Desktop 客户现场诊断
