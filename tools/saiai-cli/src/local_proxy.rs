@@ -55,16 +55,27 @@ const SAIAI_DESKTOP_EMAIL: &str = "saiai-local-proxy@example.invalid";
 const DESKTOP_STATSIG_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 // Codex Desktop 26.908.4834.0 / Statsig JS 3.33.4 gates bundled locale
 // messages behind layer 72216192. Keep this local bootstrap deliberately
-// narrow: it enables i18n and, unless disabled, Desktop browser control. It
-// does not opt the synthetic SAIAI identity into unrelated hosted experiments
-// or send it to the Statsig control plane.
+// narrow: it enables i18n and, unless disabled, Desktop browser and Computer
+// Use control. It does not opt the synthetic SAIAI identity into unrelated
+// hosted experiments or send it to the Statsig control plane.
 const DESKTOP_STATSIG_LOCAL_PAYLOAD: &str = r#"{"feature_gates":{},"dynamic_configs":{},"layer_configs":{"72216192":{"name":"72216192","value":{"enable_i18n":true},"rule_id":"saiai-local-i18n","secondary_exposures":[],"is_user_in_experiment":false,"is_experiment_active":false,"allocated_experiment_name":"","explicit_parameters":["enable_i18n"],"undelegated_secondary_exposures":[]}},"has_updates":true,"time":0,"user":{"userID":"saiai-local-proxy-user","customIDs":{"stableID":"saiai-local-proxy"}}}"#;
-// Desktop 26.1021/26.1027 greys out @Chrome/@Edge ("disabled by your
-// organization or unavailable in your region") unless this Statsig gate is on.
-// The browser extension reaches Desktop over native messaging, so model
+// Desktop only offers its node_repl control tools to a thread when one of
+// these Statsig gates is on; with none of them the model sees no browser or
+// Computer Use tool at all. 410262010 = in-app browser, 410065390 = Chrome/Edge
+// through the extension (otherwise greyed out as "disabled by your
+// organization or unavailable in your region"), 1506311413 = Computer Use,
+// 1892382740 = the cua_repl runtime ("tinysky") that Windows Computer Use
+// runs on, 1146407612 = MCP-app pages in the in-app browser. A real consumer
+// login on Desktop 26.1013 had the same set (backends chrome,iab,mcpapps plus
+// tinysky). All of them run locally (native messaging / pipes), so model
 // traffic stays on the proxied app-server and needs no ChatGPT browser login.
-// The Computer Use gate (1506311413) is intentionally left off.
-const DESKTOP_BROWSER_USE_GATE: &str = "410065390";
+const DESKTOP_CONTROL_GATES: [&str; 5] = [
+    "410262010",
+    "410065390",
+    "1506311413",
+    "1892382740",
+    "1146407612",
+];
 const DESKTOP_BROWSER_USE_ENV: &str = "SAIAI_DESKTOP_BROWSER_USE";
 static DESKTOP_STATSIG_BROWSER_PAYLOAD: LazyLock<String> =
     LazyLock::new(|| desktop_statsig_base(DesktopFeatures { browser_use: true }).to_string());
@@ -116,7 +127,8 @@ pub struct Config {
     pub ca_key_pem: String,
     pub verbose: bool,
     pub chatgpt_chat_passthrough: bool,
-    /// Lets Desktop control the user's browser through the official extension.
+    /// Lets Desktop control its in-app browser, the user's browser through the
+    /// official extension, and other apps through Computer Use.
     pub desktop_browser_use: bool,
     /// Directory holding the client-proof device key; `None` disables proofs.
     pub client_proof_dir: Option<std::path::PathBuf>,
@@ -2920,13 +2932,15 @@ fn desktop_statsig_base(features: DesktopFeatures) -> Value {
     let mut payload: Value =
         serde_json::from_str(DESKTOP_STATSIG_LOCAL_PAYLOAD).expect("valid local Statsig payload");
     if features.browser_use {
-        payload["feature_gates"][DESKTOP_BROWSER_USE_GATE] = json!({
-            "name": DESKTOP_BROWSER_USE_GATE,
-            "value": true,
-            "rule_id": "saiai-local-browser-use",
-            "id_type": "userID",
-            "secondary_exposures": []
-        });
+        for gate in DESKTOP_CONTROL_GATES {
+            payload["feature_gates"][gate] = json!({
+                "name": gate,
+                "value": true,
+                "rule_id": "saiai-local-browser-use",
+                "id_type": "userID",
+                "secondary_exposures": []
+            });
+        }
     }
     payload
 }
@@ -4678,8 +4692,17 @@ mod tests {
     }
 
     fn desktop_statsig_expected_gates() -> Value {
-        json!({"410065390": {"name": "410065390", "value": true,
-            "rule_id": "saiai-local-browser-use", "id_type": "userID", "secondary_exposures": []}})
+        let gate = |name: &str| {
+            json!({"name": name, "value": true, "rule_id": "saiai-local-browser-use",
+                "id_type": "userID", "secondary_exposures": []})
+        };
+        json!({
+            "410262010": gate("410262010"),
+            "410065390": gate("410065390"),
+            "1506311413": gate("1506311413"),
+            "1892382740": gate("1892382740"),
+            "1146407612": gate("1146407612"),
+        })
     }
 
     #[test]

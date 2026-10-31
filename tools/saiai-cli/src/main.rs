@@ -846,7 +846,8 @@ fn initialize_codex_local_proxy_at(
     }
 
     // A missing CA or an obsolete layout forces a rebuild, but an explicit
-    // choice to turn off Desktop browser control must survive it.
+    // choice to turn off Desktop browser and Computer Use control must
+    // survive it.
     let desktop_browser_use = fs::read_to_string(&config_path)
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
