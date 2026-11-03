@@ -455,6 +455,29 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
 可访问任意目标，代理核心必须强制只监听 loopback，不能仅依赖初始化器生成的默认
 地址。Gateway Key 由代理从私有配置读取，程序不会把 Key 打印到输出或请求日志。
 
+唯一的例外是第三方遥测/错误上报接收端：`CONNECT` 和明文 HTTP absolute-form
+请求在建立任何上游连接之前先按规范化主机名（小写、去掉末尾点）检查一张拒绝表，
+命中则返回 `403 Forbidden`、`Content-Length: 0`、`Connection: close`（检查在通用读取器
+读完请求之后；超限或等待 `100 Continue` 的请求仍按原有读取错误路径结束，同样不连上游），详细日志
+记一行 `telemetry host refused kind=… host=… reason=…`。表里只放只用于事件/日志/崩溃接收的主机：
+精确主机必须实测，Sentry 后缀由实测与静态提取的组织接收域归纳。精确匹配
+`http-intake.logs.us5.datadoghq.com`（Claude Code 2.1.306 未设遥测环境变量时
+实测）；按标签边界后缀匹配 `.ingest.sentry.io` 与 `.ingest.us.sentry.io`（Sentry
+按组织分配的接收子域：Codex Desktop 26.1027 的 `o33249` 实测，Claude Code 的
+`o1158394` 与 Desktop 包内 `o33249.ingest.sentry.io` 为静态证据）。只有静态证据的
+`browser-intake-us5-datadoghq.com` 暂不拒绝。后缀以 `.` 开头且要求前面至少一个标签，
+`ingest.sentry.io.evil.com`、`notsentry.io`、裸 `ingest.sentry.io` 都不受影响；
+明文 HTTP 以 URL 主机判断（与 Host 头无关），任何端口都拒绝。功能开关（Statsig、
+GrowthBook、`ab.chatgpt.com`）、登录、更新、GitHub、共享 CDN 以及 `sentry.io`、
+`api.datadoghq.com`、`mcp.sentry.dev` 等用户可能主动使用的服务不得加入。
+由于代理环境变量会被子进程继承，经代理工具运行的用户程序向使用上述接收域后缀的
+任意 Sentry 组织上报也会被拒绝，这是接受的取舍；这也不是网络层封锁，不走代理的程序或直连
+IP 不受约束。403 的实测行为（只针对所测版本）：Claude Code 2.1.306 交互会话的 Datadog 批次在
+拒绝与放行时都是 145 s 内 3 次，`claude -p` 退出耗时 2.4 s 对 2.5 s，没有重试风暴。
+Codex Desktop 26.1027（未登录、隔离 profile）在 150–180 s 空闲观察和中途强杀一个
+renderer 后的 90 s 内都没有发 Sentry；只在强杀整个进程树时出现（放行 2 次、拒绝时
+同一秒 4 次，随后进程已退出），因此存活进程收到 403 后的持续行为尚未直接观察到。
+
 明文 HTTP absolute-form 请求仍按“每个客户端连接处理一个请求”的模型经共享 reqwest
 客户端转发（上游连接可能被连接池复用；不跟随重定向；沿用现有超时与 body 上限，
 这对大体积明文上传是有意的限制）。对非托管主机，代理只去掉 hop-by-hop 头、
