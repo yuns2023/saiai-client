@@ -457,7 +457,8 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
 
 唯一的例外是第三方遥测/错误上报接收端：`CONNECT` 和明文 HTTP absolute-form
 请求在建立任何上游连接之前先按规范化主机名（小写、去掉末尾点）检查一张拒绝表，
-命中则返回 `403 Forbidden`、`Content-Length: 0`、`Connection: close`，详细日志
+命中则返回 `403 Forbidden`、`Content-Length: 0`、`Connection: close`（检查在通用读取器
+读完请求之后；超限或等待 `100 Continue` 的请求仍按原有读取错误路径结束，同样不连上游），详细日志
 记一行 `telemetry host refused kind=… host=… reason=…`。表里只放只用于事件/日志/崩溃接收的主机：
 精确主机必须实测，Sentry 后缀由实测与静态提取的组织接收域归纳。精确匹配
 `http-intake.logs.us5.datadoghq.com`（Claude Code 2.1.306 未设遥测环境变量时

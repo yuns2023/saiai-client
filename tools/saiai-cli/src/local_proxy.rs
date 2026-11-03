@@ -6766,27 +6766,31 @@ mod tests {
 
     #[tokio::test]
     async fn non_telemetry_connect_still_tunnels() {
-        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = upstream.local_addr().unwrap().port();
-        let upstream_task = tokio::spawn(async move {
-            let (mut stream, _) = upstream.accept().await.unwrap();
-            let mut buf = [0u8; 4];
-            stream.read_exact(&mut buf).await.unwrap();
-            stream.write_all(&buf).await.unwrap();
-        });
-        let connect = format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\n\r\n");
-        let (mut client, task) = start_handle_client(connect.as_bytes()).await;
-        let established = b"HTTP/1.1 200 Connection Established\r\n\r\n";
-        let mut head = vec![0u8; established.len()];
-        client.read_exact(&mut head).await.unwrap();
-        assert_eq!(head, established);
-        client.write_all(b"ping").await.unwrap();
-        let mut echoed = [0u8; 4];
-        client.read_exact(&mut echoed).await.unwrap();
-        assert_eq!(&echoed, b"ping");
-        upstream_task.await.unwrap();
-        drop(client);
-        let _ = task.await.unwrap();
+        timeout(Duration::from_secs(10), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = upstream.local_addr().unwrap().port();
+            let upstream_task = tokio::spawn(async move {
+                let (mut stream, _) = upstream.accept().await.unwrap();
+                let mut buf = [0u8; 4];
+                stream.read_exact(&mut buf).await.unwrap();
+                stream.write_all(&buf).await.unwrap();
+            });
+            let connect = format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\n\r\n");
+            let (mut client, task) = start_handle_client(connect.as_bytes()).await;
+            let established = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+            let mut head = vec![0u8; established.len()];
+            client.read_exact(&mut head).await.unwrap();
+            assert_eq!(head, established);
+            client.write_all(b"ping").await.unwrap();
+            let mut echoed = [0u8; 4];
+            client.read_exact(&mut echoed).await.unwrap();
+            assert_eq!(&echoed, b"ping");
+            upstream_task.await.unwrap();
+            drop(client);
+            let _ = task.await.unwrap();
+        })
+        .await
+        .expect("tunnel round trip must finish");
     }
 
     #[test]
