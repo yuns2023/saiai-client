@@ -6396,7 +6396,7 @@ mod tests {
             })
             .unwrap(),
         );
-        let cases: [(&str, &str, &str, &str); 11] = [
+        let cases: [(&str, &str, &str, &str); 12] = [
             (
                 "GET",
                 "/api/web/domain_info?domain=example.com",
@@ -6438,6 +6438,13 @@ mod tests {
             ),
             ("POST", "/api/hello", "HTTP/1.1 204 ", ""),
             ("head", "/api/hello", "HTTP/1.1 204 ", ""),
+            // Only an exact `HEAD` suppresses a static body.
+            (
+                "head",
+                "/api/claude_code/policy_limits",
+                "HTTP/1.1 200 ",
+                r#"{"restrictions":{}}"#,
+            ),
         ];
         for (method, target, status, body) in cases {
             let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();

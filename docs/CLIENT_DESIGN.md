@@ -461,7 +461,7 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
 `Connection` 点名的头、所有 `Proxy-*`、`Host`/`Content-Length`/`Transfer-Encoding`
 与内部 `x-saiai-client-proof`，其余端到端头（包括调用方自己的 `Authorization` 和
 `Cookie`）原样转发——与我们无关的请求不得被改写（reqwest 在缺少 `Accept` 时会补
-默认 `Accept: */*`，这是唯一的已知附加头）。对托管主机
+默认 `Accept: */*`；除此之外只有 `Host` 与消息定界头由 reqwest 重建）。对托管主机
 （`api.anthropic.com`、`api.openai.com`、ChatGPT 各域名）的明文请求仍剥离
 `Authorization` 与 `Cookie`，OAuth 凭据不走明文。`x-saiai-client-proof` 只由代理
 自己在发往 Gateway 时附加，任何出站路径都不转发调用方带来的同名头。
