@@ -50,9 +50,10 @@ const CHAT_OPENAI_HOST: &str = "chat.openai.com";
 const CHATGPT_AUX_HOST: &str = "ab.chatgpt.com";
 const CERTIFICATE_CONTROL_HOST: &str = "certificate.saiai.local";
 // Third-party telemetry and error-reporting intake hosts that the local proxy
-// refuses with 403 before any upstream connect.  Only hosts measured from the
-// clients SAIAI launches (or extracted from their bundles) and serving nothing
-// but event/log/crash ingestion belong here; feature-gate hosts (Statsig,
+// refuses with 403 before any upstream connect.  Exact hosts must be measured
+// from the clients SAIAI launches; the Sentry suffixes generalise measured
+// (and bundle-extracted) per-organisation ingest hosts.  Only hosts serving
+// nothing but event/log/crash ingestion belong here; feature-gate hosts (Statsig,
 // GrowthBook), auth, update, GitHub and shared CDN hosts must never be added.
 // Hosts are canonical (lowercase, no trailing dot).
 const TELEMETRY_DENY_EXACT_HOSTS: &[&str] = &[
@@ -813,8 +814,8 @@ fn telemetry_deny_reason(host: &str) -> Option<&'static str> {
 }
 
 /// Refuses a telemetry host before any upstream connect.  Measured on Claude
-/// Code 2.1.306 and Codex Desktop 26.1027: the empty 403 does not change their
-/// send cadence (no retry loop), which is what this relies on.
+/// Code 2.1.306: the empty 403 leaves its Datadog batch cadence unchanged (no
+/// retry loop).  See docs/CLIENT_DESIGN.md for the Codex Desktop observations.
 async fn refuse_telemetry_host(
     stream: &mut TcpStream,
     host: &str,
@@ -6737,15 +6738,20 @@ mod tests {
         let port = upstream.local_addr().unwrap().port();
         let upstream_task = tokio::spawn(async move {
             let (mut stream, _) = upstream.accept().await.unwrap();
-            let mut request = vec![0u8; 4096];
-            let read = stream.read(&mut request).await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "upstream request ended before headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
             stream
                 .write_all(
                     b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )
                 .await
                 .unwrap();
-            String::from_utf8_lossy(&request[..read]).into_owned()
+            String::from_utf8_lossy(&request).into_owned()
         });
         let raw = format!(
             "GET http://127.0.0.1:{port}/generate_204 HTTP/1.1\r\nHost: o1.ingest.sentry.io\r\n\r\n"
@@ -6754,6 +6760,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 204"), "{response}");
         let forwarded = upstream_task.await.unwrap().to_ascii_lowercase();
         assert!(forwarded.starts_with("get /generate_204 http/1.1\r\n"));
+        assert!(forwarded.contains(&format!("\r\nhost: 127.0.0.1:{port}\r\n")));
         assert!(!forwarded.contains("sentry"));
     }
 
