@@ -945,7 +945,8 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                         close_after
                     );
                 }
-                let body = if request.method.eq_ignore_ascii_case("HEAD") {
+                // HTTP methods are case-sensitive; only a real HEAD drops the body.
+                let body = if request.method == "HEAD" {
                     b"".as_slice()
                 } else {
                     resp.body
@@ -3091,6 +3092,9 @@ fn should_forward_request_header_to_gateway(name: &str, replace_authorization: b
 // headers or cookies over cleartext, so those stay stripped there.
 fn should_forward_http_proxy_header(name: &str, managed_host: bool) -> bool {
     should_forward_request_header(name)
+        && !name
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("proxy-"))
         && !(managed_host
             && (name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("cookie")))
 }
@@ -6289,6 +6293,9 @@ mod tests {
         let request = relay_plain_http_proxy_request(vec![
             ("Proxy-Connection".to_string(), "keep-alive".to_string()),
             ("Proxy-Authorization".to_string(), "Basic proxy".to_string()),
+            ("PROXY-Custom".to_string(), "must-not-forward".to_string()),
+            ("Connection".to_string(), "keep-alive, X-Other".to_string()),
+            ("X-Other".to_string(), "must-not-forward".to_string()),
             ("Connection".to_string(), "x-hop".to_string()),
             ("X-Hop".to_string(), "must-not-forward".to_string()),
             (
@@ -6309,6 +6316,8 @@ mod tests {
         assert!(!lower.contains("proxy-connection"));
         assert!(!lower.contains("proxy-authorization"));
         assert!(!lower.contains("x-hop"));
+        assert!(!lower.contains("proxy-custom"));
+        assert!(!lower.contains("x-other"));
     }
 
     #[test]
@@ -6333,6 +6342,26 @@ mod tests {
             false
         ));
         assert!(should_forward_http_proxy_header("user-agent", true));
+        assert!(!should_forward_http_proxy_header("Proxy-Anything", false));
+        assert!(should_forward_http_proxy_header("x-proxy-note", false));
+        for target in [
+            "http://API.Anthropic.COM./v1/messages",
+            "http://chatgpt.com:80/",
+            "http://Api.OpenAI.com/v1/responses",
+        ] {
+            let request = IncomingRequest {
+                method: "GET".to_string(),
+                target: target.to_string(),
+                http_version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            };
+            let url = parse_http_proxy_target(&request).unwrap();
+            assert!(
+                is_managed_host(&canonical_host(url.host_str().unwrap())),
+                "{target}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6367,7 +6396,7 @@ mod tests {
             })
             .unwrap(),
         );
-        let cases: [(&str, &str, &str, &str); 5] = [
+        let cases: [(&str, &str, &str, &str); 11] = [
             (
                 "GET",
                 "/api/web/domain_info?domain=example.com",
@@ -6383,6 +6412,32 @@ mod tests {
             ("HEAD", "/api/hello", "HTTP/1.1 200 ", ""),
             ("POST", "/api/web/domain_info", "HTTP/1.1 204 ", ""),
             ("GET", "/api/unknown_sidecar", "HTTP/1.1 204 ", ""),
+            (
+                "HEAD",
+                "/api/web/domain_info?domain=example.com",
+                "HTTP/1.1 204 ",
+                "",
+            ),
+            (
+                "get",
+                "/api/web/domain_info?domain=example.com",
+                "HTTP/1.1 204 ",
+                "",
+            ),
+            (
+                "GET",
+                "/api/web/domain_info/?domain=example.com",
+                "HTTP/1.1 204 ",
+                "",
+            ),
+            (
+                "GET",
+                "/api/web%2Fdomain_info?domain=example.com",
+                "HTTP/1.1 204 ",
+                "",
+            ),
+            ("POST", "/api/hello", "HTTP/1.1 204 ", ""),
+            ("head", "/api/hello", "HTTP/1.1 204 ", ""),
         ];
         for (method, target, status, body) in cases {
             let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
