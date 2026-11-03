@@ -455,6 +455,22 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
 可访问任意目标，代理核心必须强制只监听 loopback，不能仅依赖初始化器生成的默认
 地址。Gateway Key 由代理从私有配置读取，程序不会把 Key 打印到输出或请求日志。
 
+明文 HTTP absolute-form 请求仍是“一请求一连接”的 reqwest 转发（不跟随重定向，
+沿用现有超时与 body 上限，这对大体积明文上传是有意的限制）。对非托管主机，代理
+只去掉 hop-by-hop 头、`Connection` 点名的头、`Proxy-*`、`Host`/`Content-Length`/
+`Transfer-Encoding` 与内部 `x-saiai-client-proof`，其余端到端头（包括调用方自己的
+`Authorization` 和 `Cookie`）原样转发——与我们无关的请求不得被改写。对托管主机
+（`api.anthropic.com`、`api.openai.com`、ChatGPT 各域名）的明文请求仍剥离
+`Authorization` 与 `Cookie`，OAuth 凭据不走明文。`x-saiai-client-proof` 只由代理
+自己在发往 Gateway 时附加，任何出站路径都不转发调用方带来的同名头。
+
+`api.anthropic.com` 上两个非模型路径由本机直接应答，不发往 Gateway 或 Anthropic：
+`GET /api/web/domain_info` 返回 `200 {"can_fetch":true}`（不回显被查询的域名），
+这是本地策略——禁用 Claude Code WebFetch 的远端域名预检，否则其他未知路径的 204
+会让 WebFetch 一律报 “unable to verify domain”；`GET/HEAD /api/hello`（连通性检查，
+只看状态码）返回 200，HEAD 不带 body。详细日志对这些本机应答只记录路径，不记录
+查询串。其他未知 Anthropic 路径仍返回 204。
+
 Desktop 的精确后台统计 POST `/ces/statsc/flush` 和 `/otlp/v1/metrics` 在本机确认，
 不发往 Gateway 或模型；OTLP 按 JSON/protobuf 返回空成功响应。这不扩展普通 Chat
 模型路径的 allowlist。TLS 预连接在收到首个 HTTP 字节前空闲超时或关闭时静默结束，
