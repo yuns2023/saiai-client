@@ -830,9 +830,14 @@ async fn serve_http_proxy_request(
             request.body.len(),
         );
     }
+    let managed_host = is_managed_host(&host);
+    let nominated = connection_nominated_headers(&request.headers);
     let mut builder = state.client.request(method, target);
     for (name, value) in &request.headers {
-        if should_forward_http_proxy_header(name) {
+        if nominated.contains(&name.to_ascii_lowercase()) {
+            continue;
+        }
+        if should_forward_http_proxy_header(name, managed_host) {
             builder = builder.header(name.as_str(), value.as_str());
         }
     }
@@ -929,16 +934,28 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
         if host == ANTHROPIC_HOST {
             if let Some(resp) = local_sidecar_response(&request) {
                 if state.verbose {
+                    // Log only the path: sidecar queries can carry user data
+                    // (for example the WebFetch preflight's `domain=`).
                     eprintln!(
-                        "local sidecar response method={} target={} status={} reason={} close_after={}",
-                        request.method, request.target, resp.status, resp.reason, close_after
+                        "local sidecar response method={} path={} status={} reason={} close_after={}",
+                        request.method,
+                        request_path(&request.target).unwrap_or_else(|_| "<invalid>".to_string()),
+                        resp.status,
+                        resp.reason,
+                        close_after
                     );
                 }
+                // HTTP methods are case-sensitive; only a real HEAD drops the body.
+                let body = if request.method == "HEAD" {
+                    b"".as_slice()
+                } else {
+                    resp.body
+                };
                 write_static_response(
                     reader.get_mut(),
                     resp.status,
                     resp.content_type,
-                    resp.body,
+                    body,
                     close_after,
                 )
                 .await?;
@@ -947,8 +964,8 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                 if !is_forwarded_anthropic_path(&path) {
                     if state.verbose {
                         eprintln!(
-                            "local sidecar fallback method={} target={} status=204 reason=unknown_anthropic_sidecar close_after={}",
-                            request.method, request.target, close_after
+                            "local sidecar fallback method={} path={} status=204 reason=unknown_anthropic_sidecar close_after={}",
+                            request.method, path, close_after
                         );
                     }
                     write_static_response(
@@ -2151,7 +2168,26 @@ fn local_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse> {
         });
     };
 
+    let method = request.method.as_str();
     match path.as_str() {
+        // Local policy: Claude Code's WebFetch asks Anthropic whether a domain
+        // may be fetched and only proceeds on 200 + `can_fetch: true`.  This
+        // proxy disables that remote domain preflight by always allowing it;
+        // the queried domain is neither forwarded nor echoed back.
+        "/api/web/domain_info" if method == "GET" => Some(StaticResponse {
+            status: StatusCode::OK,
+            content_type: "application/json",
+            body: br#"{"can_fetch":true}"#,
+            reason: "web_domain_info_allow",
+        }),
+        // Claude Code's connectivity check requires 200.  HEAD responses are
+        // written without a body by the caller.
+        "/api/hello" if method == "GET" || method == "HEAD" => Some(StaticResponse {
+            status: StatusCode::OK,
+            content_type: "application/json",
+            body: br#"{"message":"hello"}"#,
+            reason: "api_hello",
+        }),
         "/api/claude_code/policy_limits" => Some(StaticResponse {
             status: StatusCode::OK,
             content_type: "application/json",
@@ -3049,13 +3085,18 @@ fn should_forward_request_header_to_gateway(name: &str, replace_authorization: b
             && (name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("cookie")))
 }
 
-// Plain HTTP proxy requests are not a credential-bearing transport.  Desktop
-// uses them for connectivity/bootstrap checks; never disclose OAuth headers or
-// cookies if an unexpected request is made to an arbitrary cleartext origin.
-fn should_forward_http_proxy_header(name: &str) -> bool {
+// Plain HTTP proxy requests to unmanaged origins are relayed unmodified apart
+// from hop-by-hop/proxy framing headers and the internal client proof: the
+// proxy must not change requests that are not ours (including the caller's
+// own Authorization and Cookie).  Managed hosts must never receive OAuth
+// headers or cookies over cleartext, so those stay stripped there.
+fn should_forward_http_proxy_header(name: &str, managed_host: bool) -> bool {
     should_forward_request_header(name)
-        && !name.eq_ignore_ascii_case("authorization")
-        && !name.eq_ignore_ascii_case("cookie")
+        && !name
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("proxy-"))
+        && !(managed_host
+            && (name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("cookie")))
 }
 
 fn should_forward_response_header(name: &str) -> bool {
@@ -6184,24 +6225,23 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn forwards_absolute_form_http_proxy_requests() {
+    /// Relays one absolute-form plain-HTTP proxy request to a local upstream
+    /// and returns the raw request head the upstream received.
+    async fn relay_plain_http_proxy_request(headers: Vec<(String, String)>) -> String {
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_port = upstream.local_addr().unwrap().port();
         let upstream_task = tokio::spawn(async move {
             let (mut stream, _) = upstream.accept().await.unwrap();
             let mut request = vec![0u8; 4096];
             let read = stream.read(&mut request).await.unwrap();
-            let request = String::from_utf8_lossy(&request[..read]);
-            assert!(request.starts_with("GET /generate_204 HTTP/1.1\r\n"));
-            assert!(!request.to_ascii_lowercase().contains("authorization:"));
-            assert!(!request.to_ascii_lowercase().contains("cookie:"));
+            let request = String::from_utf8_lossy(&request[..read]).into_owned();
             stream
                 .write_all(
                     b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )
                 .await
                 .unwrap();
+            request
         });
 
         let (ca_cert_pem, ca_key_pem) = test_ca();
@@ -6232,14 +6272,7 @@ mod tests {
             method: "GET".to_string(),
             target: format!("http://127.0.0.1:{upstream_port}/generate_204"),
             http_version: "HTTP/1.1".to_string(),
-            headers: vec![
-                ("Proxy-Connection".to_string(), "keep-alive".to_string()),
-                (
-                    "Authorization".to_string(),
-                    "Bearer must-not-forward".to_string(),
-                ),
-                ("Cookie".to_string(), "must-not-forward=1".to_string()),
-            ],
+            headers,
             body: Vec::new(),
         };
         let proxy_task = tokio::spawn(serve_http_proxy_request(
@@ -6251,8 +6284,217 @@ mod tests {
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         proxy_task.await.unwrap().unwrap();
-        upstream_task.await.unwrap();
         assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 204"));
+        upstream_task.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn forwards_absolute_form_http_proxy_requests_unmodified_for_unmanaged_hosts() {
+        let request = relay_plain_http_proxy_request(vec![
+            ("Proxy-Connection".to_string(), "keep-alive".to_string()),
+            ("Proxy-Authorization".to_string(), "Basic proxy".to_string()),
+            ("PROXY-Custom".to_string(), "must-not-forward".to_string()),
+            ("Connection".to_string(), "keep-alive, X-Other".to_string()),
+            ("X-Other".to_string(), "must-not-forward".to_string()),
+            ("Connection".to_string(), "x-hop".to_string()),
+            ("X-Hop".to_string(), "must-not-forward".to_string()),
+            (
+                "Authorization".to_string(),
+                "Bearer caller-own-token".to_string(),
+            ),
+            ("Cookie".to_string(), "session=caller-own".to_string()),
+            ("X-Saiai-Client-Proof".to_string(), "forged".to_string()),
+            ("X-Custom".to_string(), "kept".to_string()),
+        ])
+        .await;
+        let lower = request.to_ascii_lowercase();
+        assert!(request.starts_with("GET /generate_204 HTTP/1.1\r\n"));
+        assert!(lower.contains("\r\nauthorization: bearer caller-own-token\r\n"));
+        assert!(lower.contains("\r\ncookie: session=caller-own\r\n"));
+        assert!(lower.contains("\r\nx-custom: kept\r\n"));
+        assert!(!lower.contains("x-saiai-client-proof"));
+        assert!(!lower.contains("proxy-connection"));
+        assert!(!lower.contains("proxy-authorization"));
+        assert!(!lower.contains("x-hop"));
+        assert!(!lower.contains("proxy-custom"));
+        assert!(!lower.contains("x-other"));
+    }
+
+    #[test]
+    fn plain_http_to_managed_hosts_still_strips_credentials() {
+        for host in [
+            ANTHROPIC_HOST,
+            OPENAI_HOST,
+            CHATGPT_HOST,
+            CHAT_OPENAI_HOST,
+            CHATGPT_AUX_HOST,
+        ] {
+            assert!(is_managed_host(&canonical_host(host)));
+        }
+        for name in ["Authorization", "cookie", "x-saiai-client-proof"] {
+            assert!(!should_forward_http_proxy_header(name, true), "{name}");
+        }
+        for name in ["Authorization", "cookie"] {
+            assert!(should_forward_http_proxy_header(name, false), "{name}");
+        }
+        assert!(!should_forward_http_proxy_header(
+            "x-saiai-client-proof",
+            false
+        ));
+        assert!(should_forward_http_proxy_header("user-agent", true));
+        assert!(!should_forward_http_proxy_header("Proxy-Anything", false));
+        assert!(should_forward_http_proxy_header("x-proxy-note", false));
+        for target in [
+            "http://API.Anthropic.COM./v1/messages",
+            "http://chatgpt.com:80/",
+            "http://Api.OpenAI.com/v1/responses",
+        ] {
+            let request = IncomingRequest {
+                method: "GET".to_string(),
+                target: target.to_string(),
+                http_version: "HTTP/1.1".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            };
+            let url = parse_http_proxy_target(&request).unwrap();
+            assert!(
+                is_managed_host(&canonical_host(url.host_str().unwrap())),
+                "{target}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_web_preflight_and_hello_are_answered_locally() {
+        ensure_rustls_crypto_provider();
+        let (ca_cert_pem, ca_key_pem) = test_ca();
+        let ca_der = rustls_pemfile::certs(&mut std::io::Cursor::new(ca_cert_pem.as_bytes()))
+            .next()
+            .unwrap()
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_der).unwrap();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ));
+        let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = Arc::new(
+            State::new(Config {
+                listen: "127.0.0.1:0".into(),
+                base_url: format!("http://{}", gateway.local_addr().unwrap()),
+                api_key: "MOCK_ONLY_GATEWAY".into(),
+                claude: None,
+                codex: None,
+                ca_cert_pem,
+                ca_key_pem,
+                verbose: false,
+                chatgpt_chat_passthrough: false,
+                desktop_browser_use: true,
+                client_proof_dir: None,
+            })
+            .unwrap(),
+        );
+        let cases: [(&str, &str, &str, &str); 12] = [
+            (
+                "GET",
+                "/api/web/domain_info?domain=example.com",
+                "HTTP/1.1 200 ",
+                r#"{"can_fetch":true}"#,
+            ),
+            (
+                "GET",
+                "/api/hello",
+                "HTTP/1.1 200 ",
+                r#"{"message":"hello"}"#,
+            ),
+            ("HEAD", "/api/hello", "HTTP/1.1 200 ", ""),
+            ("POST", "/api/web/domain_info", "HTTP/1.1 204 ", ""),
+            ("GET", "/api/unknown_sidecar", "HTTP/1.1 204 ", ""),
+            (
+                "HEAD",
+                "/api/web/domain_info?domain=example.com",
+                "HTTP/1.1 204 ",
+                "",
+            ),
+            (
+                "get",
+                "/api/web/domain_info?domain=example.com",
+                "HTTP/1.1 204 ",
+                "",
+            ),
+            (
+                "GET",
+                "/api/web/domain_info/?domain=example.com",
+                "HTTP/1.1 204 ",
+                "",
+            ),
+            (
+                "GET",
+                "/api/web%2Fdomain_info?domain=example.com",
+                "HTTP/1.1 204 ",
+                "",
+            ),
+            ("POST", "/api/hello", "HTTP/1.1 204 ", ""),
+            ("head", "/api/hello", "HTTP/1.1 204 ", ""),
+            // Only an exact `HEAD` suppresses a static body.
+            (
+                "head",
+                "/api/claude_code/policy_limits",
+                "HTTP/1.1 200 ",
+                r#"{"restrictions":{}}"#,
+            ),
+        ];
+        for (method, target, status, body) in cases {
+            let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = proxy.local_addr().unwrap();
+            let state = state.clone();
+            let task = tokio::spawn(async move {
+                let (stream, _) = proxy.accept().await.unwrap();
+                serve_managed_tls(state, stream, ANTHROPIC_HOST).await
+            });
+            let tcp = TcpStream::connect(address).await.unwrap();
+            let mut tls = connector
+                .connect(ANTHROPIC_HOST.try_into().unwrap(), tcp)
+                .await
+                .unwrap();
+            tls.write_all(
+                format!(
+                    "{method} {target} HTTP/1.1\r\nHost: {ANTHROPIC_HOST}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            tls.flush().await.unwrap();
+            let mut response = Vec::new();
+            let _ = timeout(Duration::from_secs(2), tls.read_to_end(&mut response))
+                .await
+                .unwrap();
+            let response = String::from_utf8_lossy(&response).into_owned();
+            assert!(
+                response.starts_with(status),
+                "{method} {target}: {response}"
+            );
+            let (head, actual_body) = response.split_once("\r\n\r\n").unwrap();
+            assert_eq!(actual_body, body, "{method} {target}");
+            assert!(
+                format!("{head}\r\n").contains(&format!("Content-Length: {}\r\n", body.len())),
+                "{head}"
+            );
+            assert!(!response.contains("example.com"));
+            timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        assert!(
+            timeout(Duration::from_millis(20), gateway.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -6593,7 +6835,8 @@ mod tests {
             assert!(!should_forward_request_header(name));
             assert!(!should_forward_request_header_to_gateway(name, true));
             assert!(!should_forward_request_header_to_gateway(name, false));
-            assert!(!should_forward_http_proxy_header(name));
+            assert!(!should_forward_http_proxy_header(name, true));
+            assert!(!should_forward_http_proxy_header(name, false));
         }
         assert_eq!(bearer_token("Bearer abc"), Some("abc"));
         assert_eq!(bearer_token("bearer  abc "), Some("abc"));
