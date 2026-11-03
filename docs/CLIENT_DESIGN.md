@@ -463,8 +463,10 @@ TCP 端口的直接隧道处理，让系统 TUN、Fake-IP 和用户自己的出�
 `Cookie`）原样转发——与我们无关的请求不得被改写（reqwest 在缺少 `Accept` 时会补
 默认 `Accept: */*`；除此之外只有 `Host` 与消息定界头由 reqwest 重建）。对托管主机
 （`api.anthropic.com`、`api.openai.com`、ChatGPT 各域名）的明文请求仍剥离
-`Authorization` 与 `Cookie`，OAuth 凭据不走明文。`x-saiai-client-proof` 只由代理
-自己在发往 Gateway 时附加，任何出站路径都不转发调用方带来的同名头。
+`Authorization` 与 `Cookie`，OAuth 凭据不走明文。托管判定只按 URL 域名，直接以 IP
+访问托管服务不算托管主机（Claude Code/Codex 不会这样发凭据）。`x-saiai-client-proof`
+只由代理自己在发往 Gateway 时附加；明文 HTTP 与 MITM 路径都不转发调用方带来的同名
+头，但透明 CONNECT 隧道内的字节代理看不到，也不过滤。
 
 `api.anthropic.com` 上两个非模型路径由本机直接应答，不发往 Gateway 或 Anthropic：
 `GET /api/web/domain_info` 返回 `200 {"can_fetch":true}`（不回显被查询的域名），
