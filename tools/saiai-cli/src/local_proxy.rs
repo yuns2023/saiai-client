@@ -58,8 +58,6 @@ const CERTIFICATE_CONTROL_HOST: &str = "certificate.saiai.local";
 const TELEMETRY_DENY_EXACT_HOSTS: &[&str] = &[
     // Claude Code Datadog log intake (measured, telemetry env unset).
     "http-intake.logs.us5.datadoghq.com",
-    // Datadog browser log intake for the same us5 site (Claude Code bundle).
-    "browser-intake-us5-datadoghq.com",
 ];
 // Sentry event/envelope/minidump ingestion.  The per-organisation label
 // (`o33249` for Codex Desktop, `o1158394` for Claude Code) is the only part
@@ -814,9 +812,9 @@ fn telemetry_deny_reason(host: &str) -> Option<&'static str> {
         .then_some("telemetry_host_suffix")
 }
 
-/// Refuses a telemetry host before any upstream connect.  The empty 403 is a
-/// definitive HTTP answer, so SDKs drop the event instead of treating it as a
-/// network failure to retry.
+/// Refuses a telemetry host before any upstream connect.  Measured on Claude
+/// Code 2.1.306 and Codex Desktop 26.1027: the empty 403 does not change their
+/// send cadence (no retry loop), which is what this relies on.
 async fn refuse_telemetry_host(
     stream: &mut TcpStream,
     host: &str,
@@ -6632,7 +6630,6 @@ mod tests {
     fn telemetry_denylist_matches_only_measured_intake_hosts() {
         for host in [
             "http-intake.logs.us5.datadoghq.com",
-            "browser-intake-us5-datadoghq.com",
             "o33249.ingest.us.sentry.io",
             "o33249.ingest.sentry.io",
             "o1158394.ingest.us.sentry.io",
@@ -6663,6 +6660,8 @@ mod tests {
             "http-intake.logs.us5.datadoghq.com.evil.com",
             "xhttp-intake.logs.us5.datadoghq.com",
             "logs.us5.datadoghq.com",
+            // Static-only evidence so far; not refused until measured.
+            "browser-intake-us5-datadoghq.com",
             // Other Datadog/Sentry services users may call on purpose.
             "api.datadoghq.com",
             "sentry.io",
@@ -6715,6 +6714,47 @@ mod tests {
         )
         .await;
         assert_eq!(response, TELEMETRY_403);
+    }
+
+    #[tokio::test]
+    async fn plain_http_telemetry_check_uses_url_host_and_any_port() {
+        // The URL authority decides; a harmless Host header cannot unblock it.
+        let response = handle_client_response(
+            b"GET http://HTTP-INTAKE.logs.us5.datadoghq.com.:8080/api/v2/logs HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response, TELEMETRY_403);
+        let response = handle_client_response(
+            b"CONNECT http-intake.logs.us5.datadoghq.com:80 HTTP/1.1\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response, TELEMETRY_403);
+    }
+
+    #[tokio::test]
+    async fn plain_http_to_non_telemetry_host_with_telemetry_host_header_is_forwarded() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&request[..read]).into_owned()
+        });
+        let raw = format!(
+            "GET http://127.0.0.1:{port}/generate_204 HTTP/1.1\r\nHost: o1.ingest.sentry.io\r\n\r\n"
+        );
+        let response = handle_client_response(raw.as_bytes()).await;
+        assert!(response.starts_with("HTTP/1.1 204"), "{response}");
+        let forwarded = upstream_task.await.unwrap().to_ascii_lowercase();
+        assert!(forwarded.starts_with("get /generate_204 http/1.1\r\n"));
+        assert!(!forwarded.contains("sentry"));
     }
 
     #[tokio::test]
