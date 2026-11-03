@@ -49,6 +49,23 @@ const CHAT_OPENAI_HOST: &str = "chat.openai.com";
 // the SAIAI placeholder and the app appears logged out.
 const CHATGPT_AUX_HOST: &str = "ab.chatgpt.com";
 const CERTIFICATE_CONTROL_HOST: &str = "certificate.saiai.local";
+// Third-party telemetry and error-reporting intake hosts that the local proxy
+// refuses with 403 before any upstream connect.  Only hosts measured from the
+// clients SAIAI launches (or extracted from their bundles) and serving nothing
+// but event/log/crash ingestion belong here; feature-gate hosts (Statsig,
+// GrowthBook), auth, update, GitHub and shared CDN hosts must never be added.
+// Hosts are canonical (lowercase, no trailing dot).
+const TELEMETRY_DENY_EXACT_HOSTS: &[&str] = &[
+    // Claude Code Datadog log intake (measured, telemetry env unset).
+    "http-intake.logs.us5.datadoghq.com",
+    // Datadog browser log intake for the same us5 site (Claude Code bundle).
+    "browser-intake-us5-datadoghq.com",
+];
+// Sentry event/envelope/minidump ingestion.  The per-organisation label
+// (`o33249` for Codex Desktop, `o1158394` for Claude Code) is the only part
+// that varies, so these are matched as label-boundary suffixes.  sentry.io
+// itself, docs, and `mcp.sentry.dev` stay reachable.
+const TELEMETRY_DENY_HOST_SUFFIXES: &[&str] = &[".ingest.sentry.io", ".ingest.us.sentry.io"];
 const CERTIFICATE_SPKI_HEADER: &str = "x-saiai-leaf-spki-sha256";
 const CHATGPT_CHAT_PASSTHROUGH_ENV: &str = "SAIAI_CHATGPT_CHAT_PASSTHROUGH";
 const SAIAI_DESKTOP_EMAIL: &str = "saiai-local-proxy@example.invalid";
@@ -717,7 +734,23 @@ async fn handle_client(
     };
 
     if let InitialProxyRequest::Http(request) = request {
-        let stream = reader.into_inner();
+        let mut stream = reader.into_inner();
+        if let Ok(target) = parse_http_proxy_target(&request) {
+            let host = canonical_host(target.host_str().unwrap_or_default());
+            let port = target.port_or_known_default().unwrap_or(80);
+            if let Some(reason) = telemetry_deny_reason(&host) {
+                return refuse_telemetry_host(
+                    &mut stream,
+                    &host,
+                    port,
+                    "http",
+                    reason,
+                    &peer,
+                    state.verbose,
+                )
+                .await;
+            }
+        }
         return serve_http_proxy_request(state, stream, request, &peer).await;
     }
     let InitialProxyRequest::Connect(connect) = request else {
@@ -725,6 +758,18 @@ async fn handle_client(
     };
 
     let mut stream = reader.into_inner();
+    if let Some(reason) = telemetry_deny_reason(&connect.host) {
+        return refuse_telemetry_host(
+            &mut stream,
+            &connect.host,
+            connect.port,
+            "connect",
+            reason,
+            &peer,
+            state.verbose,
+        )
+        .await;
+    }
     if connect.host == CERTIFICATE_CONTROL_HOST && connect.port == 443 {
         let spki = state.desktop_tls_spki_list()?;
         stream
@@ -754,6 +799,45 @@ async fn handle_client(
     } else {
         serve_direct_tunnel(stream, &connect.host, connect.port, &peer, state.verbose).await
     }
+}
+
+/// Returns why `host` (already canonical) is a refused telemetry intake host.
+fn telemetry_deny_reason(host: &str) -> Option<&'static str> {
+    if TELEMETRY_DENY_EXACT_HOSTS.contains(&host) {
+        return Some("telemetry_exact_host");
+    }
+    // Every suffix starts with '.', so a match always ends on a label
+    // boundary and needs at least one label in front of it.
+    TELEMETRY_DENY_HOST_SUFFIXES
+        .iter()
+        .any(|suffix| host.len() > suffix.len() && host.ends_with(suffix))
+        .then_some("telemetry_host_suffix")
+}
+
+/// Refuses a telemetry host before any upstream connect.  The empty 403 is a
+/// definitive HTTP answer, so SDKs drop the event instead of treating it as a
+/// network failure to retry.
+async fn refuse_telemetry_host(
+    stream: &mut TcpStream,
+    host: &str,
+    port: u16,
+    kind: &str,
+    reason: &str,
+    peer: &str,
+    verbose: bool,
+) -> Result<()> {
+    if verbose {
+        eprintln!(
+            "telemetry host refused kind={kind} host={host}:{port} reason={reason} remote={peer}"
+        );
+    }
+    // The client may already have gone away; there is nothing to report then.
+    let _ = stream
+        .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .await;
+    let _ = stream.flush().await;
+    let _ = stream.shutdown().await;
+    Ok(())
 }
 
 async fn read_initial_proxy_request<R>(reader: &mut R) -> Result<InitialProxyRequest>
@@ -6495,6 +6579,167 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    fn telemetry_test_state() -> Arc<State> {
+        let (ca_cert_pem, ca_key_pem) = test_ca();
+        Arc::new(
+            State::new(Config {
+                listen: "127.0.0.1:0".to_string(),
+                base_url: "https://gateway.example.test".to_string(),
+                api_key: "test-key".to_string(),
+                claude: None,
+                codex: None,
+                ca_cert_pem,
+                ca_key_pem,
+                verbose: true,
+                chatgpt_chat_passthrough: false,
+                desktop_browser_use: true,
+                client_proof_dir: None,
+            })
+            .unwrap(),
+        )
+    }
+
+    /// Runs `handle_client` for one raw request and returns the client stream
+    /// after the request bytes were written, plus the proxy task.
+    async fn start_handle_client(raw: &[u8]) -> (TcpStream, tokio::task::JoinHandle<Result<()>>) {
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let (client, server) = tokio::join!(TcpStream::connect(proxy_addr), proxy.accept());
+        let mut client = client.unwrap();
+        let (server, remote) = server.unwrap();
+        let task = tokio::spawn(handle_client(telemetry_test_state(), server, remote));
+        client.write_all(raw).await.unwrap();
+        (client, task)
+    }
+
+    async fn handle_client_response(raw: &[u8]) -> String {
+        let (mut client, task) = start_handle_client(raw).await;
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+            .await
+            .expect("proxy must close the refused connection")
+            .unwrap();
+        task.await.unwrap().unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    const TELEMETRY_403: &str =
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    #[test]
+    fn telemetry_denylist_matches_only_measured_intake_hosts() {
+        for host in [
+            "http-intake.logs.us5.datadoghq.com",
+            "browser-intake-us5-datadoghq.com",
+            "o33249.ingest.us.sentry.io",
+            "o33249.ingest.sentry.io",
+            "o1158394.ingest.us.sentry.io",
+            "a.b.ingest.sentry.io",
+        ] {
+            assert!(
+                telemetry_deny_reason(&canonical_host(host)).is_some(),
+                "{host}"
+            );
+        }
+        assert_eq!(
+            telemetry_deny_reason("http-intake.logs.us5.datadoghq.com"),
+            Some("telemetry_exact_host")
+        );
+        assert_eq!(
+            telemetry_deny_reason("o33249.ingest.us.sentry.io"),
+            Some("telemetry_host_suffix")
+        );
+        for host in [
+            // Look-alikes and label-boundary traps.
+            "notsentry.io",
+            "ingest.sentry.io",
+            "ingest.us.sentry.io",
+            "xingest.sentry.io",
+            "o1-ingest.sentry.io",
+            "ingest.sentry.io.evil.com",
+            "o1.ingest.sentry.io.evil.com",
+            "http-intake.logs.us5.datadoghq.com.evil.com",
+            "xhttp-intake.logs.us5.datadoghq.com",
+            "logs.us5.datadoghq.com",
+            // Other Datadog/Sentry services users may call on purpose.
+            "api.datadoghq.com",
+            "sentry.io",
+            "mcp.sentry.dev",
+            // Feature gates, auth, update, source hosting and CDNs.
+            "statsigapi.net",
+            "api.oaistatsig.com",
+            "statsigcdn.openai.com",
+            "featuregates.org",
+            "cdn.growthbook.io",
+            "ab.chatgpt.com",
+            "auth.openai.com",
+            "platform.claude.com",
+            "claude.ai",
+            "downloads.claude.ai",
+            "persistent.oaistatic.com",
+            "github.com",
+            "api.github.com",
+            "raw.githubusercontent.com",
+            "update.googleapis.com",
+            ANTHROPIC_HOST,
+            OPENAI_HOST,
+            CHATGPT_HOST,
+        ] {
+            assert_eq!(telemetry_deny_reason(&canonical_host(host)), None, "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_to_telemetry_exact_host_is_refused_with_empty_403() {
+        let response = handle_client_response(
+            b"CONNECT HTTP-Intake.Logs.US5.DatadogHQ.com.:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        assert_eq!(response, TELEMETRY_403);
+    }
+
+    #[tokio::test]
+    async fn connect_to_telemetry_suffix_host_is_refused_with_empty_403() {
+        let response =
+            handle_client_response(b"CONNECT o33249.Ingest.US.Sentry.io:443 HTTP/1.1\r\n\r\n")
+                .await;
+        assert_eq!(response, TELEMETRY_403);
+    }
+
+    #[tokio::test]
+    async fn plain_http_to_telemetry_host_is_refused_before_forwarding() {
+        let response = handle_client_response(
+            b"POST http://O1158394.ingest.sentry.IO./api/1/envelope/ HTTP/1.1\r\nHost: o1158394.ingest.sentry.io\r\nContent-Length: 2\r\n\r\n{}",
+        )
+        .await;
+        assert_eq!(response, TELEMETRY_403);
+    }
+
+    #[tokio::test]
+    async fn non_telemetry_connect_still_tunnels() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await.unwrap();
+            stream.write_all(&buf).await.unwrap();
+        });
+        let connect = format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\n\r\n");
+        let (mut client, task) = start_handle_client(connect.as_bytes()).await;
+        let established = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+        let mut head = vec![0u8; established.len()];
+        client.read_exact(&mut head).await.unwrap();
+        assert_eq!(head, established);
+        client.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+        upstream_task.await.unwrap();
+        drop(client);
+        let _ = task.await.unwrap();
     }
 
     #[test]
