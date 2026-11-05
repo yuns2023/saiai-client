@@ -5666,7 +5666,7 @@ fn check_stale_windows_saiai_cas(report: &mut DoctorReport, ca_path: &Path) {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "Get-ChildItem Cert:\\CurrentUser\\Root, Cert:\\LocalMachine\\Root | Where-Object { $_.Subject -match '(^|, )O=SAIAI(,|$)' } | ForEach-Object { $_.Thumbprint + ' ' + [Convert]::ToBase64String($_.RawData) }",
+            "$ErrorActionPreference='Stop'; foreach ($store in 'CurrentUser','LocalMachine') { Get-ChildItem \"Cert:\\$store\\Root\" | Where-Object { $_.Subject -match '(^|, )O=SAIAI(,|$)' } | ForEach-Object { $_.Thumbprint + ' ' + $store + ' ' + [Convert]::ToBase64String($_.RawData) } }",
         ],
     );
     match listing {
@@ -5676,7 +5676,7 @@ fn check_stale_windows_saiai_cas(report: &mut DoctorReport, ca_path: &Path) {
                 report.warn(
                     "other SAIAI CAs",
                     format!(
-                        "{} other SAIAI CA(s) are trusted in the Windows root store ({}); they are left from an earlier installation and can be removed in certmgr.msc",
+                        "{} other SAIAI CA(s) are trusted in Windows root stores ({}); they may belong to another SAIAI instance or an earlier installation, so confirm before removing them",
                         stale.len(),
                         stale.join(", ")
                     ),
@@ -5691,11 +5691,15 @@ fn check_stale_windows_saiai_cas(report: &mut DoctorReport, ca_path: &Path) {
 fn stale_saiai_ca_thumbprints(listing: &str, current_der_base64: &str) -> Vec<String> {
     let mut stale = Vec::new();
     for line in listing.lines() {
-        let Some((thumbprint, der)) = line.trim().split_once(' ') else {
+        let mut fields = line.split_whitespace();
+        let (Some(thumbprint), Some(store), Some(der)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
             continue;
         };
-        if der.trim() != current_der_base64 && !stale.iter().any(|seen| seen == thumbprint) {
-            stale.push(thumbprint.to_string());
+        let entry = format!("{thumbprint} in {store}\\Root");
+        if der != current_der_base64 && !stale.contains(&entry) {
+            stale.push(entry);
         }
     }
     stale
@@ -9534,12 +9538,36 @@ HTTPS_PROXY="http://127.0.0.1:1111"
 
     #[test]
     fn reports_each_other_saiai_ca_once() {
-        let listing = "AAA current\r\nBBB old\nBBB old\n\nCCC older\n";
+        let listing = "AAA CurrentUser current\r\nBBB CurrentUser old\nBBB CurrentUser old\n\nBBB LocalMachine old\nCCC\n";
         assert_eq!(
             stale_saiai_ca_thumbprints(listing, "current"),
-            vec!["BBB".to_string(), "CCC".to_string()]
+            vec![
+                "BBB in CurrentUser\\Root".to_string(),
+                "BBB in LocalMachine\\Root".to_string()
+            ]
         );
-        assert!(stale_saiai_ca_thumbprints("AAA current\n", "current").is_empty());
+        assert!(stale_saiai_ca_thumbprints("AAA CurrentUser current\n", "current").is_empty());
+    }
+
+    #[test]
+    fn keeps_an_existing_ca_with_the_legacy_subject_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) = (dir.path().join("ca.crt"), dir.path().join("ca.key"));
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "SAIAI local installation CA");
+        params
+            .distinguished_name
+            .push(DnType::OrganizationName, "SAIAI");
+        let cert_pem = params.self_signed(&key).unwrap().pem();
+        fs::write(&cert_path, &cert_pem).unwrap();
+        fs::write(&key_path, key.serialize_pem()).unwrap();
+
+        assert!(!ensure_installation_ca(&cert_path, &key_path, "test").unwrap());
+        assert_eq!(fs::read_to_string(&cert_path).unwrap(), cert_pem);
     }
 
     #[test]

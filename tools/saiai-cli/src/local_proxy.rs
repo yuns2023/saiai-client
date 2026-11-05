@@ -3639,27 +3639,33 @@ mod tests {
 
     #[test]
     fn leaf_names_its_issuer_key_so_a_stale_same_name_ca_is_not_chosen() {
+        use x509_parser::extensions::ParsedExtension;
         let (ca_cert_pem, ca_key_pem) = test_ca();
-        let rcgen::KeyIdMethod::PreSpecified(ca_ski) =
-            CertificateParams::from_ca_cert_pem(&ca_cert_pem)
-                .unwrap()
-                .key_identifier_method
-        else {
-            panic!("generated CA has no subject key identifier");
-        };
-        assert!(!ca_ski.is_empty());
+        let (_, ca_pem) = x509_parser::pem::parse_x509_pem(ca_cert_pem.as_bytes()).unwrap();
+        let ca = ca_pem.parse_x509().unwrap();
+        let ca_ski = ca
+            .extensions()
+            .iter()
+            .find_map(|extension| match extension.parsed_extension() {
+                ParsedExtension::SubjectKeyIdentifier(id) => Some(id.0.to_vec()),
+                _ => None,
+            })
+            .expect("generated CA has no subject key identifier");
+
         let (leaf_der, _) =
             sign_leaf_certificate(ANTHROPIC_HOST, &ca_cert_pem, &ca_key_pem).unwrap();
-        // authorityKeyIdentifier (2.5.29.35) { [0] keyIdentifier }
-        let mut expected = vec![0x06, 0x03, 0x55, 0x1d, 0x23, 0x04, ca_ski.len() as u8 + 4];
-        expected.extend([0x30, ca_ski.len() as u8 + 2, 0x80, ca_ski.len() as u8]);
-        expected.extend(&ca_ski);
-        assert!(
-            leaf_der
-                .windows(expected.len())
-                .any(|window| window == expected),
-            "leaf certificate lacks an authority key identifier matching its CA"
-        );
+        let (_, leaf) = x509_parser::parse_x509_certificate(&leaf_der).unwrap();
+        let leaf_aki = leaf
+            .extensions()
+            .iter()
+            .find_map(|extension| match extension.parsed_extension() {
+                ParsedExtension::AuthorityKeyIdentifier(aki) => {
+                    aki.key_identifier.as_ref().map(|id| id.0.to_vec())
+                }
+                _ => None,
+            })
+            .expect("leaf certificate lacks an authority key identifier");
+        assert_eq!(leaf_aki, ca_ski);
     }
 
     #[test]
