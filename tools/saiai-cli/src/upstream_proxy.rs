@@ -402,7 +402,9 @@ fn is_loopback_target(host: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Policy
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+// Holds raw proxy configuration (possibly credentials): no Debug outside tests.
+#[derive(Clone, Default, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 struct StaticProxies {
     http: Option<Endpoint>,
     https: Option<Endpoint>,
@@ -431,7 +433,9 @@ impl StaticProxies {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+// Holds raw proxy configuration (possibly credentials): no Debug outside tests.
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 enum Policy {
     Direct,
     Static(StaticProxies),
@@ -446,14 +450,18 @@ enum Policy {
 
 /// Raw proxy configuration as read from the environment and the OS. Two
 /// equal readings yield the same policy, so only changes publish a snapshot.
-#[derive(Clone, Debug, PartialEq, Eq)]
+// Holds raw proxy configuration (possibly credentials): no Debug outside tests.
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 struct Inputs {
     mode: Result<Mode, String>,
     env: EnvProxies,
     os: OsProxy,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+// Holds raw proxy configuration (possibly credentials): no Debug outside tests.
+#[derive(Clone, Default, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 struct EnvProxies {
     https: Option<(&'static str, String)>,
     http: Option<(&'static str, String)>,
@@ -480,7 +488,9 @@ impl EnvProxies {
 }
 
 // Each platform constructs only its own variant.
-#[derive(Clone, Debug, PartialEq, Eq)]
+// Holds raw proxy configuration (possibly credentials): no Debug outside tests.
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 #[allow(dead_code)]
 enum OsProxy {
     None,
@@ -1058,9 +1068,15 @@ impl UpstreamProxy {
     }
 
     /// Re-reads the proxy configuration (blocking) and publishes a new
-    /// snapshot when it changed. A failed read keeps the previous snapshot.
+    /// snapshot when it changed. A failed system read publishes an
+    /// unavailable policy: an unknown configuration is never assumed to be
+    /// the previous one.
     pub(crate) fn refresh(&self) -> bool {
-        let inputs = Inputs {
+        self.publish(self.read_inputs())
+    }
+
+    fn read_inputs(&self) -> Inputs {
+        Inputs {
             mode: self.mode.clone(),
             env: if self.mode == Ok(Mode::System) {
                 EnvProxies::from_lookup(|name| std::env::var(name).ok())
@@ -1072,12 +1088,12 @@ impl UpstreamProxy {
             } else {
                 OsProxy::None
             },
-        };
+        }
+    }
+
+    fn publish(&self, inputs: Inputs) -> bool {
         let mut last = self.last_inputs.lock().unwrap_or_else(|e| e.into_inner());
         if last.as_ref() == Some(&inputs) {
-            return false;
-        }
-        if last.is_some() && matches!(inputs.os, OsProxy::Unreadable(_)) {
             return false;
         }
         let (policy, description) = policy_from_inputs(&inputs, self.listen);
@@ -1896,6 +1912,38 @@ mod tests {
         assert_eq!(
             decide(Err(ERROR_AUTODETECTION_FAILED), false),
             (Ok(proxy("manual:3128")), true)
+        );
+    }
+
+    #[test]
+    fn an_unreadable_system_proxy_replaces_the_previous_policy() {
+        let upstream = UpstreamProxy::new(Some("system"), listen(), Vec::new());
+        let inputs = |os| Inputs {
+            mode: Ok(Mode::System),
+            env: EnvProxies::default(),
+            os,
+        };
+        upstream.publish(inputs(OsProxy::None));
+        assert_eq!(
+            upstream
+                .snapshot()
+                .route_blocking(true, "api.saiai.top", 443)
+                .unwrap(),
+            Route::Direct
+        );
+        assert!(upstream.publish(inputs(OsProxy::Unreadable("scutil failed".to_string()))));
+        assert!(
+            upstream
+                .snapshot()
+                .route_blocking(true, "api.saiai.top", 443)
+                .is_err()
+        );
+        assert!(upstream.publish(inputs(OsProxy::None)));
+        assert!(
+            upstream
+                .snapshot()
+                .route_blocking(true, "api.saiai.top", 443)
+                .is_ok()
         );
     }
 

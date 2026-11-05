@@ -503,22 +503,12 @@ impl State {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let http = Arc::clone(&self.http);
-        let proof = Arc::clone(proof);
-        let gateway = gateway.to_string();
-        let api_key = Zeroizing::new(api_key.to_string());
-        runtime.spawn(async move {
-            match http.for_url(&gateway).await {
-                Ok(client) => {
-                    proof
-                        .enroll(client, gateway, api_key, &client_proof::ENROLL_BACKOFF)
-                        .await;
-                }
-                Err(error) => {
-                    eprintln!("client proof: enrollment skipped: {error:#}");
-                }
-            }
-        });
+        runtime.spawn(Arc::clone(proof).enroll(
+            Arc::clone(&self.http),
+            gateway.to_string(),
+            Zeroizing::new(api_key.to_string()),
+            &client_proof::ENROLL_BACKOFF,
+        ));
     }
 
     /// Proof header for one Gateway request attempt; `bearer` is the exact
