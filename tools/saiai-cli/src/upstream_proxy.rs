@@ -33,6 +33,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PROXY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROXY_RESPONSE_HEAD: usize = 16 * 1024;
+const PAC_QUEUE_BUDGET: Duration = Duration::from_secs(30);
 #[cfg(target_os = "windows")]
 const PAC_CACHE_TTL: Duration = Duration::from_secs(300);
 #[cfg(target_os = "windows")]
@@ -535,8 +536,12 @@ fn system_policy(env: &EnvProxies, os: &OsProxy, listen: Option<SocketAddr>) -> 
     // value (often a SOCKS URL next to HTTP ones) does not matter, and an
     // unsupported value only fails the scheme that needs it.
     let mut scheme = |own: &Option<(&'static str, String)>| {
-        let entry = if own.is_some() { own } else { &env.all };
-        parse_env(entry).map_err(|error| format!("{error:#}"))
+        // A scheme variable pointing at this listener is ignored like an
+        // unset one, so ALL_PROXY still applies.
+        if let Some(endpoint) = parse_env(own).map_err(|error| format!("{error:#}"))? {
+            return Ok(Some(endpoint));
+        }
+        parse_env(&env.all).map_err(|error| format!("{error:#}"))
     };
     let https = scheme(&env.https);
     let http = scheme(&env.http);
@@ -864,6 +869,22 @@ impl Snapshot {
         if !matches!(self.policy, Policy::WindowsAuto { .. }) {
             return self.route_blocking(https, host, port);
         }
+        #[cfg(target_os = "windows")]
+        if let Some(route) = self.pac.cached(&(https, normalize_host(host), port)) {
+            return route
+                .map_err(|message| anyhow::anyhow!("upstream proxy unavailable: {message}"));
+        }
+        // Bound the blocking threads WinHTTP evaluations may hold and how
+        // long a request waits for one.
+        static PAC_EVALUATIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+        let _permit = tokio::time::timeout(PAC_QUEUE_BUDGET, PAC_EVALUATIONS.acquire())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "upstream proxy unavailable: proxy auto-configuration is not responding"
+                )
+            })?
+            .context("proxy auto-configuration is shutting down")?;
         let snapshot = Arc::clone(self);
         let host = host.to_string();
         tokio::task::spawn_blocking(move || snapshot.route_blocking(https, &host, port))
@@ -1303,7 +1324,7 @@ mod windows {
     use windows_sys::Win32::Foundation::{GetLastError, GlobalFree};
     use windows_sys::Win32::Networking::WinHttp::*;
 
-    type CacheKey = (bool, String, u16);
+    pub(super) type CacheKey = (bool, String, u16);
     type CacheEntry = (Instant, Result<Route, String>);
     const PAC_CACHE_LIMIT: usize = 1024;
     // After WPAD finds nothing, retry discovery after this long (e.g. once a
@@ -1357,7 +1378,7 @@ mod windows {
             route
         }
 
-        fn cached(&self, key: &CacheKey) -> Option<Result<Route, String>> {
+        pub(super) fn cached(&self, key: &CacheKey) -> Option<Result<Route, String>> {
             let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             let (at, route) = cache.get(key)?;
             let ttl = if route.is_ok() {
@@ -1664,6 +1685,18 @@ mod tests {
             );
             assert!(description.contains("ignored"), "{description}");
         }
+        // A scheme variable pointing at SAIAI falls back to ALL_PROXY.
+        let (policy, _) = system(
+            env(&[
+                ("HTTPS_PROXY", "http://localhost:19908"),
+                ("ALL_PROXY", "http://localhost:7890"),
+            ]),
+            OsProxy::None,
+        );
+        assert_eq!(
+            route(&policy, true, "api.saiai.top"),
+            proxy("localhost:7890")
+        );
         // Same host, different port: a real local proxy such as Clash.
         let (policy, _) = system(
             env(&[("HTTPS_PROXY", "http://127.0.0.1:7890")]),
