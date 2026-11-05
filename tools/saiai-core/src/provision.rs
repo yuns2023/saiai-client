@@ -279,7 +279,13 @@ fn generate_installation_ca() -> Result<(String, String)> {
         })?;
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let mut distinguished_name = DistinguishedName::new();
-    distinguished_name.push(DnType::CommonName, "SAIAI local installation CA");
+    // A per-installation suffix keeps a regenerated CA from sharing its
+    // subject name with a stale SAIAI CA left in an OS trust store.
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    distinguished_name.push(
+        DnType::CommonName,
+        format!("SAIAI local installation CA {}", &suffix[..8]),
+    );
     distinguished_name.push(DnType::OrganizationName, "SAIAI");
     params.distinguished_name = distinguished_name;
     let certificate = params

@@ -3256,6 +3256,7 @@ fn sign_leaf_certificate(
     ca_key_pem: &str,
 ) -> Result<(Vec<u8>, KeyPair)> {
     let ca_key = KeyPair::from_pem(ca_key_pem).context("failed to parse SAIAI CA key")?;
+    ensure_ca_key_matches_certificate(ca_cert_pem, &ca_key)?;
     let ca_params = CertificateParams::from_ca_cert_pem(ca_cert_pem)
         .context("failed to parse SAIAI CA certificate")?;
     let ca_cert = ca_params
@@ -3275,6 +3276,21 @@ fn sign_leaf_certificate(
         .signed_by(&leaf_key, &ca_cert, &ca_key)
         .context("failed to sign leaf certificate")?;
     Ok((leaf.der().to_vec(), leaf_key))
+}
+
+// Leaves are issued from parameters re-parsed from the CA certificate, so a
+// certificate paired with the wrong key would still sign leaves (now naming
+// the certificate's key identifier) that no client can verify.
+fn ensure_ca_key_matches_certificate(ca_cert_pem: &str, ca_key: &KeyPair) -> Result<()> {
+    let (_, pem) = x509_parser::pem::parse_x509_pem(ca_cert_pem.as_bytes())
+        .map_err(|_| anyhow::anyhow!("failed to parse SAIAI CA certificate PEM"))?;
+    let certificate = pem
+        .parse_x509()
+        .map_err(|_| anyhow::anyhow!("failed to parse SAIAI CA certificate"))?;
+    if certificate.public_key().raw != ca_key.public_key_der().as_slice() {
+        bail!("SAIAI CA key does not match the CA certificate");
+    }
+    Ok(())
 }
 
 fn desktop_leaf_key(ca_key: &KeyPair, host: &str) -> Result<KeyPair> {
@@ -3644,6 +3660,14 @@ mod tests {
                 .any(|window| window == expected),
             "leaf certificate lacks an authority key identifier matching its CA"
         );
+    }
+
+    #[test]
+    fn rejects_a_ca_certificate_paired_with_another_key() {
+        let (ca_cert_pem, _) = test_ca();
+        let (_, other_key_pem) = test_ca();
+        let error = validate_tls_config(&ca_cert_pem, &other_key_pem).unwrap_err();
+        assert!(format!("{error:#}").contains("does not match"), "{error:#}");
     }
 
     fn test_ca() -> (String, String) {
