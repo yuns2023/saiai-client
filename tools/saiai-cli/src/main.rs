@@ -597,7 +597,16 @@ fn generate_installation_ca() -> Result<(String, String)> {
         .context("failed to create SAIAI installation CA parameters")?;
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let mut distinguished_name = DistinguishedName::new();
-    distinguished_name.push(DnType::CommonName, "SAIAI local installation CA");
+    // A per-installation suffix keeps a regenerated CA from sharing its
+    // subject name with a stale SAIAI CA left in an OS trust store.
+    let suffix: String = Sha256::digest(key.public_key_der())[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    distinguished_name.push(
+        DnType::CommonName,
+        format!("SAIAI local installation CA {suffix}"),
+    );
     distinguished_name.push(DnType::OrganizationName, "SAIAI");
     params.distinguished_name = distinguished_name;
     let certificate = params
@@ -5285,6 +5294,8 @@ fn check_saiai_config(report: &mut DoctorReport, cfg: &SaiaiConfig) {
 
     let ca_path = PathBuf::from(&cfg.ca_cert_path);
     check_ca_cert(report, "configured CA", &ca_path);
+    #[cfg(target_os = "windows")]
+    check_stale_windows_saiai_cas(report, &ca_path);
     if cfg.ca_key_path.trim().is_empty() {
         report.error("configured CA key", "missing; rerun SAIAI setup");
     } else {
@@ -5632,6 +5643,66 @@ fn check_codex_environment_context_time(report: &mut DoctorReport, codex_dir: &P
             }
         }
     }
+}
+
+// Another SAIAI CA left trusted in a Windows root store is harmless for
+// leaves that carry an authority key identifier, but older SAIAI leaves did
+// not, and clients that build chains by subject name then fail with a
+// signature error. Report it; removal stays a user decision.
+#[cfg(target_os = "windows")]
+fn check_stale_windows_saiai_cas(report: &mut DoctorReport, ca_path: &Path) {
+    let current = fs::read(ca_path).ok().and_then(|pem| {
+        rustls_pemfile::certs(&mut pem.as_slice())
+            .next()
+            .and_then(Result::ok)
+            .map(|der| base64::engine::general_purpose::STANDARD.encode(der.as_ref()))
+    });
+    let Some(current) = current else {
+        return;
+    };
+    let listing = command_output(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$ErrorActionPreference='Stop'; foreach ($store in 'CurrentUser','LocalMachine') { Get-ChildItem \"Cert:\\$store\\Root\" | Where-Object { $_.Subject -match '(^|, )O=SAIAI(,|$)' } | ForEach-Object { $_.Thumbprint + ' ' + $store + ' ' + [Convert]::ToBase64String($_.RawData) } }",
+        ],
+    );
+    match listing {
+        Ok(listing) => {
+            let stale = stale_saiai_ca_thumbprints(&listing, &current);
+            if !stale.is_empty() {
+                report.warn(
+                    "other SAIAI CAs",
+                    format!(
+                        "{} other SAIAI CA(s) are trusted in Windows root stores ({}); they may belong to another SAIAI instance or an earlier installation, so confirm before removing them",
+                        stale.len(),
+                        stale.join(", ")
+                    ),
+                );
+            }
+        }
+        Err(error) => report.warn("other SAIAI CAs", format!("could not inspect: {error:#}")),
+    }
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn stale_saiai_ca_thumbprints(listing: &str, current_der_base64: &str) -> Vec<String> {
+    let mut stale = Vec::new();
+    for line in listing.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(thumbprint), Some(store), Some(der)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let entry = format!("{thumbprint} in {store}\\Root");
+        if der != current_der_base64 && !stale.contains(&entry) {
+            stale.push(entry);
+        }
+    }
+    stale
 }
 
 fn check_ca_cert(report: &mut DoctorReport, label: &str, path: &Path) {
@@ -9463,6 +9534,59 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         let invalid_path = dir.path().join("invalid-ca.crt");
         fs::write(&invalid_path, b"not a pem certificate").unwrap();
         assert!(load_ca_root_store(&invalid_path).is_err());
+    }
+
+    #[test]
+    fn reports_each_other_saiai_ca_once() {
+        let listing = "AAA CurrentUser current\r\nBBB CurrentUser old\nBBB CurrentUser old\n\nBBB LocalMachine old\nCCC\n";
+        assert_eq!(
+            stale_saiai_ca_thumbprints(listing, "current"),
+            vec![
+                "BBB in CurrentUser\\Root".to_string(),
+                "BBB in LocalMachine\\Root".to_string()
+            ]
+        );
+        assert!(stale_saiai_ca_thumbprints("AAA CurrentUser current\n", "current").is_empty());
+    }
+
+    #[test]
+    fn keeps_an_existing_ca_with_the_legacy_subject_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) = (dir.path().join("ca.crt"), dir.path().join("ca.key"));
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "SAIAI local installation CA");
+        params
+            .distinguished_name
+            .push(DnType::OrganizationName, "SAIAI");
+        let cert_pem = params.self_signed(&key).unwrap().pem();
+        fs::write(&cert_path, &cert_pem).unwrap();
+        fs::write(&key_path, key.serialize_pem()).unwrap();
+
+        assert!(!ensure_installation_ca(&cert_path, &key_path, "test").unwrap());
+        assert_eq!(fs::read_to_string(&cert_path).unwrap(), cert_pem);
+    }
+
+    #[test]
+    fn regenerated_installation_cas_have_distinct_subject_names() {
+        let common_name = |pem: &str| {
+            CertificateParams::from_ca_cert_pem(pem)
+                .unwrap()
+                .distinguished_name
+                .get(&DnType::CommonName)
+                .cloned()
+        };
+        let (first, _) = generate_installation_ca().unwrap();
+        let (second, _) = generate_installation_ca().unwrap();
+        let first = common_name(&first).unwrap();
+        assert!(
+            format!("{first:?}").contains("SAIAI local installation CA "),
+            "{first:?}"
+        );
+        assert_ne!(Some(first), common_name(&second));
     }
 
     #[test]

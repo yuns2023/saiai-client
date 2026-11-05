@@ -481,8 +481,20 @@ def verify_workflows_and_docs() -> None:
     require("SAIAI V2 Preview" not in combined_docs, "public docs still advertise V2 Preview")
 
 
+CREDENTIAL_PATTERN = re.compile(r"(?i)(?:sk|key)[-_][A-Za-z0-9_-]{16,}")
+
+
+def is_possible_credential(match: str) -> bool:
+    # Lowercase snake_case is a Rust identifier such as rcgen's
+    # `use_authority_key_identifier_extension`; real keys carry digits or
+    # uppercase letters.
+    if re.fullmatch(r"[a-z_]+", match):
+        return False
+    return "TEST" not in match.upper() and "YOUR" not in match.upper()
+
+
 def verify_no_non_test_credentials() -> None:
-    key_pattern = re.compile(r"(?i)(?:sk|key)[-_][A-Za-z0-9_-]{16,}")
+    key_pattern = CREDENTIAL_PATTERN
     roots = (
         ROOT / "tools" / "saiai-cli",
         ROOT / "scripts" / "saiai-cli",
@@ -500,7 +512,7 @@ def verify_no_non_test_credentials() -> None:
             content = path.read_text(encoding="utf-8", errors="ignore")
             for match in key_pattern.findall(content):
                 require(
-                    "TEST" in match.upper() or "YOUR" in match.upper(),
+                    not is_possible_credential(match),
                     f"possible credential in {path}",
                 )
 

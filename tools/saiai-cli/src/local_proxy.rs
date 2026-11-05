@@ -3232,24 +3232,9 @@ fn build_leaf_server_config(
     ca_cert_pem: &str,
     ca_key_pem: &str,
 ) -> Result<ManagedCertificate> {
-    let ca_key = KeyPair::from_pem(ca_key_pem).context("failed to parse SAIAI CA key")?;
-    let ca_params = CertificateParams::from_ca_cert_pem(ca_cert_pem)
-        .context("failed to parse SAIAI CA certificate")?;
-    let ca_cert = ca_params
-        .self_signed(&ca_key)
-        .context("failed to load SAIAI CA")?;
-
-    let mut params = CertificateParams::new(vec![host.to_string()])?;
-    let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, host);
-    params.distinguished_name = dn;
-    let leaf_key = desktop_leaf_key(&ca_key, host)?;
+    let (cert_der, leaf_key) = sign_leaf_certificate(host, ca_cert_pem, ca_key_pem)?;
     let spki_sha256 =
         base64::engine::general_purpose::STANDARD.encode(Sha256::digest(leaf_key.public_key_der()));
-    let leaf = params
-        .signed_by(&leaf_key, &ca_cert, &ca_key)
-        .context("failed to sign leaf certificate")?;
-    let cert_der = leaf.der().to_vec();
     let key_der = leaf_key.serialize_der();
 
     let cert_chain = vec![CertificateDer::from(cert_der)];
@@ -3263,6 +3248,49 @@ fn build_leaf_server_config(
         config: Arc::new(config),
         spki_sha256,
     })
+}
+
+fn sign_leaf_certificate(
+    host: &str,
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
+) -> Result<(Vec<u8>, KeyPair)> {
+    let ca_key = KeyPair::from_pem(ca_key_pem).context("failed to parse SAIAI CA key")?;
+    ensure_ca_key_matches_certificate(ca_cert_pem, &ca_key)?;
+    let ca_params = CertificateParams::from_ca_cert_pem(ca_cert_pem)
+        .context("failed to parse SAIAI CA certificate")?;
+    let ca_cert = ca_params
+        .self_signed(&ca_key)
+        .context("failed to load SAIAI CA")?;
+
+    let mut params = CertificateParams::new(vec![host.to_string()])?;
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, host);
+    params.distinguished_name = dn;
+    // Older SAIAI CAs share this CA's subject name and may remain trusted in
+    // an OS store. Without an authority key identifier, OpenSSL/BoringSSL
+    // clients can pick such a stale CA by name and fail the signature check.
+    params.use_authority_key_identifier_extension = true;
+    let leaf_key = desktop_leaf_key(&ca_key, host)?;
+    let leaf = params
+        .signed_by(&leaf_key, &ca_cert, &ca_key)
+        .context("failed to sign leaf certificate")?;
+    Ok((leaf.der().to_vec(), leaf_key))
+}
+
+// Leaves are issued from parameters re-parsed from the CA certificate, so a
+// certificate paired with the wrong key would still sign leaves (now naming
+// the certificate's key identifier) that no client can verify.
+fn ensure_ca_key_matches_certificate(ca_cert_pem: &str, ca_key: &KeyPair) -> Result<()> {
+    let (_, pem) = x509_parser::pem::parse_x509_pem(ca_cert_pem.as_bytes())
+        .map_err(|_| anyhow::anyhow!("failed to parse SAIAI CA certificate PEM"))?;
+    let certificate = pem
+        .parse_x509()
+        .map_err(|_| anyhow::anyhow!("failed to parse SAIAI CA certificate"))?;
+    if certificate.public_key().raw != ca_key.public_key_der().as_slice() {
+        bail!("SAIAI CA key does not match the CA certificate");
+    }
+    Ok(())
 }
 
 fn desktop_leaf_key(ca_key: &KeyPair, host: &str) -> Result<KeyPair> {
@@ -3607,6 +3635,45 @@ mod tests {
         }
         assert!(!is_forwarded_openai_path("/v1/codex/images/unknown"));
         assert!(!is_forwarded_openai_path("/v1/images/generations"));
+    }
+
+    #[test]
+    fn leaf_names_its_issuer_key_so_a_stale_same_name_ca_is_not_chosen() {
+        use x509_parser::extensions::ParsedExtension;
+        let (ca_cert_pem, ca_key_pem) = test_ca();
+        let (_, ca_pem) = x509_parser::pem::parse_x509_pem(ca_cert_pem.as_bytes()).unwrap();
+        let ca = ca_pem.parse_x509().unwrap();
+        let ca_ski = ca
+            .extensions()
+            .iter()
+            .find_map(|extension| match extension.parsed_extension() {
+                ParsedExtension::SubjectKeyIdentifier(id) => Some(id.0.to_vec()),
+                _ => None,
+            })
+            .expect("generated CA has no subject key identifier");
+
+        let (leaf_der, _) =
+            sign_leaf_certificate(ANTHROPIC_HOST, &ca_cert_pem, &ca_key_pem).unwrap();
+        let (_, leaf) = x509_parser::parse_x509_certificate(&leaf_der).unwrap();
+        let leaf_aki = leaf
+            .extensions()
+            .iter()
+            .find_map(|extension| match extension.parsed_extension() {
+                ParsedExtension::AuthorityKeyIdentifier(aki) => {
+                    aki.key_identifier.as_ref().map(|id| id.0.to_vec())
+                }
+                _ => None,
+            })
+            .expect("leaf certificate lacks an authority key identifier");
+        assert_eq!(leaf_aki, ca_ski);
+    }
+
+    #[test]
+    fn rejects_a_ca_certificate_paired_with_another_key() {
+        let (ca_cert_pem, _) = test_ca();
+        let (_, other_key_pem) = test_ca();
+        let error = validate_tls_config(&ca_cert_pem, &other_key_pem).unwrap_err();
+        assert!(format!("{error:#}").contains("does not match"), "{error:#}");
     }
 
     fn test_ca() -> (String, String) {
