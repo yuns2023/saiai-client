@@ -279,25 +279,28 @@ mod tests {
 
     #[test]
     fn service_start_keeps_the_user_proxy_while_claude_gets_saiai() {
+        // Windows environment names are case-insensitive, so look them up
+        // the same way.
+        fn child_env(command: &Command, name: &str) -> Option<std::ffi::OsString> {
+            command
+                .get_envs()
+                .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                .last()
+                .and_then(|(_, value)| value.map(OsStr::to_os_string))
+        }
         let config = config();
         let mut start = Command::new("saiai");
         apply_environment(&mut start, &config, "token");
         restore_user_proxy_environment(&mut start);
-        let envs: std::collections::HashMap<_, _> = start.get_envs().collect();
         for name in ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"] {
-            assert_eq!(
-                envs.get(OsStr::new(name)).cloned().flatten(),
-                env::var_os(name).as_deref(),
-                "{name}"
-            );
+            assert_eq!(child_env(&start, name), env::var_os(name), "{name}");
         }
 
         let mut child = Command::new("claude");
         apply_environment(&mut child, &config, "token");
-        let envs: std::collections::HashMap<_, _> = child.get_envs().collect();
         assert_eq!(
-            envs.get(OsStr::new("https_proxy")).cloned().flatten(),
-            Some(OsStr::new("http://127.0.0.1:19908"))
+            child_env(&child, "https_proxy"),
+            Some("http://127.0.0.1:19908".into())
         );
     }
 
