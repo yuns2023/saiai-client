@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
-use tokio::net::{TcpListener, TcpStream, lookup_host};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, timeout_at};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
@@ -28,11 +28,12 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::Role;
-use tokio_tungstenite::{Connector, connect_async_tls_with_config};
+use tokio_tungstenite::{Connector, client_async_tls_with_config};
 use url::Url;
 use zeroize::Zeroizing;
 
 use crate::client_proof::{self, ClientProof};
+use crate::upstream_proxy::{Snapshot, UpstreamProxy};
 use crate::upstream_tls;
 
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
@@ -149,6 +150,8 @@ pub struct Config {
     pub desktop_browser_use: bool,
     /// Directory holding the client-proof device key; `None` disables proofs.
     pub client_proof_dir: Option<std::path::PathBuf>,
+    /// `upstream_proxy` setting: `system` (default), `direct`, or a URL.
+    pub upstream_proxy: Option<String>,
 }
 
 #[derive(Clone)]
@@ -185,7 +188,10 @@ struct State {
     verbose: bool,
     chatgpt_chat_passthrough: bool,
     desktop_features: DesktopFeatures,
-    client: Client,
+    upstream: Arc<UpstreamProxy>,
+    // Rebuilt for each upstream proxy generation so pooled connections never
+    // outlive a route change.
+    http_client: Mutex<Option<(u64, Client)>>,
     websocket_tls: rustls::ClientConfig,
     certs: Mutex<HashMap<String, ManagedCertificate>>,
     openai_trace: Option<Arc<OpenAITrace>>,
@@ -316,6 +322,11 @@ type AccountSidecarResponse = (
 
 pub async fn run(cfg: Config) -> Result<()> {
     let state = Arc::new(State::new(cfg)?);
+    eprintln!(
+        "upstream proxy: {}",
+        state.upstream.snapshot().description()
+    );
+    state.upstream.spawn_refresh();
     state.spawn_client_proof_enrollment();
     let listener = TcpListener::bind(&state.listen)
         .await
@@ -387,12 +398,23 @@ impl State {
         build_leaf_server_config(ANTHROPIC_HOST, &cfg.ca_cert_pem, &cfg.ca_key_pem)
             .context("failed to validate installation-specific SAIAI CA")?;
 
-        let client = upstream_tls::upstream_http_client_builder(&cfg.ca_cert_pem)
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .pool_idle_timeout(Duration::from_secs(90))
-            .build()
-            .context("failed to build upstream HTTP client")?;
+        let gateways = [
+            Some(&default_route),
+            claude_route.as_ref(),
+            codex_route.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|route| {
+            let url = Url::parse(&route.base_url).ok()?;
+            Some((url.host_str()?.to_string(), url.port_or_known_default()?))
+        })
+        .collect();
+        let upstream = Arc::new(UpstreamProxy::new(
+            cfg.upstream_proxy.as_deref(),
+            Some(listen_addr),
+            gateways,
+        ));
         let websocket_tls = upstream_tls::upstream_websocket_tls_config(&cfg.ca_cert_pem);
         let openai_trace = OpenAITrace::from_env()?;
         let chatgpt_chat_passthrough = match env::var(CHATGPT_CHAT_PASSTHROUGH_ENV).ok().as_deref()
@@ -420,13 +442,35 @@ impl State {
             verbose,
             chatgpt_chat_passthrough,
             desktop_features: DesktopFeatures { browser_use },
-            client,
+            upstream,
+            http_client: Mutex::new(None),
             websocket_tls,
             certs: Mutex::new(HashMap::new()),
             openai_trace,
             client_proof_dir: cfg.client_proof_dir,
             client_proof: std::sync::OnceLock::new(),
         })
+    }
+
+    /// HTTP client for the current upstream proxy generation. Fails when the
+    /// configured upstream proxy cannot be used.
+    fn http_client(&self) -> Result<Client> {
+        let snapshot = self.upstream.snapshot();
+        let mut cached = self.http_client.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((generation, client)) = cached.as_ref()
+            && *generation == snapshot.generation()
+        {
+            return Ok(client.clone());
+        }
+        let builder = upstream_tls::upstream_http_client_builder(&self.ca_cert_pem)
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_idle_timeout(Duration::from_secs(90));
+        let client = snapshot
+            .apply(builder)?
+            .build()
+            .context("failed to build upstream HTTP client")?;
+        *cached = Some((snapshot.generation(), client.clone()));
+        Ok(client)
     }
 
     /// Loads the device key and enrolls with each Gateway used by the Claude
@@ -474,8 +518,11 @@ impl State {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        let Ok(client) = self.http_client() else {
+            return;
+        };
         runtime.spawn(Arc::clone(proof).enroll(
-            self.client.clone(),
+            client,
             gateway.to_string(),
             Zeroizing::new(api_key.to_string()),
             &client_proof::ENROLL_BACKOFF,
@@ -796,7 +843,16 @@ async fn handle_client(
         }
         serve_managed_tls(state, stream, &connect.host).await
     } else {
-        serve_direct_tunnel(stream, &connect.host, connect.port, &peer, state.verbose).await
+        let upstream = state.upstream.snapshot();
+        serve_direct_tunnel(
+            stream,
+            &upstream,
+            &connect.host,
+            connect.port,
+            &peer,
+            state.verbose,
+        )
+        .await
     }
 }
 
@@ -915,7 +971,14 @@ async fn serve_http_proxy_request(
     }
     let managed_host = is_managed_host(&host);
     let nominated = connection_nominated_headers(&request.headers);
-    let mut builder = state.client.request(method, target);
+    let client = match state.http_client() {
+        Ok(client) => client,
+        Err(err) => {
+            let _ = write_plain_error(&mut stream, StatusCode::BAD_GATEWAY).await;
+            return Err(err);
+        }
+    };
+    let mut builder = client.request(method, target);
     for (name, value) in &request.headers {
         if nominated.contains(&name.to_ascii_lowercase()) {
             continue;
@@ -950,17 +1013,18 @@ async fn serve_http_proxy_request(
 
 async fn serve_direct_tunnel(
     mut client: TcpStream,
+    upstream: &Arc<Snapshot>,
     host: &str,
     port: u16,
     peer: &str,
     verbose: bool,
 ) -> Result<()> {
-    let mut upstream = match connect_direct_target(host, port).await {
+    let mut upstream = match connect_passthrough_target(upstream, host, port).await {
         Ok(upstream) => upstream,
         Err(err) => {
             let _ = write_plain_error(&mut client, StatusCode::BAD_GATEWAY).await;
             return Err(err).with_context(|| {
-                format!("failed to open direct tunnel to {host}:{port} for local client {peer}")
+                format!("failed to open tunnel to {host}:{port} for local client {peer}")
             });
         }
     };
@@ -1286,8 +1350,29 @@ async fn serve_openai_websocket(
     let mut websocket_tls = state.websocket_tls.clone();
     websocket_tls.resumption = rustls::client::Resumption::default();
     let connector = Connector::Rustls(Arc::new(websocket_tls));
+    let websocket_host = upstream_url
+        .host_str()
+        .context("Gateway WebSocket URL has no host")?
+        .to_string();
+    let websocket_port = upstream_url
+        .port_or_known_default()
+        .context("Gateway WebSocket URL has no port")?;
+    let upstream_tcp = match state
+        .upstream
+        .snapshot()
+        .connect(&websocket_host, websocket_port)
+        .await
+    {
+        Ok(stream) => stream,
+        Err(error) => {
+            let _ = write_plain_error(&mut client_stream, StatusCode::BAD_GATEWAY).await;
+            return Err(error).context("failed to connect to the Gateway WebSocket");
+        }
+    };
     let (upstream_ws, upstream_response) =
-        match connect_async_tls_with_config(upstream_request, None, false, Some(connector)).await {
+        match client_async_tls_with_config(upstream_request, upstream_tcp, None, Some(connector))
+            .await
+        {
             Ok(result) => result,
             Err(tungstenite::Error::Http(response))
                 if relays_websocket_rejection(response.status().as_u16()) =>
@@ -1724,7 +1809,8 @@ where
     let upstream_url = state.upstream_url(&request.target, route)?;
     let method = Method::from_bytes(request.method.as_bytes())
         .with_context(|| format!("unsupported HTTP method {}", request.method))?;
-    let mut builder = state.client.request(method, &upstream_url);
+    let client = state.http_client()?;
+    let mut builder = client.request(method, &upstream_url);
 
     let mut has_authorization = false;
     let mut forwarded_authorization = Vec::new();
@@ -1811,7 +1897,7 @@ where
                 value,
             );
         }
-        state.client.execute(upstream_request).await
+        client.execute(upstream_request).await
     }
     .await
     .map_err(|error| {
@@ -3202,29 +3288,17 @@ fn is_hop_by_hop_header(name: &str) -> bool {
     )
 }
 
-async fn connect_direct_target(host: &str, port: u16) -> Result<TcpStream> {
+/// Passthrough connection for a non-managed CONNECT target, routed like all
+/// other SAIAI egress (directly or through the user's proxy).
+async fn connect_passthrough_target(
+    upstream: &Arc<Snapshot>,
+    host: &str,
+    port: u16,
+) -> Result<TcpStream> {
     if is_managed_host(host) && port == 443 {
         bail!("managed host must use local MITM route");
     }
-    let addrs = lookup_host((host, port))
-        .await
-        .with_context(|| format!("failed to resolve {host}:{port}"))?
-        .collect::<Vec<_>>();
-    if addrs.is_empty() {
-        bail!("no addresses resolved for {host}:{port}");
-    }
-
-    let mut last_err = None;
-    for addr in addrs {
-        match TcpStream::connect(addr).await {
-            Ok(stream) => return Ok(stream),
-            Err(err) => last_err = Some(err),
-        }
-    }
-    match last_err {
-        Some(err) => Err(err).with_context(|| format!("failed to connect to {host}:{port}")),
-        None => bail!("no usable addresses resolved for {host}:{port}"),
-    }
+    upstream.connect(host, port).await
 }
 
 fn build_leaf_server_config(
@@ -3563,6 +3637,7 @@ mod tests {
                 chatgpt_chat_passthrough: false,
                 desktop_browser_use: true,
                 client_proof_dir: None,
+                upstream_proxy: None,
             })
             .unwrap(),
         );
@@ -4035,6 +4110,7 @@ mod tests {
                 chatgpt_chat_passthrough: true,
                 desktop_browser_use: true,
                 client_proof_dir: None,
+                upstream_proxy: None,
             })
             .unwrap();
             state.openai_trace = Some(Arc::new(OpenAITrace {
@@ -4572,6 +4648,7 @@ mod tests {
                 chatgpt_chat_passthrough: true,
                 desktop_browser_use: true,
                 client_proof_dir: None,
+                upstream_proxy: None,
             })
             .unwrap(),
         );
@@ -5566,6 +5643,7 @@ mod tests {
             chatgpt_chat_passthrough: true,
             desktop_browser_use: true,
             client_proof_dir: None,
+            upstream_proxy: None,
         })
         .unwrap();
         let directory = tempfile::tempdir().unwrap();
@@ -5662,6 +5740,7 @@ mod tests {
             chatgpt_chat_passthrough: false,
             desktop_browser_use: true,
             client_proof_dir: None,
+            upstream_proxy: None,
         })
         .unwrap();
         let body = b"{ \"model\":\"mock_native\",\"reasoning\":{\"effort\":\"high\"},\"future\":[null,true] }".to_vec();
@@ -5755,6 +5834,7 @@ mod tests {
                 chatgpt_chat_passthrough: true,
                 desktop_browser_use: true,
                 client_proof_dir: None,
+                upstream_proxy: None,
             })
             .unwrap();
             let trace = tempfile::NamedTempFile::new().unwrap();
@@ -5883,6 +5963,7 @@ mod tests {
                 chatgpt_chat_passthrough: true,
                 desktop_browser_use: true,
                 client_proof_dir: None,
+                upstream_proxy: None,
             })
             .unwrap();
             let request = IncomingRequest {
@@ -6024,6 +6105,7 @@ mod tests {
             chatgpt_chat_passthrough: true,
             desktop_browser_use: true,
             client_proof_dir: None,
+            upstream_proxy: None,
         };
         let state = State::new(cfg.clone()).unwrap();
 
@@ -6408,6 +6490,7 @@ mod tests {
                 chatgpt_chat_passthrough: false,
                 desktop_browser_use: true,
                 client_proof_dir: None,
+                upstream_proxy: None,
             })
             .unwrap(),
         );
@@ -6543,6 +6626,7 @@ mod tests {
                 chatgpt_chat_passthrough: false,
                 desktop_browser_use: true,
                 client_proof_dir: None,
+                upstream_proxy: None,
             })
             .unwrap(),
         );
@@ -6662,6 +6746,7 @@ mod tests {
                 chatgpt_chat_passthrough: false,
                 desktop_browser_use: true,
                 client_proof_dir: None,
+                upstream_proxy: None,
             })
             .unwrap(),
         )
@@ -6869,8 +6954,11 @@ mod tests {
     async fn direct_tunnel_connects_to_any_target_port() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let (connected, accepted) =
-            tokio::join!(connect_direct_target("127.0.0.1", port), listener.accept());
+        let direct = Snapshot::direct_for_tests();
+        let (connected, accepted) = tokio::join!(
+            connect_passthrough_target(&direct, "127.0.0.1", port),
+            listener.accept()
+        );
 
         assert!(connected.is_ok());
         assert!(accepted.is_ok());
@@ -6878,7 +6966,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_tunnel_cannot_bypass_anthropic_mitm_route() {
-        let error = connect_direct_target(ANTHROPIC_HOST, 443)
+        let error = connect_passthrough_target(&Snapshot::direct_for_tests(), ANTHROPIC_HOST, 443)
             .await
             .err()
             .unwrap();
@@ -6891,7 +6979,10 @@ mod tests {
 
     #[tokio::test]
     async fn direct_tunnel_cannot_bypass_openai_mitm_route() {
-        let error = connect_direct_target(OPENAI_HOST, 443).await.err().unwrap();
+        let error = connect_passthrough_target(&Snapshot::direct_for_tests(), OPENAI_HOST, 443)
+            .await
+            .err()
+            .unwrap();
         assert!(
             error
                 .to_string()
@@ -6914,6 +7005,7 @@ mod tests {
             chatgpt_chat_passthrough: true,
             desktop_browser_use: true,
             client_proof_dir: None,
+            upstream_proxy: None,
         })
         .err()
         .unwrap();
@@ -7007,6 +7099,7 @@ mod tests {
             chatgpt_chat_passthrough: true,
             desktop_browser_use: true,
             client_proof_dir: Some(directory.path().to_path_buf()),
+            upstream_proxy: None,
         })
         .unwrap();
         let proof = Arc::new(ClientProof::load(directory.path()).unwrap());
@@ -7173,6 +7266,7 @@ mod tests {
                 chatgpt_chat_passthrough: true,
                 desktop_browser_use: true,
                 client_proof_dir: Some(directory.path().to_path_buf()),
+                upstream_proxy: None,
             })
             .unwrap(),
         );

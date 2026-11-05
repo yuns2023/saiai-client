@@ -37,6 +37,7 @@ mod desktop_product;
 mod environment_scope;
 mod local_proxy;
 mod uninstall;
+mod upstream_proxy;
 mod upstream_tls;
 mod vscode;
 #[cfg(target_os = "windows")]
@@ -69,6 +70,7 @@ Usage:
   saiai vscode                                                    # configure the Codex VSCode extension for SAIAI
   saiai desktop [codex] [-- <Desktop arguments>]                # launch Codex Desktop through SAIAI
   saiai uninstall [--yes] [--dry-run] [--forget-unknown-environments]  # remove SAIAI services, settings, data and program
+  saiai upstream-proxy [system|direct|http://host:port]         # show or set the proxy SAIAI itself uses
   saiai init       --base-url <base_url> --api-key <api_key>      # initialize Claude Code
   saiai init-codex --base-url <base_url> --api-key <api_key> [--websockets]
 Initialization uses provider-specific CA files and preserves VSCode editor settings.
@@ -83,9 +85,13 @@ const WINDOWS_PACKAGED_PROXY_LEASE_FILENAME: &str = "windows-packaged-proxy-leas
 const SAIAI_CONFIG_VERSION: u32 = 2;
 const CLAUDE_STREAM_IDLE_TIMEOUT_MS: &str = "600000";
 const DEFAULT_LOCAL_PROXY_LISTEN: &str = "127.0.0.1:19908";
-// Claude's updater must use the user's normal network path. Model/API
-// traffic remains routed through the SAIAI local proxy.
-const DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local,downloads.claude.ai";
+// Claude's updater goes through the local proxy like everything else; the
+// local proxy follows the user's network (proxy or direct) for passthrough
+// destinations such as downloads.claude.ai.
+const DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local";
+// Written by Client 1.1.0–1.1.57; recognized by uninstall and migrated at
+// local proxy startup.
+const LEGACY_DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local,downloads.claude.ai";
 const SAIAI_CONFIG_FILENAME: &str = "config.json";
 
 // `saiai codex` owns these variables only in the Codex child process. The
@@ -288,6 +294,7 @@ fn main() -> Result<()> {
         Command::VSCode => configure_vscode(),
         Command::Desktop { product, args } => run_desktop(product, &args),
         Command::Uninstall(args) => uninstall::run(args),
+        Command::UpstreamProxy(value) => run_upstream_proxy_command(value),
         #[cfg(target_os = "linux")]
         Command::RunLinuxBackgroundProxy => run_linux_background_proxy_worker(),
         #[cfg(target_os = "windows")]
@@ -319,6 +326,7 @@ enum Command {
         args: Vec<String>,
     },
     Uninstall(uninstall::Args),
+    UpstreamProxy(Option<String>),
     #[cfg(target_os = "linux")]
     RunLinuxBackgroundProxy,
     #[cfg(target_os = "windows")]
@@ -393,6 +401,15 @@ fn parse_command(args: &[String]) -> Result<Command> {
         }
         "vscode" => return parse_no_arg_command("vscode", &args[1..], Command::VSCode),
         "uninstall" => return Ok(Command::Uninstall(uninstall::parse_args(&args[1..])?)),
+        "upstream-proxy" => {
+            return match &args[1..] {
+                [] => Ok(Command::UpstreamProxy(None)),
+                [value] => Ok(Command::UpstreamProxy(Some(value.clone()))),
+                [_, extra, ..] => {
+                    bail!("Unexpected argument after upstream-proxy: {extra}\n\n{USAGE}")
+                }
+            };
+        }
         "desktop" | "chatgpt" => {
             let (product, start) = if args[0] == "chatgpt" {
                 (DesktopProduct::ChatGPT, 1)
@@ -855,13 +872,19 @@ fn initialize_codex_local_proxy_at(
     }
 
     // A missing CA or an obsolete layout forces a rebuild, but an explicit
-    // choice to turn off Desktop browser and Computer Use control must
-    // survive it.
-    let desktop_browser_use = fs::read_to_string(&config_path)
+    // choice to turn off Desktop browser and Computer Use control, or an
+    // upstream proxy choice, must survive it.
+    let existing = fs::read_to_string(&config_path)
         .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    let desktop_browser_use = existing
+        .as_ref()
         .and_then(|existing| existing.get("desktop_browser_use")?.as_bool())
         .unwrap_or(true);
+    let upstream_proxy = existing
+        .as_ref()
+        .and_then(|existing| existing.get("upstream_proxy")?.as_str())
+        .map(str::to_string);
     backup_if_exists(&config_path, timestamp)?;
     let ca_cert_path = config_dir.join(SAIAI_CA_FILENAME);
     let ca_key_path = config_dir.join(SAIAI_CA_KEY_FILENAME);
@@ -875,6 +898,7 @@ fn initialize_codex_local_proxy_at(
         ca_key_path: ca_key_path.display().to_string(),
         chatgpt_chat_passthrough: true,
         desktop_browser_use,
+        upstream_proxy,
         providers: ProviderCredentials::default(),
     };
     config.providers.codex = Some(ProviderCredential {
@@ -3488,6 +3512,10 @@ struct SaiaiConfig {
     chatgpt_chat_passthrough: bool,
     #[serde(default = "default_true")]
     desktop_browser_use: bool,
+    /// `system` (default when absent), `direct`, or an http:// proxy URL for
+    /// SAIAI's own egress; see `upstream_proxy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upstream_proxy: Option<String>,
     #[serde(default)]
     providers: ProviderCredentials,
 }
@@ -3661,6 +3689,7 @@ fn update_saiai_provider_config_at(
             .unwrap_or_default(),
         chatgpt_chat_passthrough: true,
         desktop_browser_use: true,
+        upstream_proxy: None,
         providers: ProviderCredentials::default(),
     });
     let existing_listen = (!config.listen.trim().is_empty()).then_some(config.listen.as_str());
@@ -3725,6 +3754,7 @@ fn proxy_runtime_config_changed(previous: Option<&SaiaiConfig>, current: &SaiaiC
         || previous.ca_key_path != current.ca_key_path
         || previous.chatgpt_chat_passthrough != current.chatgpt_chat_passthrough
         || previous.desktop_browser_use != current.desktop_browser_use
+        || previous.upstream_proxy != current.upstream_proxy
         || previous.providers != current.providers
         || (previous.providers.is_empty()
             && (previous.base_url != current.base_url || previous.api_key != current.api_key))
@@ -3780,6 +3810,11 @@ fn run_local_proxy(verbose: bool) -> Result<()> {
     let cfg = read_saiai_config()?;
     let (ca_cert_pem, ca_key_pem) = read_runtime_ca(&cfg)?;
     ensure_listen_available(&cfg.listen)?;
+    if let Err(error) = resolve_claude_config_paths()
+        .and_then(|paths| migrate_legacy_claude_no_proxy(&paths.settings_path, &cfg.listen))
+    {
+        eprintln!("warning: could not update Claude no_proxy: {error:#}");
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -3812,7 +3847,63 @@ fn run_local_proxy(verbose: bool) -> Result<()> {
         chatgpt_chat_passthrough: cfg.chatgpt_chat_passthrough,
         desktop_browser_use: cfg.desktop_browser_use,
         client_proof_dir: saiai_config_dir().ok(),
+        upstream_proxy: cfg.upstream_proxy,
     }))
+}
+
+fn run_upstream_proxy_command(value: Option<String>) -> Result<()> {
+    let Some(value) = value else {
+        let cfg = read_saiai_config()?;
+        println!(
+            "setting: {}",
+            upstream_proxy::describe_setting(cfg.upstream_proxy.as_deref())
+        );
+        println!(
+            "this shell resolves it to: {}",
+            Egress::for_config(&cfg).upstream.description()
+        );
+        println!("the running service logs its own resolution at startup and on every change");
+        return Ok(());
+    };
+    upstream_proxy::validate_setting(&value)?;
+    let _initialization_lock = lock_initialization()?;
+    let mut cfg = read_saiai_config()?;
+    let value = value.trim();
+    cfg.upstream_proxy = (!value.eq_ignore_ascii_case("system")).then(|| value.to_string());
+    write_saiai_config_at(&saiai_config_path()?, &cfg)?;
+    println!(
+        "upstream proxy set to {}; run `saiai restart` to apply it to the running service",
+        upstream_proxy::describe_setting(cfg.upstream_proxy.as_deref())
+    );
+    Ok(())
+}
+
+/// HTTP egress for one-shot CLI requests (health check, self-update), routed
+/// like the local proxy's own Gateway traffic.
+struct Egress {
+    installation_ca_pem: String,
+    upstream: Arc<upstream_proxy::Snapshot>,
+}
+
+impl Egress {
+    fn for_config(cfg: &SaiaiConfig) -> Self {
+        let upstream = upstream_proxy::UpstreamProxy::new(
+            cfg.upstream_proxy.as_deref(),
+            cfg.listen.parse().ok(),
+            Vec::new(),
+        );
+        Self {
+            installation_ca_pem: installation_ca_pem(cfg),
+            upstream: upstream.snapshot(),
+        }
+    }
+
+    fn client_builder(&self) -> Result<reqwest::ClientBuilder> {
+        self.upstream
+            .apply(upstream_tls::upstream_http_client_builder(
+                &self.installation_ca_pem,
+            ))
+    }
 }
 
 /// The installation CA certificate, excluded from upstream trust. Empty when
@@ -4364,8 +4455,8 @@ fn run_update() -> Result<()> {
         .context("failed to start async runtime")?;
 
     println!("Checking: {manifest_url}");
-    let installation_ca = installation_ca_pem(&cfg);
-    let manifest = runtime.block_on(download_update_manifest(&manifest_url, &installation_ca))?;
+    let egress = Egress::for_config(&cfg);
+    let manifest = runtime.block_on(download_update_manifest(&manifest_url, &egress))?;
     let expected_sha256 = if let Some(manifest) = manifest {
         let remote_version = manifest.version.trim();
         let ordering = compare_versions(remote_version, env!("CARGO_PKG_VERSION"))
@@ -4401,7 +4492,7 @@ fn run_update() -> Result<()> {
     };
 
     println!("Downloading: {url}");
-    let bytes = runtime.block_on(download_update_asset(&url, &installation_ca))?;
+    let bytes = runtime.block_on(download_update_asset(&url, &egress))?;
     validate_update_asset(&bytes, asset)?;
     if let Some(expected) = &expected_sha256 {
         let actual = sha256_hex(&bytes);
@@ -4582,8 +4673,29 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
             DoctorTarget::Codex => provider_route(cfg, ProviderKind::Codex).0,
             DoctorTarget::All => cfg.base_url.as_str(),
         };
-        let installation_ca = installation_ca_pem(cfg);
-        match runtime.block_on(check_gateway_health(health_base, &installation_ca)) {
+        let egress = Egress::for_config(cfg);
+        report.ok(
+            "upstream proxy",
+            format!(
+                "{} (as seen by this doctor process; the service logs its own at startup)",
+                egress.upstream.description()
+            ),
+        );
+        if let Some(message) = egress.upstream.unavailable() {
+            report.error("upstream proxy", message);
+        }
+        for (label, url) in [
+            ("SAIAI egress", health_base),
+            ("Claude downloads egress", "https://downloads.claude.ai"),
+        ] {
+            if let Ok(url) = url::Url::parse(url)
+                && let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default())
+                && let Ok(route) = egress.upstream.route_blocking(true, host, port)
+            {
+                report.ok(label, format!("{host} {route}"));
+            }
+        }
+        match runtime.block_on(check_gateway_health(health_base, &egress)) {
             Ok(status) => report.ok("SAIAI health", status),
             Err(err) => report.error("SAIAI health", format!("{err:#}")),
         }
@@ -5959,10 +6071,10 @@ fn process_name(pid: u32) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-async fn check_gateway_health(base_url: &str, installation_ca_pem: &str) -> Result<String> {
+async fn check_gateway_health(base_url: &str, egress: &Egress) -> Result<String> {
     let health_url = format!("{}/health", base_url.trim().trim_end_matches('/'));
-    let response = upstream_tls::upstream_http_client_builder(installation_ca_pem)
-        .no_proxy()
+    let response = egress
+        .client_builder()?
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -6224,12 +6336,9 @@ fn check_service_config(report: &mut DoctorReport) {
 fn check_service_config(_report: &mut DoctorReport) {}
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-async fn download_update_manifest(
-    url: &str,
-    installation_ca_pem: &str,
-) -> Result<Option<UpdateManifest>> {
-    let response = upstream_tls::upstream_http_client_builder(installation_ca_pem)
-        .no_proxy()
+async fn download_update_manifest(url: &str, egress: &Egress) -> Result<Option<UpdateManifest>> {
+    let response = egress
+        .client_builder()?
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -6255,9 +6364,9 @@ async fn download_update_manifest(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-async fn download_update_asset(url: &str, installation_ca_pem: &str) -> Result<Vec<u8>> {
-    let response = upstream_tls::upstream_http_client_builder(installation_ca_pem)
-        .no_proxy()
+async fn download_update_asset(url: &str, egress: &Egress) -> Result<Vec<u8>> {
+    let response = egress
+        .client_builder()?
         .timeout(Duration::from_secs(60))
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -7803,6 +7912,34 @@ fn apply_common_claude_env(env_obj: &mut Map<String, Value>, api_key: &str) {
     );
 }
 
+/// Older clients sent Claude's updater (downloads.claude.ai) around the
+/// local proxy. Drop that bypass from settings this listener manages, so
+/// existing installations follow the user's network without re-running init.
+fn migrate_legacy_claude_no_proxy(settings_path: &Path, listen: &str) -> Result<()> {
+    let mut settings = load_json_object(settings_path)?;
+    let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    let proxy = format!("http://{listen}");
+    if env.get("no_proxy").and_then(Value::as_str) != Some(LEGACY_DEFAULT_NO_PROXY)
+        || env.get("https_proxy").and_then(Value::as_str) != Some(proxy.as_str())
+    {
+        return Ok(());
+    }
+    env.insert(
+        "no_proxy".to_string(),
+        Value::String(DEFAULT_NO_PROXY.to_string()),
+    );
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S%.9f").to_string();
+    backup_if_exists(settings_path, &timestamp)?;
+    write_json_object(settings_path, Value::Object(settings))?;
+    eprintln!(
+        "Claude updater downloads now follow the SAIAI upstream proxy ({} updated)",
+        settings_path.display()
+    );
+    Ok(())
+}
+
 fn clean_claude_settings(settings: &mut Map<String, Value>) {
     settings.remove("oauthAccount");
 }
@@ -9144,6 +9281,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             ca_key_path: "/tmp/saiai-ca.key".to_string(),
             chatgpt_chat_passthrough: true,
             desktop_browser_use: true,
+            upstream_proxy: None,
             providers: providers.clone(),
         };
         let current = SaiaiConfig {
@@ -9513,7 +9651,10 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         let err = runtime
             .block_on(check_gateway_health(
                 &format!("http://127.0.0.1:{port}"),
-                "",
+                &Egress {
+                    installation_ca_pem: String::new(),
+                    upstream: upstream_proxy::Snapshot::direct_for_tests(),
+                },
             ))
             .unwrap_err();
         let outer = err.to_string();
@@ -9587,6 +9728,44 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             "{first:?}"
         );
         assert_ne!(Some(first), common_name(&second));
+    }
+
+    #[test]
+    fn migrates_only_the_legacy_no_proxy_this_listener_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let write = |no_proxy: &str, https_proxy: &str| {
+            fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "kept",
+                    "env": {"no_proxy": no_proxy, "https_proxy": https_proxy}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        let read = || serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap();
+
+        write(LEGACY_DEFAULT_NO_PROXY, "http://127.0.0.1:19908");
+        migrate_legacy_claude_no_proxy(&path, "127.0.0.1:19908").unwrap();
+        assert_eq!(read()["env"]["no_proxy"], DEFAULT_NO_PROXY);
+        assert_eq!(read()["model"], "kept");
+
+        for (no_proxy, https_proxy) in [
+            (LEGACY_DEFAULT_NO_PROXY, "http://127.0.0.1:20000"),
+            (
+                "downloads.claude.ai,corp.internal",
+                "http://127.0.0.1:19908",
+            ),
+        ] {
+            write(no_proxy, https_proxy);
+            migrate_legacy_claude_no_proxy(&path, "127.0.0.1:19908").unwrap();
+            assert_eq!(read()["env"]["no_proxy"], no_proxy);
+        }
+        fs::remove_file(&path).unwrap();
+        migrate_legacy_claude_no_proxy(&path, "127.0.0.1:19908").unwrap();
+        assert!(!path.exists());
     }
 
     #[test]
@@ -10023,7 +10202,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert!(env_obj.get("HTTPS_PROXY").is_none());
         assert!(env_obj.get("ALL_PROXY").is_none());
         assert!(env_obj.get("NO_PROXY").is_none());
-        assert!(json_str(&env_obj, "no_proxy").contains("downloads.claude.ai"));
+        assert!(!json_str(&env_obj, "no_proxy").contains("downloads.claude.ai"));
         assert_eq!(
             json_str(&env_obj, "NODE_EXTRA_CA_CERTS"),
             "/tmp/saiai-ca.crt"

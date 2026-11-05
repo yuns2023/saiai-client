@@ -118,8 +118,39 @@ JSON 字段和机器本地身份值保持不变。客户端为每个用户生成
 
 代理仅监听 loopback。`api.anthropic.com:443` 和 Codex 使用的
 `api.openai.com:443` 由本地代理终止 TLS 并转发到 Gateway；其他 HTTP `CONNECT`
-请求以任意目标、任意 TCP 端口直接建立隧道，因此可由本机 TUN、Fake-IP 和用户
-自己的出站规则继续处理。
+请求（包括 Claude 更新下载 `downloads.claude.ai`）以任意目标、任意 TCP 端口建立
+隧道，同样可由本机 TUN、Fake-IP 和用户自己的出站规则继续处理。
+
+### 上游代理
+
+本地代理自己的出站连接（到 Gateway 的 HTTPS/WebSocket、上述 CONNECT 隧道、明文 HTTP
+转发）以及 `saiai doctor` 健康检查和 `saiai update` 下载，默认跟随用户网络：
+
+- SAIAI 服务进程环境中的 `https_proxy`/`http_proxy`/`all_proxy`（及大写形式）与
+  `no_proxy` 优先；指向 SAIAI 自己监听端口的值会被忽略。
+- 否则使用系统代理：Windows 通过 WinHTTP 读取当前用户的 Internet 设置，包括
+  例外列表、自动检测（WPAD）和自动配置脚本（PAC，按目标求值）；macOS 读取
+  `scutil --proxy` 的 HTTP/HTTPS 代理与例外列表（macOS 自动配置/PAC 暂不求值，按
+  直连处理）；Linux 仅使用环境变量。
+- 都没有配置时直连。
+
+只支持 HTTP 代理（可带 Basic 认证）；SOCKS 或 HTTPS 代理会报错而不是直连。已配置的
+代理不可用（例如 Clash 退出但系统代理未清除）时请求失败，不会静默改为直连。系统代理
+每 30 秒重新读取一次，变化后新连接使用新路由，已建立的隧道和 WebSocket 保持原路由直到结束。
+
+可用以下命令查看或固定：
+
+```bash
+saiai upstream-proxy                          # 显示设置及当前 shell 解析结果
+saiai upstream-proxy http://user:pass@host:8080
+saiai upstream-proxy direct                   # 始终直连
+saiai upstream-proxy system                   # 恢复默认
+saiai restart                                 # 让运行中的服务生效
+```
+
+也可以为服务进程设置 `SAIAI_UPSTREAM_PROXY`（取值同上，优先于配置文件）。服务启动日志
+和 `saiai doctor` 会显示实际路由（不显示凭据）。旧版本写入 Claude `no_proxy` 的
+`downloads.claude.ai` 会在本地代理启动时移除，使 Claude 更新同样跟随上游代理。
 
 默认路径是 `~/.claude/settings.json`、`~/.claude.json` 和
 `~/.claude/.credentials.json`、`~/.claude/saiai-ca.crt` 和
