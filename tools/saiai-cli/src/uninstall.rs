@@ -821,7 +821,13 @@ fn claude_settings_removal(settings: &Map<String, Value>, owned: &ClaudeOwned) -
     for key in CLAUDE_PROXY_ENV {
         check(key, &owned.proxies);
     }
-    check("no_proxy", &[crate::DEFAULT_NO_PROXY.to_string()]);
+    check(
+        "no_proxy",
+        &[
+            crate::DEFAULT_NO_PROXY.to_string(),
+            crate::LEGACY_DEFAULT_NO_PROXY.to_string(),
+        ],
+    );
     check("NODE_EXTRA_CA_CERTS", &owned.ca_paths);
     result.generic = CLAUDE_GENERIC_ENV
         .iter()

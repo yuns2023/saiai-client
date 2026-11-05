@@ -317,6 +317,13 @@ pub(crate) fn record_product_dir(create: bool) -> Result<()> {
         .with_context(|| format!("failed to record {}", path.display()))
 }
 
+/// Product directory recorded for the active isolated environment.
+pub(crate) fn recorded_product_dir() -> Option<PathBuf> {
+    let scope = active().filter(|scope| scope.isolated)?;
+    let recorded = fs::read_to_string(scope.directory.join(PRODUCT_DIR_FILENAME)).ok()?;
+    Some(PathBuf::from(recorded.trim())).filter(|path| path.is_dir())
+}
+
 pub(crate) fn active() -> Option<&'static Scope> {
     ACTIVE.get()
 }

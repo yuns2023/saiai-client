@@ -68,6 +68,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         let mut start =
             Command::new(env::current_exe().context("failed to resolve SAIAI executable")?);
         apply_environment(&mut start, &config, token);
+        // The service follows the user's own proxy for its egress; only the
+        // Claude child is pointed at SAIAI.
+        restore_user_proxy_environment(&mut start);
         crate::environment_scope::pin_start(&mut start)?;
         let status = start
             .arg("start")
@@ -120,6 +123,24 @@ fn validate_listen(listen: &str) -> Result<()> {
         bail!("SAIAI local proxy must listen on a nonzero loopback port");
     }
     Ok(())
+}
+
+fn restore_user_proxy_environment(command: &mut Command) {
+    for name in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ] {
+        match env::var_os(name) {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
 }
 
 fn apply_environment(command: &mut Command, config: &SaiaiConfig, token: &str) {
@@ -251,8 +272,41 @@ mod tests {
             ca_key_path: "/synthetic/ca.key".to_string(),
             chatgpt_chat_passthrough: false,
             desktop_browser_use: false,
+            upstream_proxy: None,
             providers: ProviderCredentials::default(),
         }
+    }
+
+    #[test]
+    fn service_start_keeps_the_user_proxy_while_claude_gets_saiai() {
+        // Windows environment names are case-insensitive, so look them up
+        // the same way.
+        fn child_env(command: &Command, name: &str) -> Option<std::ffi::OsString> {
+            command
+                .get_envs()
+                .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                .last()
+                .and_then(|(_, value)| value.map(OsStr::to_os_string))
+        }
+        let config = config();
+        let mut start = Command::new("saiai");
+        apply_environment(&mut start, &config, "token");
+        restore_user_proxy_environment(&mut start);
+        for name in ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"] {
+            assert_eq!(child_env(&start, name), env::var_os(name), "{name}");
+        }
+
+        let mut child = Command::new("claude");
+        apply_environment(&mut child, &config, "token");
+        assert_eq!(
+            child_env(&child, "https_proxy"),
+            Some("http://127.0.0.1:19908".into())
+        );
+    }
+
+    #[test]
+    fn claude_settings_and_launcher_exclude_the_same_destinations() {
+        assert_eq!(LOCAL_NO_PROXY, crate::DEFAULT_NO_PROXY);
     }
 
     #[test]

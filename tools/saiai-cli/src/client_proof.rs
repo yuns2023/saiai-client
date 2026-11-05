@@ -616,7 +616,7 @@ impl ClientProof {
     /// background; failures only leave the requests unsigned.
     pub async fn enroll(
         self: Arc<Self>,
-        client: reqwest::Client,
+        clients: impl ClientSource,
         gateway: String,
         api_key: Zeroizing<String>,
         backoff: &'static [Duration],
@@ -630,7 +630,13 @@ impl ClientProof {
         }
         let mut attempt = 0usize;
         loop {
-            match self.enroll_once(&client, &gateway, &api_key).await {
+            // Resolve the route for every attempt: the upstream proxy may
+            // have changed since the previous one.
+            let outcome = match clients.client_for(&gateway).await {
+                Ok(client) => self.enroll_once(&client, &gateway, &api_key).await,
+                Err(error) => EnrollOutcome::Retry(format!("route_error={error:#}")),
+            };
+            match outcome {
                 EnrollOutcome::Enrolled(device_id) => {
                     let record = (gateway.clone(), api_key.clone(), device_id.clone());
                     self.persist_blocking(move |proof| {
@@ -671,6 +677,23 @@ impl ClientProof {
                 }
             }
         }
+    }
+}
+
+/// Where enrollment gets an HTTP client for each attempt.
+pub trait ClientSource {
+    fn client_for(&self, url: &str) -> impl Future<Output = Result<reqwest::Client>> + Send;
+}
+
+impl ClientSource for reqwest::Client {
+    async fn client_for(&self, _url: &str) -> Result<reqwest::Client> {
+        Ok(self.clone())
+    }
+}
+
+impl ClientSource for Arc<crate::upstream_proxy::HttpClients> {
+    async fn client_for(&self, url: &str) -> Result<reqwest::Client> {
+        self.for_url(url).await
     }
 }
 
@@ -1132,6 +1155,43 @@ mod tests {
                 .sign_request(&gateway, "GET", "/v1/models", "MOCK_ONLY_KEY")
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn enrollment_resolves_the_route_again_for_every_attempt() {
+        // The first attempt cannot be routed (e.g. the upstream proxy is not
+        // usable yet); a later attempt gets a fresh client and enrolls.
+        struct Flaky(std::sync::atomic::AtomicUsize);
+        impl ClientSource for Flaky {
+            async fn client_for(&self, _url: &str) -> Result<reqwest::Client> {
+                match self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => anyhow::bail!("upstream proxy unavailable"),
+                    _ => Ok(reqwest::Client::new()),
+                }
+            }
+        }
+        let (gateway, server) = mock_gateway(vec![(
+            200,
+            r#"{"device_id":"cd_CCCCCCCCCCCCCCCCCCCCCC","status":"active"}"#,
+        )])
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let proof = Arc::new(ClientProof::load(directory.path()).unwrap());
+        let source = Flaky(std::sync::atomic::AtomicUsize::new(0));
+        let device = Arc::clone(&proof)
+            .enroll(
+                source,
+                gateway.clone(),
+                Zeroizing::new("MOCK_ONLY_KEY".into()),
+                &FAST_RETRY,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            device.device_id.as_deref(),
+            Some("cd_CCCCCCCCCCCCCCCCCCCCCC")
+        );
+        assert_eq!(server.await.unwrap().len(), 1);
     }
 
     #[tokio::test]
