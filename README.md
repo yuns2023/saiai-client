@@ -129,12 +129,14 @@ JSON 字段和机器本地身份值保持不变。客户端为每个用户生成
 - SAIAI 服务进程环境中的 `https_proxy`/`http_proxy`/`all_proxy`（及大写形式）与
   `no_proxy` 优先；指向 SAIAI 自己监听端口的值会被忽略。
 - 否则使用系统代理：Windows 通过 WinHTTP 读取当前用户的 Internet 设置，包括
-  例外列表、自动检测（WPAD）和自动配置脚本（PAC，按目标求值）；macOS 读取
+  例外列表、自动检测（WPAD）和自动配置脚本（PAC，按目标主机和端口求值，不含 URL
+  路径；脚本无法获取或执行时报错，WPAD 未发现配置时使用手动代理设置）；macOS 读取
   `scutil --proxy` 的 HTTP/HTTPS 代理与例外列表（macOS 自动配置/PAC 暂不求值，按
   直连处理）；Linux 仅使用环境变量。
 - 都没有配置时直连。
 
-只支持 HTTP 代理（可带 Basic 认证）；SOCKS 或 HTTPS 代理会报错而不是直连。已配置的
+只支持 HTTP 代理（可带 Basic 认证）；SOCKS 或 HTTPS 代理会报错而不是直连（未被使用的
+`ALL_PROXY=socks5://…` 不影响已设置的 `HTTP(S)_PROXY`）。例外列表中带端口的条目只匹配该端口。已配置的
 代理不可用（例如 Clash 退出但系统代理未清除）时请求失败，不会静默改为直连。系统代理
 每 30 秒重新读取一次，变化后新连接使用新路由，已建立的隧道和 WebSocket 保持原路由直到结束。
 

@@ -633,6 +633,24 @@ fn generate_installation_ca() -> Result<(String, String)> {
 }
 
 fn lock_initialization() -> Result<fs::File> {
+    let file = open_initialization_lock()?;
+    file.lock().context("failed to lock SAIAI initialization")?;
+    Ok(file)
+}
+
+/// `None` while another process initializes.
+fn try_lock_initialization() -> Result<Option<fs::File>> {
+    let file = open_initialization_lock()?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(error)) => {
+            Err(error).context("failed to lock SAIAI initialization")
+        }
+    }
+}
+
+fn open_initialization_lock() -> Result<fs::File> {
     let directory = environment_scope::active()
         .map(|s| s.root.clone())
         .unwrap_or(saiai_config_dir()?);
@@ -644,9 +662,7 @@ fn lock_initialization() -> Result<fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let file = options.open(directory.join("initialization.lock"))?;
-    file.lock().context("failed to lock SAIAI initialization")?;
-    Ok(file)
+    Ok(options.open(directory.join("initialization.lock"))?)
 }
 
 fn init_claude(args: InitArgs) -> Result<()> {
@@ -3810,9 +3826,7 @@ fn run_local_proxy(verbose: bool) -> Result<()> {
     let cfg = read_saiai_config()?;
     let (ca_cert_pem, ca_key_pem) = read_runtime_ca(&cfg)?;
     ensure_listen_available(&cfg.listen)?;
-    if let Err(error) = resolve_claude_config_paths()
-        .and_then(|paths| migrate_legacy_claude_no_proxy(&paths.settings_path, &cfg.listen))
-    {
+    if let Err(error) = migrate_legacy_claude_no_proxy_for_instance(&cfg.listen) {
         eprintln!("warning: could not update Claude no_proxy: {error:#}");
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -3898,11 +3912,15 @@ impl Egress {
         }
     }
 
-    fn client_builder(&self) -> Result<reqwest::ClientBuilder> {
-        self.upstream
-            .apply(upstream_tls::upstream_http_client_builder(
-                &self.installation_ca_pem,
-            ))
+    /// Client builder for requests to `url` (a single host: redirects are
+    /// never followed). Fails instead of going direct when the configured
+    /// proxy cannot be used.
+    fn client_builder(&self, url: &str) -> Result<reqwest::ClientBuilder> {
+        let route = upstream_proxy::route_for_url_blocking(&self.upstream, url)?;
+        upstream_proxy::client_builder_for_route(
+            upstream_tls::upstream_http_client_builder(&self.installation_ca_pem),
+            &route,
+        )
     }
 }
 
@@ -4688,11 +4706,9 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
             ("SAIAI egress", health_base),
             ("Claude downloads egress", "https://downloads.claude.ai"),
         ] {
-            if let Ok(url) = url::Url::parse(url)
-                && let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default())
-                && let Ok(route) = egress.upstream.route_blocking(true, host, port)
-            {
-                report.ok(label, format!("{host} {route}"));
+            match upstream_proxy::route_for_url_blocking(&egress.upstream, url) {
+                Ok(route) => report.ok(label, format!("{url} {route}")),
+                Err(error) => report.error(label, format!("{url}: {error:#}")),
             }
         }
         match runtime.block_on(check_gateway_health(health_base, &egress)) {
@@ -6074,7 +6090,7 @@ fn process_name(pid: u32) -> Option<String> {
 async fn check_gateway_health(base_url: &str, egress: &Egress) -> Result<String> {
     let health_url = format!("{}/health", base_url.trim().trim_end_matches('/'));
     let response = egress
-        .client_builder()?
+        .client_builder(&health_url)?
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -6338,7 +6354,7 @@ fn check_service_config(_report: &mut DoctorReport) {}
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 async fn download_update_manifest(url: &str, egress: &Egress) -> Result<Option<UpdateManifest>> {
     let response = egress
-        .client_builder()?
+        .client_builder(url)?
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -6366,7 +6382,7 @@ async fn download_update_manifest(url: &str, egress: &Egress) -> Result<Option<U
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 async fn download_update_asset(url: &str, egress: &Egress) -> Result<Vec<u8>> {
     let response = egress
-        .client_builder()?
+        .client_builder(url)?
         .timeout(Duration::from_secs(60))
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -7912,10 +7928,26 @@ fn apply_common_claude_env(env_obj: &mut Map<String, Value>, api_key: &str) {
     );
 }
 
+fn migrate_legacy_claude_no_proxy_for_instance(listen: &str) -> Result<()> {
+    // A running init rewrites the settings itself and may be waiting for
+    // this service to start, so never wait for it.
+    let Some(_initialization_lock) = try_lock_initialization()? else {
+        return Ok(());
+    };
+    // The background service does not inherit CLAUDE_CONFIG_DIR; an isolated
+    // environment records its Claude directory instead.
+    let settings_path = match environment_scope::recorded_product_dir() {
+        Some(directory) => directory.join("settings.json"),
+        None => resolve_claude_config_paths()?.settings_path,
+    };
+    migrate_legacy_claude_no_proxy(&settings_path, listen)
+}
+
 /// Older clients sent Claude's updater (downloads.claude.ai) around the
 /// local proxy. Drop that bypass from settings this listener manages, so
 /// existing installations follow the user's network without re-running init.
 fn migrate_legacy_claude_no_proxy(settings_path: &Path, listen: &str) -> Result<()> {
+    let original = fs::read(settings_path).ok();
     let mut settings = load_json_object(settings_path)?;
     let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
         return Ok(());
@@ -7930,6 +7962,10 @@ fn migrate_legacy_claude_no_proxy(settings_path: &Path, listen: &str) -> Result<
         "no_proxy".to_string(),
         Value::String(DEFAULT_NO_PROXY.to_string()),
     );
+    // Claude may have rewritten the file meanwhile; leave its version.
+    if fs::read(settings_path).ok() != original {
+        return Ok(());
+    }
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S%.9f").to_string();
     backup_if_exists(settings_path, &timestamp)?;
     write_json_object(settings_path, Value::Object(settings))?;

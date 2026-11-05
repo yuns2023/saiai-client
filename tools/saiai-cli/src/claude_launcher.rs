@@ -278,6 +278,35 @@ mod tests {
     }
 
     #[test]
+    fn service_start_keeps_the_user_proxy_while_claude_gets_saiai() {
+        let config = config();
+        let mut start = Command::new("saiai");
+        apply_environment(&mut start, &config, "token");
+        restore_user_proxy_environment(&mut start);
+        let envs: std::collections::HashMap<_, _> = start.get_envs().collect();
+        for name in ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"] {
+            assert_eq!(
+                envs.get(OsStr::new(name)).cloned().flatten(),
+                env::var_os(name).as_deref(),
+                "{name}"
+            );
+        }
+
+        let mut child = Command::new("claude");
+        apply_environment(&mut child, &config, "token");
+        let envs: std::collections::HashMap<_, _> = child.get_envs().collect();
+        assert_eq!(
+            envs.get(OsStr::new("https_proxy")).cloned().flatten(),
+            Some(OsStr::new("http://127.0.0.1:19908"))
+        );
+    }
+
+    #[test]
+    fn claude_settings_and_launcher_exclude_the_same_destinations() {
+        assert_eq!(LOCAL_NO_PROXY, crate::DEFAULT_NO_PROXY);
+    }
+
+    #[test]
     fn launcher_checks_claude_settings_whether_or_not_proxy_is_running() {
         let source = include_str!("claude_launcher.rs");
         let run = source

@@ -35,9 +35,11 @@ const PROXY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROXY_RESPONSE_HEAD: usize = 16 * 1024;
 #[cfg(target_os = "windows")]
 const PAC_CACHE_TTL: Duration = Duration::from_secs(300);
+#[cfg(target_os = "windows")]
+const PAC_ERROR_TTL: Duration = Duration::from_secs(30);
 
 /// An HTTP proxy. Credentials never appear in `Debug`/`Display` output.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Endpoint {
     host: String,
     port: u16,
@@ -93,16 +95,6 @@ impl Endpoint {
         host_port(&self.host, self.port)
     }
 
-    /// The URL handed to reqwest, which turns userinfo into Basic auth.
-    fn reqwest_url(&self) -> Option<url::Url> {
-        let mut url = url::Url::parse(&format!("http://{}", self.authority())).ok()?;
-        if self.has_credentials() {
-            url.set_username(&self.username).ok()?;
-            url.set_password(self.password.as_deref()).ok()?;
-        }
-        Some(url)
-    }
-
     fn proxy_authorization(&self) -> Option<String> {
         self.has_credentials().then(|| {
             let credentials = format!(
@@ -131,6 +123,7 @@ impl Endpoint {
             || host.ends_with(".localhost")
             || host
                 .parse::<IpAddr>()
+                .map(|ip| ip.to_canonical())
                 .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified() || ip == listen.ip())
     }
 }
@@ -185,7 +178,7 @@ fn normalize_host(host: &str) -> String {
         .to_ascii_lowercase()
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Route {
     Direct,
     Proxy(Endpoint),
@@ -246,9 +239,16 @@ enum BypassRule {
     Network(IpAddr, u8),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BypassEntry {
+    rule: BypassRule,
+    /// `host:port` entries only match that destination port.
+    port: Option<u16>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Bypass {
-    rules: Vec<BypassRule>,
+    rules: Vec<BypassEntry>,
     /// `NO_PROXY`/macOS style: `example.com` also covers its subdomains.
     /// Windows `ProxyOverride` entries match exactly unless they use `*`.
     subdomains: bool,
@@ -259,66 +259,74 @@ impl Bypass {
         let mut rules = Vec::new();
         for entry in entries {
             let entry = entry.trim();
+            let entry = entry
+                .strip_prefix("http://")
+                .or_else(|| entry.strip_prefix("https://"))
+                .unwrap_or(entry);
             if entry.is_empty() {
                 continue;
             }
-            if entry == "*" {
-                rules.push(BypassRule::All);
+            let (entry, port) = split_entry_port(entry);
+            let rule = if entry == "*" {
+                BypassRule::All
             } else if entry.eq_ignore_ascii_case("<local>") {
-                rules.push(BypassRule::SimpleHostnames);
+                BypassRule::SimpleHostnames
             } else if let Some(network) = parse_network(entry) {
-                rules.push(network);
+                network
+            } else if entry.contains('*') {
+                BypassRule::Glob(entry.to_ascii_lowercase())
             } else {
-                let entry = strip_entry_port(entry).to_ascii_lowercase();
-                let entry = entry
-                    .trim_start_matches("http://")
-                    .trim_start_matches("https://");
-                if entry.contains('*') {
-                    rules.push(BypassRule::Glob(entry.to_string()));
-                } else {
-                    rules.push(BypassRule::Domain(normalize_host(entry)));
-                }
-            }
+                BypassRule::Domain(normalize_host(entry))
+            };
+            rules.push(BypassEntry { rule, port });
         }
         Self { rules, subdomains }
     }
 
-    fn matches(&self, host: &str) -> bool {
+    fn matches(&self, host: &str, port: u16) -> bool {
         let host = normalize_host(host);
         let ip = host.parse::<IpAddr>().ok();
-        self.rules.iter().any(|rule| match rule {
-            BypassRule::All => true,
-            BypassRule::SimpleHostnames => ip.is_none() && !host.contains('.'),
-            BypassRule::Glob(pattern) => glob_matches(pattern, &host),
-            BypassRule::Domain(domain) => {
-                let domain = domain.trim_start_matches('.');
-                host == domain
-                    || ((self.subdomains || rule_had_leading_dot(rule))
-                        && host.ends_with(&format!(".{domain}")))
-            }
-            BypassRule::Network(network, prefix) => {
-                ip.is_some_and(|ip| ip_in_network(ip, *network, *prefix))
-            }
+        self.rules.iter().any(|entry| {
+            entry.port.is_none_or(|only| only == port)
+                && match &entry.rule {
+                    BypassRule::All => true,
+                    BypassRule::SimpleHostnames => ip.is_none() && !host.contains('.'),
+                    BypassRule::Glob(pattern) => glob_matches(pattern, &host),
+                    BypassRule::Domain(domain) => {
+                        let bare = domain.trim_start_matches('.');
+                        host == bare
+                            || ((self.subdomains || domain.starts_with('.'))
+                                && host.ends_with(&format!(".{bare}")))
+                    }
+                    BypassRule::Network(network, prefix) => {
+                        ip.is_some_and(|ip| ip_in_network(ip, *network, *prefix))
+                    }
+                }
         })
     }
 }
 
-fn rule_had_leading_dot(rule: &BypassRule) -> bool {
-    matches!(rule, BypassRule::Domain(domain) if domain.starts_with('.'))
-}
-
-fn strip_entry_port(entry: &str) -> &str {
-    // `host:port`, never an IPv6 literal (those have several colons).
+/// Splits `host:port`, `[v6]:port` and `[v6]`; bare IPv6 literals and CIDR
+/// ranges keep their colons.
+fn split_entry_port(entry: &str) -> (&str, Option<u16>) {
+    if let Some(rest) = entry.strip_prefix('[')
+        && let Some((host, tail)) = rest.split_once(']')
+    {
+        return (
+            host,
+            tail.strip_prefix(':').and_then(|port| port.parse().ok()),
+        );
+    }
     match entry.rsplit_once(':') {
-        Some((host, port)) if !host.contains(':') && port.chars().all(|c| c.is_ascii_digit()) => {
-            host
-        }
-        _ => entry,
+        Some((host, port)) if !host.contains(':') && !port.is_empty() => match port.parse() {
+            Ok(port) => (host, Some(port)),
+            Err(_) => (entry, None),
+        },
+        _ => (entry, None),
     }
 }
 
 fn parse_network(entry: &str) -> Option<BypassRule> {
-    let entry = entry.trim_start_matches('[').trim_end_matches(']');
     let (address, prefix) = match entry.split_once('/') {
         Some((address, prefix)) => (address, Some(prefix.parse::<u8>().ok()?)),
         None => (entry, None),
@@ -386,7 +394,9 @@ fn is_loopback_target(host: &str) -> bool {
     let host = normalize_host(host);
     host == "localhost"
         || host.ends_with(".localhost")
-        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
 // ---------------------------------------------------------------------------
@@ -400,8 +410,8 @@ struct StaticProxies {
 }
 
 impl StaticProxies {
-    fn route(&self, https: bool, host: &str) -> Route {
-        if self.bypass.matches(host) {
+    fn route(&self, https: bool, host: &str, port: u16) -> Route {
+        if self.bypass.matches(host, port) {
             return Route::Direct;
         }
         let endpoint = if https { &self.https } else { &self.http };
@@ -509,12 +519,17 @@ fn system_policy(env: &EnvProxies, os: &OsProxy, listen: Option<SocketAddr>) -> 
         }
         Ok(Some(endpoint))
     };
+    // ALL_PROXY only fills a scheme without its own proxy, so an unused
+    // value (often a SOCKS URL next to HTTP ones) does not matter.
     let parsed = (|| -> Result<_> {
-        Ok((
-            parse_env(&env.https)?,
-            parse_env(&env.http)?,
-            parse_env(&env.all)?,
-        ))
+        let https = parse_env(&env.https)?;
+        let http = parse_env(&env.http)?;
+        let all = if https.is_none() || http.is_none() {
+            parse_env(&env.all)?
+        } else {
+            None
+        };
+        Ok((https, http, all))
     })();
     let (https, http, all) = match parsed {
         Ok(parsed) => parsed,
@@ -573,15 +588,16 @@ fn os_policy(os: &OsProxy, listen: Option<SocketAddr>) -> (Policy, String) {
                 Err(error) => return unavailable(format!("Windows proxy {error:#}")),
             };
             if *auto_detect || config_url.is_some() {
-                let description = format!(
-                    "Windows automatic configuration ({}{}), else {}",
-                    if *auto_detect { "auto-detect" } else { "" },
-                    config_url
-                        .as_ref()
-                        .map(|_| { if *auto_detect { " + script" } else { "script" } })
-                        .unwrap_or_default(),
-                    describe_static(&fallback)
-                );
+                // A configured script that fails is an error; only WPAD
+                // finding nothing falls back to the static settings.
+                let description = if config_url.is_some() {
+                    "Windows automatic configuration script".to_string()
+                } else {
+                    format!(
+                        "Windows automatic proxy detection, else {}",
+                        describe_static(&fallback)
+                    )
+                };
                 return (
                     Policy::WindowsAuto {
                         auto_detect: *auto_detect,
@@ -718,7 +734,10 @@ fn macos_policy(scutil: &str, listen: Option<SocketAddr>) -> (Policy, String) {
     }
     let mut bypass = Bypass::parse(exceptions.iter().map(String::as_str), true);
     if enabled("ExcludeSimpleHostnames") {
-        bypass.rules.push(BypassRule::SimpleHostnames);
+        bypass.rules.push(BypassEntry {
+            rule: BypassRule::SimpleHostnames,
+            port: None,
+        });
     }
     let proxies = StaticProxies {
         https,
@@ -737,16 +756,24 @@ pub(crate) struct Snapshot {
     generation: u64,
     description: String,
     policy: Policy,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    listen: Option<SocketAddr>,
     #[cfg(target_os = "windows")]
     pac: windows::PacState,
 }
 
 impl Snapshot {
-    fn new(generation: u64, policy: Policy, description: String) -> Self {
+    fn new(
+        generation: u64,
+        policy: Policy,
+        description: String,
+        listen: Option<SocketAddr>,
+    ) -> Self {
         Self {
             generation,
             description,
             policy,
+            listen,
             #[cfg(target_os = "windows")]
             pac: windows::PacState::default(),
         }
@@ -754,7 +781,7 @@ impl Snapshot {
 
     #[cfg(test)]
     pub(crate) fn direct_for_tests() -> Arc<Self> {
-        Arc::new(Self::new(1, Policy::Direct, "direct".to_string()))
+        Arc::new(Self::new(1, Policy::Direct, "direct".to_string(), None))
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -781,26 +808,27 @@ impl Snapshot {
         }
         match &self.policy {
             Policy::Direct => Ok(Route::Direct),
-            Policy::Static(proxies) => Ok(proxies.route(https, host)),
+            Policy::Static(proxies) => Ok(proxies.route(https, host, port)),
             Policy::Unavailable(message) => bail!("upstream proxy unavailable: {message}"),
             #[cfg(target_os = "windows")]
             Policy::WindowsAuto {
                 auto_detect,
                 config_url,
                 fallback,
-            } => Ok(self.pac.route(
-                *auto_detect,
-                config_url.as_deref(),
-                fallback,
-                https,
-                host,
-                port,
-            )),
+            } => self
+                .pac
+                .route(
+                    *auto_detect,
+                    config_url.as_deref(),
+                    fallback,
+                    self.listen,
+                    https,
+                    host,
+                    port,
+                )
+                .map_err(|message| anyhow::anyhow!("upstream proxy unavailable: {message}")),
             #[cfg(not(target_os = "windows"))]
-            Policy::WindowsAuto { fallback, .. } => {
-                let _ = port;
-                Ok(fallback.route(https, host))
-            }
+            Policy::WindowsAuto { fallback, .. } => Ok(fallback.route(https, host, port)),
         }
     }
 
@@ -820,40 +848,119 @@ impl Snapshot {
             .context("proxy auto-configuration task failed")?
     }
 
-    /// Adds this snapshot's routing to an HTTP client. Fails closed when no
-    /// route can be determined.
-    pub(crate) fn apply(
-        self: &Arc<Self>,
-        builder: reqwest::ClientBuilder,
-    ) -> Result<reqwest::ClientBuilder> {
-        if let Some(message) = self.unavailable() {
-            bail!("upstream proxy unavailable: {message}");
-        }
-        if self.policy == Policy::Direct {
-            return Ok(builder.no_proxy());
-        }
-        let snapshot = Arc::clone(self);
-        // reqwest asks synchronously for every request it routes. Static
-        // policies answer from memory; Windows automatic configuration is
-        // cached per host, and long-running callers resolve the target with
-        // `route` first so this callback does not block on WinHTTP.
-        Ok(builder.proxy(reqwest::Proxy::custom(move |url| {
-            let host = url.host_str()?;
-            let port = url.port_or_known_default()?;
-            match snapshot.route_blocking(url.scheme() == "https", host, port) {
-                Ok(Route::Proxy(endpoint)) => endpoint.reqwest_url(),
-                _ => None,
-            }
-        })))
-    }
-
     /// Opens a TCP connection to `host:port`, through an HTTP CONNECT tunnel
-    /// when the route uses a proxy.
-    pub(crate) async fn connect(self: &Arc<Self>, host: &str, port: u16) -> Result<TcpStream> {
-        match self.route(true, host, port).await? {
+    /// when the route uses a proxy. `https` selects the HTTPS proxy setting
+    /// (CONNECT tunnels and `wss://`) rather than the plain HTTP one.
+    pub(crate) async fn connect(
+        self: &Arc<Self>,
+        https: bool,
+        host: &str,
+        port: u16,
+    ) -> Result<TcpStream> {
+        match self.route(https, host, port).await? {
             Route::Direct => connect_direct(host, port).await,
             Route::Proxy(endpoint) => open_tunnel(&endpoint, host, port).await,
         }
+    }
+}
+
+/// Configures `builder` for exactly one route. reqwest never evaluates a
+/// proxy itself: callers resolve the route first (off the async workers for
+/// Windows automatic configuration) and use one client per route, so a
+/// route change never reuses another route's pooled connection.
+pub(crate) fn client_builder_for_route(
+    builder: reqwest::ClientBuilder,
+    route: &Route,
+) -> Result<reqwest::ClientBuilder> {
+    Ok(match route {
+        Route::Direct => builder.no_proxy(),
+        Route::Proxy(endpoint) => {
+            let mut proxy = reqwest::Proxy::all(format!("http://{}", endpoint.authority()))
+                .context("invalid upstream proxy")?;
+            // The exact header used for CONNECT tunnels. reqwest's
+            // `basic_auth` would route the decoded credentials through URL
+            // userinfo and decode them a second time.
+            if let Some(authorization) = endpoint.proxy_authorization() {
+                let mut header = reqwest::header::HeaderValue::from_str(&authorization)
+                    .context("invalid upstream proxy credentials")?;
+                header.set_sensitive(true);
+                proxy = proxy.custom_http_auth(header);
+            }
+            builder.proxy(proxy)
+        }
+    })
+}
+
+/// Route for an absolute URL; blocking for Windows automatic configuration.
+pub(crate) fn route_for_url_blocking(snapshot: &Snapshot, url: &str) -> Result<Route> {
+    let (https, host, port) = url_target(url)?;
+    snapshot.route_blocking(https, &host, port)
+}
+
+fn url_target(url: &str) -> Result<(bool, String, u16)> {
+    let url = url::Url::parse(url).context("invalid upstream URL")?;
+    let host = url
+        .host_str()
+        .context("upstream URL has no host")?
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .context("upstream URL has no port")?;
+    Ok((matches!(url.scheme(), "https" | "wss"), host, port))
+}
+
+/// HTTP clients of a long-running process, one per (policy generation,
+/// route).
+type ConfigureClient = Box<dyn Fn() -> reqwest::ClientBuilder + Send + Sync>;
+
+pub(crate) struct HttpClients {
+    upstream: Arc<UpstreamProxy>,
+    configure: ConfigureClient,
+    cache: Mutex<(u64, HashMap<Route, reqwest::Client>)>,
+}
+
+impl HttpClients {
+    pub(crate) fn new(
+        upstream: Arc<UpstreamProxy>,
+        configure: impl Fn() -> reqwest::ClientBuilder + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            upstream,
+            configure: Box::new(configure),
+            cache: Mutex::new((0, HashMap::new())),
+        }
+    }
+
+    pub(crate) fn upstream(&self) -> &Arc<UpstreamProxy> {
+        &self.upstream
+    }
+
+    /// Client for a request to `url`; fails instead of going direct when
+    /// the configured proxy cannot be used.
+    pub(crate) async fn for_url(&self, url: &str) -> Result<reqwest::Client> {
+        let (https, host, port) = url_target(url)?;
+        let snapshot = self.upstream.snapshot();
+        let route = snapshot.route(https, &host, port).await?;
+        self.client(snapshot.generation(), route)
+    }
+
+    fn client(&self, generation: u64, route: Route) -> Result<reqwest::Client> {
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if generation > cache.0 {
+            *cache = (generation, HashMap::new());
+        }
+        if generation == cache.0
+            && let Some(client) = cache.1.get(&route)
+        {
+            return Ok(client.clone());
+        }
+        let client = client_builder_for_route((self.configure)(), &route)?
+            .build()
+            .context("failed to build upstream HTTP client")?;
+        if generation == cache.0 {
+            cache.1.insert(route, client.clone());
+        }
+        Ok(client)
     }
 }
 
@@ -894,6 +1001,7 @@ impl UpstreamProxy {
                 0,
                 Policy::Unavailable("not resolved yet".to_string()),
                 "not resolved yet".to_string(),
+                listen,
             ))),
             last_inputs: Mutex::new(None),
         };
@@ -930,7 +1038,7 @@ impl UpstreamProxy {
         }
         let (policy, description) = policy_from_inputs(&inputs, self.listen);
         let generation = self.snapshot().generation + 1;
-        let snapshot = Arc::new(Snapshot::new(generation, policy, description));
+        let snapshot = Arc::new(Snapshot::new(generation, policy, description, self.listen));
         *last = Some(inputs);
         *self.current.write().unwrap_or_else(|e| e.into_inner()) = snapshot;
         true
@@ -1007,6 +1115,7 @@ fn read_os_proxy() -> OsProxy {
 
 /// Direct TCP connection, trying every resolved address in order.
 pub(crate) async fn connect_direct(host: &str, port: u16) -> Result<TcpStream> {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
     let addrs = lookup_host((host, port))
         .await
         .with_context(|| format!("failed to resolve {host}:{port}"))?
@@ -1110,66 +1219,112 @@ fn parse_status(head: &[u8]) -> Result<u16> {
 #[cfg(target_os = "windows")]
 mod windows {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
     use windows_sys::Win32::Foundation::{GetLastError, GlobalFree};
     use windows_sys::Win32::Networking::WinHttp::*;
 
     type CacheKey = (bool, String, u16);
+    type CacheEntry = (Instant, Result<Route, String>);
+    const PAC_CACHE_LIMIT: usize = 1024;
+    // After WPAD finds nothing, retry discovery after this long (e.g. once a
+    // laptop joins the corporate VPN) instead of never.
+    const AUTO_DETECT_RETRY: Duration = Duration::from_secs(300);
 
     #[derive(Default)]
     pub(super) struct PacState {
-        cache: Mutex<HashMap<CacheKey, (Instant, Route)>>,
-        /// WPAD discovery failed once for this snapshot; later lookups use
-        /// only the script URL (if any) and the static fallback.
-        auto_detect_failed: AtomicBool,
+        cache: Mutex<HashMap<CacheKey, CacheEntry>>,
+        auto_detect_failed_at: Mutex<Option<Instant>>,
     }
 
     impl PacState {
+        /// Route from WinHTTP automatic configuration. A script that cannot
+        /// be fetched or evaluated, or returns an unusable proxy, is an
+        /// error, never a direct connection. Only WPAD finding no
+        /// configuration at all falls back to the static settings.
+        #[allow(clippy::too_many_arguments)]
         pub(super) fn route(
             &self,
             auto_detect: bool,
             config_url: Option<&str>,
             fallback: &StaticProxies,
+            listen: Option<SocketAddr>,
             https: bool,
             host: &str,
             port: u16,
-        ) -> Route {
+        ) -> Result<Route, String> {
             let key = (https, normalize_host(host), port);
             if let Some((at, route)) = self
                 .cache
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&key)
-                && at.elapsed() < PAC_CACHE_TTL
+                && at.elapsed()
+                    < if route.is_ok() {
+                        PAC_CACHE_TTL
+                    } else {
+                        PAC_ERROR_TTL
+                    }
             {
                 return route.clone();
             }
             // Like WinINet, the bypass list also applies with auto-config.
-            let route = if fallback.bypass.matches(host) {
-                Route::Direct
+            let route = if fallback.bypass.matches(host, port) {
+                Ok(Route::Direct)
             } else {
-                let auto_detect = auto_detect && !self.auto_detect_failed.load(Ordering::Relaxed);
-                let scheme = if https { "https" } else { "http" };
-                let url = format!("{scheme}://{}/", host_port(&normalize_host(host), port));
-                match get_proxy_for_url(&url, auto_detect, config_url) {
-                    Ok(Some(list)) => first_proxy(&list)
-                        .map(Route::Proxy)
-                        .unwrap_or_else(|| fallback.route(https, host)),
-                    Ok(None) => Route::Direct,
-                    Err(code) => {
-                        if auto_detect && code == ERROR_WINHTTP_AUTODETECTION_FAILED {
-                            self.auto_detect_failed.store(true, Ordering::Relaxed);
-                        }
-                        fallback.route(https, host)
-                    }
-                }
+                self.evaluate(auto_detect, config_url, fallback, listen, https, host, port)
             };
-            self.cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(key, (Instant::now(), route.clone()));
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.len() >= PAC_CACHE_LIMIT {
+                cache.clear();
+            }
+            cache.insert(key, (Instant::now(), route.clone()));
             route
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn evaluate(
+            &self,
+            auto_detect: bool,
+            config_url: Option<&str>,
+            fallback: &StaticProxies,
+            listen: Option<SocketAddr>,
+            https: bool,
+            host: &str,
+            port: u16,
+        ) -> Result<Route, String> {
+            let auto_detect = auto_detect
+                && self
+                    .auto_detect_failed_at
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_none_or(|at| at.elapsed() >= AUTO_DETECT_RETRY);
+            if !auto_detect && config_url.is_none() {
+                return Ok(fallback.route(https, host, port));
+            }
+            let scheme = if https { "https" } else { "http" };
+            let url = format!("{scheme}://{}/", host_port(&normalize_host(host), port));
+            match get_proxy_for_url(&url, auto_detect, config_url) {
+                Ok(None) => Ok(Route::Direct),
+                Ok(Some(list)) => match first_proxy(&list) {
+                    Some(endpoint) if endpoint.is_listener(listen) => {
+                        Err("proxy auto-configuration returned this SAIAI proxy itself".to_string())
+                    }
+                    Some(endpoint) => Ok(Route::Proxy(endpoint)),
+                    None => {
+                        Err("proxy auto-configuration returned no usable HTTP proxy".to_string())
+                    }
+                },
+                Err(ERROR_WINHTTP_AUTODETECTION_FAILED) if config_url.is_none() => {
+                    *self
+                        .auto_detect_failed_at
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+                    Ok(fallback.route(https, host, port))
+                }
+                Err(code) => Err(format!(
+                    "proxy auto-configuration failed (WinHTTP error {code})"
+                )),
+            }
         }
     }
 
@@ -1178,9 +1333,12 @@ mod windows {
         list.split([';', ' '])
             .map(str::trim)
             .filter(|entry| !entry.is_empty())
-            .find_map(|entry| {
-                let entry = entry.split_once('=').map_or(entry, |(_, value)| value);
-                Endpoint::parse(entry).ok()
+            .find_map(|entry| match entry.split_once('=') {
+                Some((scheme, value)) if !scheme.eq_ignore_ascii_case("socks") => {
+                    Endpoint::parse(value).ok()
+                }
+                Some(_) => None,
+                None => Endpoint::parse(entry).ok(),
             })
     }
 
@@ -1324,7 +1482,7 @@ mod tests {
     }
 
     fn route(policy: &Policy, https: bool, host: &str) -> Route {
-        Snapshot::new(1, policy.clone(), String::new())
+        Snapshot::new(1, policy.clone(), String::new(), listen())
             .route_blocking(https, host, 443)
             .unwrap()
     }
@@ -1350,8 +1508,6 @@ mod tests {
                 base64::engine::general_purpose::STANDARD.encode("us@er:p:ss")
             )
         );
-        let url = endpoint.reqwest_url().unwrap();
-        assert_eq!(url.username(), "us%40er");
 
         assert_eq!(
             Endpoint::parse("127.0.0.1:7890").unwrap().authority(),
@@ -1466,6 +1622,33 @@ mod tests {
             proxy("127.0.0.1:7890")
         );
 
+        // An unused SOCKS ALL_PROXY next to HTTP proxies is common and ignored.
+        let (policy, _) = system(
+            env(&[
+                ("HTTPS_PROXY", "http://127.0.0.1:7890"),
+                ("HTTP_PROXY", "http://127.0.0.1:7890"),
+                ("ALL_PROXY", "socks5://127.0.0.1:7891"),
+            ]),
+            OsProxy::None,
+        );
+        assert_eq!(
+            route(&policy, true, "api.saiai.top"),
+            proxy("127.0.0.1:7890")
+        );
+        let (policy, _) = system(
+            env(&[
+                ("HTTPS_PROXY", "http://127.0.0.1:7890"),
+                ("ALL_PROXY", "socks5://127.0.0.1:7891"),
+            ]),
+            OsProxy::None,
+        );
+        assert!(matches!(policy, Policy::Unavailable(_)));
+        assert!(
+            Endpoint::parse("http://[::ffff:127.0.0.1]:19908")
+                .unwrap()
+                .is_listener(listen())
+        );
+
         let (policy, _) = system(env(&[("ALL_PROXY", "http://corp:8080")]), OsProxy::None);
         assert_eq!(route(&policy, false, "example.com"), proxy("corp:8080"));
 
@@ -1483,34 +1666,40 @@ mod tests {
             windows_static_proxies(Some(proxy), bypass, listen()).unwrap()
         };
         let all = routes("127.0.0.1:7890", Some("localhost;127.*;10.*;<local>"));
-        assert_eq!(all.route(true, "api.saiai.top"), proxy("127.0.0.1:7890"));
-        assert_eq!(all.route(false, "api.saiai.top"), proxy("127.0.0.1:7890"));
-        assert_eq!(all.route(true, "10.2.3.4"), Route::Direct);
-        assert_eq!(all.route(true, "intranet"), Route::Direct);
         assert_eq!(
-            all.route(true, "sub.localhost.example"),
+            all.route(true, "api.saiai.top", 443),
+            proxy("127.0.0.1:7890")
+        );
+        assert_eq!(
+            all.route(false, "api.saiai.top", 443),
+            proxy("127.0.0.1:7890")
+        );
+        assert_eq!(all.route(true, "10.2.3.4", 443), Route::Direct);
+        assert_eq!(all.route(true, "intranet", 443), Route::Direct);
+        assert_eq!(
+            all.route(true, "sub.localhost.example", 443),
             proxy("127.0.0.1:7890")
         );
 
         let split = routes("https=secure:443;http=plain:80;ftp=f:21", None);
-        assert_eq!(split.route(true, "a.com"), proxy("secure:443"));
-        assert_eq!(split.route(false, "a.com"), proxy("plain:80"));
+        assert_eq!(split.route(true, "a.com", 443), proxy("secure:443"));
+        assert_eq!(split.route(false, "a.com", 443), proxy("plain:80"));
         let http_only = routes("http=plain:80", None);
-        assert_eq!(http_only.route(true, "a.com"), Route::Direct);
+        assert_eq!(http_only.route(true, "a.com", 443), Route::Direct);
         let reversed = routes(" https=b:2 ; http=a:1 ", None);
-        assert_eq!(reversed.route(true, "a.com"), proxy("b:2"));
+        assert_eq!(reversed.route(true, "a.com", 443), proxy("b:2"));
 
         assert!(windows_static_proxies(Some("socks=127.0.0.1:1080"), None, listen()).is_err());
         assert_eq!(
-            routes("socks=s:1;https=h:2", None).route(true, "a.com"),
+            routes("socks=s:1;https=h:2", None).route(true, "a.com", 443),
             proxy("h:2")
         );
         assert!(windows_static_proxies(Some("http=:80"), None, listen()).is_err());
 
         let exact = routes("p:1", Some("example.com;*.corp.com"));
-        assert_eq!(exact.route(true, "example.com"), Route::Direct);
-        assert_eq!(exact.route(true, "www.example.com"), proxy("p:1"));
-        assert_eq!(exact.route(true, "a.corp.com"), Route::Direct);
+        assert_eq!(exact.route(true, "example.com", 443), Route::Direct);
+        assert_eq!(exact.route(true, "www.example.com", 443), proxy("p:1"));
+        assert_eq!(exact.route(true, "a.corp.com", 443), Route::Direct);
     }
 
     #[test]
@@ -1525,7 +1714,10 @@ mod tests {
             listen(),
         );
         assert!(matches!(policy, Policy::WindowsAuto { .. }), "{policy:?}");
-        assert!(description.contains("auto-detect"), "{description}");
+        assert!(
+            description.contains("detection, else https"),
+            "{description}"
+        );
     }
 
     #[test]
@@ -1566,23 +1758,28 @@ mod tests {
             ".corp.com,exact.org,10.0.0.0/8,fc00::/7,*.svc.local,host.with.port:8443,*".split(','),
             true,
         );
-        assert!(bypass.matches("anything"));
+        assert!(bypass.matches("anything", 443));
         let bypass = Bypass::parse(
             ".corp.com,exact.org,10.0.0.0/8,fc00::/7,*.svc.local,host.with.port:8443".split(','),
             true,
         );
-        assert!(bypass.matches("a.corp.com"));
-        assert!(bypass.matches("corp.com"));
-        assert!(!bypass.matches("evilcorp.com"));
-        assert!(bypass.matches("exact.org"));
-        assert!(bypass.matches("sub.exact.org"));
-        assert!(!bypass.matches("notexact.org"));
-        assert!(bypass.matches("10.255.0.1"));
-        assert!(!bypass.matches("11.0.0.1"));
-        assert!(bypass.matches("[fd00::1]"));
-        assert!(bypass.matches("a.svc.local"));
-        assert!(bypass.matches("host.with.port"));
-        assert!(bypass.matches("EXACT.ORG."));
+        assert!(bypass.matches("a.corp.com", 443));
+        assert!(bypass.matches("corp.com", 443));
+        assert!(!bypass.matches("evilcorp.com", 443));
+        assert!(bypass.matches("exact.org", 443));
+        assert!(bypass.matches("sub.exact.org", 443));
+        assert!(!bypass.matches("notexact.org", 443));
+        assert!(bypass.matches("10.255.0.1", 443));
+        assert!(!bypass.matches("11.0.0.1", 443));
+        assert!(bypass.matches("[fd00::1]", 443));
+        assert!(bypass.matches("a.svc.local", 443));
+        assert!(bypass.matches("host.with.port", 8443));
+        assert!(!bypass.matches("host.with.port", 443));
+        let ipv6_port = Bypass::parse(["[fd00::1]:8443", "[fd00::2]"], false);
+        assert!(ipv6_port.matches("fd00::1", 8443));
+        assert!(!ipv6_port.matches("fd00::1", 443));
+        assert!(ipv6_port.matches("[fd00::2]", 443));
+        assert!(bypass.matches("EXACT.ORG.", 443));
         assert!(glob_matches("*.example.*", "a.example.com"));
         assert!(!glob_matches("a*b", "ac"));
     }
@@ -1683,10 +1880,14 @@ mod tests {
                 bypass: Bypass::default(),
             }),
             String::new(),
+            None,
         ));
         let error = format!(
             "{:#}",
-            snapshot.connect("api.saiai.top", 443).await.unwrap_err()
+            snapshot
+                .connect(true, "api.saiai.top", 443)
+                .await
+                .unwrap_err()
         );
         assert!(error.contains("unreachable"), "{error}");
 
@@ -1694,9 +1895,15 @@ mod tests {
             1,
             Policy::Unavailable("SOCKS".to_string()),
             String::new(),
+            None,
         ));
-        assert!(unavailable.connect("api.saiai.top", 443).await.is_err());
-        assert!(unavailable.apply(reqwest::Client::builder()).is_err());
+        assert!(
+            unavailable
+                .connect(true, "api.saiai.top", 443)
+                .await
+                .is_err()
+        );
+        assert!(route_for_url_blocking(&unavailable, "https://api.saiai.top").is_err());
     }
 
     #[tokio::test]
@@ -1714,20 +1921,15 @@ mod tests {
                 .unwrap();
             String::from_utf8(head).unwrap()
         });
-        let snapshot = Arc::new(Snapshot::new(
-            1,
-            Policy::Static(StaticProxies {
-                http: Some(Endpoint::parse(&format!("http://u:p@127.0.0.1:{port}")).unwrap()),
-                https: None,
-                bypass: Bypass::default(),
-            }),
-            String::new(),
+        // `%2541` is a literal `%41` in the password; reqwest must not
+        // decode it a second time.
+        let upstream = Arc::new(UpstreamProxy::new(
+            Some(&format!("http://u:p%2541@127.0.0.1:{port}")),
+            listen(),
+            Vec::new(),
         ));
-        let client = snapshot
-            .apply(reqwest::Client::builder())
-            .unwrap()
-            .build()
-            .unwrap();
+        let clients = HttpClients::new(upstream, reqwest::Client::builder);
+        let client = clients.for_url("http://upstream.example/x").await.unwrap();
         let response = client
             .get("http://upstream.example/x")
             .send()
@@ -1739,9 +1941,41 @@ mod tests {
             head.starts_with("GET http://upstream.example/x HTTP/1.1"),
             "{head}"
         );
+        let expected = format!(
+            "proxy-authorization: basic {}",
+            base64::engine::general_purpose::STANDARD.encode("u:p%41")
+        );
         assert!(
             head.to_ascii_lowercase()
-                .contains("proxy-authorization: basic"),
+                .contains(&expected.to_ascii_lowercase()),
+            "{head}"
+        );
+
+        // HTTPS goes through a CONNECT tunnel with the same credentials.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let head = read_response_head(&mut socket).await.unwrap();
+            let _ = socket.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await;
+            String::from_utf8(head).unwrap()
+        });
+        let upstream = Arc::new(UpstreamProxy::new(
+            Some(&format!("http://u:p%2541@127.0.0.1:{port}")),
+            listen(),
+            Vec::new(),
+        ));
+        let clients = HttpClients::new(upstream, reqwest::Client::builder);
+        let client = clients.for_url("https://api.saiai.top/x").await.unwrap();
+        assert!(client.get("https://api.saiai.top/x").send().await.is_err());
+        let head = server.await.unwrap();
+        assert!(
+            head.starts_with("CONNECT api.saiai.top:443 HTTP/1.1"),
+            "{head}"
+        );
+        assert!(
+            head.to_ascii_lowercase()
+                .contains(&expected.to_ascii_lowercase()),
             "{head}"
         );
     }

@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
-use reqwest::{Client, Method, StatusCode};
+use reqwest::{Method, StatusCode};
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -33,7 +33,7 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use crate::client_proof::{self, ClientProof};
-use crate::upstream_proxy::{Snapshot, UpstreamProxy};
+use crate::upstream_proxy::{HttpClients, Snapshot, UpstreamProxy};
 use crate::upstream_tls;
 
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
@@ -188,10 +188,8 @@ struct State {
     verbose: bool,
     chatgpt_chat_passthrough: bool,
     desktop_features: DesktopFeatures,
-    upstream: Arc<UpstreamProxy>,
-    // Rebuilt for each upstream proxy generation so pooled connections never
-    // outlive a route change.
-    http_client: Mutex<Option<(u64, Client)>>,
+    // Gateway and plain-HTTP egress clients, one per upstream route.
+    http: Arc<HttpClients>,
     websocket_tls: rustls::ClientConfig,
     certs: Mutex<HashMap<String, ManagedCertificate>>,
     openai_trace: Option<Arc<OpenAITrace>>,
@@ -324,9 +322,9 @@ pub async fn run(cfg: Config) -> Result<()> {
     let state = Arc::new(State::new(cfg)?);
     eprintln!(
         "upstream proxy: {}",
-        state.upstream.snapshot().description()
+        state.http.upstream().snapshot().description()
     );
-    state.upstream.spawn_refresh();
+    state.http.upstream().spawn_refresh();
     state.spawn_client_proof_enrollment();
     let listener = TcpListener::bind(&state.listen)
         .await
@@ -415,6 +413,15 @@ impl State {
             Some(listen_addr),
             gateways,
         ));
+        let installation_ca = cfg.ca_cert_pem.clone();
+        let http = Arc::new(HttpClients::new(upstream, move || {
+            upstream_tls::upstream_http_client_builder(&installation_ca)
+                .redirect(reqwest::redirect::Policy::none())
+                .pool_idle_timeout(Duration::from_secs(90))
+                // Covers the TCP connect, a proxy CONNECT and TLS, not the
+                // streamed response.
+                .connect_timeout(Duration::from_secs(30))
+        }));
         let websocket_tls = upstream_tls::upstream_websocket_tls_config(&cfg.ca_cert_pem);
         let openai_trace = OpenAITrace::from_env()?;
         let chatgpt_chat_passthrough = match env::var(CHATGPT_CHAT_PASSTHROUGH_ENV).ok().as_deref()
@@ -442,50 +449,13 @@ impl State {
             verbose,
             chatgpt_chat_passthrough,
             desktop_features: DesktopFeatures { browser_use },
-            upstream,
-            http_client: Mutex::new(None),
+            http,
             websocket_tls,
             certs: Mutex::new(HashMap::new()),
             openai_trace,
             client_proof_dir: cfg.client_proof_dir,
             client_proof: std::sync::OnceLock::new(),
         })
-    }
-
-    /// HTTP client for a request to `url`. The route is resolved first off
-    /// the async workers (Windows automatic configuration may block), so
-    /// reqwest's synchronous proxy callback only reads the cached route.
-    /// Fails when the configured upstream proxy cannot be used.
-    async fn http_client_for(&self, url: &str) -> Result<Client> {
-        let snapshot = self.upstream.snapshot();
-        if let Ok(url) = Url::parse(url)
-            && let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default())
-        {
-            snapshot.route(url.scheme() == "https", host, port).await?;
-        }
-        self.client_for(&snapshot)
-    }
-
-    fn http_client(&self) -> Result<Client> {
-        self.client_for(&self.upstream.snapshot())
-    }
-
-    fn client_for(&self, snapshot: &Arc<Snapshot>) -> Result<Client> {
-        let mut cached = self.http_client.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((generation, client)) = cached.as_ref()
-            && *generation == snapshot.generation()
-        {
-            return Ok(client.clone());
-        }
-        let builder = upstream_tls::upstream_http_client_builder(&self.ca_cert_pem)
-            .redirect(reqwest::redirect::Policy::none())
-            .pool_idle_timeout(Duration::from_secs(90));
-        let client = snapshot
-            .apply(builder)?
-            .build()
-            .context("failed to build upstream HTTP client")?;
-        *cached = Some((snapshot.generation(), client.clone()));
-        Ok(client)
     }
 
     /// Loads the device key and enrolls with each Gateway used by the Claude
@@ -533,15 +503,22 @@ impl State {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let Ok(client) = self.http_client() else {
-            return;
-        };
-        runtime.spawn(Arc::clone(proof).enroll(
-            client,
-            gateway.to_string(),
-            Zeroizing::new(api_key.to_string()),
-            &client_proof::ENROLL_BACKOFF,
-        ));
+        let http = Arc::clone(&self.http);
+        let proof = Arc::clone(proof);
+        let gateway = gateway.to_string();
+        let api_key = Zeroizing::new(api_key.to_string());
+        runtime.spawn(async move {
+            match http.for_url(&gateway).await {
+                Ok(client) => {
+                    proof
+                        .enroll(client, gateway, api_key, &client_proof::ENROLL_BACKOFF)
+                        .await;
+                }
+                Err(error) => {
+                    eprintln!("client proof: enrollment skipped: {error:#}");
+                }
+            }
+        });
     }
 
     /// Proof header for one Gateway request attempt; `bearer` is the exact
@@ -858,7 +835,7 @@ async fn handle_client(
         }
         serve_managed_tls(state, stream, &connect.host).await
     } else {
-        let upstream = state.upstream.snapshot();
+        let upstream = state.http.upstream().snapshot();
         serve_direct_tunnel(
             stream,
             &upstream,
@@ -986,7 +963,7 @@ async fn serve_http_proxy_request(
     }
     let managed_host = is_managed_host(&host);
     let nominated = connection_nominated_headers(&request.headers);
-    let client = match state.http_client_for(target.as_str()).await {
+    let client = match state.http.for_url(target.as_str()).await {
         Ok(client) => client,
         Err(err) => {
             let _ = write_plain_error(&mut stream, StatusCode::BAD_GATEWAY).await;
@@ -1373,9 +1350,14 @@ async fn serve_openai_websocket(
         .port_or_known_default()
         .context("Gateway WebSocket URL has no port")?;
     let upstream_tcp = match state
-        .upstream
+        .http
+        .upstream()
         .snapshot()
-        .connect(&websocket_host, websocket_port)
+        .connect(
+            upstream_url.scheme() == "wss",
+            &websocket_host,
+            websocket_port,
+        )
         .await
     {
         Ok(stream) => stream,
@@ -1824,7 +1806,7 @@ where
     let upstream_url = state.upstream_url(&request.target, route)?;
     let method = Method::from_bytes(request.method.as_bytes())
         .with_context(|| format!("unsupported HTTP method {}", request.method))?;
-    let client = state.http_client_for(upstream_url.as_str()).await?;
+    let client = state.http.for_url(upstream_url.as_str()).await?;
     let mut builder = client.request(method, &upstream_url);
 
     let mut has_authorization = false;
@@ -3313,7 +3295,7 @@ async fn connect_passthrough_target(
     if is_managed_host(host) && port == 443 {
         bail!("managed host must use local MITM route");
     }
-    upstream.connect(host, port).await
+    upstream.connect(true, host, port).await
 }
 
 fn build_leaf_server_config(
