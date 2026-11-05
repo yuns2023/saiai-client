@@ -833,9 +833,10 @@ impl Snapshot {
             return Ok(builder.no_proxy());
         }
         let snapshot = Arc::clone(self);
-        // reqwest asks for every request it routes. Static policies answer
-        // from memory; Windows automatic configuration is cached per host
-        // and prewarmed for the Gateways when a snapshot is published.
+        // reqwest asks synchronously for every request it routes. Static
+        // policies answer from memory; Windows automatic configuration is
+        // cached per host, and long-running callers resolve the target with
+        // `route` first so this callback does not block on WinHTTP.
         Ok(builder.proxy(reqwest::Proxy::custom(move |url| {
             let host = url.host_str()?;
             let port = url.port_or_known_default()?;
@@ -930,27 +931,41 @@ impl UpstreamProxy {
         let (policy, description) = policy_from_inputs(&inputs, self.listen);
         let generation = self.snapshot().generation + 1;
         let snapshot = Arc::new(Snapshot::new(generation, policy, description));
-        #[cfg(target_os = "windows")]
-        for (host, port) in &self.prewarm {
-            let _ = snapshot.route_blocking(true, host, *port);
-        }
-        #[cfg(not(target_os = "windows"))]
-        let _ = &self.prewarm;
         *last = Some(inputs);
         *self.current.write().unwrap_or_else(|e| e.into_inner()) = snapshot;
         true
+    }
+
+    /// Resolves the Gateway origins once per snapshot so Windows automatic
+    /// configuration (WPAD discovery can take seconds) is cached before the
+    /// first request. Blocking; never on the startup path.
+    fn prewarm(&self) {
+        let snapshot = self.snapshot();
+        for (host, port) in &self.prewarm {
+            let _ = snapshot.route_blocking(true, host, *port);
+        }
     }
 
     /// Keeps the snapshot current for a long-running proxy process.
     pub(crate) fn spawn_refresh(self: &Arc<Self>) {
         let proxy = Arc::clone(self);
         tokio::spawn(async move {
+            let warming = Arc::clone(&proxy);
+            let _ = tokio::task::spawn_blocking(move || warming.prewarm()).await;
             let mut interval = tokio::time::interval(REFRESH_INTERVAL);
             interval.tick().await;
             loop {
                 interval.tick().await;
                 let refreshing = Arc::clone(&proxy);
-                if let Ok(true) = tokio::task::spawn_blocking(move || refreshing.refresh()).await {
+                let changed = tokio::task::spawn_blocking(move || {
+                    let changed = refreshing.refresh();
+                    if changed {
+                        refreshing.prewarm();
+                    }
+                    changed
+                })
+                .await;
+                if let Ok(true) = changed {
                     eprintln!("upstream proxy: {}", proxy.snapshot().description());
                 }
             }

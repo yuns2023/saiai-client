@@ -452,10 +452,25 @@ impl State {
         })
     }
 
-    /// HTTP client for the current upstream proxy generation. Fails when the
-    /// configured upstream proxy cannot be used.
-    fn http_client(&self) -> Result<Client> {
+    /// HTTP client for a request to `url`. The route is resolved first off
+    /// the async workers (Windows automatic configuration may block), so
+    /// reqwest's synchronous proxy callback only reads the cached route.
+    /// Fails when the configured upstream proxy cannot be used.
+    async fn http_client_for(&self, url: &str) -> Result<Client> {
         let snapshot = self.upstream.snapshot();
+        if let Ok(url) = Url::parse(url)
+            && let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default())
+        {
+            snapshot.route(url.scheme() == "https", host, port).await?;
+        }
+        self.client_for(&snapshot)
+    }
+
+    fn http_client(&self) -> Result<Client> {
+        self.client_for(&self.upstream.snapshot())
+    }
+
+    fn client_for(&self, snapshot: &Arc<Snapshot>) -> Result<Client> {
         let mut cached = self.http_client.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((generation, client)) = cached.as_ref()
             && *generation == snapshot.generation()
@@ -971,7 +986,7 @@ async fn serve_http_proxy_request(
     }
     let managed_host = is_managed_host(&host);
     let nominated = connection_nominated_headers(&request.headers);
-    let client = match state.http_client() {
+    let client = match state.http_client_for(target.as_str()).await {
         Ok(client) => client,
         Err(err) => {
             let _ = write_plain_error(&mut stream, StatusCode::BAD_GATEWAY).await;
@@ -1809,7 +1824,7 @@ where
     let upstream_url = state.upstream_url(&request.target, route)?;
     let method = Method::from_bytes(request.method.as_bytes())
         .with_context(|| format!("unsupported HTTP method {}", request.method))?;
-    let client = state.http_client()?;
+    let client = state.http_client_for(upstream_url.as_str()).await?;
     let mut builder = client.request(method, &upstream_url);
 
     let mut has_authorization = false;
