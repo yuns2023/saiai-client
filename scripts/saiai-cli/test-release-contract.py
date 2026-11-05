@@ -15,6 +15,21 @@ VERIFIER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(VERIFIER)
 
 
+class CredentialScanTests(unittest.TestCase):
+    def test_snake_case_identifiers_are_not_credentials(self) -> None:
+        for identifier in ("use_authority_key_identifier_extension", "key_matches_certificate"):
+            for match in VERIFIER.CREDENTIAL_PATTERN.findall(identifier):
+                self.assertFalse(VERIFIER.is_possible_credential(match), match)
+
+    def test_key_shaped_values_are_credentials(self) -> None:
+        # Built by concatenation so this file does not trip the scan itself.
+        for value in ("sk-ant-" + "api03-AbCdEf0123456789xyz", "sk_live_" + "0123456789abcdefgh", "key-" + "ABCDEFGHIJKLMNOPQR"):
+            matches = VERIFIER.CREDENTIAL_PATTERN.findall(value)
+            self.assertTrue(matches, value)
+            self.assertTrue(all(VERIFIER.is_possible_credential(match) for match in matches), value)
+        self.assertFalse(VERIFIER.is_possible_credential("sk-test-0123456789abcdefgh"))
+
+
 class OptionalClaudeContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.main = VERIFIER.text("tools/saiai-cli/src/main.rs")
