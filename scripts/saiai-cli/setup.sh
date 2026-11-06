@@ -42,10 +42,49 @@ sha256_file() {
   fi
 }
 
+# Pick a JSON reader: sets json_tool to python, node, plutil or empty, and
+# python_command for python. On macOS without the Command Line Tools,
+# /usr/bin/python3 is a stub that opens an install dialog instead of running,
+# so it is skipped there; plutil ships with every macOS.
+select_json_tool() {
+  local name candidate
+  json_tool=""
+  python_command=""
+  for name in python3 python; do
+    candidate="$(command -v "${name}" 2>/dev/null)" || continue
+    case "${candidate}" in
+      /usr/bin/*)
+        if [ "$(uname -s)" = "Darwin" ] && ! xcode-select -p >/dev/null 2>&1; then
+          continue
+        fi
+        ;;
+    esac
+    json_tool="python"
+    python_command="${candidate}"
+    return 0
+  done
+  if command -v node >/dev/null 2>&1; then
+    json_tool="node"
+  elif [ "$(uname -s)" = "Darwin" ] && command -v plutil >/dev/null 2>&1; then
+    json_tool="plutil"
+  fi
+}
+
+# Print the scalar at key path $1 of JSON file $2 with plutil, failing unless
+# its type is $3 (string, integer, ...). plutil reports a missing key on
+# stdout, so the value is printed only on success.
+plutil_value() {
+  local type value
+  type="$(plutil -type "$1" "$2" 2>/dev/null)" || return 1
+  [ "${type}" = "$3" ] || return 1
+  value="$(plutil -extract "$1" raw -o - "$2" 2>/dev/null)" || return 1
+  printf '%s\n' "${value}"
+}
+
 # Validate the release manifest inside directory $1. Sets asset,
 # expected_sha256, expected_size and release_version.
 fetch_release_metadata() {
-  local work="$1" platform architecture python_command
+  local work="$1" platform architecture json_tool python_command
   case "$(uname -s)" in
     Linux) platform="linux" ;;
     Darwin) platform="macos" ;;
@@ -71,15 +110,9 @@ fetch_release_metadata() {
   echo "Checking SAIAI client release metadata..." >&2
   curl -fsSL --proto '=https,file,http' -o "${manifest_path}" "${DOWNLOAD_BASE}/manifest.json"
 
-  if command -v python3 >/dev/null 2>&1; then
-    python_command="$(command -v python3)"
-  elif command -v python >/dev/null 2>&1; then
-    python_command="$(command -v python)"
-  else
-    python_command=""
-  fi
+  select_json_tool
 
-  if [ -n "${python_command}" ]; then
+  if [ "${json_tool}" = "python" ]; then
     "${python_command}" - "${manifest_path}" "${asset}" >"${metadata_path}" <<'PY'
 import json
 import re
@@ -107,7 +140,7 @@ print(sha256)
 print(size)
 print(manifest.get("version", ""))
 PY
-  elif command -v node >/dev/null 2>&1; then
+  elif [ "${json_tool}" = "node" ]; then
     node - "${manifest_path}" "${asset}" >"${metadata_path}" <<'JS'
 const fs = require("node:fs");
 const [path, asset] = process.argv.slice(2);
@@ -121,6 +154,44 @@ if (typeof entry.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(entry.sha256)) th
 if (!Number.isSafeInteger(entry.size) || entry.size <= 0) throw new Error(`manifest size is invalid for ${asset}`);
 process.stdout.write(`${entry.sha256}\n${entry.size}\n${manifest.version ?? ""}\n`);
 JS
+  elif [ "${json_tool}" = "plutil" ]; then
+    local manifest_schema client_mode configuration_schema sha256 size version
+    # plutil -type and "raw" need macOS 12 or later.
+    if ! plutil -type manifest_schema "${manifest_path}" >/dev/null 2>&1; then
+      echo "Could not read the SAIAI release manifest with this macOS plutil; install Python or Node.js and retry." >&2
+      exit 1
+    fi
+    manifest_schema="$(plutil_value manifest_schema "${manifest_path}" integer)" || manifest_schema=""
+    client_mode="$(plutil_value client_mode "${manifest_path}" string)" || client_mode=""
+    configuration_schema="$(plutil_value configuration_schema_version "${manifest_path}" integer)" || configuration_schema=""
+    if [ "$(plutil -type "assets.${asset}" "${manifest_path}" 2>/dev/null)" != "dictionary" ]; then
+      echo "manifest does not contain ${asset}" >&2
+      exit 1
+    fi
+    sha256="$(plutil_value "assets.${asset}.sha256" "${manifest_path}" string)" || sha256=""
+    size="$(plutil_value "assets.${asset}.size" "${manifest_path}" integer)" || size=""
+    version="$(plutil_value version "${manifest_path}" string)" || version=""
+    if [ "${manifest_schema}" != "1" ]; then
+      echo "unsupported SAIAI manifest schema" >&2
+      exit 1
+    fi
+    if [ "${client_mode}" != "local-proxy" ]; then
+      echo "release is not a SAIAI local-proxy client" >&2
+      exit 1
+    fi
+    if [ "${configuration_schema}" != "1" ]; then
+      echo "unsupported SAIAI configuration schema" >&2
+      exit 1
+    fi
+    if ! [[ "${sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+      echo "manifest sha256 is invalid for ${asset}" >&2
+      exit 1
+    fi
+    if ! [[ "${size}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "manifest size is invalid for ${asset}" >&2
+      exit 1
+    fi
+    printf '%s\n%s\n%s\n' "${sha256}" "${size}" "${version}" >"${metadata_path}"
   else
     echo "Python or Node.js is required to validate the SAIAI release manifest." >&2
     exit 1
@@ -219,8 +290,9 @@ if [ "$#" -eq 1 ] && [ "$1" = "init-codex" ]; then
     config_path=""
   fi
   if [ -f "${config_path}" ]; then
-    if command -v python3 >/dev/null 2>&1; then
-      read -r base_url api_key < <(python3 - "${config_path}" <<'PY'
+    select_json_tool
+    if [ "${json_tool}" = "python" ]; then
+      read -r base_url api_key < <("${python_command}" - "${config_path}" <<'PY'
 import json
 import sys
 
@@ -229,13 +301,20 @@ with open(sys.argv[1], "r", encoding="utf-8") as handle:
 print(config.get("base_url", ""), config.get("api_key", ""))
 PY
       )
-    elif command -v node >/dev/null 2>&1; then
+    elif [ "${json_tool}" = "node" ]; then
       read -r base_url api_key < <(node - "${config_path}" <<'JS'
 const fs = require("node:fs");
 const config = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
 process.stdout.write(`${config.base_url ?? ""} ${config.api_key ?? ""}\n`);
 JS
       )
+    elif [ "${json_tool}" = "plutil" ]; then
+      if ! plutil -convert json -o /dev/null "${config_path}" >/dev/null 2>&1; then
+        echo "Could not read ${config_path}." >&2
+        exit 1
+      fi
+      base_url="$(plutil_value base_url "${config_path}" string)" || base_url=""
+      api_key="$(plutil_value api_key "${config_path}" string)" || api_key=""
     fi
   fi
   if [ -z "${base_url}" ]; then
