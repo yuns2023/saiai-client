@@ -580,8 +580,10 @@ Linux、macOS 与 Windows 共用；各平台只在真正需要刷新时调用其
 初始化入口；`--websockets` 仅为旧 WebUI 命令形状保留，代理本身默认支持 HTTP 与
 WebSocket。`saiai codex [-- <codex arguments>]` 遵守生效的 `CODEX_HOME`
 （默认 `~/.codex`），不写入第三方 `base_url`，而是在启动的 Codex 子进程中设置
-本地 HTTP 代理和 `CODEX_CA_CERTIFICATE`。Linux launcher 通过子进程命令行启用
-`features.respect_system_proxy`。Windows/macOS 必须反向设置为 `false`：Codex 的
+本地 HTTP 代理和 `CODEX_CA_CERTIFICATE`。launcher 通过子进程命令行把
+`features.respect_system_proxy` 设为 `false`（Linux 无平台解析，开启时也回退到同一组代理变量，但
+Codex 0.167 起开启的实验特性会出现在 `x-codex-beta-features`；1.1.58 及更早在 Linux
+持久化的 `true` 由本地代理启动时迁移）。Windows/macOS 尤其必须为 `false`：Codex 的
 平台 resolver 优先采用 WinHTTP/IE 或 SystemConfiguration 结果，当系统返回 `DIRECT`
 时不会再读取子进程 `HTTP_PROXY`/`HTTPS_PROXY`；transport-default 的
 reqwest/Tungstenite 才会读取这些
@@ -865,7 +867,7 @@ Claude `init` 默认写入 Claude 配置的代理和 `NODE_EXTRA_CA_CERTS`；`in
 占位、第三方 provider/base URL 清理和备份逻辑，在 `CODEX_HOME/.env` 中写入当前
 loopback HTTP(S) proxy、`NO_PROXY` 和
 `SSL_CERT_FILE`，并按同一平台规则在 Codex 配置中写入
-`features.respect_system_proxy`（Linux 为 `true`，Windows/macOS 为 `false`）；它不
+`features.respect_system_proxy = false`（所有平台）；它不
 修改 shell 或系统环境变量，也不写第三方 `base_url`。官方扩展的 Codex app-server
 会读取 `.env` 中的标准代理和 `SSL_CERT_FILE`，但扩展宿主自己的 Node HTTP 请求
 不会因此继承该文件。实测 Codex 0.153.4 从 `.env` 读取

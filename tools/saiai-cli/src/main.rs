@@ -1397,7 +1397,10 @@ fn codex_respect_system_proxy_enabled() -> bool {
     // precedence over HTTP_PROXY/HTTPS_PROXY. A DIRECT system decision
     // therefore bypasses the child-only SAIAI proxy environment. Reqwest and
     // Tungstenite both honor those variables in transport-default mode.
-    cfg!(target_os = "linux")
+    // Linux has no platform resolver, so the feature only falls back to the
+    // same variables there; keep it off too, because Codex 0.167+ lists
+    // enabled experimental features in `x-codex-beta-features`.
+    false
 }
 
 fn codex_args_override_feature(args: &[String], feature: &str) -> bool {
@@ -3828,6 +3831,11 @@ fn run_local_proxy(verbose: bool) -> Result<()> {
     ensure_listen_available(&cfg.listen)?;
     if let Err(error) = migrate_legacy_claude_no_proxy_for_instance(&cfg.listen) {
         eprintln!("warning: could not update Claude no_proxy: {error:#}");
+    }
+    if cfg!(target_os = "linux")
+        && let Err(error) = migrate_legacy_codex_system_proxy_for_instance(&cfg)
+    {
+        eprintln!("warning: could not update Codex respect_system_proxy: {error:#}");
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -7976,6 +7984,58 @@ fn migrate_legacy_claude_no_proxy(settings_path: &Path, listen: &str) -> Result<
     Ok(())
 }
 
+fn migrate_legacy_codex_system_proxy_for_instance(cfg: &SaiaiConfig) -> Result<()> {
+    let Some(_initialization_lock) = try_lock_initialization()? else {
+        return Ok(());
+    };
+    let codex_dir = match environment_scope::recorded_product_dir() {
+        Some(directory) => directory,
+        None => codex_config_dir()?,
+    };
+    migrate_legacy_codex_system_proxy(&codex_dir, &cfg.listen, &cfg.ca_cert_path)
+}
+
+/// Linux clients up to 1.1.58 persisted `features.respect_system_proxy = true`
+/// into the Codex config they manage. Turn it off in a directory whose `.env`
+/// carries this listener's managed block, so IDE and daemon sessions stop
+/// advertising it without re-running init.
+fn migrate_legacy_codex_system_proxy(
+    codex_dir: &Path,
+    listen: &str,
+    ca_cert_path: &str,
+) -> Result<()> {
+    let env = fs::read_to_string(codex_dir.join(".env")).unwrap_or_default();
+    if !env.contains(merge_codex_ide_env("", listen, ca_cert_path).trim()) {
+        return Ok(());
+    }
+    let path = codex_dir.join("config.toml");
+    let Ok(original) = fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let Ok(mut document) = original.parse::<DocumentMut>() else {
+        return Ok(());
+    };
+    let Some(features) = document.get_mut("features").and_then(Item::as_table_mut) else {
+        return Ok(());
+    };
+    if features.get("respect_system_proxy").and_then(Item::as_bool) != Some(true) {
+        return Ok(());
+    }
+    features.insert("respect_system_proxy", value(false));
+    // Codex or the user may have rewritten the file meanwhile; leave theirs.
+    if fs::read_to_string(&path).ok().as_deref() != Some(original.as_str()) {
+        return Ok(());
+    }
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S%.9f").to_string();
+    backup_if_exists(&path, &timestamp)?;
+    write_bytes_atomic(&path, document.to_string().as_bytes(), 0o600)?;
+    eprintln!(
+        "Codex respect_system_proxy turned off ({} updated)",
+        path.display()
+    );
+    Ok(())
+}
+
 fn clean_claude_settings(settings: &mut Map<String, Value>) {
     settings.remove("oauthAccount");
 }
@@ -8482,7 +8542,7 @@ base_url = "https://third-party.example/v1"
         assert_eq!(doc["features"]["other_flag"].as_bool(), Some(true));
         assert_eq!(
             doc["features"]["respect_system_proxy"].as_bool(),
-            Some(codex_respect_system_proxy_enabled())
+            Some(false)
         );
         assert!(doc["features"].get("responses_websockets_v2").is_none());
     }
@@ -9539,10 +9599,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             codex_launcher_args(&args),
             vec![
                 "-c".to_string(),
-                format!(
-                    "features.respect_system_proxy={}",
-                    codex_respect_system_proxy_enabled()
-                ),
+                "features.respect_system_proxy=false".to_string(),
                 "-c".to_string(),
                 "otel.metrics_exporter=\"none\"".to_string(),
                 "-c".to_string(),
@@ -9764,6 +9821,68 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             "{first:?}"
         );
         assert_ne!(Some(first), common_name(&second));
+    }
+
+    #[test]
+    fn migrates_legacy_codex_system_proxy_only_in_this_listeners_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let env = dir.path().join(".env");
+        let listen = "127.0.0.1:19908";
+        let managed = merge_codex_ide_env("", listen, "/ca.pem");
+        let legacy = "model = \"kept\"\n\n[features]\nrespect_system_proxy = true\nother = true\n";
+        let migrate = || migrate_legacy_codex_system_proxy(dir.path(), listen, "/ca.pem").unwrap();
+        let backups = || {
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("config.toml.bak-")
+                })
+                .count()
+        };
+
+        fs::write(&config, legacy).unwrap();
+        fs::write(&env, merge_codex_ide_env("", "127.0.0.1:20000", "/ca.pem")).unwrap();
+        migrate();
+        assert_eq!(fs::read_to_string(&config).unwrap(), legacy);
+
+        fs::write(&env, format!("USER_VAR=1\n{managed}")).unwrap();
+        migrate();
+        let doc = read_str(&config).parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            doc["features"]["respect_system_proxy"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(doc["features"]["other"].as_bool(), Some(true));
+        assert_eq!(doc["model"].as_str(), Some("kept"));
+        assert_eq!(backups(), 1);
+
+        migrate();
+        assert_eq!(backups(), 1);
+
+        fs::write(&config, "features.respect_system_proxy = true\n").unwrap();
+        migrate();
+        let doc = read_str(&config).parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            doc["features"]["respect_system_proxy"].as_bool(),
+            Some(false)
+        );
+
+        for unchanged in [
+            "[features]\nrespect_system_proxy = false\n",
+            "model = \"kept\"\n",
+            "features = 1\n",
+            "not toml [",
+        ] {
+            fs::write(&config, unchanged).unwrap();
+            migrate();
+            assert_eq!(fs::read_to_string(&config).unwrap(), unchanged);
+        }
     }
 
     #[test]
