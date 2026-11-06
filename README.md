@@ -229,10 +229,13 @@ saiai desktop codex
 ```
 
 `saiai codex` 只在 Codex 子进程中设置 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和
-`CODEX_CA_CERTIFICATE`。Linux 通过子进程参数启用 Codex 的
-`features.respect_system_proxy`；Windows/macOS 则明确关闭该特性，使 Responses
-HTTP/WS 使用子进程代理环境，避免 WinHTTP/SystemConfiguration 返回 `DIRECT` 后
-绕过本地代理。它不会修改用户
+`CODEX_CA_CERTIFICATE`，并通过子进程参数关闭 Codex 的
+`features.respect_system_proxy`，使 Responses HTTP/WS 使用子进程代理环境，避免
+WinHTTP/SystemConfiguration 返回 `DIRECT` 后绕过本地代理。Linux 没有平台代理解析，
+开启它也只会回退到同一组代理变量；Codex 0.167 起会把开启的实验特性写进 `x-codex-beta-features`，
+因此 Linux 也保持关闭（1.1.58 及更早版本在 Linux 写入的 `true` 由本地代理启动时改回
+`false`；只迁移本地代理管理的那个 Codex 目录，其他 `CODEX_HOME` 重新运行
+`init-codex` 即可）。它不会修改用户
 shell、系统环境变量或把这个开关写入 `config.toml`。启动前会备份并清理
 生效 `CODEX_HOME` 中的第三方 `base_url`、provider 和 WebSocket 开关，将根
 provider 恢复为官方内置 `openai`，且不保留旧直连 SAIAI provider 或历史线程兼容
@@ -288,8 +291,7 @@ saiai vscode
 该可选命令会应用 OAuth/local-proxy 配置和 **VSCode 整体代理**：清理同一 `CODEX_HOME` 中冲突的
 provider/base URL，创建或保留本地代理 OAuth 状态，并在 Codex 专属 `.env` 中写入
 当前 loopback 代理、`SSL_CERT_FILE` 和
-`NO_PROXY`；同时按平台在 Codex 配置中写入 `features.respect_system_proxy`：
-Linux 为 `true`，Windows/macOS 为 `false`。它不会
+`NO_PROXY`；同时在 Codex 配置中写入 `features.respect_system_proxy = false`（所有平台）。它不会
 修改 shell 或操作系统环境变量，也不会写入第三方 `base_url`。其他扩展共享编辑器代理；
 证书加载器未信任当前 CA 时保留编辑器设置并提示，不自动导入根证书或关闭 TLS 校验。
 配置完成后完全退出并重新打开 VSCode。已有不同的显式 `http.proxy` 会保留并报告冲突。
