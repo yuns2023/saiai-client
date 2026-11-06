@@ -30,14 +30,14 @@ SH
 chmod +x "${asset}"
 sha256="$(sha256sum "${asset}" | awk '{print $1}')"
 size="$(wc -c <"${asset}" | tr -d '[:space:]')"
-printf '{"client_mode":"local-proxy","configuration_schema_version":1,"manifest_schema":1,"version":"1.1.25","assets":{"saiai-linux-x86_64":{"sha256":"%s","size":%s}}}\n' \
-  "${sha256}" "${size}" >"${fixtures}/manifest.json"
+printf '{"client_mode":"local-proxy","configuration_schema_version":1,"manifest_schema":1,"version":"1.1.25","assets":{"saiai-linux-x86_64":{"sha256":"%s","size":%s},"saiai-macos-aarch64":{"sha256":"%s","size":%s}}}\n' \
+  "${sha256}" "${size}" "${sha256}" "${size}" >"${fixtures}/manifest.json"
 
 cat >"${fake_bin}/uname" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
-  -s) printf 'Linux\n' ;;
-  -m) printf 'x86_64\n' ;;
+  -s) printf '%s\n' "${SAIAI_TEST_UNAME_S:-Linux}" ;;
+  -m) printf '%s\n' "${SAIAI_TEST_UNAME_M:-x86_64}" ;;
   *) exit 1 ;;
 esac
 SH
@@ -62,7 +62,7 @@ if [ "${SAIAI_TEST_CURL_FAIL:-}" = 1 ]; then
 fi
 case "${url}" in
   */manifest.json) cp "${SAIAI_TEST_FIXTURES:?}/manifest.json" "${destination}" ;;
-  */saiai-linux-x86_64) cp "${SAIAI_TEST_FIXTURES:?}/saiai-linux-x86_64" "${destination}" ;;
+  */saiai-linux-x86_64|*/saiai-macos-aarch64) cp "${SAIAI_TEST_FIXTURES:?}/saiai-linux-x86_64" "${destination}" ;;
   *) echo "unexpected wrapper URL: ${url}" >&2; exit 1 ;;
 esac
 SH
@@ -77,7 +77,7 @@ run_setup() {
   env -u CODEX_HOME -u CLAUDE_CONFIG_DIR "${scope_environment[@]}" \
     HOME="${home}" \
     SAIAI_HOME="${home}/.saiai" \
-    PATH="${fake_bin}:${PATH}" \
+    PATH="${SAIAI_TEST_PATH:-${fake_bin}:${PATH}}" \
     SAIAI_DOWNLOAD_BASE="https://download.example.test/client" \
     SAIAI_INSTALL_DIR="${install_dir}" \
     SAIAI_TEST_FIXTURES="${fixtures}" \
@@ -141,6 +141,127 @@ test "${reused_invocation[4]}" = "TEST_ONLY_REUSED_CODEX_KEY"
 test "${#reused_invocation[@]}" -eq 5
 test "$(grep -Fc '/manifest.json' "${curl_log}")" -eq 4
 test "$(grep -Fc '/saiai-linux-x86_64' "${curl_log}")" -eq 1
+
+# macOS without the Command Line Tools: /usr/bin/python3 is an installer stub
+# and must not run. With Node available the wrapper uses Node.
+real_node="$(command -v node)"
+real_python="$(command -v python3)"
+mac_bin="${temporary}/mac-bin"
+mkdir -p "${mac_bin}"
+for tool in bash env awk sed sha256sum wc tr mktemp mkdir cp mv chmod rm cat grep; do
+  ln -s "$(command -v "${tool}")" "${mac_bin}/${tool}"
+done
+ln -s "${fake_bin}/uname" "${mac_bin}/uname"
+ln -s "${fake_bin}/curl" "${mac_bin}/curl"
+printf '#!/usr/bin/env bash\nexit 2\n' >"${mac_bin}/xcode-select"
+chmod +x "${mac_bin}/xcode-select"
+node_log="${temporary}/node-log"
+printf '#!/usr/bin/env bash\necho node >>"%s"\nexec "%s" "$@"\n' "${node_log}" "${real_node}" >"${mac_bin}/node"
+chmod +x "${mac_bin}/node"
+# The PATH below resolves python3 to /usr/bin/python3, standing in for the stub.
+test -x /usr/bin/python3
+export SAIAI_TEST_UNAME_S=Darwin SAIAI_TEST_UNAME_M=arm64
+SAIAI_TEST_PATH="${mac_bin}:/usr/bin" run_setup init-codex "https://mac.example.test/v1" "TEST_ONLY_MAC_KEY"
+test -s "${node_log}"
+mapfile -t mac_node_invocation <"${invoked}"
+test "${mac_node_invocation[2]}" = "init-codex"
+test "${mac_node_invocation[3]}" = "https://mac.example.test/v1"
+
+# macOS with neither a usable Python nor Node: plutil reads the manifest and
+# the saved config. The fake plutil mirrors `plutil -extract KEY raw -o - FILE`.
+rm -f "${mac_bin}/node"
+cat >"${mac_bin}/plutil" <<SH
+#!/usr/bin/env bash
+exec "${real_python}" -I - "\$@" <<'PY'
+import json, sys
+args = sys.argv[1:]
+if args[0] == "-convert":
+    assert args[1:4] == ["json", "-o", "/dev/null"], args
+    try:
+        json.load(open(args[4]))
+    except ValueError:
+        sys.exit(1)
+    sys.exit(0)
+if args[0] == "-type":
+    path = args[2]
+else:
+    assert args[0] == "-extract" and args[2] == "raw" and args[3:5] == ["-o", "-"], args
+    path = args[5]
+value = json.load(open(path))
+for part in args[1].split("."):
+    if not isinstance(value, dict) or part not in value:
+        print(path + ": Could not extract value, error: No value at that key path")
+        sys.exit(1)
+    value = value[part]
+if args[0] == "-type":
+    kinds = [(bool, "bool"), (int, "integer"), (float, "float"), (str, "string"), (dict, "dictionary"), (list, "array")]
+    print(next(name for kind, name in kinds if isinstance(value, kind)))
+elif isinstance(value, bool):
+    print("true" if value else "false")
+elif isinstance(value, (dict, list)):
+    print("\n".join(value))
+else:
+    print(value)
+PY
+SH
+chmod +x "${mac_bin}/plutil"
+plutil_path="${mac_bin}"
+if PATH="${plutil_path}" command -v node >/dev/null || PATH="${plutil_path}" command -v python3 >/dev/null; then
+  echo "test PATH still exposes node or python3" >&2
+  exit 1
+fi
+printf '%s\n' '{"base_url":"https://plutil.example.test","api_key":"TEST_ONLY_PLUTIL_KEY"}' >"${home}/.saiai/config.json"
+SAIAI_TEST_PATH="${plutil_path}" run_setup init-codex
+mapfile -t plutil_invocation <"${invoked}"
+test "${plutil_invocation[2]}" = "init-codex"
+test "${plutil_invocation[3]}" = "https://plutil.example.test"
+test "${plutil_invocation[4]}" = "TEST_ONLY_PLUTIL_KEY"
+test "${#plutil_invocation[@]}" -eq 5
+
+# plutil rejects a bad manifest the same way Python and Node do.
+cp "${fixtures}/manifest.json" "${temporary}/manifest.good"
+sed -i 's/"local-proxy"/"other"/' "${fixtures}/manifest.json"
+if SAIAI_TEST_PATH="${plutil_path}" run_setup "https://gateway.example.test" "TEST_ONLY_KEY"; then
+  echo "plutil path accepted a non-local-proxy manifest" >&2
+  exit 1
+fi
+grep -Fq 'release is not a SAIAI local-proxy client' "${output}"
+cp "${temporary}/manifest.good" "${fixtures}/manifest.json"
+sed -i 's/"saiai-macos-aarch64":{"sha256":"[0-9a-f]*"/"saiai-macos-aarch64":{"sha256":"bad"/' "${fixtures}/manifest.json"
+if SAIAI_TEST_PATH="${plutil_path}" run_setup "https://gateway.example.test" "TEST_ONLY_KEY"; then
+  echo "plutil path accepted an invalid sha256" >&2
+  exit 1
+fi
+grep -Fq 'manifest sha256 is invalid for saiai-macos-aarch64' "${output}"
+cp "${temporary}/manifest.good" "${fixtures}/manifest.json"
+sed -i 's/"saiai-macos-aarch64":{"sha256":"\([0-9a-f]*\)","size":\([0-9]*\)/"saiai-macos-aarch64":{"sha256":"\1","size":"\2"/' "${fixtures}/manifest.json"
+if SAIAI_TEST_PATH="${plutil_path}" run_setup "https://gateway.example.test" "TEST_ONLY_KEY"; then
+  echo "plutil path accepted a string size" >&2
+  exit 1
+fi
+grep -Fq 'manifest size is invalid for saiai-macos-aarch64' "${output}"
+sed -i 's/"manifest_schema":1/"manifest_schema":"1"/' "${temporary}/manifest.good"
+cp "${temporary}/manifest.good" "${fixtures}/manifest.json"
+if SAIAI_TEST_PATH="${plutil_path}" run_setup "https://gateway.example.test" "TEST_ONLY_KEY"; then
+  echo "plutil path accepted a string manifest schema" >&2
+  exit 1
+fi
+grep -Fq 'unsupported SAIAI manifest schema' "${output}"
+sed -i 's/"manifest_schema":"1"/"manifest_schema":1/; s/"saiai-macos-aarch64"/"saiai-macos-other"/' "${fixtures}/manifest.json"
+if SAIAI_TEST_PATH="${plutil_path}" run_setup "https://gateway.example.test" "TEST_ONLY_KEY"; then
+  echo "plutil path accepted a manifest without the asset" >&2
+  exit 1
+fi
+grep -Fq 'manifest does not contain saiai-macos-aarch64' "${output}"
+sed -i 's/"manifest_schema":"1"/"manifest_schema":1/' "${temporary}/manifest.good"
+cp "${temporary}/manifest.good" "${fixtures}/manifest.json"
+printf '{broken' >"${home}/.saiai/config.json"
+if SAIAI_TEST_PATH="${plutil_path}" run_setup init-codex </dev/null; then
+  echo "plutil path accepted a broken config" >&2
+  exit 1
+fi
+grep -Fq "Could not read ${home}/.saiai/config.json." "${output}"
+unset SAIAI_TEST_UNAME_S SAIAI_TEST_UNAME_M
 
 before_invalid="$(wc -l <"${curl_log}")"
 if run_setup "only-one-argument"; then
