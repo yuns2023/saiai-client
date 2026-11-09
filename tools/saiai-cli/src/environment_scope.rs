@@ -191,6 +191,28 @@ pub(crate) fn parse_selector(args: &mut Vec<String>) -> Result<Option<(String, S
     Ok(Some((selector, value)))
 }
 
+fn command_product(command: &Command) -> Option<&'static str> {
+    match command {
+        Command::Init(_)
+        | Command::Claude(_)
+        | Command::Doctor(DoctorTarget::Claude)
+        | Command::ClaudeDesktopDoctor
+        | Command::Desktop {
+            product: crate::desktop_product::DesktopProduct::Claude,
+            ..
+        } => Some("claude"),
+        Command::InitCodex(_)
+        | Command::Codex(_)
+        | Command::VSCode
+        | Command::Desktop {
+            product: crate::desktop_product::DesktopProduct::Codex,
+            ..
+        }
+        | Command::Doctor(DoctorTarget::Codex) => Some("codex"),
+        _ => None,
+    }
+}
+
 pub(crate) fn initialize(command: &Command, selector: Option<(String, String)>) -> Result<()> {
     // Uninstall enumerates every environment itself and never uses a scope.
     if matches!(
@@ -200,17 +222,7 @@ pub(crate) fn initialize(command: &Command, selector: Option<(String, String)>) 
         return Ok(());
     }
     let (home, root) = layout()?;
-    let product = match command {
-        Command::Init(_) | Command::Claude(_) | Command::Doctor(DoctorTarget::Claude) => {
-            Some("claude")
-        }
-        Command::InitCodex(_)
-        | Command::Codex(_)
-        | Command::VSCode
-        | Command::Desktop { .. }
-        | Command::Doctor(DoctorTarget::Codex) => Some("codex"),
-        _ => None,
-    };
+    let product = command_product(command);
     let (selected, product_dir) = match selector.as_ref() {
         Some((flag, value)) if flag == "--instance-dir" => {
             if product.is_some() {
@@ -408,5 +420,38 @@ mod tests {
         ] {
             assert_eq!(environment_product(foreign), None, "{foreign}");
         }
+    }
+}
+
+#[cfg(test)]
+mod desktop_scope_tests {
+    use super::*;
+    #[test]
+    fn desktop_and_doctor_select_their_product_environment() {
+        use crate::desktop_product::DesktopProduct;
+        for (product, expected) in [
+            (DesktopProduct::Claude, "claude"),
+            (DesktopProduct::Codex, "codex"),
+        ] {
+            assert_eq!(
+                command_product(&Command::Desktop {
+                    product,
+                    args: vec![]
+                }),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            command_product(&Command::ClaudeDesktopDoctor),
+            Some("claude")
+        );
+        assert_eq!(
+            command_product(&Command::Doctor(DoctorTarget::Claude)),
+            Some("claude")
+        );
+        assert_eq!(
+            command_product(&Command::Doctor(DoctorTarget::Codex)),
+            Some("codex")
+        );
     }
 }

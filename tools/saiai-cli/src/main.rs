@@ -29,6 +29,8 @@ use toml_edit::{DocumentMut, Item, Table, value};
 use url::Url;
 use uuid::Uuid;
 
+mod claude_desktop;
+mod claude_desktop_fixtures;
 mod claude_launcher;
 mod client_proof;
 mod codex_daemon;
@@ -68,7 +70,8 @@ Usage:
   saiai claude [-- <claude arguments>]                            # launch Claude with a child-only SAIAI environment
   saiai codex [-- <codex arguments>]                              # launch Codex through SAIAI local proxy
   saiai vscode                                                    # configure the Codex VSCode extension for SAIAI
-  saiai desktop [codex] [-- <Desktop arguments>]                # launch Codex Desktop through SAIAI
+  saiai desktop [codex|claude] [-- <Desktop arguments>]         # Claude: Linux Code only
+  saiai doctor --desktop claude                                  # check Claude Desktop adapter
   saiai uninstall [--yes] [--dry-run] [--forget-unknown-environments]  # remove SAIAI services, settings, data and program
   saiai upstream-proxy [system|direct|http://host:port]         # show or set the proxy SAIAI itself uses
   saiai init       --base-url <base_url> --api-key <api_key>      # initialize Claude Code
@@ -286,6 +289,7 @@ fn main() -> Result<()> {
         Command::Update => run_update(),
         Command::Restart => run_service_restart(),
         Command::Doctor(target) => run_doctor(target),
+        Command::ClaudeDesktopDoctor => claude_desktop::doctor(),
         Command::Version => print_version(),
         Command::Init(init) => init_claude(init),
         Command::InitCodex(init) => init_codex(init),
@@ -315,6 +319,7 @@ enum Command {
     Update,
     Restart,
     Doctor(DoctorTarget),
+    ClaudeDesktopDoctor,
     Version,
     Init(InitArgs),
     InitCodex(InitArgs),
@@ -370,6 +375,12 @@ fn parse_command(args: &[String]) -> Result<Command> {
         "update" => return parse_no_arg_command("update", &args[1..], Command::Update),
         "restart" => return parse_no_arg_command("restart", &args[1..], Command::Restart),
         "doctor" => {
+            if args.get(1).map(String::as_str) == Some("--desktop")
+                && args.get(2).map(String::as_str) == Some("claude")
+                && args.len() == 3
+            {
+                return Ok(Command::ClaudeDesktopDoctor);
+            }
             return match args.get(1).map(String::as_str) {
                 None => Ok(Command::Doctor(DoctorTarget::All)),
                 Some("claude") if args.len() == 2 => Ok(Command::Doctor(DoctorTarget::Claude)),
@@ -1689,6 +1700,9 @@ fn codex_auth_expiry_warning(path: &Path) -> Result<Option<String>> {
 }
 
 fn run_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
+    if product == DesktopProduct::Claude {
+        return claude_desktop::run(args);
+    }
     if !product.has_adapter() {
         bail!(
             "SAIAI Desktop currently supports Codex only; ordinary ChatGPT history and settings are not supported. Use `saiai desktop codex`."
@@ -3869,6 +3883,11 @@ fn run_local_proxy(verbose: bool) -> Result<()> {
         chatgpt_chat_passthrough: cfg.chatgpt_chat_passthrough,
         desktop_browser_use: cfg.desktop_browser_use,
         client_proof_dir: saiai_config_dir().ok(),
+        desktop_config_root: if cfg!(target_os = "linux") {
+            Some(saiai_config_dir()?)
+        } else {
+            None
+        },
         upstream_proxy: cfg.upstream_proxy,
     }))
 }
