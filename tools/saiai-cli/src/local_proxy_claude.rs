@@ -46,10 +46,22 @@ pub(super) fn auth_error(error: &anyhow::Error) -> (StatusCode, &'static [u8]) {
     }
 }
 
+/// Credential policy for the Desktop-only listener. Only the Desktop's own
+/// placeholder is ever swapped for the route key; a missing Authorization,
+/// an `x-api-key`-only request or any other Bearer is refused here instead of
+/// reaching the shared forwarder, which injects the route key when no
+/// Authorization header survives filtering.
 pub(super) fn credential_policy(
     state: &State,
     request: &IncomingRequest,
 ) -> Result<CredentialPolicy> {
+    match classify_request(state, request)? {
+        CredentialPolicy::DesktopPlaceholder => Ok(CredentialPolicy::DesktopPlaceholder),
+        _ => bail!("Claude Desktop listener requires its local placeholder token"),
+    }
+}
+
+fn classify_request(state: &State, request: &IncomingRequest) -> Result<CredentialPolicy> {
     let headers: Vec<_> = request
         .headers
         .iter()

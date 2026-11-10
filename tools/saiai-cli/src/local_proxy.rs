@@ -794,8 +794,15 @@ enum EntryPoint {
 }
 
 impl EntryPoint {
+    /// Hosts this listener terminates TLS for. The Desktop listener manages
+    /// only the two Claude hosts; OpenAI/ChatGPT hosts stay Main-only, so a
+    /// CONNECT to them on the Desktop listener hits the passthrough guard and
+    /// fails closed instead of receiving the OpenAI route credential.
     fn manages(self, host: &str) -> bool {
-        is_managed_host(host) || (self == Self::ClaudeDesktop && host == "claude.ai")
+        match self {
+            Self::Main => is_managed_host(host),
+            Self::ClaudeDesktop => host == "claude.ai" || host == ANTHROPIC_HOST,
+        }
     }
 }
 

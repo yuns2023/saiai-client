@@ -456,3 +456,60 @@ async fn desktop_settings_put_requires_session_and_fragment_is_rejected() {
         );
     }
 }
+
+#[tokio::test]
+async fn desktop_never_injects_the_route_key_without_its_placeholder() {
+    let root = tempfile::tempdir().unwrap();
+    crate::claude_desktop::Identity::prepare(root.path()).unwrap();
+    let state = state(Some(root.path()), None);
+    for headers in [
+        "Connection: close\r\n",
+        "x-api-key: saiai-desktop-claude-FOREIGN\r\nConnection: close\r\n",
+        "x-api-key: MOCK_ONLY\r\nCookie: sessionKey=MOCK_ONLY\r\nConnection: close\r\n",
+        "Authorization: Bearer ordinary-saiai-key\r\nConnection: close\r\n",
+        "Authorization: Bearer ordinary-saiai-key\r\nConnection: authorization, close\r\n",
+    ] {
+        for path in ["/v1/messages", "/v1/messages/count_tokens", "/v1/models"] {
+            let response = tls_request(
+                Arc::clone(&state),
+                EntryPoint::ClaudeDesktop,
+                ANTHROPIC_HOST,
+                format!("POST {path} HTTP/1.1\r\n{headers}Content-Length: 2\r\n\r\n{{}}")
+                    .as_bytes(),
+            )
+            .await;
+            let text = String::from_utf8(response).unwrap();
+            assert!(
+                text.starts_with("HTTP/1.1 401"),
+                "{headers:?} {path}: {text}"
+            );
+            assert!(text.contains("invalid_local_desktop_token"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn desktop_listener_does_not_mitm_openai_hosts() {
+    for host in [
+        OPENAI_HOST,
+        CHATGPT_HOST,
+        CHAT_OPENAI_HOST,
+        CHATGPT_AUX_HOST,
+    ] {
+        assert!(EntryPoint::Main.manages(host));
+        assert!(!EntryPoint::ClaudeDesktop.manages(host));
+        let (mut stream, task) = connection(state(None, None), EntryPoint::ClaudeDesktop).await;
+        stream
+            .write_all(
+                format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(head(&mut stream).await.starts_with(b"HTTP/1.1 502"));
+        assert!(task.await.unwrap().is_err());
+    }
+    for host in ["claude.ai", ANTHROPIC_HOST] {
+        assert!(EntryPoint::ClaudeDesktop.manages(host));
+    }
+    assert!(!EntryPoint::Main.manages("claude.ai"));
+}
