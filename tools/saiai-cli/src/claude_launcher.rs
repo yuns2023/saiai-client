@@ -11,7 +11,7 @@ use crate::{
 
 const LOCAL_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local";
 
-const CONFLICTING_ENV: &[&str] = &[
+pub(crate) const CONFLICTING_ENV: &[&str] = &[
     "ANTHROPIC_BASE_URL",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_AUTH_TOKEN",

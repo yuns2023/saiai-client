@@ -32,6 +32,12 @@ use tokio_tungstenite::{Connector, client_async_tls_with_config};
 use url::Url;
 use zeroize::Zeroizing;
 
+#[path = "local_proxy_claude.rs"]
+mod claude_desktop;
+#[cfg(test)]
+#[path = "local_proxy_ingress_tests.rs"]
+mod ingress_tests;
+
 use crate::client_proof::{self, ClientProof};
 use crate::upstream_proxy::{HttpClients, Snapshot, UpstreamProxy};
 use crate::upstream_tls;
@@ -60,6 +66,7 @@ const CERTIFICATE_CONTROL_HOST: &str = "certificate.saiai.local";
 const TELEMETRY_DENY_EXACT_HOSTS: &[&str] = &[
     // Claude Code Datadog log intake (measured, telemetry env unset).
     "http-intake.logs.us5.datadoghq.com",
+    "browser-intake-us5-datadoghq.com",
 ];
 // Sentry event/envelope/minidump ingestion.  The per-organisation label
 // (`o33249` for Codex Desktop, `o1158394` for Claude Code) is the only part
@@ -150,6 +157,8 @@ pub struct Config {
     pub desktop_browser_use: bool,
     /// Directory holding the client-proof device key; `None` disables proofs.
     pub client_proof_dir: Option<std::path::PathBuf>,
+    /// Selected SAIAI environment root; independent of client-proof storage.
+    pub desktop_config_root: Option<std::path::PathBuf>,
     /// `upstream_proxy` setting: `system` (default), `direct`, or a URL.
     pub upstream_proxy: Option<String>,
 }
@@ -194,6 +203,7 @@ struct State {
     certs: Mutex<HashMap<String, ManagedCertificate>>,
     openai_trace: Option<Arc<OpenAITrace>>,
     client_proof_dir: Option<std::path::PathBuf>,
+    desktop_config_root: Option<std::path::PathBuf>,
     // Set by the background loader; until then requests are sent unsigned.
     client_proof: std::sync::OnceLock<Arc<ClientProof>>,
 }
@@ -330,6 +340,18 @@ pub async fn run(cfg: Config) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind local proxy on {}", state.listen))?;
 
+    let mut desktop_listener = match crate::claude_desktop::bind_if_initialized(
+        state.desktop_config_root.as_deref(),
+        &state.listen,
+    )
+    .await
+    {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("Claude Desktop listener unavailable: {error:#}");
+            None
+        }
+    };
     eprintln!("saiai local proxy listening on http://{}", state.listen);
     eprintln!(
         "forwarding managed Claude/OpenAI traffic to {}",
@@ -348,6 +370,27 @@ pub async fn run(cfg: Config) -> Result<()> {
                         && (verbose || !is_benign_client_error(&err))
                     {
                         eprintln!("local proxy client {} error: {err:#}", remote_addr);
+                    }
+                });
+            }
+            accepted = async {
+                match &desktop_listener {
+                    Some(listener) => listener.accept().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let (stream, remote_addr) = match accepted {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        eprintln!("Claude Desktop listener stopped after accept error: {error}");
+                        desktop_listener = None;
+                        continue;
+                    }
+                };
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    if let Err(error) = handle_client_on(state, stream, remote_addr, EntryPoint::ClaudeDesktop).await {
+                        eprintln!("Claude Desktop proxy connection failed: {error:#}");
                     }
                 });
             }
@@ -454,6 +497,7 @@ impl State {
             certs: Mutex::new(HashMap::new()),
             openai_trace,
             client_proof_dir: cfg.client_proof_dir,
+            desktop_config_root: cfg.desktop_config_root,
             client_proof: std::sync::OnceLock::new(),
         })
     }
@@ -743,10 +787,38 @@ fn is_benign_direct_tunnel_close(err: &anyhow::Error) -> bool {
             || message.contains("early eof"))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum EntryPoint {
+    Main,
+    ClaudeDesktop,
+}
+
+impl EntryPoint {
+    /// Hosts this listener terminates TLS for. The Desktop listener manages
+    /// only the two Claude hosts; OpenAI/ChatGPT hosts stay Main-only, so a
+    /// CONNECT to them on the Desktop listener hits the passthrough guard and
+    /// fails closed instead of receiving the OpenAI route credential.
+    fn manages(self, host: &str) -> bool {
+        match self {
+            Self::Main => is_managed_host(host),
+            Self::ClaudeDesktop => host == "claude.ai" || host == ANTHROPIC_HOST,
+        }
+    }
+}
+
 async fn handle_client(
     state: Arc<State>,
     stream: TcpStream,
     remote_addr: SocketAddr,
+) -> Result<()> {
+    handle_client_on(state, stream, remote_addr, EntryPoint::Main).await
+}
+
+async fn handle_client_on(
+    state: Arc<State>,
+    stream: TcpStream,
+    remote_addr: SocketAddr,
+    entry: EntryPoint,
 ) -> Result<()> {
     let peer = stream
         .peer_addr()
@@ -779,6 +851,15 @@ async fn handle_client(
                 .await;
             }
         }
+        if entry == EntryPoint::ClaudeDesktop
+            && let Ok(target) = parse_http_proxy_target(&request)
+            && matches!(
+                canonical_host(target.host_str().unwrap_or_default()).as_str(),
+                "claude.ai" | ANTHROPIC_HOST
+            )
+        {
+            return write_plain_error(&mut stream, StatusCode::BAD_REQUEST).await;
+        }
         return serve_http_proxy_request(state, stream, request, &peer).await;
     }
     let InitialProxyRequest::Connect(connect) = request else {
@@ -799,7 +880,15 @@ async fn handle_client(
         .await;
     }
     if connect.host == CERTIFICATE_CONTROL_HOST && connect.port == 443 {
-        let spki = state.desktop_tls_spki_list()?;
+        let spki = if entry == EntryPoint::ClaudeDesktop {
+            ["claude.ai", ANTHROPIC_HOST]
+                .into_iter()
+                .map(|host| state.tls_spki_for_host(host))
+                .collect::<Result<Vec<_>>>()?
+                .join(",")
+        } else {
+            state.desktop_tls_spki_list()?
+        };
         stream
             .write_all(
                 format!(
@@ -812,7 +901,7 @@ async fn handle_client(
         stream.flush().await?;
         return Ok(());
     }
-    if is_managed_host(&connect.host) && connect.port == 443 {
+    if entry.manages(&connect.host) && connect.port == 443 {
         stream
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await
@@ -823,7 +912,7 @@ async fn handle_client(
                 connect.host, connect.port, peer
             );
         }
-        serve_managed_tls(state, stream, &connect.host).await
+        serve_managed_tls_on(state, stream, &connect.host, entry).await
     } else {
         let upstream = state.http.upstream().snapshot();
         serve_direct_tunnel(
@@ -1023,7 +1112,17 @@ async fn serve_direct_tunnel(
     Ok(())
 }
 
+#[cfg(test)]
 async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> Result<()> {
+    serve_managed_tls_on(state, stream, host, EntryPoint::Main).await
+}
+
+async fn serve_managed_tls_on(
+    state: Arc<State>,
+    stream: TcpStream,
+    host: &str,
+    entry: EntryPoint,
+) -> Result<()> {
     let tls_config = state.tls_config_for_host(host)?;
     let acceptor = TlsAcceptor::from(tls_config);
     let tls_stream = acceptor
@@ -1060,6 +1159,14 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
         handled_requests += 1;
         let close_after = request_wants_close(&request);
 
+        if entry == EntryPoint::ClaudeDesktop
+            && claude_desktop::handle(&state, reader.get_mut(), &request, host, close_after).await?
+        {
+            if close_after {
+                return Ok(());
+            }
+            continue;
+        }
         if host == ANTHROPIC_HOST {
             if let Some(resp) = local_sidecar_response(&request) {
                 if state.verbose {
@@ -1106,7 +1213,57 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
                     )
                     .await?;
                 } else {
-                    forward_to_saiai(&state, reader.get_mut(), request, close_after, false).await?;
+                    let policy = if entry == EntryPoint::Main {
+                        CredentialPolicy::Preserve
+                    } else {
+                        match claude_desktop::credential_policy(&state, &request) {
+                            Ok(policy) => policy,
+                            Err(error) => {
+                                let (status, body) = claude_desktop::auth_error(&error);
+                                write_static_response(
+                                    reader.get_mut(),
+                                    status,
+                                    "application/json",
+                                    body,
+                                    close_after,
+                                )
+                                .await?;
+                                if close_after {
+                                    return Ok(());
+                                }
+                                continue;
+                            }
+                        }
+                    };
+                    if policy == CredentialPolicy::DesktopPlaceholder
+                        && path == "/v1/messages"
+                        && let Err(error) = claude_desktop::inspect_message(&request.body)
+                    {
+                        let body = serde_json::to_vec(
+                            &json!({"error":{"type":"desktop_identity_invalid","message":error.to_string()}}),
+                        )?;
+                        write_static_response(
+                            reader.get_mut(),
+                            StatusCode::BAD_REQUEST,
+                            "application/json",
+                            &body,
+                            close_after,
+                        )
+                        .await?;
+                        if close_after {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    forward_to_saiai(
+                        &state,
+                        reader.get_mut(),
+                        request,
+                        close_after,
+                        GatewayRoute::Anthropic,
+                        policy,
+                    )
+                    .await?;
                 }
             }
         } else if host == OPENAI_HOST
@@ -1216,7 +1373,15 @@ async fn serve_managed_tls(state: Arc<State>, stream: TcpStream, host: &str) -> 
             if is_forwarded_openai_path(&path) {
                 // Codex's OAuth request shape is preserved; only the Gateway
                 // credential is substituted at this upstream boundary.
-                forward_to_saiai(&state, reader.get_mut(), request, close_after, true).await?;
+                forward_to_saiai(
+                    &state,
+                    reader.get_mut(),
+                    request,
+                    close_after,
+                    GatewayRoute::OpenAI,
+                    CredentialPolicy::Replace,
+                )
+                .await?;
             } else {
                 if state.verbose {
                     eprintln!(
@@ -1753,12 +1918,25 @@ where
     Ok(body)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum GatewayRoute {
+    Anthropic,
+    OpenAI,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CredentialPolicy {
+    Preserve,
+    Replace,
+    DesktopPlaceholder,
+}
+
 async fn forward_to_saiai<W>(
     state: &State,
     writer: &mut W,
     request: IncomingRequest,
     close_after: bool,
-    replace_authorization: bool,
+    gateway: GatewayRoute,
+    credentials: CredentialPolicy,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -1771,7 +1949,8 @@ where
         writer,
         request,
         close_after,
-        replace_authorization,
+        gateway,
+        credentials,
         preferences_path.as_deref(),
     )
     .await
@@ -1782,17 +1961,18 @@ async fn forward_to_saiai_with_preferences_path<W>(
     writer: &mut W,
     request: IncomingRequest,
     close_after: bool,
-    replace_authorization: bool,
+    gateway: GatewayRoute,
+    credentials: CredentialPolicy,
     preferences_path: Option<&std::path::Path>,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let route = if replace_authorization {
-        state.route_for_host(OPENAI_HOST)
-    } else {
-        state.route_for_host(ANTHROPIC_HOST)
-    };
+    let route = state.route_for_host(match gateway {
+        GatewayRoute::Anthropic => ANTHROPIC_HOST,
+        GatewayRoute::OpenAI => OPENAI_HOST,
+    });
+    let replace_authorization = credentials != CredentialPolicy::Preserve;
     let upstream_url = state.upstream_url(&request.target, route)?;
     let method = Method::from_bytes(request.method.as_bytes())
         .with_context(|| format!("unsupported HTTP method {}", request.method))?;
@@ -1809,7 +1989,10 @@ where
         if name.eq_ignore_ascii_case("authorization") {
             has_authorization = true;
         }
-        if should_forward_request_header_to_gateway(name, replace_authorization) {
+        if should_forward_request_header_to_gateway(name, replace_authorization)
+            && !(credentials == CredentialPolicy::DesktopPlaceholder
+                && name.eq_ignore_ascii_case("x-api-key"))
+        {
             if name.eq_ignore_ascii_case("authorization") {
                 forwarded_authorization.push(value.as_str());
             }
@@ -1831,7 +2014,8 @@ where
     // Native Mac requires only the provider-issued device proof. The Gateway
     // verifies its scoped digest and original account before forwarding it.
     // Session/auth cookies still never cross this credential substitution.
-    if replace_authorization
+    if gateway == GatewayRoute::OpenAI
+        && replace_authorization
         && is_chatgpt_device_cookie_target(&request.target)
         && !nominated.contains("cookie")
         && let Some(cookie) = chatgpt_device_cookie(&request.headers)?
@@ -1857,7 +2041,8 @@ where
         &upstream_url
     };
     let request_bytes = request.body.len();
-    let preserve_chat_preference = state.chatgpt_chat_passthrough
+    let preserve_chat_preference = gateway == GatewayRoute::OpenAI
+        && state.chatgpt_chat_passthrough
         && replace_authorization
         && is_fresh_chat_init(&request)
         && preferences_path.and_then(saved_chat_model_at).is_some();
@@ -3624,6 +3809,7 @@ mod tests {
                 chatgpt_chat_passthrough: false,
                 desktop_browser_use: true,
                 client_proof_dir: None,
+                desktop_config_root: None,
                 upstream_proxy: None,
             })
             .unwrap(),
@@ -3738,7 +3924,7 @@ mod tests {
         assert!(format!("{error:#}").contains("does not match"), "{error:#}");
     }
 
-    fn test_ca() -> (String, String) {
+    pub(super) fn test_ca() -> (String, String) {
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -4097,6 +4283,7 @@ mod tests {
                 chatgpt_chat_passthrough: true,
                 desktop_browser_use: true,
                 client_proof_dir: None,
+                desktop_config_root: None,
                 upstream_proxy: None,
             })
             .unwrap();
@@ -4635,6 +4822,7 @@ mod tests {
                 chatgpt_chat_passthrough: true,
                 desktop_browser_use: true,
                 client_proof_dir: None,
+                desktop_config_root: None,
                 upstream_proxy: None,
             })
             .unwrap(),
@@ -5630,6 +5818,7 @@ mod tests {
             chatgpt_chat_passthrough: true,
             desktop_browser_use: true,
             client_proof_dir: None,
+            desktop_config_root: None,
             upstream_proxy: None,
         })
         .unwrap();
@@ -5657,7 +5846,8 @@ mod tests {
             &mut writer,
             request,
             true,
-            true,
+            GatewayRoute::OpenAI,
+            CredentialPolicy::Replace,
             Some(&path),
         )
         .await
@@ -5727,6 +5917,7 @@ mod tests {
             chatgpt_chat_passthrough: false,
             desktop_browser_use: true,
             client_proof_dir: None,
+            desktop_config_root: None,
             upstream_proxy: None,
         })
         .unwrap();
@@ -5749,9 +5940,16 @@ mod tests {
             ],
         };
         let (mut writer, mut output) = tokio::io::duplex(16_384);
-        forward_to_saiai(&state, &mut writer, request, true, true)
-            .await
-            .unwrap();
+        forward_to_saiai(
+            &state,
+            &mut writer,
+            request,
+            true,
+            GatewayRoute::OpenAI,
+            CredentialPolicy::Replace,
+        )
+        .await
+        .unwrap();
         drop(writer);
         let mut response = Vec::new();
         output.read_to_end(&mut response).await.unwrap();
@@ -5821,6 +6019,7 @@ mod tests {
                 chatgpt_chat_passthrough: true,
                 desktop_browser_use: true,
                 client_proof_dir: None,
+                desktop_config_root: None,
                 upstream_proxy: None,
             })
             .unwrap();
@@ -5860,9 +6059,16 @@ mod tests {
             };
             state.trace_openai_request("request", "to_gateway", &request);
             let (mut writer, mut output) = tokio::io::duplex(16384);
-            forward_to_saiai(&state, &mut writer, request, true, true)
-                .await
-                .unwrap();
+            forward_to_saiai(
+                &state,
+                &mut writer,
+                request,
+                true,
+                GatewayRoute::OpenAI,
+                CredentialPolicy::Replace,
+            )
+            .await
+            .unwrap();
             drop(writer);
             let mut response = Vec::new();
             output.read_to_end(&mut response).await.unwrap();
@@ -5950,6 +6156,7 @@ mod tests {
                 chatgpt_chat_passthrough: true,
                 desktop_browser_use: true,
                 client_proof_dir: None,
+                desktop_config_root: None,
                 upstream_proxy: None,
             })
             .unwrap();
@@ -5965,9 +6172,16 @@ mod tests {
                 body: Vec::new(),
             };
             let (mut writer, mut output) = tokio::io::duplex(16_384);
-            forward_to_saiai(&state, &mut writer, request, true, true)
-                .await
-                .unwrap();
+            forward_to_saiai(
+                &state,
+                &mut writer,
+                request,
+                true,
+                GatewayRoute::OpenAI,
+                CredentialPolicy::Replace,
+            )
+            .await
+            .unwrap();
             drop(writer);
             let mut response = Vec::new();
             output.read_to_end(&mut response).await.unwrap();
@@ -6092,6 +6306,7 @@ mod tests {
             chatgpt_chat_passthrough: true,
             desktop_browser_use: true,
             client_proof_dir: None,
+            desktop_config_root: None,
             upstream_proxy: None,
         };
         let state = State::new(cfg.clone()).unwrap();
@@ -6477,6 +6692,7 @@ mod tests {
                 chatgpt_chat_passthrough: false,
                 desktop_browser_use: true,
                 client_proof_dir: None,
+                desktop_config_root: None,
                 upstream_proxy: None,
             })
             .unwrap(),
@@ -6613,6 +6829,7 @@ mod tests {
                 chatgpt_chat_passthrough: false,
                 desktop_browser_use: true,
                 client_proof_dir: None,
+                desktop_config_root: None,
                 upstream_proxy: None,
             })
             .unwrap(),
@@ -6733,6 +6950,7 @@ mod tests {
                 chatgpt_chat_passthrough: false,
                 desktop_browser_use: true,
                 client_proof_dir: None,
+                desktop_config_root: None,
                 upstream_proxy: None,
             })
             .unwrap(),
@@ -6769,6 +6987,7 @@ mod tests {
     #[test]
     fn telemetry_denylist_matches_only_measured_intake_hosts() {
         for host in [
+            "browser-intake-us5-datadoghq.com",
             "http-intake.logs.us5.datadoghq.com",
             "o33249.ingest.us.sentry.io",
             "o33249.ingest.sentry.io",
@@ -6800,8 +7019,6 @@ mod tests {
             "http-intake.logs.us5.datadoghq.com.evil.com",
             "xhttp-intake.logs.us5.datadoghq.com",
             "logs.us5.datadoghq.com",
-            // Static-only evidence so far; not refused until measured.
-            "browser-intake-us5-datadoghq.com",
             // Other Datadog/Sentry services users may call on purpose.
             "api.datadoghq.com",
             "sentry.io",
@@ -6992,6 +7209,7 @@ mod tests {
             chatgpt_chat_passthrough: true,
             desktop_browser_use: true,
             client_proof_dir: None,
+            desktop_config_root: None,
             upstream_proxy: None,
         })
         .err()
@@ -7038,7 +7256,7 @@ mod tests {
 
     /// Captures `count` forwarded requests and at least `enrolls` device
     /// enrollments (answered 429 so they stop); returns (forwarded, enrolls).
-    async fn capture_gateway_requests(
+    pub(super) async fn capture_gateway_requests(
         count: usize,
         enrolls: usize,
     ) -> (
@@ -7067,7 +7285,7 @@ mod tests {
         (base_url, server)
     }
 
-    fn proof_test_state(
+    pub(super) fn proof_test_state(
         base_url: &str,
         gateway: &str,
         enrolled_key: Option<&str>,
@@ -7086,6 +7304,7 @@ mod tests {
             chatgpt_chat_passthrough: true,
             desktop_browser_use: true,
             client_proof_dir: Some(directory.path().to_path_buf()),
+            desktop_config_root: Some(directory.path().to_path_buf()),
             upstream_proxy: None,
         })
         .unwrap();
@@ -7139,7 +7358,8 @@ mod tests {
                 &mut writer,
                 proof_request(target, "Bearer MOCK_ONLY_CLIENT"),
                 true,
-                true,
+                GatewayRoute::OpenAI,
+                CredentialPolicy::Replace,
             )
             .await
             .unwrap();
@@ -7164,6 +7384,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn desktop_placeholder_uses_anthropic_route_and_signs_replaced_key() {
+        let (base_url, server) = capture_gateway_requests(1, 0).await;
+        let (mut state, directory) =
+            proof_test_state(&base_url, &base_url, Some("MOCK_ONLY_CLAUDE_KEY"));
+        state.claude_route = Some(
+            validate_route(
+                "Claude",
+                RouteConfig {
+                    base_url: base_url.clone(),
+                    api_key: "MOCK_ONLY_CLAUDE_KEY".into(),
+                },
+            )
+            .unwrap(),
+        );
+        state.codex_route = Some(
+            validate_route(
+                "Codex",
+                RouteConfig {
+                    base_url: "http://127.0.0.1:1".into(),
+                    api_key: "MOCK_ONLY_OPENAI_KEY".into(),
+                },
+            )
+            .unwrap(),
+        );
+        let identity = crate::claude_desktop::Identity::prepare(directory.path()).unwrap();
+        let mut request = proof_request(
+            "/v1/messages?beta=true",
+            &format!("Bearer {}", identity.access_token),
+        );
+        request.headers.extend([
+            ("Cookie".into(), "sessionKey=LOCAL_ONLY".into()),
+            ("x-api-key".into(), "LOCAL_ONLY".into()),
+        ]);
+        let original = request.body.clone();
+        let policy = claude_desktop::credential_policy(&state, &request).unwrap();
+        let (mut writer, mut output) = tokio::io::duplex(16_384);
+        forward_to_saiai(
+            &state,
+            &mut writer,
+            request,
+            true,
+            GatewayRoute::Anthropic,
+            policy,
+        )
+        .await
+        .unwrap();
+        drop(writer);
+        output.read_to_end(&mut Vec::new()).await.unwrap();
+        let (captured, _) = server.await.unwrap();
+        let request = &captured[0];
+        assert_eq!(request.body, original);
+        assert_eq!(
+            header_value(&request.headers, "authorization"),
+            Some("Bearer MOCK_ONLY_CLAUDE_KEY")
+        );
+        assert!(header_value(&request.headers, "cookie").is_none());
+        assert!(header_value(&request.headers, "x-api-key").is_none());
+        verify_proof(
+            state.client_proof.get().unwrap(),
+            proof_headers(request)[0],
+            "POST",
+            &request.target,
+            "MOCK_ONLY_CLAUDE_KEY",
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_unknown_control_and_foreign_org_are_local_errors() {
+        let (state, directory) = proof_test_state("http://127.0.0.1:1", "http://127.0.0.1:1", None);
+        crate::claude_desktop::Identity::prepare(directory.path()).unwrap();
+        for (path, expected) in [
+            ("/api/unknown", "501"),
+            ("/api/organizations/foreign", "501"),
+            ("/%61pi/private", "400"),
+            ("/api/desktop/linux/x64/deb/latest", "204"),
+        ] {
+            let mut request = proof_request(path, "Bearer unused");
+            request.method = "GET".into();
+            let (mut writer, mut output) = tokio::io::duplex(16_384);
+            assert!(
+                claude_desktop::handle(&state, &mut writer, &request, "claude.ai", true)
+                    .await
+                    .unwrap()
+            );
+            drop(writer);
+            let mut response = Vec::new();
+            output.read_to_end(&mut response).await.unwrap();
+            assert!(
+                String::from_utf8(response)
+                    .unwrap()
+                    .starts_with(&format!("HTTP/1.1 {expected}"))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn claude_client_bearer_is_the_signed_api_key() {
         let (base_url, server) = capture_gateway_requests(1, 0).await;
         let (state, _directory) =
@@ -7174,7 +7490,8 @@ mod tests {
             &mut writer,
             proof_request("/v1/messages?beta=true", "Bearer MOCK_ONLY_CLAUDE_KEY"),
             true,
-            false,
+            GatewayRoute::Anthropic,
+            CredentialPolicy::Preserve,
         )
         .await
         .unwrap();
@@ -7214,7 +7531,8 @@ mod tests {
                 &mut writer,
                 proof_request("/v1/messages", authorization),
                 true,
-                false,
+                GatewayRoute::Anthropic,
+                CredentialPolicy::Preserve,
             )
             .await
             .unwrap();
@@ -7253,6 +7571,7 @@ mod tests {
                 chatgpt_chat_passthrough: true,
                 desktop_browser_use: true,
                 client_proof_dir: Some(directory.path().to_path_buf()),
+                desktop_config_root: Some(directory.path().to_path_buf()),
                 upstream_proxy: None,
             })
             .unwrap(),
