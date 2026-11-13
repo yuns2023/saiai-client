@@ -40,8 +40,8 @@ mod ingress_tests;
 
 use crate::brand::BRAND;
 use crate::gateway::{
-    self, ConfiguredRoute, GatewayExtension, GatewayHttp, GatewaySession, GatewayStart, SignInput,
-    Transport,
+    self, ConfiguredRoute, GatewayExtension, GatewayHttp, GatewaySession, GatewayStart,
+    NativeChatProtocol, SignInput, Transport,
 };
 use crate::upstream_proxy::{HttpClients, Snapshot, UpstreamProxy};
 use crate::upstream_tls;
@@ -1033,6 +1033,13 @@ async fn serve_http_proxy_request(
     };
     let host = canonical_host(target.host_str().unwrap_or_default());
     let port = target.port_or_known_default().unwrap_or(80);
+    // The Chat relay gate holds on the plain HTTP proxy too, on the path
+    // the absolute-form URL resolved to (the one that would be sent).
+    if state.gateway.native_chat().is_none() && refused_without_chat_relay(&host, target.path()) {
+        let resp = chat_relay_disabled_response();
+        return write_static_response(&mut stream, resp.status, resp.content_type, resp.body, true)
+            .await;
+    }
     if state.verbose {
         eprintln!(
             "http proxy accepted method={} scheme=http host={}:{} remote={} bytes={}",
@@ -1284,19 +1291,24 @@ async fn serve_managed_tls_on(
                 &request,
             );
             let is_chatgpt = matches!(host, CHATGPT_HOST | CHAT_OPENAI_HOST | CHATGPT_AUX_HOST);
+            // The Gateway's ordinary Chat relay, if it has one.
+            let chat = state.gateway.native_chat();
             if is_chatgpt {
-                match normalize_chatgpt_gateway_target(&request.target) {
+                match normalize_chatgpt_gateway_target(&request.target, chat.as_ref()) {
                     Ok(target) => request.target = target,
                     Err(_) => {
-                        let ordinary_chat_forwarded = state.chatgpt_chat_passthrough
-                            && normalize_chatgpt_chat_target(&request.target)
+                        let relay = chat.filter(|_| state.chatgpt_chat_passthrough);
+                        let ordinary_chat_forwarded = relay.is_some_and(|chat| {
+                            normalize_chatgpt_chat_target_with(&request.target, &chat)
                                 .map(|target| {
                                     request.target = target;
                                 })
-                                .is_ok();
+                                .is_ok()
+                        });
                         if !ordinary_chat_forwarded {
-                            if !state.chatgpt_chat_passthrough
-                                && let Some(resp) = chatgpt_chat_disabled_response(&request)
+                            if relay.is_none()
+                                && let Some(resp) =
+                                    chatgpt_chat_disabled_response(&request, chat.as_ref())
                             {
                                 write_static_response(
                                     reader.get_mut(),
@@ -1363,17 +1375,40 @@ async fn serve_managed_tls_on(
                                 }
                                 continue;
                             }
-                            return normalize_chatgpt_gateway_target(&request.target).map(|_| ());
+                            return normalize_chatgpt_gateway_target(
+                                &request.target,
+                                chat.as_ref(),
+                            )
+                            .map(|_| ());
                         }
                     }
                 }
+            }
+            let path = request_path(&request.target)?;
+            // Without a Chat relay, relay paths (already prefixed by the
+            // client, or Codex images, however spelled) are refused
+            // explicitly — before any WebSocket upgrade, and never answered
+            // with an empty success.
+            if chat.is_none() && may_reach_chat_relay(&request.target) {
+                let resp = chat_relay_disabled_response();
+                write_static_response(
+                    reader.get_mut(),
+                    resp.status,
+                    resp.content_type,
+                    resp.body,
+                    close_after,
+                )
+                .await?;
+                if close_after {
+                    return Ok(());
+                }
+                continue;
             }
             if is_websocket_upgrade(&request) {
                 let client_stream = reader.into_inner();
                 return serve_openai_websocket(state, client_stream, request).await;
             }
-            let path = request_path(&request.target)?;
-            if is_forwarded_openai_path(&path) {
+            if is_forwarded_openai_path(&path, chat.as_ref()) {
                 // Codex's OAuth request shape is preserved; only the Gateway
                 // credential is substituted at this upstream boundary.
                 forward_to_saiai(
@@ -2029,11 +2064,13 @@ where
     // Native Mac requires only the provider-issued device proof. The Gateway
     // verifies its scoped digest and original account before forwarding it.
     // Session/auth cookies still never cross this credential substitution.
+    let chat = state.gateway.native_chat();
     if gateway == GatewayRoute::OpenAI
         && replace_authorization
+        && let Some(chat) = chat
         && is_chatgpt_device_cookie_target(&request.target)
         && !nominated.contains("cookie")
-        && let Some(cookie) = chatgpt_device_cookie(&request.headers)?
+        && let Some(cookie) = chatgpt_device_cookie(&request.headers, chat.rejected_device_proofs)?
     {
         builder = builder.header("Cookie", cookie);
     }
@@ -2056,11 +2093,16 @@ where
         &upstream_url
     };
     let request_bytes = request.body.len();
-    let preserve_chat_preference = gateway == GatewayRoute::OpenAI
-        && state.chatgpt_chat_passthrough
-        && replace_authorization
-        && is_fresh_chat_init(&request)
-        && preferences_path.and_then(saved_chat_model_at).is_some();
+    // Without a Chat relay the preference file is never read.
+    let preserve_chat_preference = chat
+        .filter(|_| {
+            gateway == GatewayRoute::OpenAI
+                && state.chatgpt_chat_passthrough
+                && replace_authorization
+                && is_fresh_chat_init(&request)
+                && preferences_path.and_then(saved_chat_model_at).is_some()
+        })
+        .map(|chat| chat.preference_restored_header);
     if state.verbose {
         eprintln!(
             "forward request method={} target={} upstream={} bytes={} close_after={}",
@@ -2095,8 +2137,8 @@ where
             "request phase failed forwarding {request_method} {request_target} to {log_upstream_url}"
         )
     })?;
-    let outcome = if preserve_chat_preference {
-        write_chat_init_response(writer, response, close_after).await
+    let outcome = if let Some(restored_header) = preserve_chat_preference {
+        write_chat_init_response(writer, response, close_after, restored_header).await
     } else {
         write_upstream_response(writer, response, close_after).await
     }
@@ -2150,7 +2192,20 @@ fn is_fresh_chat_init(request: &IncomingRequest) -> bool {
     .all(|key| body.get(*key).is_none_or(Value::is_null))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Times this thread looked at a saved Chat preference file.
+    static PREFERENCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn preference_reads() -> usize {
+    PREFERENCE_READS.with(std::cell::Cell::get)
+}
+
 fn saved_chat_model_at(path: &std::path::Path) -> Option<String> {
+    #[cfg(test)]
+    PREFERENCE_READS.with(|reads| reads.set(reads.get() + 1));
     let file = fs::File::open(path).ok()?;
     if !file.metadata().ok()?.is_file() {
         return None;
@@ -2209,6 +2264,7 @@ async fn write_chat_init_response<W>(
     writer: &mut W,
     response: reqwest::Response,
     close_after: bool,
+    restored_header: &'static str,
 ) -> Result<UpstreamResponseOutcome>
 where
     W: AsyncWrite + Unpin,
@@ -2255,7 +2311,7 @@ where
         for key in ["content-length", "etag", "content-md5", "digest"] {
             headers.remove(key);
         }
-        headers.insert(BRAND.gateway.chat_preference_restored_header, "1".parse()?);
+        headers.insert(restored_header, "1".parse()?);
     }
     let mut result = tungstenite::http::Response::builder()
         .status(status)
@@ -2593,17 +2649,21 @@ fn is_forwarded_anthropic_path(path: &str) -> bool {
         || path.starts_with("/v1/models/")
 }
 
-fn is_forwarded_openai_path(path: &str) -> bool {
+fn is_forwarded_openai_path(path: &str, chat: Option<&NativeChatProtocol>) -> bool {
     path == "/v1/responses"
         || path.starts_with("/v1/responses/")
         || path == "/v1/models"
         || path.starts_with("/v1/models/")
-        || path == "/v1/codex/images/generations"
-        || path == "/v1/codex/images/edits"
-        || is_forwarded_chatgpt_path(path)
+        || (chat.is_some()
+            && (path == "/v1/codex/images/generations" || path == "/v1/codex/images/edits"))
+        || is_forwarded_chatgpt_path_with(path, chat)
 }
 
-pub(crate) fn is_forwarded_chatgpt_path(path: &str) -> bool {
+/// Gateway path of the ordinary Chat relay; nothing without a relay.
+fn is_forwarded_chatgpt_path_with(path: &str, chat: Option<&NativeChatProtocol>) -> bool {
+    let Some(chat) = chat else {
+        return false;
+    };
     path == "/chatgpt/backend-api/models"
         || path == "/chatgpt/backend-api/devicecheck"
         || path == "/chatgpt/backend-api/ios/attestation_challenge"
@@ -2618,8 +2678,79 @@ pub(crate) fn is_forwarded_chatgpt_path(path: &str) -> bool {
         || path.starts_with("/chatgpt/backend-api/files/download/")
         || path == "/chatgpt/backend-api/estuary/content"
         || path == "/chatgpt/backend-api/celsius/ws/user"
-        || path.strip_prefix("/chatgpt") == Some(BRAND.gateway.chat_updates_path)
+        || path.strip_prefix("/chatgpt") == Some(chat.updates_path)
         || is_chatgpt_owned_conversation_path(path.strip_prefix("/chatgpt").unwrap_or(path))
+}
+
+/// [`is_forwarded_chatgpt_path_with`] for the running extension (tests).
+#[cfg(test)]
+pub(crate) fn is_forwarded_chatgpt_path(path: &str) -> bool {
+    is_forwarded_chatgpt_path_with(path, crate::runtime::gateway().native_chat().as_ref())
+}
+
+/// Codex image endpoints, a part of the Gateway's ChatGPT relay.
+/// Whether `target` may reach the Chat relay (`/chatgpt`, Codex images),
+/// compared on `relay_gate_path`. The outgoing URL is the Gateway base URL
+/// followed by the target, so a path with dot segments could resolve into
+/// the relay below any base path; such a path counts as reaching it.
+fn may_reach_chat_relay(target: &str) -> bool {
+    let Ok(path) = request_path(target) else {
+        return false;
+    };
+    let Some(path) = relay_gate_path(&path) else {
+        return true;
+    };
+    let under = |root: &str| {
+        path == root
+            || path
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    under("/chatgpt") || under("/v1/codex/images") || under("/backend-api/codex/images")
+}
+
+/// Whether a request to `host` is refused because the Gateway has no Chat
+/// relay: relay paths on any OpenAI host, and ordinary Chat paths on the
+/// ChatGPT hosts — however spelled. Codex and other traffic is not.
+fn refused_without_chat_relay(host: &str, target: &str) -> bool {
+    let chatgpt = matches!(host, CHATGPT_HOST | CHAT_OPENAI_HOST | CHATGPT_AUX_HOST);
+    if !chatgpt && host != OPENAI_HOST {
+        return false;
+    }
+    may_reach_chat_relay(target)
+        || chatgpt
+            && request_path(target)
+                .ok()
+                .and_then(|path| relay_gate_path(&path))
+                .is_some_and(|path| normalize_ordinary_chat_target(&path, None).is_ok())
+}
+
+/// `path` as the Chat relay gate compares it: any fragment cut (never sent),
+/// lowercase, `%2f` and `%2e` decoded, `;` parameters and empty segments
+/// dropped. `None` when it holds dot segments or backslashes, whose
+/// resolution depends on the Gateway base path.
+fn relay_gate_path(path: &str) -> Option<String> {
+    let path = path.split('#').next().unwrap_or_default();
+    if path.contains('\\') {
+        return None;
+    }
+    let decoded = path
+        .to_ascii_lowercase()
+        .replace("%2f", "/")
+        .replace("%2e", ".");
+    let mut gate = String::new();
+    for segment in decoded.split('/') {
+        let segment = segment.split(';').next().unwrap_or_default();
+        match segment {
+            "" => {}
+            "." | ".." => return None,
+            segment => {
+                gate.push('/');
+                gate.push_str(segment);
+            }
+        }
+    }
+    Some(if gate.is_empty() { "/".into() } else { gate })
 }
 
 fn is_chatgpt_upload_target(target: &str) -> bool {
@@ -2650,7 +2781,10 @@ fn is_chatgpt_device_cookie_target(target: &str) -> bool {
     )
 }
 
-fn chatgpt_device_cookie(headers: &[(String, String)]) -> Result<Option<String>> {
+fn chatgpt_device_cookie(
+    headers: &[(String, String)],
+    rejected: &[&str],
+) -> Result<Option<String>> {
     let mut proof = None;
     let mut seen = false;
     for (_, raw) in headers
@@ -2674,9 +2808,9 @@ fn chatgpt_device_cookie(headers: &[(String, String)]) -> Result<Option<String>>
                 bail!("invalid native Chat device proof");
             }
             seen = true;
-            // Never replay the historical local bootstrap placeholder as a
-            // provider proof. A real registration replaces it on startup.
-            if value != "saiai-local-proxy" {
+            // Never replay a local placeholder (the Gateway's rejected
+            // values) as a provider proof.
+            if !rejected.contains(&value) {
                 proof = Some(format!("_devicecheck={value}"));
             }
         }
@@ -2700,7 +2834,10 @@ fn is_chatgpt_owned_conversation_path(path: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-fn normalize_chatgpt_gateway_target(target: &str) -> Result<String> {
+fn normalize_chatgpt_gateway_target(
+    target: &str,
+    chat: Option<&NativeChatProtocol>,
+) -> Result<String> {
     let path = request_path(target)?;
     let normalized = if path == "/backend-api/codex/responses" {
         "/v1/responses"
@@ -2710,9 +2847,9 @@ fn normalize_chatgpt_gateway_target(target: &str) -> Result<String> {
         "/v1/models"
     } else if path.starts_with("/backend-api/codex/models/") {
         return Ok(target.replacen("/backend-api/codex/models", "/v1/models", 1));
-    } else if path == "/backend-api/codex/images/generations" {
+    } else if chat.is_some() && path == "/backend-api/codex/images/generations" {
         "/v1/codex/images/generations"
-    } else if path == "/backend-api/codex/images/edits" {
+    } else if chat.is_some() && path == "/backend-api/codex/images/edits" {
         "/v1/codex/images/edits"
     } else {
         bail!("unsupported ChatGPT Codex path: {path}");
@@ -2724,7 +2861,22 @@ fn normalize_chatgpt_gateway_target(target: &str) -> Result<String> {
     })
 }
 
+/// Gateway target of an ordinary Chat request for a relay with `chat`.
+fn normalize_chatgpt_chat_target_with(target: &str, chat: &NativeChatProtocol) -> Result<String> {
+    normalize_ordinary_chat_target(target, Some(chat.updates_path))
+}
+
+/// [`normalize_chatgpt_chat_target_with`] for the running extension (tests).
+#[cfg(test)]
 pub(crate) fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
+    let chat = crate::runtime::gateway()
+        .native_chat()
+        .context("the running Gateway has no Chat relay")?;
+    normalize_chatgpt_chat_target_with(target, &chat)
+}
+
+/// Ordinary Chat target (optionally including a Gateway's updates path).
+fn normalize_ordinary_chat_target(target: &str, updates_path: Option<&str>) -> Result<String> {
     let path = request_path(target)?;
     if path == "/api/estuary/upload_content_bytes" {
         return Ok(format!("/chatgpt{target}"));
@@ -2749,7 +2901,7 @@ pub(crate) fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
         || path.starts_with("/backend-api/files/download/")
         || path == "/backend-api/estuary/content"
         || path == "/backend-api/celsius/ws/user"
-        || path == BRAND.gateway.chat_updates_path
+        || Some(path.as_str()) == updates_path
         || is_chatgpt_owned_conversation_path(&path);
     if !allowed {
         bail!("unsupported ChatGPT ordinary Chat path: {path}");
@@ -2921,14 +3073,26 @@ fn desktop_control_unsupported_response() -> StaticResponse {
     }
 }
 
-fn chatgpt_chat_disabled_response(request: &IncomingRequest) -> Option<StaticResponse> {
-    normalize_chatgpt_chat_target(&request.target).ok()?;
-    Some(StaticResponse {
+/// Explicit answer for ordinary Chat requests that are not relayed (user
+/// switch off, or a Gateway without a Chat relay).
+fn chatgpt_chat_disabled_response(
+    request: &IncomingRequest,
+    chat: Option<&NativeChatProtocol>,
+) -> Option<StaticResponse> {
+    let covered = match chat {
+        Some(chat) => normalize_chatgpt_chat_target_with(&request.target, chat).is_ok(),
+        None => refused_without_chat_relay(CHATGPT_HOST, &request.target),
+    };
+    covered.then(chat_relay_disabled_response)
+}
+
+fn chat_relay_disabled_response() -> StaticResponse {
+    StaticResponse {
         status: StatusCode::NOT_IMPLEMENTED,
         content_type: "application/json",
         body: br#"{"error":{"type":"chat_mode_temporarily_disabled","message":"Chat mode is temporarily unsupported; switch to Codex mode."}}"#,
         reason: "chat_mode_temporarily_disabled",
-    })
+    }
 }
 
 #[cfg(test)]
@@ -3715,6 +3879,11 @@ fn request_path(target: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The SAIAI Gateway's Chat relay (the unit-test fallback extension).
+    pub(super) fn saiai_chat() -> Option<NativeChatProtocol> {
+        crate::runtime::gateway().native_chat()
+    }
     use crate::client_proof::{self, ClientProof};
     use crate::gateway_saiai::SaiaiSession;
     use rcgen::{BasicConstraints, IsCa};
@@ -3895,21 +4064,35 @@ mod tests {
         for operation in ["generations", "edits"] {
             let path = format!("/backend-api/codex/images/{operation}");
             let target = format!("{path}?opaque=a%2Fb&opaque=%2B");
-            let normalized = normalize_chatgpt_gateway_target(&target).unwrap();
+            let normalized =
+                normalize_chatgpt_gateway_target(&target, saiai_chat().as_ref()).unwrap();
             assert_eq!(
                 normalized,
                 format!("/v1/codex/images/{operation}?opaque=a%2Fb&opaque=%2B")
             );
             assert!(is_forwarded_openai_path(
-                &request_path(&normalized).unwrap()
+                &request_path(&normalized).unwrap(),
+                saiai_chat().as_ref()
             ));
             assert!(!is_forwarded_chatgpt_path(
                 &request_path(&normalized).unwrap()
             ));
-            assert!(normalize_chatgpt_gateway_target(&format!("{path}/unexpected")).is_err());
+            assert!(
+                normalize_chatgpt_gateway_target(
+                    &format!("{path}/unexpected"),
+                    saiai_chat().as_ref()
+                )
+                .is_err()
+            );
         }
-        assert!(!is_forwarded_openai_path("/v1/codex/images/unknown"));
-        assert!(!is_forwarded_openai_path("/v1/images/generations"));
+        assert!(!is_forwarded_openai_path(
+            "/v1/codex/images/unknown",
+            saiai_chat().as_ref()
+        ));
+        assert!(!is_forwarded_openai_path(
+            "/v1/images/generations",
+            saiai_chat().as_ref()
+        ));
     }
 
     #[test]
@@ -3987,24 +4170,194 @@ mod tests {
 
     #[test]
     fn detects_forwarded_openai_paths() {
-        assert!(is_forwarded_openai_path("/v1/responses"));
-        assert!(is_forwarded_openai_path("/v1/responses/compact"));
-        assert!(is_forwarded_openai_path("/v1/models"));
-        assert!(is_forwarded_openai_path("/v1/models/gpt-5.3-codex"));
-        assert!(!is_forwarded_openai_path("/backend-api/codex/models"));
+        assert!(is_forwarded_openai_path(
+            "/v1/responses",
+            saiai_chat().as_ref()
+        ));
+        assert!(is_forwarded_openai_path(
+            "/v1/responses/compact",
+            saiai_chat().as_ref()
+        ));
+        assert!(is_forwarded_openai_path(
+            "/v1/models",
+            saiai_chat().as_ref()
+        ));
+        assert!(is_forwarded_openai_path(
+            "/v1/models/gpt-5.3-codex",
+            saiai_chat().as_ref()
+        ));
+        assert!(!is_forwarded_openai_path(
+            "/backend-api/codex/models",
+            saiai_chat().as_ref()
+        ));
+    }
+
+    /// Every layer of the Native Chat gate holds on its own, not only the
+    /// first one an ingress request meets.
+    #[test]
+    fn each_native_chat_gate_closes_without_the_capability_and_keeps_codex() {
+        let on = saiai_chat();
+        let on = on.as_ref();
+        for path in ["/v1/codex/images/generations", "/v1/codex/images/edits"] {
+            assert!(is_forwarded_openai_path(path, on), "{path}");
+            assert!(!is_forwarded_openai_path(path, None), "{path}");
+        }
+        for path in ["/v1/responses", "/v1/responses/compact", "/v1/models"] {
+            assert!(is_forwarded_openai_path(path, None), "{path}");
+        }
+        for (target, mapped) in [
+            (
+                "/backend-api/codex/images/generations",
+                "/v1/codex/images/generations",
+            ),
+            ("/backend-api/codex/images/edits", "/v1/codex/images/edits"),
+        ] {
+            assert_eq!(
+                normalize_chatgpt_gateway_target(target, on).unwrap(),
+                mapped
+            );
+            assert!(
+                normalize_chatgpt_gateway_target(target, None).is_err(),
+                "{target}"
+            );
+        }
+        for (target, mapped) in [
+            ("/backend-api/codex/responses", "/v1/responses"),
+            (
+                "/backend-api/codex/responses/compact",
+                "/v1/responses/compact",
+            ),
+            (
+                "/backend-api/codex/models?client_version=1",
+                "/v1/models?client_version=1",
+            ),
+        ] {
+            assert_eq!(
+                normalize_chatgpt_gateway_target(target, None).unwrap(),
+                mapped
+            );
+        }
+        for path in [
+            "/chatgpt/backend-api/models",
+            "/chatgpt/backend-api/devicecheck",
+            "/chatgpt/backend-api/f/conversation",
+            "/chatgpt/backend-api/saiai/chat-updates",
+        ] {
+            assert!(is_forwarded_chatgpt_path_with(path, on), "{path}");
+            assert!(!is_forwarded_chatgpt_path_with(path, None), "{path}");
+        }
+        let request = |target: &str| IncomingRequest {
+            method: "POST".into(),
+            target: target.into(),
+            http_version: "HTTP/1.1".into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        for target in [
+            "/backend-api/f/conversation",
+            "/backend-api/codex/images/generations",
+            "/v1/codex/images/edits",
+        ] {
+            let response = chatgpt_chat_disabled_response(&request(target), None)
+                .unwrap_or_else(|| panic!("{target}"));
+            assert_eq!(response.status, StatusCode::NOT_IMPLEMENTED);
+            assert_eq!(response.reason, "chat_mode_temporarily_disabled");
+        }
+        for path in [
+            "/v1/responses/%2E%2e/x",
+            "/v1/responses/./x",
+            "/v1/responses\\x",
+            "/a/.%2E;p/b",
+        ] {
+            assert_eq!(relay_gate_path(path), None, "{path}");
+        }
+        for (path, gate) in [
+            ("/v1/responses", "/v1/responses"),
+            ("/v1/responses/..x", "/v1/responses/..x"),
+            ("/v1/.well", "/v1/.well"),
+            ("/ChatGPT//Backend-API/", "/chatgpt/backend-api"),
+            ("/chatgpt%2Fbackend-api;x=1/f", "/chatgpt/backend-api/f"),
+            ("/chatgpt#x", "/chatgpt"),
+            ("/backend-api/devicecheck#/../x", "/backend-api/devicecheck"),
+        ] {
+            assert_eq!(relay_gate_path(path).as_deref(), Some(gate), "{path}");
+        }
+        // Every spelling of a relay path, on the hosts it belongs to.
+        for (host, target) in [
+            (OPENAI_HOST, "/ChatGPT/backend-api/celsius/ws/user"),
+            (OPENAI_HOST, "/chatgpt/"),
+            (OPENAI_HOST, "//chatgpt/backend-api/models"),
+            (OPENAI_HOST, "/chatgpt;x/backend-api/models"),
+            (OPENAI_HOST, "/v1/codex/images/generations/"),
+            (OPENAI_HOST, "/V1/Codex/Images/edits"),
+            (OPENAI_HOST, "/v1/codex/images"),
+            (CHATGPT_HOST, "/Backend-API/f/conversation"),
+            (CHAT_OPENAI_HOST, "/backend-api/devicecheck/"),
+            (CHATGPT_AUX_HOST, "/backend-api/codex/images/generations/"),
+            (CHATGPT_HOST, "/celsius/ws/user"),
+            (OPENAI_HOST, "/chatgpt#x"),
+            (CHATGPT_HOST, "/backend-api/devicecheck#x"),
+        ] {
+            assert!(refused_without_chat_relay(host, target), "{host}{target}");
+        }
+        // Codex, the Desktop sidecars and other hosts are not.
+        for (host, target) in [
+            (OPENAI_HOST, "/v1/responses"),
+            (OPENAI_HOST, "/v1/responses/compact"),
+            (OPENAI_HOST, "/v1/models/gpt-5.3-codex"),
+            (OPENAI_HOST, "/v1/codex/imagesx"),
+            (OPENAI_HOST, "/chatgptx"),
+            (CHATGPT_HOST, "/backend-api/codex/responses"),
+            (CHATGPT_HOST, "/backend-api/codex/models?client_version=1"),
+            (CHATGPT_HOST, "/backend-api/me"),
+            (ANTHROPIC_HOST, "/chatgpt/backend-api/models"),
+            ("example.com", "/backend-api/f/conversation"),
+        ] {
+            assert!(!refused_without_chat_relay(host, target), "{host}{target}");
+        }
+        // Ordinary Codex traffic stays open, including relay-looking queries.
+        for target in [
+            "/v1/responses",
+            "/v1/responses/compact",
+            "/v1/models?client_version=0.1.0",
+            "/v1/responses?x=/chatgpt/../..",
+        ] {
+            assert!(!may_reach_chat_relay(target), "{target}");
+        }
+        for target in [
+            "/backend-api/codex/responses",
+            "/v1/responses",
+            "/backend-api/me",
+        ] {
+            assert!(
+                chatgpt_chat_disabled_response(&request(target), None).is_none(),
+                "{target}"
+            );
+        }
     }
 
     #[test]
     fn normalizes_chatgpt_codex_targets_for_gateway() {
         assert_eq!(
-            normalize_chatgpt_gateway_target("/backend-api/codex/responses?stream=true").unwrap(),
+            normalize_chatgpt_gateway_target(
+                "/backend-api/codex/responses?stream=true",
+                saiai_chat().as_ref()
+            )
+            .unwrap(),
             "/v1/responses?stream=true"
         );
         assert_eq!(
-            normalize_chatgpt_gateway_target("/backend-api/codex/models/gpt-5").unwrap(),
+            normalize_chatgpt_gateway_target(
+                "/backend-api/codex/models/gpt-5",
+                saiai_chat().as_ref()
+            )
+            .unwrap(),
             "/v1/models/gpt-5"
         );
-        assert!(normalize_chatgpt_gateway_target("/backend-api/conversations").is_err());
+        assert!(
+            normalize_chatgpt_gateway_target("/backend-api/conversations", saiai_chat().as_ref())
+                .is_err()
+        );
         assert!(is_managed_host(CHATGPT_HOST));
         assert!(is_managed_host(CHAT_OPENAI_HOST));
         assert!(is_managed_host(CHATGPT_AUX_HOST));
@@ -4018,7 +4371,8 @@ mod tests {
             "/chatgpt/backend-api/ios/attestation_challenge?x=a%2Fb&x=a+b"
         );
         assert!(is_forwarded_openai_path(
-            "/chatgpt/backend-api/ios/attestation_challenge"
+            "/chatgpt/backend-api/ios/attestation_challenge",
+            saiai_chat().as_ref()
         ));
         assert!(
             normalize_chatgpt_chat_target("/backend-api/ios/attestation_challenge/future").is_err()
@@ -4028,8 +4382,13 @@ mod tests {
                 .unwrap(),
             "/chatgpt/backend-api/models?language=zh-CN&x=a%2Bb&x=c"
         );
-        assert!(is_forwarded_openai_path("/chatgpt/backend-api/models"));
-        assert!(normalize_chatgpt_gateway_target("/backend-api/models").is_err());
+        assert!(is_forwarded_openai_path(
+            "/chatgpt/backend-api/models",
+            saiai_chat().as_ref()
+        ));
+        assert!(
+            normalize_chatgpt_gateway_target("/backend-api/models", saiai_chat().as_ref()).is_err()
+        );
         assert!(normalize_chatgpt_chat_target("/backend-api/models/future").is_err());
         assert!(normalize_chatgpt_chat_target("/backend-api/models-admin").is_err());
         assert_eq!(
@@ -4085,14 +4444,17 @@ mod tests {
             headers: Vec::new(),
             body: Vec::new(),
         };
-        let response = chatgpt_chat_disabled_response(&request).unwrap();
+        let response = chatgpt_chat_disabled_response(&request, saiai_chat().as_ref()).unwrap();
         assert_eq!(response.status, StatusCode::NOT_IMPLEMENTED);
         assert_eq!(response.reason, "chat_mode_temporarily_disabled");
         assert!(
-            !chatgpt_chat_disabled_response(&IncomingRequest {
-                target: "/backend-api/codex/models".to_string(),
-                ..request
-            })
+            !chatgpt_chat_disabled_response(
+                &IncomingRequest {
+                    target: "/backend-api/codex/models".to_string(),
+                    ..request
+                },
+                saiai_chat().as_ref()
+            )
             .is_some()
         );
     }
@@ -4193,7 +4555,9 @@ mod tests {
             "session=MOCK_ONLY_AUTH; _devicecheck=MOCK_ONLY_PROOF; other=MOCK_ONLY_OTHER".into(),
         )];
         assert_eq!(
-            chatgpt_device_cookie(&headers).unwrap().as_deref(),
+            chatgpt_device_cookie(&headers, saiai_chat().unwrap().rejected_device_proofs)
+                .unwrap()
+                .as_deref(),
             Some("_devicecheck=MOCK_ONLY_PROOF")
         );
         for invalid in [
@@ -4201,12 +4565,21 @@ mod tests {
             "_devicecheck=\"MOCK_ONLY_PROOF\"",
             "_devicecheck=MOCK_ONLY_FIRST; _devicecheck=MOCK_ONLY_SECOND",
         ] {
-            assert!(chatgpt_device_cookie(&[("Cookie".into(), invalid.into())]).is_err());
+            assert!(
+                chatgpt_device_cookie(
+                    &[("Cookie".into(), invalid.into())],
+                    saiai_chat().unwrap().rejected_device_proofs
+                )
+                .is_err()
+            );
         }
         assert!(
-            chatgpt_device_cookie(&[("Cookie".into(), "_devicecheck=saiai-local-proxy".into())])
-                .unwrap()
-                .is_none()
+            chatgpt_device_cookie(
+                &[("Cookie".into(), "_devicecheck=saiai-local-proxy".into())],
+                saiai_chat().unwrap().rejected_device_proofs
+            )
+            .unwrap()
+            .is_none()
         );
         assert!(!is_chatgpt_device_cookie_target("/v1/responses"));
         assert!(!is_chatgpt_device_cookie_target(
@@ -5778,9 +6151,14 @@ mod tests {
         }
         let response: reqwest::Response = response.body(body.clone()).unwrap().into();
         let (mut writer, mut reader) = tokio::io::duplex(body.len() + 8192);
-        write_chat_init_response(&mut writer, response, true)
-            .await
-            .unwrap();
+        write_chat_init_response(
+            &mut writer,
+            response,
+            true,
+            saiai_chat().unwrap().preference_restored_header,
+        )
+        .await
+        .unwrap();
         drop(writer);
         let mut raw = Vec::new();
         reader.read_to_end(&mut raw).await.unwrap();

@@ -69,7 +69,7 @@ pub use brand::{
 use desktop_product::DesktopProduct;
 pub use gateway::{
     ConfiguredRoute, GatewayExtension, GatewayHttp, GatewaySession, GatewayStart,
-    NoGatewayExtension, SignInput, Transport,
+    NativeChatProtocol, NoGatewayExtension, SignInput, Transport,
 };
 pub use runtime::RuntimeContext;
 

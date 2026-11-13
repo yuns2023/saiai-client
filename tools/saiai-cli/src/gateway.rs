@@ -35,6 +35,14 @@ pub trait GatewayExtension: std::any::Any + Send + Sync {
 
     /// Starts the per-run session. Must return immediately.
     fn start(&self, start: GatewayStart) -> Arc<dyn GatewaySession>;
+
+    /// Whether the Gateway relays the official ChatGPT Desktop's ordinary
+    /// Chat (below `/chatgpt/`), and its names for that relay. `None` turns
+    /// the relay off: those requests get an explicit "unsupported" response,
+    /// while Codex traffic and the local Desktop compatibility layer stay.
+    fn native_chat(&self) -> Option<NativeChatProtocol> {
+        None
+    }
 }
 
 /// What a session gets from the local proxy run that starts it.
@@ -50,6 +58,28 @@ pub struct GatewayStart {
     pub runtime: tokio::runtime::Handle,
     /// Released program version.
     pub version: &'static str,
+}
+
+/// A Gateway's ordinary Chat relay for the official ChatGPT Desktop.
+///
+/// Data only: the relay itself (path allowlist, device-proof cookie,
+/// preference restore, trace redaction) is ChatGPT client protocol handled
+/// by the kernel; a Gateway contributes that it serves the relay plus the
+/// names that are its own.
+///
+/// Codex images (`/v1/codex/images/*`) belong to this capability too: a
+/// generic Gateway does not promise that endpoint, so without the relay the
+/// explicit refusal beats forwarding to an endpoint that may not exist. A
+/// separate capability can split them out if a Gateway ever needs it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeChatProtocol {
+    /// Gateway's Chat updates channel: a complete path starting with
+    /// `/backend-api/` (forwarded as `/chatgpt` + this path).
+    pub updates_path: &'static str,
+    /// Lowercase response header marking a restored Chat preference.
+    pub preference_restored_header: &'static str,
+    /// `_devicecheck` values that are local placeholders, never forwarded.
+    pub rejected_device_proofs: &'static [&'static str],
 }
 
 /// One configured Gateway route.
@@ -169,6 +199,24 @@ pub(crate) fn validate_extension(extension: &dyn GatewayExtension) -> Result<()>
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
         if !valid || is_protected_header(name) {
             anyhow::bail!("Gateway extension declares an unusable signature header {name:?}");
+        }
+    }
+    if let Some(chat) = extension.native_chat() {
+        let header = chat.preference_restored_header;
+        let valid = !header.is_empty()
+            && header
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+        if !valid || is_protected_header(header) {
+            anyhow::bail!("Gateway extension declares an unusable Chat response header {header:?}");
+        }
+        let path = chat.updates_path;
+        if !path.starts_with("/backend-api/")
+            || !path
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_'))
+        {
+            anyhow::bail!("Gateway extension declares an unusable Chat updates path {path:?}");
         }
     }
     Ok(())

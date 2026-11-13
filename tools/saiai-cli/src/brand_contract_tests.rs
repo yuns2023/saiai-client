@@ -1355,9 +1355,23 @@ fn inline_contract_literals_are_present() {
         ),
         ("local_proxy.rs", "\"userID\":\"saiai-local-proxy-user\""),
         ("local_proxy.rs", "\"stableID\":\"saiai-local-proxy\""),
+        // The restored-preference marker: the forwarder writes the header the
+        // Native Chat capability names, and SAIAI names its brand header.
         (
             "local_proxy.rs",
-            "headers.insert(BRAND.gateway.chat_preference_restored_header, \"1\".parse()?);",
+            "headers.insert(restored_header, \"1\".parse()?);",
+        ),
+        (
+            "gateway_saiai.rs",
+            "preference_restored_header: brand.gateway.chat_preference_restored_header,",
+        ),
+        (
+            "gateway_saiai.rs",
+            "updates_path: brand.gateway.chat_updates_path,",
+        ),
+        (
+            "gateway_saiai.rs",
+            "rejected_device_proofs: &[\"saiai-local-proxy\"],",
         ),
         // Atomic temporary files that uninstall recognizes.
         (
@@ -1889,6 +1903,20 @@ fn saiai_brand_values_are_frozen() {
     assert_eq!(
         brand.gateway.chat_preference_restored_header,
         "x-saiai-chat-preference-restored"
+    );
+    // SAIAI turns the Native Chat relay on with exactly its brand names and
+    // the historical placeholder device proof it never forwards.
+    assert_eq!(
+        crate::GatewayExtension::native_chat(&crate::gateway_saiai::SAIAI_GATEWAY),
+        Some(crate::NativeChatProtocol {
+            updates_path: "/backend-api/saiai/chat-updates",
+            preference_restored_header: "x-saiai-chat-preference-restored",
+            rejected_device_proofs: &["saiai-local-proxy"],
+        })
+    );
+    assert_eq!(
+        crate::GatewayExtension::native_chat(&crate::gateway::NoGatewayExtension),
+        None
     );
     assert_eq!(brand.winhttp_agent, "SAIAI");
     assert_eq!(brand.codex_daemon_client_name, "saiai_daemon_check");

@@ -8,7 +8,8 @@
 
 use crate::client_proof::{self, ClientProof};
 use crate::gateway::{
-    ConfiguredRoute, GatewayExtension, GatewayHttp, GatewaySession, GatewayStart, SignInput,
+    ConfiguredRoute, GatewayExtension, GatewayHttp, GatewaySession, GatewayStart,
+    NativeChatProtocol, SignInput,
 };
 use std::sync::{Arc, OnceLock};
 use zeroize::Zeroizing;
@@ -23,6 +24,18 @@ pub struct SaiaiGateway {
 impl GatewayExtension for SaiaiGateway {
     fn signature_headers(&self) -> &'static [&'static str] {
         std::slice::from_ref(&crate::brand::brand().client_proof.header)
+    }
+
+    /// The SAIAI Gateway relays ordinary Chat for the official Desktop.
+    fn native_chat(&self) -> Option<NativeChatProtocol> {
+        let brand = crate::brand::brand();
+        Some(NativeChatProtocol {
+            updates_path: brand.gateway.chat_updates_path,
+            preference_restored_header: brand.gateway.chat_preference_restored_header,
+            // The historical local bootstrap placeholder is never a provider
+            // proof; a real registration replaces it on startup.
+            rejected_device_proofs: &["saiai-local-proxy"],
+        })
     }
 
     fn start(&self, start: GatewayStart) -> Arc<dyn GatewaySession> {
