@@ -43,6 +43,11 @@ mod claude_launcher;
 mod client_proof;
 mod codex_daemon;
 mod codex_diagnostics;
+#[cfg(any(test, feature = "contract"))]
+#[doc(hidden)]
+pub mod contract;
+#[cfg(test)]
+mod contract_desktop_tests;
 mod desktop_product;
 mod environment_scope;
 mod gateway;

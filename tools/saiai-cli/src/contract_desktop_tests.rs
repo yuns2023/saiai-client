@@ -2,20 +2,39 @@
 //! (Codex/ChatGPT Desktop sidecars, Claude Desktop control plane). Frozen
 //! from the SAIAI build before their brand names moved to `Brand`; with the
 //! SAIAI brand every byte must stay as written here.
+//!
+//! SAIAI-side tests: they reach the kernel only through `crate::contract`
+//! and public items, as they will from the SAIAI program's own crate.
 
-use super::*;
+use crate::brand_saiai::SAIAI_BRAND;
+use crate::contract::claude_desktop::{self as claude, Identity};
+use crate::contract::desktop::{self, Request};
 use serde_json::json;
 
-fn req(method: &str, target: &str, headers: &[(&str, &str)], body: &str) -> IncomingRequest {
-    IncomingRequest {
-        method: method.into(),
-        target: target.into(),
-        http_version: "HTTP/1.1".into(),
-        headers: headers
-            .iter()
-            .map(|(name, value)| (name.to_string(), value.to_string()))
-            .collect(),
-        body: body.as_bytes().to_vec(),
+/// The SAIAI brand and runtime, installed the way the program installs them.
+fn saiai() -> &'static crate::Brand {
+    crate::contract::install(
+        &SAIAI_BRAND,
+        crate::RuntimeContext {
+            version: env!("CARGO_PKG_VERSION"),
+            gateway: &crate::gateway_saiai::SAIAI_GATEWAY,
+        },
+    )
+    .unwrap();
+    &SAIAI_BRAND
+}
+
+fn req<'a>(
+    method: &'a str,
+    target: &'a str,
+    headers: &'a [(&'a str, &'a str)],
+    body: &'a str,
+) -> Request<'a> {
+    Request {
+        method,
+        target,
+        headers,
+        body: body.as_bytes(),
     }
 }
 
@@ -46,47 +65,53 @@ fn desktop_statsig_answers_are_byte_identical() {
             STATSIG_BOOTSTRAP_BROWSER_TRUE,
         ),
     ] {
-        let features = DesktopFeatures { browser_use };
-        let response =
-            chatgpt_sidecar_response_with(&req("POST", "/v1/initialize", &[], "{}"), features)
-                .unwrap();
-        assert_eq!(response.status, StatusCode::OK);
-        assert_eq!(response.content_type, "application/json");
+        let response = desktop::sidecar(
+            saiai(),
+            &req("POST", "/v1/initialize", &[], "{}"),
+            browser_use,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, Some("application/json"));
         assert_eq!(response.reason, "desktop_statsig_local_bootstrap");
-        assert_eq!(std::str::from_utf8(response.body).unwrap(), static_body);
+        assert_eq!(std::str::from_utf8(&response.body).unwrap(), static_body);
 
         let user = r#"{"user":{"userID":"u-fixed","customIDs":{"stableID":"s-fixed"}}}"#;
-        let (status, body, reason, headers) = chatgpt_account_sidecar_response_with(
+        let answer = desktop::account_sidecar(
+            saiai(),
             &req("POST", "/v1/initialize", &[], user),
-            features,
+            browser_use,
         )
+        .unwrap()
         .unwrap();
         assert_eq!(
-            (status, reason, headers.len()),
-            (StatusCode::OK, "desktop_statsig_identity_bootstrap", 0)
+            (answer.status, answer.reason, answer.headers.len()),
+            (200, "desktop_statsig_identity_bootstrap", 0)
         );
-        assert_eq!(std::str::from_utf8(&body).unwrap(), account_body);
+        assert_eq!(std::str::from_utf8(&answer.body).unwrap(), account_body);
 
         // No OAuth identity: the synthetic user id stands in.
-        let (status, body, _, _) = chatgpt_account_sidecar_response_with(
+        let answer = desktop::account_sidecar(
+            saiai(),
             &req(
                 "POST",
                 "/backend-api/wham/statsig/bootstrap",
                 &ACCOUNT,
                 "{}",
             ),
-            features,
+            browser_use,
         )
+        .unwrap()
         .unwrap();
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(std::str::from_utf8(&body).unwrap(), bootstrap_body);
+        assert_eq!(answer.status, 200);
+        assert_eq!(std::str::from_utf8(&answer.body).unwrap(), bootstrap_body);
     }
 }
 
 /// Fixed Desktop sidecar refusals.
 #[test]
 fn desktop_sidecar_refusals_are_byte_identical() {
-    let features = DesktopFeatures { browser_use: true };
     for (method, target, status, body) in [
         (
             "PUT",
@@ -101,12 +126,13 @@ fn desktop_sidecar_refusals_are_byte_identical() {
             r#"{"error":{"type":"desktop_control_unsupported","message":"This Desktop control endpoint is unavailable through SAIAI."}}"#,
         ),
     ] {
-        let response =
-            chatgpt_sidecar_response_with(&req(method, target, &[], ""), features).unwrap();
-        assert_eq!(response.status.as_u16(), status, "{method} {target}");
-        assert_eq!(response.content_type, "application/json");
+        let response = desktop::sidecar(saiai(), &req(method, target, &[], ""), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status, status, "{method} {target}");
+        assert_eq!(response.content_type, Some("application/json"));
         assert_eq!(
-            std::str::from_utf8(response.body).unwrap(),
+            std::str::from_utf8(&response.body).unwrap(),
             body,
             "{method} {target}"
         );
@@ -117,7 +143,6 @@ fn desktop_sidecar_refusals_are_byte_identical() {
 /// request carries no OAuth identity and the local MCP server's name.
 #[test]
 fn desktop_identity_answers_are_byte_identical() {
-    let features = DesktopFeatures { browser_use: true };
     for (method, target, request_body, status, body) in [
         (
             "POST",
@@ -162,15 +187,14 @@ fn desktop_identity_answers_are_byte_identical() {
             r#"{"account":{"id":"acct-fixed","is_fedramp_compliant_workspace":false},"account_user":{"account_id":"acct-fixed","pending_seat_upgrade_request":false,"seat_type":"default","trial_expires_at":null,"user_id":"saiai-local-proxy-user"}}"#,
         ),
     ] {
-        let (code, response, _, headers) = chatgpt_account_sidecar_response_with(
-            &req(method, target, &ACCOUNT, request_body),
-            features,
-        )
-        .unwrap();
-        assert_eq!(code.as_u16(), status, "{method} {target}");
-        assert!(headers.is_empty());
+        let answer =
+            desktop::account_sidecar(saiai(), &req(method, target, &ACCOUNT, request_body), true)
+                .unwrap()
+                .unwrap();
+        assert_eq!(answer.status, status, "{method} {target}");
+        assert!(answer.headers.is_empty());
         assert_eq!(
-            std::str::from_utf8(&response).unwrap(),
+            std::str::from_utf8(&answer.body).unwrap(),
             body,
             "{method} {target}"
         );
@@ -181,7 +205,7 @@ fn desktop_identity_answers_are_byte_identical() {
 /// real ones are random, see `Identity::prepare`).
 #[test]
 fn claude_desktop_fixtures_are_byte_identical() {
-    let id = crate::claude_desktop::Identity {
+    let id = Identity {
         account: "acct-uuid".into(),
         organization: "org-uuid".into(),
         access_token: "MOCK_ONLY_ACCESS".into(),
@@ -189,12 +213,11 @@ fn claude_desktop_fixtures_are_byte_identical() {
         session: "MOCK_ONLY_SESSION".into(),
     };
     assert_eq!(
-        crate::claude_desktop_fixtures::account(&id).to_string(),
+        claude::account(saiai(), &id).unwrap(),
         r#"{"age_is_verified":true,"created_at":"2026-01-01T00:00:00Z","display_name":"SAIAI Local Code","email_address":"","full_name":"SAIAI Local Code","has_completed_onboarding":true,"has_consented_to_terms":true,"invites":[],"is_verified":true,"memberships":[{"organization":{"active_flags":[],"capabilities":["chat","claude_pro","claude_code"],"created_at":"2026-01-01T00:00:00Z","name":"SAIAI Local Code","rate_limit_tier":"default_claude_ai","settings":{},"uuid":"org-uuid"},"role":"owner"}],"settings":{"has_finished_claudeai_onboarding":true},"uuid":"acct-uuid"}"#
     );
     assert_eq!(
-        crate::claude_desktop_fixtures::selectors(&[], &json!({"id":"code","model":"m"}))
-            .to_string(),
+        claude::selectors(saiai(), &[], &json!({"id":"code","model":"m"})).unwrap(),
         r#"[{"default_model":"m","id":"code","models":[],"revision":"saiai-local-1"},{"default_model":null,"id":"chat","models":[],"revision":"saiai-local-1"}]"#
     );
     for (method, path, status, body) in [
@@ -211,9 +234,9 @@ fn claude_desktop_fixtures_are_byte_identical() {
             r#"{"error":{"message":"SAIAI supports Code only. Open the Code tab; Chat and Cowork are not supported.","type":"desktop_surface_unsupported"}}"#,
         ),
     ] {
-        let (code, value) = crate::claude_desktop_fixtures::local(method, path, &id).unwrap();
+        let (code, value) = claude::local(saiai(), method, path, &id).unwrap().unwrap();
         assert_eq!(code, status, "{method} {path}");
-        assert_eq!(value.to_string(), body, "{method} {path}");
+        assert_eq!(value, body, "{method} {path}");
     }
 }
 
@@ -221,8 +244,8 @@ fn claude_desktop_fixtures_are_byte_identical() {
 /// its own names and none of SAIAI's.
 #[test]
 fn synthetic_names_follow_the_brand() {
-    use crate::brand::{Brand, PlaceholderIdentities};
     use crate::brand_saiai::SAIAI_VALUES;
+    use crate::{Brand, PlaceholderIdentities};
     static ACME: Brand = Brand {
         binary_name: "acme",
         product_name: "Acme",
@@ -232,7 +255,7 @@ fn synthetic_names_follow_the_brand() {
         },
         ..SAIAI_VALUES
     };
-    let payload = desktop_statsig_local_payload(&ACME);
+    let payload = desktop::statsig_local_payload(&ACME);
     for name in [
         r#""rule_id":"acme-local-i18n""#,
         r#""userID":"acme-local-proxy-user""#,
@@ -240,25 +263,57 @@ fn synthetic_names_follow_the_brand() {
     ] {
         assert!(payload.contains(name), "{payload}");
     }
-    let browser = desktop_statsig_base(&ACME, DesktopFeatures { browser_use: true }).to_string();
+    let browser = desktop::statsig_base(&ACME, true);
     assert!(
         browser.contains(r#""rule_id":"acme-local-browser-use""#),
         "{browser}"
     );
-    assert_eq!(synthetic_user_id(&ACME), "acme-local-proxy-user");
+    assert_eq!(desktop::synthetic_user_id(&ACME), "acme-local-proxy-user");
     assert_eq!(
-        desktop_control_unsupported_message(&ACME),
+        desktop::control_unsupported_message(&ACME),
         "This Desktop control endpoint is unavailable through Acme."
     );
-    assert_eq!(
-        crate::claude_desktop_fixtures::local_code_name(&ACME),
-        "Acme Local Code"
-    );
-    assert_eq!(
-        crate::claude_desktop_fixtures::desktop_claude_command(&ACME),
-        "acme desktop claude"
-    );
+    assert_eq!(claude::local_code_name(&ACME), "Acme Local Code");
+    assert_eq!(claude::desktop_claude_command(&ACME), "acme desktop claude");
     for text in [payload, browser] {
         assert!(!text.to_ascii_lowercase().contains("saiai"), "{text}");
     }
+}
+
+/// Entries that depend on the installed brand refuse any other brand.
+#[test]
+fn contract_entries_refuse_a_brand_that_is_not_installed() {
+    static OTHER: crate::Brand = crate::Brand {
+        binary_name: "other",
+        ..crate::brand_saiai::SAIAI_VALUES
+    };
+    saiai();
+    assert!(desktop::sidecar(&OTHER, &req("GET", "/automations", &[], ""), true).is_err());
+    assert!(
+        claude::local(
+            &OTHER,
+            "GET",
+            "/logout",
+            &Identity {
+                account: String::new(),
+                organization: String::new(),
+                access_token: String::new(),
+                refresh_token: String::new(),
+                session: String::new(),
+            }
+        )
+        .is_err()
+    );
+    // Installing another brand is refused; the installed one stays.
+    assert!(
+        crate::contract::install(
+            &OTHER,
+            crate::RuntimeContext {
+                version: env!("CARGO_PKG_VERSION"),
+                gateway: &crate::gateway_saiai::SAIAI_GATEWAY,
+            },
+        )
+        .is_err()
+    );
+    assert!(desktop::sidecar(saiai(), &req("GET", "/automations", &[], ""), true).is_ok());
 }

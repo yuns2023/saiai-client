@@ -19,6 +19,11 @@ path = "src/lib.rs"
 name = "saiai"
 path = "src/main.rs"
 
+[features]
+# Test entry points for a distribution's contract tests (see `contract`);
+# never enabled for a release build.
+contract = []
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"

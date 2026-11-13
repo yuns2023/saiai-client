@@ -2678,7 +2678,13 @@ fn kernel_module_path_scanner_sees_aliases_groups_and_spacing() {
 /// can move out of the library unchanged. Tests in these files included.
 #[test]
 fn saiai_side_uses_only_the_public_kernel_root() {
-    const SAIAI_SIDE: [&str; 3] = ["client_proof", "gateway_saiai", "brand_saiai"];
+    // The SAIAI modules and SAIAI-side tests that move with them.
+    const SAIAI_SIDE: [&str; 4] = [
+        "client_proof",
+        "gateway_saiai",
+        "brand_saiai",
+        "contract_desktop_tests",
+    ];
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let lib = fs::read_to_string(root.join("lib.rs")).unwrap();
     // Every module lib.rs declares, minus the public ones and the SAIAI side.

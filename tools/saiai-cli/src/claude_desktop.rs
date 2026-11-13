@@ -104,7 +104,7 @@ fn verified_endpoint(root: &Path, cfg: &crate::AppConfig) -> Result<(String, Str
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct Identity {
+pub struct Identity {
     pub account: String,
     pub organization: String,
     pub access_token: String,
