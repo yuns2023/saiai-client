@@ -292,7 +292,7 @@ mod tests {
     fn install_accepts_the_same_brand_and_rejects_another_without_overwriting() {
         static OTHER: Brand = Brand {
             binary_name: "other",
-            ..crate::brand_saiai::SAIAI_BRAND
+            ..crate::brand_saiai::SAIAI_VALUES
         };
         let saiai = &crate::brand_saiai::SAIAI_BRAND;
         let slot = OnceLock::new();

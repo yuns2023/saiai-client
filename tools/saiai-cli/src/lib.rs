@@ -284,7 +284,8 @@ fn is_managed_claude_env(key: &str) -> bool {
 }
 
 /// Runs one command of the client as the program described by `distribution`
-/// (names, directories, services, certificates, …). `context` carries facts
+/// (names, directories, services, certificates, …). A process runs as one
+/// brand: pass the same `static` instance if `run` is called again. `context` carries facts
 /// about the final program (its release version) that the library must not
 /// take from its own package metadata.
 pub fn run(distribution: &'static Brand, context: RuntimeContext) -> Result<()> {
