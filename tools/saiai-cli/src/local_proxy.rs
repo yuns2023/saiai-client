@@ -37,6 +37,9 @@ mod claude_desktop;
 #[cfg(test)]
 #[path = "local_proxy_ingress_tests.rs"]
 mod ingress_tests;
+#[cfg(test)]
+#[path = "local_proxy_synthetic_tests.rs"]
+mod synthetic_tests;
 
 use crate::brand::BRAND;
 use crate::gateway::{
