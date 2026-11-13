@@ -10,6 +10,13 @@
 //! Changing a value strands existing installations of that distribution
 //! (orphaned directories, services, certificates, pins or markers), so the
 //! SAIAI values are frozen by `brand_contract_tests`.
+//!
+//! Value constraints (not checked at run time):
+//! - file and directory names are single path components without separators;
+//! - environment variable names are `[A-Z0-9_]+` (they are also written as an
+//!   XML `<key>` in the macOS LaunchAgent and as `NAME=value` in systemd);
+//! - HTTP header names are lowercase RFC 9110 tokens;
+//! - URL path segments and paths use only unreserved characters and `/`.
 
 // A brand is complete data for every platform; each platform build reads only
 // the fields that apply to it.
@@ -19,7 +26,8 @@
 pub(crate) const BRAND: &Brand = &crate::brand_saiai::SAIAI_BRAND;
 
 pub(crate) struct Brand {
-    /// Executable name (without `.exe`); also the prefix printed by `--version`.
+    /// Executable name (without `.exe`); also the prefix printed by `--version`,
+    /// followed by one space and the version.
     pub binary_name: &'static str,
     /// Per-user data directory below the home directory.
     pub home_dir_name: &'static str,
@@ -33,6 +41,7 @@ pub(crate) struct Brand {
     pub markers: OwnershipMarkers,
     pub placeholders: PlaceholderIdentities,
     pub client_proof: ClientProofNames,
+    pub gateway: GatewayProtocolNames,
     /// WinHTTP session agent used for proxy auto-configuration lookups.
     pub winhttp_agent: &'static str,
     /// `clientInfo.name` of the read-only Codex daemon initialization check.
@@ -48,6 +57,8 @@ impl Brand {
 
 pub(crate) struct ConfigNames {
     pub filename: &'static str,
+    /// Configuration *format* version, not a brand identity; it only lives
+    /// here because the format is shared by this distribution's installs.
     pub version: u32,
     /// Infix of atomic-write temporary files (`.<file>.<infix>-<pid>-<id>`).
     pub temp_file_infix: &'static str,
@@ -74,6 +85,9 @@ pub(crate) struct EnvironmentNames {
 pub(crate) struct CertificateNames {
     pub ca_cert_filename: &'static str,
     pub ca_key_filename: &'static str,
+    /// Backups starting with this prefix belong to the CA pair and are not
+    /// listed as generic Claude settings backups by uninstall.
+    pub ca_backup_prefix: &'static str,
     /// Common name prefix; a per-installation key suffix follows a space.
     pub ca_common_name_prefix: &'static str,
     pub ca_organization: &'static str,
@@ -120,11 +134,22 @@ pub(crate) struct PlaceholderIdentities {
     pub codex_token: &'static str,
     /// Placeholder access tokens written by older clients.
     pub legacy_codex_token_prefix: &'static str,
-    /// Every synthetic Desktop bearer token starts with this.
+    /// Every synthetic Desktop bearer token starts with this; such tokens
+    /// are never forwarded upstream.
     pub desktop_token_prefix: &'static str,
+    /// Claude Desktop access tokens; must start with `desktop_token_prefix`.
     pub claude_desktop_token_prefix: &'static str,
     pub claude_desktop_session_prefix: &'static str,
     pub desktop_email: &'static str,
+}
+
+/// Names of Gateway endpoints and headers specific to this distribution.
+pub(crate) struct GatewayProtocolNames {
+    /// Native Chat update channel below `/backend-api` (also served below
+    /// `/chatgpt/backend-api` on the Gateway side).
+    pub chat_updates_path: &'static str,
+    /// Response header marking a restored native Chat preference.
+    pub chat_preference_restored_header: &'static str,
 }
 
 pub(crate) struct ClientProofNames {

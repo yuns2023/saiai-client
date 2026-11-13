@@ -4476,15 +4476,23 @@ fn start_managed_service_after_initialization(config_changed: bool) -> Result<()
     Ok(())
 }
 
+/// Manifest and asset URLs of the update channel below a Gateway base URL.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn update_urls(base_url: &str, asset: &str) -> (String, String) {
+    let base = base_url.trim().trim_end_matches('/');
+    let channel = BRAND.update.channel_path;
+    (
+        format!("{base}/{channel}/manifest.json"),
+        format!("{base}/{channel}/{asset}"),
+    )
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn run_update() -> Result<()> {
     let service_was_active = managed_service_is_active();
     let cfg = read_saiai_config()?;
     let asset = current_platform_asset_name()?;
-    let base = cfg.base_url.trim().trim_end_matches('/');
-    let channel = BRAND.update.channel_path;
-    let manifest_url = format!("{base}/{channel}/manifest.json");
-    let url = format!("{base}/{channel}/{asset}");
+    let (manifest_url, url) = update_urls(&cfg.base_url, &asset);
     let current_exe = env::current_exe().context("failed to resolve current saiai executable")?;
     let current_exe = fs::canonicalize(&current_exe).unwrap_or_else(|_| current_exe.clone());
     let parent = current_exe

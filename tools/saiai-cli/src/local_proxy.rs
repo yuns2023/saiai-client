@@ -2240,7 +2240,7 @@ where
         for key in ["content-length", "etag", "content-md5", "digest"] {
             headers.remove(key);
         }
-        headers.insert("x-saiai-chat-preference-restored", "1".parse()?);
+        headers.insert(BRAND.gateway.chat_preference_restored_header, "1".parse()?);
     }
     let mut result = tungstenite::http::Response::builder()
         .status(status)
@@ -2588,7 +2588,7 @@ fn is_forwarded_openai_path(path: &str) -> bool {
         || is_forwarded_chatgpt_path(path)
 }
 
-fn is_forwarded_chatgpt_path(path: &str) -> bool {
+pub(crate) fn is_forwarded_chatgpt_path(path: &str) -> bool {
     path == "/chatgpt/backend-api/models"
         || path == "/chatgpt/backend-api/devicecheck"
         || path == "/chatgpt/backend-api/ios/attestation_challenge"
@@ -2603,7 +2603,7 @@ fn is_forwarded_chatgpt_path(path: &str) -> bool {
         || path.starts_with("/chatgpt/backend-api/files/download/")
         || path == "/chatgpt/backend-api/estuary/content"
         || path == "/chatgpt/backend-api/celsius/ws/user"
-        || path == "/chatgpt/backend-api/saiai/chat-updates"
+        || path.strip_prefix("/chatgpt") == Some(BRAND.gateway.chat_updates_path)
         || is_chatgpt_owned_conversation_path(path.strip_prefix("/chatgpt").unwrap_or(path))
 }
 
@@ -2709,7 +2709,7 @@ fn normalize_chatgpt_gateway_target(target: &str) -> Result<String> {
     })
 }
 
-fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
+pub(crate) fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
     let path = request_path(target)?;
     if path == "/api/estuary/upload_content_bytes" {
         return Ok(format!("/chatgpt{target}"));
@@ -2734,7 +2734,7 @@ fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
         || path.starts_with("/backend-api/files/download/")
         || path == "/backend-api/estuary/content"
         || path == "/backend-api/celsius/ws/user"
-        || path == "/backend-api/saiai/chat-updates"
+        || path == BRAND.gateway.chat_updates_path
         || is_chatgpt_owned_conversation_path(&path);
     if !allowed {
         bail!("unsupported ChatGPT ordinary Chat path: {path}");

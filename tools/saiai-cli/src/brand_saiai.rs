@@ -4,8 +4,8 @@
 //! `brand_contract_tests` before changing any of them.
 
 use crate::brand::{
-    Brand, CertificateNames, ClientProofNames, ConfigNames, EnvironmentNames, OwnershipMarkers,
-    PlaceholderIdentities, ServiceNames, UpdateNames,
+    Brand, CertificateNames, ClientProofNames, ConfigNames, EnvironmentNames, GatewayProtocolNames,
+    OwnershipMarkers, PlaceholderIdentities, ServiceNames, UpdateNames,
 };
 
 pub(crate) const SAIAI_BRAND: Brand = Brand {
@@ -36,6 +36,7 @@ pub(crate) const SAIAI_BRAND: Brand = Brand {
     certificates: CertificateNames {
         ca_cert_filename: "saiai-ca.crt",
         ca_key_filename: "saiai-ca.key",
+        ca_backup_prefix: "saiai-ca.",
         ca_common_name_prefix: "SAIAI local installation CA",
         ca_organization: "SAIAI",
         nss_nickname: "saiai-local-proxy",
@@ -81,6 +82,10 @@ pub(crate) const SAIAI_BRAND: Brand = Brand {
         lock_filename: "client-device.lock",
         device_filename: "client-device.json",
         corrupt_key_filename: "client-device-key.corrupt",
+    },
+    gateway: GatewayProtocolNames {
+        chat_updates_path: "/backend-api/saiai/chat-updates",
+        chat_preference_restored_header: "x-saiai-chat-preference-restored",
     },
     winhttp_agent: "SAIAI",
     codex_daemon_client_name: "saiai_daemon_check",

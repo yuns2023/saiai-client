@@ -769,7 +769,7 @@ fn collect_backups(dir: &Path, exclude_saiai_ca: bool, plan: &mut Plan) {
         .filter_map(|entry| {
             let name = entry.file_name().to_str()?.to_string();
             (name.contains(".bak-")
-                && !(exclude_saiai_ca && name.starts_with(&ca_file_prefix()))
+                && !(exclude_saiai_ca && name.starts_with(BRAND.certificates.ca_backup_prefix))
                 && entry.file_type().is_ok_and(|kind| kind.is_file()))
             .then(|| entry.path())
         })
@@ -1435,16 +1435,6 @@ pub(crate) fn is_saiai_home_file(name: &str) -> bool {
             || name.starts_with(&format!("{file}.bak-"))
             || name.starts_with(&format!(".{file}.{}-", BRAND.config.temp_file_infix))
     })
-}
-
-/// `<ca stem>.` shared by the CA certificate, its key and their backups.
-fn ca_file_prefix() -> String {
-    let (stem, _) = BRAND
-        .certificates
-        .ca_cert_filename
-        .split_once('.')
-        .unwrap_or((BRAND.certificates.ca_cert_filename, ""));
-    format!("{stem}.")
 }
 
 pub(crate) fn is_claude_ca_file(name: &str) -> bool {

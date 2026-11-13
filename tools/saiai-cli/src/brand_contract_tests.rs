@@ -1131,7 +1131,8 @@ fn after<'a>(_: &'a str) { env::var(\"SAIAI_AFTER\"); let _ = r#\"{\"SAIAI_RAW\"
 /// Every `SAIAI_*` environment variable the client reads or hands to its own
 /// helper processes and scripts, with the production files that spell it.
 /// Names owned by the brand are spelled only in `brand_saiai.rs`; their
-/// consumers are pinned by `brand_environment_fields_have_every_consumer`.
+/// users are pinned by `brand_environment_fields_are_used_by_the_same_files`
+/// and `brand_environment_call_sites_are_pinned`.
 /// Users, installers, services and older clients set these names; renaming
 /// or dropping one anywhere is a breaking change, and adding one should be a
 /// conscious decision recorded here.
@@ -1328,7 +1329,10 @@ fn inline_contract_literals_are_present() {
         ),
         ("local_proxy.rs", "\"userID\":\"saiai-local-proxy-user\""),
         ("local_proxy.rs", "\"stableID\":\"saiai-local-proxy\""),
-        ("local_proxy.rs", "\"x-saiai-chat-preference-restored\""),
+        (
+            "local_proxy.rs",
+            "headers.insert(BRAND.gateway.chat_preference_restored_header, \"1\".parse()?);",
+        ),
         // Atomic temporary files that uninstall recognizes.
         (
             "main.rs",
@@ -1345,10 +1349,12 @@ fn inline_contract_literals_are_present() {
     }
 }
 
-/// Every brand-owned environment variable is still read (or passed) by each
-/// production file that used the literal name before it moved to the brand.
+/// File-level check: each brand-owned environment variable field is used by
+/// exactly the production files that spelled the name before it moved to the
+/// brand. It does not prove every call site; the most error-prone ones are
+/// pinned per function in `brand_environment_call_sites_are_pinned`.
 #[test]
-fn brand_environment_fields_have_every_consumer() {
+fn brand_environment_fields_are_used_by_the_same_files() {
     let sources = cli_sources();
     let expected: &[(&str, &[&str])] = &[
         (
@@ -1390,6 +1396,301 @@ fn brand_environment_fields_have_every_consumer() {
             .map(|(file, _)| file.as_str())
             .collect::<Vec<_>>();
         assert_eq!(&users, files, "consumers of {field}");
+    }
+}
+
+/// Text of every function named `name` in production text (all `cfg`
+/// variants), matched by braces outside literals.
+fn function_texts<'a>(text: &'a str, name: &str) -> Vec<&'a str> {
+    let mask = literal_mask(text);
+    let signature = format!("fn {name}(");
+    let mut found = Vec::new();
+    for (start, _) in text.match_indices(&signature) {
+        if mask[start] {
+            continue;
+        }
+        let mut depth = 0_usize;
+        let mut end = text.len();
+        for (index, byte) in text.bytes().enumerate().skip(start) {
+            if mask[index] {
+                continue;
+            }
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = index + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        found.push(&text[start..end]);
+    }
+    found
+}
+
+/// Call sites where the wrong brand field (or none) would silently change
+/// which variable a user, installer or child process sees.
+#[test]
+fn brand_environment_call_sites_are_pinned() {
+    let sources = cli_sources();
+    for (file, function, needle) in [
+        // Desktop executable overrides: `DESKTOP_BIN` wins over `CHATGPT_BIN`
+        // on macOS and Windows; Linux only honors `CHATGPT_BIN`.
+        (
+            "main.rs",
+            "resolve_macos_desktop_override",
+            "for variable in [BRAND.env.desktop_bin, BRAND.env.chatgpt_bin] {",
+        ),
+        (
+            "main.rs",
+            "resolve_windows_desktop_override",
+            "for variable in [BRAND.env.desktop_bin, BRAND.env.chatgpt_bin] {",
+        ),
+        (
+            "main.rs",
+            "run_linux_desktop",
+            "env::var_os(BRAND.env.chatgpt_bin)",
+        ),
+        // Every service/helper child is pinned to the resolved home.
+        (
+            "main.rs",
+            "finalize_update",
+            ".env(BRAND.env.home, saiai_config_dir()?)",
+        ),
+        (
+            "main.rs",
+            "start_linux_background_proxy",
+            ".env(BRAND.env.home, &saiai_home)",
+        ),
+        (
+            "main.rs",
+            "start_windows_background_proxy",
+            ".env(BRAND.env.home, &saiai_home)",
+        ),
+        (
+            "main.rs",
+            "saiai_config_dir",
+            "env_dir_override(BRAND.env.home)",
+        ),
+        (
+            "environment_scope.rs",
+            "layout",
+            "override_dir(BRAND.env.home)?",
+        ),
+        (
+            "uninstall.rs",
+            "discover_layout",
+            "env_dir_override(BRAND.env.home)",
+        ),
+        (
+            "uninstall.rs",
+            "discover_layout",
+            "env_dir_override(BRAND.env.install_dir)",
+        ),
+        (
+            "local_proxy.rs",
+            "desktop_account_id_fallback",
+            "env::var_os(BRAND.env.home)",
+        ),
+        // Timezone opt-in: read once, never leaked to Desktop children.
+        (
+            "main.rs",
+            "resolve_chatgpt_timezone",
+            "env::var_os(SAIAI_CHATGPT_TIMEZONE_ENV)",
+        ),
+        (
+            "main.rs",
+            "run_windows_packaged_desktop",
+            "env::var_os(SAIAI_CHATGPT_TIMEZONE_ENV).is_some()",
+        ),
+        (
+            "main.rs",
+            "run_linux_desktop",
+            "command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV);",
+        ),
+        (
+            "main.rs",
+            "run_macos_desktop",
+            "command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV);",
+        ),
+        (
+            "main.rs",
+            "run_windows_desktop",
+            "command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV);",
+        ),
+        // Installer hand-off and configure-only switch.
+        (
+            "main.rs",
+            "start_managed_service_after_initialization",
+            "env::var(BRAND.env.skip_start)",
+        ),
+        (
+            "main.rs",
+            "start_managed_service_after_initialization",
+            "env::var(BRAND.env.binary_updated)",
+        ),
+        (
+            "codex_daemon.rs",
+            "after_initialization",
+            "BRAND.env.skip_start",
+        ),
+        // Local proxy switches.
+        (
+            "local_proxy.rs",
+            "new",
+            "env::var(CHATGPT_CHAT_PASSTHROUGH_ENV)",
+        ),
+        ("local_proxy.rs", "new", "env::var(DESKTOP_BROWSER_USE_ENV)"),
+        ("local_proxy.rs", "new", "env::var(BRAND.env.proxy_verbose)"),
+        (
+            "local_proxy.rs",
+            "from_env",
+            "env::var(BRAND.env.openai_trace)",
+        ),
+        (
+            "local_proxy.rs",
+            "from_env",
+            "env::var(BRAND.env.openai_trace_path)",
+        ),
+        (
+            "upstream_proxy.rs",
+            "new",
+            "std::env::var(UPSTREAM_PROXY_ENV)",
+        ),
+        (
+            "claude_desktop.rs",
+            "run",
+            "BRAND.env.claude_desktop_allow_untested",
+        ),
+    ] {
+        let text = sources
+            .get(file)
+            .unwrap_or_else(|| panic!("production source {file} disappeared"));
+        let functions = function_texts(text, function);
+        assert!(
+            !functions.is_empty(),
+            "fn {function} disappeared from {file}"
+        );
+        assert!(
+            functions.iter().any(|body| body.contains(needle)),
+            "fn {function} in {file} no longer contains {needle}"
+        );
+    }
+    // The aliases those call sites use still name the brand fields.
+    for (file, needle) in [
+        (
+            "main.rs",
+            "const SAIAI_CHATGPT_TIMEZONE_ENV: &str = BRAND.env.chatgpt_timezone;",
+        ),
+        (
+            "local_proxy.rs",
+            "const CHATGPT_CHAT_PASSTHROUGH_ENV: &str = BRAND.env.chatgpt_chat_passthrough;",
+        ),
+        (
+            "local_proxy.rs",
+            "const DESKTOP_BROWSER_USE_ENV: &str = BRAND.env.desktop_browser_use;",
+        ),
+        (
+            "upstream_proxy.rs",
+            "pub(crate) const UPSTREAM_PROXY_ENV: &str = crate::brand::BRAND.env.upstream_proxy;",
+        ),
+    ] {
+        assert!(sources[file].contains(needle), "{file}: {needle}");
+    }
+}
+
+/// Update channel URLs below a Gateway base URL, written out in full.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[test]
+fn update_channel_urls_are_frozen() {
+    for base in [
+        "https://api.saiai.top",
+        "https://api.saiai.top/",
+        "https://api.saiai.top///",
+        "  https://api.saiai.top/  ",
+    ] {
+        assert_eq!(
+            update_urls(base, "saiai-linux-x86_64"),
+            (
+                "https://api.saiai.top/saiai-cli/manifest.json".to_string(),
+                "https://api.saiai.top/saiai-cli/saiai-linux-x86_64".to_string()
+            ),
+            "{base:?}"
+        );
+    }
+    assert_eq!(
+        update_urls(
+            "https://gateway.example/prefix/",
+            "saiai-windows-x86_64.exe"
+        ),
+        (
+            "https://gateway.example/prefix/saiai-cli/manifest.json".to_string(),
+            "https://gateway.example/prefix/saiai-cli/saiai-windows-x86_64.exe".to_string()
+        )
+    );
+    for (asset, url) in [
+        (
+            "saiai-linux-x86_64",
+            "https://api.saiai.top/saiai-cli/saiai-linux-x86_64",
+        ),
+        (
+            "saiai-linux-aarch64",
+            "https://api.saiai.top/saiai-cli/saiai-linux-aarch64",
+        ),
+        (
+            "saiai-macos-x86_64",
+            "https://api.saiai.top/saiai-cli/saiai-macos-x86_64",
+        ),
+        (
+            "saiai-macos-aarch64",
+            "https://api.saiai.top/saiai-cli/saiai-macos-aarch64",
+        ),
+        (
+            "saiai-windows-x86_64.exe",
+            "https://api.saiai.top/saiai-cli/saiai-windows-x86_64.exe",
+        ),
+        (
+            "saiai-windows-aarch64.exe",
+            "https://api.saiai.top/saiai-cli/saiai-windows-aarch64.exe",
+        ),
+    ] {
+        assert_eq!(update_urls("https://api.saiai.top", asset).1, url);
+    }
+}
+
+/// Native Chat update channel of the SAIAI Gateway, on both entry spellings.
+#[test]
+fn native_chat_update_route_is_frozen() {
+    assert_eq!(
+        local_proxy::normalize_chatgpt_chat_target("/backend-api/saiai/chat-updates?since=1")
+            .unwrap(),
+        "/chatgpt/backend-api/saiai/chat-updates?since=1"
+    );
+    assert!(local_proxy::is_forwarded_chatgpt_path(
+        "/chatgpt/backend-api/saiai/chat-updates"
+    ));
+    for rejected in [
+        "/backend-api/saiai/chat-updates/admin",
+        "/backend-api/aitp/chat-updates",
+    ] {
+        assert!(
+            local_proxy::normalize_chatgpt_chat_target(rejected).is_err(),
+            "{rejected}"
+        );
+    }
+    for unforwarded in [
+        "/chatgpt/backend-api/saiai/chat-updates/admin",
+        "/backend-api/saiai/chat-updates",
+        "/chatgpt/backend-api/aitp/chat-updates",
+    ] {
+        assert!(
+            !local_proxy::is_forwarded_chatgpt_path(unforwarded),
+            "{unforwarded}"
+        );
     }
 }
 
@@ -1495,6 +1796,15 @@ fn saiai_brand_values_are_frozen() {
     assert_eq!(proof.lock_filename, "client-device.lock");
     assert_eq!(proof.device_filename, "client-device.json");
     assert_eq!(proof.corrupt_key_filename, "client-device-key.corrupt");
+    assert_eq!(certificates.ca_backup_prefix, "saiai-ca.");
+    assert_eq!(
+        brand.gateway.chat_updates_path,
+        "/backend-api/saiai/chat-updates"
+    );
+    assert_eq!(
+        brand.gateway.chat_preference_restored_header,
+        "x-saiai-chat-preference-restored"
+    );
     assert_eq!(brand.winhttp_agent, "SAIAI");
     assert_eq!(brand.codex_daemon_client_name, "saiai_daemon_check");
 }
