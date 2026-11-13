@@ -226,6 +226,7 @@ class OptionalClaudeContractTests(unittest.TestCase):
         self.verify(launcher=self.inject('eprintln!("plain" /* note */);'))
         self.verify(launcher=self.inject('eprintln!("{brand_product}" /* a */, /* b */ brand_product = BRAND.product_name);'))
         self.verify(launcher=self.inject('// use std::eprintln as notice;\nconst TEXT: &str = "use std::println as out;";'))
+        self.verify(launcher=self.inject('fn r#use(eprintln: u8) -> u16 { eprintln as u16 }\nconst X: u8 = 0;'))
 
     def test_c_strings_do_not_hide_the_next_diagnostic(self) -> None:
         for behavior in (

@@ -320,7 +320,7 @@ def verify_claude_launcher(main: str) -> None:
         require(False, f"optional Claude launcher has an unreadable string literal: {error}")
     # An alias (`use std::eprintln as notice;`) would escape the name-based
     # checks below, so output macros may not be imported under another name.
-    for item in re.findall(r"\buse\b[^;]*;", rust_without_comments(production, blank_literals=True)):
+    for item in re.findall(r"(?<!r#)\buse\b[^;]*;", rust_without_comments(production, blank_literals=True)):
         require(
             re.search(r"\b(?:e?print(?:ln)?|dbg)\s+as\b", item) is None,
             "Claude diagnostics must not import output macros under another name",
