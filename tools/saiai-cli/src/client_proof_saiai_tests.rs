@@ -90,7 +90,10 @@ async fn client_proof_enrollment_request_is_frozen() {
         String::from_utf8(request).unwrap()
     });
     let directory = tempfile::tempdir().unwrap();
-    let proof = Arc::new(ClientProof::load(directory.path()).unwrap());
+    // The version the program passes: its own package version.
+    let proof = Arc::new(
+        ClientProof::load_for_version(directory.path(), env!("CARGO_PKG_VERSION")).unwrap(),
+    );
     // No retries and no inherited proxy: a broken contract fails fast.
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     tokio::time::timeout(

@@ -217,7 +217,7 @@ async fn main_oauth_update_and_profile_keep_the_original_response_bytes() {
 #[tokio::test]
 async fn main_preserves_provider_and_reserved_bearers_and_does_not_inspect_email() {
     let (url, server) = capture_gateway_requests(2, 0).await;
-    let (mut state, root) = proof_test_state(&url, &url, None);
+    let (mut state, root) = proof_test_state(&url);
     state.gateway_session = std::sync::OnceLock::new();
     crate::claude_desktop::Identity::prepare(root.path()).unwrap();
     fs::write(
@@ -414,7 +414,7 @@ async fn run_without_desktop_identity_keeps_only_main_entry_and_creates_no_deskt
 #[tokio::test]
 async fn main_openai_replace_preserves_x_api_key() {
     let (url, server) = capture_gateway_requests(1, 0).await;
-    let (mut state, _root) = proof_test_state(&url, &url, None);
+    let (mut state, _root) = proof_test_state(&url);
     state.gateway_session = std::sync::OnceLock::new();
     let response = tls_request(
         Arc::new(state),
@@ -602,7 +602,7 @@ async fn claude_model_catalog_pages_are_each_signed_with_the_route_key() {
         }
         captured
     });
-    let (state, root) = proof_test_state(&url, &url, Some("MOCK_ONLY_GATEWAY"));
+    let (state, root) = proof_test_state(&url);
     let identity = crate::claude_desktop::Identity::prepare(root.path()).unwrap();
     let models = claude_desktop::models(&state, &identity).await.unwrap();
     assert_eq!(
@@ -613,8 +613,6 @@ async fn claude_model_catalog_pages_are_each_signed_with_the_route_key() {
         ["m-1", "m-2"]
     );
     let captured = server.await.unwrap();
-    let proof = super::tests::saiai_proof(&state);
-    let mut nonces = std::collections::HashSet::new();
     for (request, target) in captured
         .iter()
         .zip(["/v1/models", "/v1/models?after_id=m+1%2Fx"])
@@ -624,9 +622,11 @@ async fn claude_model_catalog_pages_are_each_signed_with_the_route_key() {
             header_value(&request.headers, "authorization"),
             Some("Bearer MOCK_ONLY_GATEWAY")
         );
-        let header = header_value(&request.headers, "x-saiai-client-proof").expect("signed page");
-        super::tests::verify_proof(&proof, header, "GET", target, "MOCK_ONLY_GATEWAY");
-        assert!(nonces.insert(header.split('.').nth(3).unwrap().to_string()));
+        // Every page is signed for its own target.
+        assert_eq!(
+            header_value(&request.headers, crate::gateway_test::SIGNATURE_HEADER),
+            Some(super::tests::test_signature("GET", &url, target, "MOCK_ONLY_GATEWAY").as_str())
+        );
     }
 }
 
@@ -636,7 +636,7 @@ async fn claude_model_catalog_pages_are_each_signed_with_the_route_key() {
 async fn no_gateway_extension_stores_and_signs_nothing() {
     static NONE: crate::gateway::NoGatewayExtension = crate::gateway::NoGatewayExtension;
     let (url, server) = capture_gateway_requests(1, 0).await;
-    let (mut state, root) = proof_test_state(&url, &url, None);
+    let (mut state, root) = proof_test_state(&url);
     state.gateway = &NONE;
     state.gateway_session = std::sync::OnceLock::new();
     let state_dir = tempfile::tempdir().unwrap();
@@ -661,112 +661,30 @@ async fn no_gateway_extension_stores_and_signs_nothing() {
     drop(root);
 }
 
-/// Inbound proofs are stripped from the first request on, whether or not the
-/// extension ever loads its key (here the key directory is a file).
+/// Inbound copies of the brand's sensitive headers and of the extension's
+/// reserved headers are stripped from the first request on, also while no
+/// Gateway session has started (none signs then).
 #[tokio::test]
-async fn reserved_headers_are_stripped_even_when_the_extension_fails_to_load() {
+async fn reserved_headers_are_stripped_before_any_session_starts() {
     let (url, server) = capture_gateway_requests(1, 0).await;
-    let (mut state, root) = proof_test_state(&url, &url, None);
+    let (mut state, _root) = proof_test_state(&url);
     state.gateway_session = std::sync::OnceLock::new();
-    let blocked = root.path().join("not-a-directory");
-    fs::write(&blocked, b"file").unwrap();
-    state.gateway_state_dir = Some(blocked);
     let state = Arc::new(state);
-    state.start_gateway_session();
     let response = tls_request(
         Arc::clone(&state),
         EntryPoint::Main,
         ANTHROPIC_HOST,
-        b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nX-SAIAI-Client-Proof: v1.MOCK_SPOOFED\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
+        b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nX-SAIAI-Client-Proof: v1.MOCK_SPOOFED\r\nX-Test-Gateway-Signature: MOCK_SPOOFED\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
     )
     .await;
     assert!(response.starts_with(b"HTTP/1.1 200"));
     let (requests, _) = server.await.unwrap();
-    assert_eq!(
-        header_value(&requests[0].headers, "x-saiai-client-proof"),
-        None
-    );
-}
-
-/// Signing starts as soon as the key is loaded, while the configured route's
-/// enrollment is still in flight, and that configured claim uses none of the
-/// on-demand enrollment budget.
-#[tokio::test]
-async fn signing_does_not_wait_for_enrollment_and_configured_routes_use_no_budget() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let (enrolled, mut enrollments) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let (forward, mut forwarded) = tokio::sync::mpsc::unbounded_channel::<IncomingRequest>();
-    let server = tokio::spawn(async move {
-        // Enrollment connections are held open and never answered.
-        let mut held = Vec::new();
-        loop {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            let request = read_http_request(&mut reader).await.unwrap();
-            if request.target.ends_with("/client/devices/enroll") {
-                let _ = enrolled.send(());
-                held.push(reader);
-                continue;
-            }
-            reader
-                .get_mut()
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
-                .await
-                .unwrap();
-            let _ = forward.send(request);
-        }
-    });
-    let (mut state, _root) = proof_test_state(&url, &url, None);
-    state.gateway_session = std::sync::OnceLock::new();
-    let state_dir = tempfile::tempdir().unwrap();
-    crate::client_proof::ClientProof::load(state_dir.path())
-        .unwrap()
-        .record_device(&url, "MOCK_ONLY_GATEWAY", "cd_MOCKMOCKMOCKMOCKMOCK00")
-        .unwrap();
-    state.gateway_state_dir = Some(state_dir.path().to_path_buf());
-    let state = Arc::new(state);
-    state.start_gateway_session();
-
-    timeout(Duration::from_secs(5), enrollments.recv())
-        .await
-        .expect("configured route enrollment started")
-        .unwrap();
-    let session = state.gateway_session.get().unwrap();
-    let saiai = session
-        .as_any()
-        .downcast_ref::<crate::gateway_saiai::SaiaiSession>()
-        .unwrap();
-    // Publication follows the configured claims without awaiting enrollment.
-    timeout(Duration::from_secs(5), async {
-        while saiai.proof().is_none() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("proof published while enrollment is pending");
-
-    let response = tls_request(
-        Arc::clone(&state),
-        EntryPoint::Main,
-        ANTHROPIC_HOST,
-        b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
-    )
-    .await;
-    assert!(response.starts_with(b"HTTP/1.1 200"));
-    let request = timeout(Duration::from_secs(5), forwarded.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let proof = super::tests::saiai_proof(&state);
-    let header = header_value(&request.headers, "x-saiai-client-proof").expect("signed");
-    super::tests::verify_proof(&proof, header, "POST", "/v1/messages", "MOCK_ONLY_GATEWAY");
-    // The whole on-demand budget (16 extra credentials) is still available.
-    for index in 0..16 {
-        assert!(proof.claim_enrollment(&url, &format!("TEST_ONLY_EXTRA_{index}"), true));
+    for name in [
+        "x-saiai-client-proof",
+        crate::gateway_test::SIGNATURE_HEADER,
+    ] {
+        assert_eq!(header_value(&requests[0].headers, name), None, "{name}");
     }
-    assert!(!proof.claim_enrollment(&url, "TEST_ONLY_EXTRA_16", true));
-    server.abort();
 }
 
 /// A test extension that reserves a header outside the brand's sensitive
@@ -814,10 +732,6 @@ impl crate::gateway::GatewaySession for TestProofSession {
             format!("signed {} {}", input.method, input.target),
         )]
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 fn signed_for(gateway: &str) -> Vec<(crate::gateway::Transport, String, String, Option<String>)> {
@@ -838,7 +752,7 @@ fn signed_for(gateway: &str) -> Vec<(crate::gateway::Transport, String, String, 
 #[tokio::test]
 async fn extension_reserved_headers_are_stripped_and_signed_on_managed_tls() {
     let (url, server) = capture_gateway_requests(2, 0).await;
-    let (mut state, _root) = proof_test_state(&url, &url, None);
+    let (mut state, _root) = proof_test_state(&url);
     state.gateway = &TEST_PROOF;
     state.gateway_session = std::sync::OnceLock::new();
     let state = Arc::new(state);
@@ -978,7 +892,7 @@ async fn model_catalog_exit_passes_the_finished_request_to_the_extension() {
             .unwrap();
         request
     });
-    let (mut state, root) = proof_test_state(&url, &url, None);
+    let (mut state, root) = proof_test_state(&url);
     // A configured key with surrounding spaces is used verbatim.
     state.default_route.api_key = Zeroizing::new(" MOCK_SPACED_KEY ".to_string());
     state.gateway = &TEST_PROOF;
@@ -1068,7 +982,7 @@ async fn native_chat_relay_follows_the_gateway_capability_and_the_user_switch() 
     for capability in [true, false] {
         for passthrough in [true, false] {
             let (url, mut forwarded, task) = recording_gateway().await;
-            let (mut state, _root) = proof_test_state(&url, &url, None);
+            let (mut state, _root) = proof_test_state(&url);
             state.gateway_session = std::sync::OnceLock::new();
             state.chatgpt_chat_passthrough = passthrough;
             if !capability {
@@ -1208,7 +1122,7 @@ async fn no_chat_relay_means_no_device_cookie_and_no_preference_rewrite() {
         reader.get_mut().write_all(upstream).await.unwrap();
         captured
     });
-    let (mut state, root) = proof_test_state(&url, &url, None);
+    let (mut state, root) = proof_test_state(&url);
     state.gateway = &NONE;
     state.gateway_session = std::sync::OnceLock::new();
     // The user switch is on: only the missing capability holds both back.
@@ -1262,7 +1176,7 @@ async fn no_chat_relay_means_no_device_cookie_and_no_preference_rewrite() {
 async fn no_chat_relay_refuses_every_spelling_of_a_relay_path() {
     static NONE: crate::gateway::NoGatewayExtension = crate::gateway::NoGatewayExtension;
     let (url, mut forwarded, task) = recording_gateway().await;
-    let (mut state, _root) = proof_test_state(&url, &url, None);
+    let (mut state, _root) = proof_test_state(&url);
     state.gateway = &NONE;
     state.gateway_session = std::sync::OnceLock::new();
     state.chatgpt_chat_passthrough = true;
@@ -1432,7 +1346,7 @@ async fn no_chat_relay_never_parses_the_device_cookie_nor_reads_preferences() {
     static NONE: crate::gateway::NoGatewayExtension = crate::gateway::NoGatewayExtension;
     for capability in [true, false] {
         let (url, mut forwarded, task) = recording_gateway().await;
-        let (mut state, root) = proof_test_state(&url, &url, None);
+        let (mut state, root) = proof_test_state(&url);
         state.gateway_session = std::sync::OnceLock::new();
         state.chatgpt_chat_passthrough = true;
         if !capability {

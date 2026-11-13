@@ -94,10 +94,10 @@ fn uninstalled_gateway() -> &'static dyn GatewayExtension {
     panic!("the runtime context is installed by run() before any command executes")
 }
 
-// Unit tests see the SAIAI extension, matching the SAIAI fallback brand.
+// Unit tests see the kernel's own test extension.
 #[cfg(test)]
 fn uninstalled_gateway() -> &'static dyn GatewayExtension {
-    &crate::gateway_saiai::SAIAI_GATEWAY
+    &crate::gateway_test::TEST_GATEWAY
 }
 
 #[cfg(not(test))]
@@ -124,7 +124,7 @@ mod tests {
         let slot = OnceLock::new();
         let first = RuntimeContext {
             version: "1.2.3",
-            gateway: &crate::gateway_saiai::SAIAI_GATEWAY,
+            gateway: &crate::gateway_test::TEST_GATEWAY,
         };
         install_into(&slot, first).unwrap();
         install_into(&slot, first).unwrap();

@@ -4038,8 +4038,8 @@ mod tests {
             None
         ));
     }
-    use crate::client_proof::{self, ClientProof};
-    use crate::gateway_saiai::SaiaiSession;
+    use crate::gateway::{SignInput, Transport};
+    use crate::gateway_test::{SIGNATURE_HEADER, TestGatewaySession};
     use rcgen::{BasicConstraints, IsCa};
     use tokio::time::timeout;
     use tokio_tungstenite::connect_async;
@@ -7837,28 +7837,23 @@ mod tests {
         )));
     }
 
-    pub(super) fn verify_proof(
-        proof: &ClientProof,
-        header: &str,
+    /// The value the test Gateway session signs an HTTP attempt with.
+    pub(super) fn test_signature(
         method: &str,
+        gateway: &str,
         target: &str,
-        key: &str,
-    ) {
-        use p256::ecdsa::signature::Verifier;
-        let parts = header.split('.').collect::<Vec<_>>();
-        assert_eq!(parts.len(), 5, "{header}");
-        assert_eq!(parts[..2], ["v1", "cd_MOCKMOCKMOCKMOCKMOCK00"]);
-        let message =
-            client_proof::proof_message(method, target, parts[2].parse().unwrap(), parts[3], key);
-        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let public =
-            p256::ecdsa::VerifyingKey::from_sec1_bytes(&engine.decode(proof.public_key()).unwrap())
-                .unwrap();
-        let signature =
-            p256::ecdsa::Signature::from_slice(&engine.decode(parts[4]).unwrap()).unwrap();
-        public
-            .verify(message.as_bytes(), &signature)
-            .expect("client proof must verify");
+        bearer: &str,
+    ) -> String {
+        crate::gateway_test::signature(
+            &SignInput {
+                transport: Transport::Http,
+                gateway,
+                method,
+                target,
+                bearer: Some(bearer),
+            },
+            bearer,
+        )
     }
 
     /// Captures `count` forwarded requests and at least `enrolls` device
@@ -7892,35 +7887,84 @@ mod tests {
         (base_url, server)
     }
 
-    /// Publishes `proof` through a SAIAI Gateway session, as the background
-    /// loader would once the key is loaded.
-    pub(super) fn install_saiai_proof(state: &State, proof: &Arc<ClientProof>) {
-        let session = SaiaiSession::with_proof(
-            Arc::clone(proof),
-            Arc::new(ProxyGatewayHttp(Arc::clone(&state.http))),
-            tokio::runtime::Handle::current(),
+    /// Starts the test Gateway session, as the background loader would.
+    pub(super) fn install_test_session(state: &State) {
+        assert!(
+            state
+                .gateway_session
+                .set(Arc::new(TestGatewaySession))
+                .is_ok()
         );
-        assert!(state.gateway_session.set(Arc::new(session)).is_ok());
     }
 
-    /// The loaded SAIAI proof of the running session.
-    pub(super) fn saiai_proof(state: &State) -> Arc<ClientProof> {
-        let session = state
-            .gateway_session
-            .get()
-            .expect("Gateway session started");
-        let saiai = session
-            .as_any()
-            .downcast_ref::<SaiaiSession>()
-            .expect("SAIAI Gateway session");
-        Arc::clone(saiai.proof().expect("proof loaded"))
+    /// The Gateway session starts only when the proxy starts (no disk or
+    /// network work in `State::new`), once, with the run's state directory,
+    /// configured routes and release version.
+    #[tokio::test]
+    async fn the_gateway_session_starts_with_the_run_only_when_the_proxy_starts() {
+        type Start = (
+            Option<std::path::PathBuf>,
+            Vec<(String, String)>,
+            &'static str,
+        );
+        static STARTS: std::sync::Mutex<Vec<Start>> = std::sync::Mutex::new(Vec::new());
+        struct Recording;
+        static RECORDING: Recording = Recording;
+        impl GatewayExtension for Recording {
+            fn start(&self, start: GatewayStart) -> Arc<dyn crate::gateway::GatewaySession> {
+                STARTS.lock().unwrap().push((
+                    start.state_dir,
+                    start
+                        .routes
+                        .iter()
+                        .map(|route| (route.base_url.clone(), route.api_key.to_string()))
+                        .collect(),
+                    start.version,
+                ));
+                Arc::new(TestGatewaySession)
+            }
+        }
+        let (ca_cert_pem, ca_key_pem) = test_ca();
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = State::new(Config {
+            listen: "127.0.0.1:0".into(),
+            base_url: "http://127.0.0.1:9/gateway".into(),
+            api_key: "MOCK_ONLY_GATEWAY".into(),
+            claude: None,
+            codex: None,
+            ca_cert_pem,
+            ca_key_pem,
+            verbose: false,
+            chatgpt_chat_passthrough: true,
+            desktop_browser_use: true,
+            gateway_state_dir: Some(directory.path().to_path_buf()),
+            desktop_config_root: Some(directory.path().to_path_buf()),
+            upstream_proxy: None,
+        })
+        .unwrap();
+        state.gateway = &RECORDING;
+        assert!(state.gateway_session.get().is_none());
+        assert!(STARTS.lock().unwrap().is_empty());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+        let state = Arc::new(state);
+        state.start_gateway_session();
+        assert!(state.gateway_session.get().is_some());
+        let route = (
+            "http://127.0.0.1:9/gateway".to_string(),
+            "MOCK_ONLY_GATEWAY".to_string(),
+        );
+        assert_eq!(
+            *STARTS.lock().unwrap(),
+            [(
+                Some(directory.path().to_path_buf()),
+                vec![route.clone(), route],
+                crate::runtime::version()
+            )]
+        );
     }
 
-    pub(super) fn proof_test_state(
-        base_url: &str,
-        gateway: &str,
-        enrolled_key: Option<&str>,
-    ) -> (State, tempfile::TempDir) {
+    /// A proxy state for `base_url` with a started test Gateway session.
+    pub(super) fn proof_test_state(base_url: &str) -> (State, tempfile::TempDir) {
         let (ca_cert_pem, ca_key_pem) = test_ca();
         let directory = tempfile::tempdir().unwrap();
         let state = State::new(Config {
@@ -7939,13 +7983,11 @@ mod tests {
             upstream_proxy: None,
         })
         .unwrap();
-        let proof = Arc::new(ClientProof::load(directory.path()).unwrap());
-        install_saiai_proof(&state, &proof);
-        if let Some(key) = enrolled_key {
-            proof
-                .record_device(gateway, key, "cd_MOCKMOCKMOCKMOCKMOCK00")
-                .unwrap();
-        }
+        // Explicitly the test extension: another test in this process may
+        // install a distribution's runtime context.
+        let mut state = state;
+        state.gateway = &crate::gateway_test::TEST_GATEWAY;
+        install_test_session(&state);
         (state, directory)
     }
 
@@ -7962,6 +8004,7 @@ mod tests {
                     "x-saiai-client-proof".into(),
                     "v1.MOCK_SPOOFED_AGAIN".into(),
                 ),
+                ("X-Test-Gateway-Signature".into(), "MOCK_SPOOFED".into()),
             ],
         }
     }
@@ -7970,7 +8013,7 @@ mod tests {
         request
             .headers
             .iter()
-            .filter(|(name, _)| name.eq_ignore_ascii_case(client_proof::HEADER_NAME))
+            .filter(|(name, _)| name.eq_ignore_ascii_case(SIGNATURE_HEADER))
             .map(|(_, value)| value.as_str())
             .collect()
     }
@@ -7980,7 +8023,7 @@ mod tests {
         let (base_url, server) = capture_gateway_requests(2, 0).await;
         // A path prefix in the Gateway base URL is part of the signed target.
         let gateway = format!("{base_url}/prefix");
-        let (state, _directory) = proof_test_state(&gateway, &gateway, Some("MOCK_ONLY_GATEWAY"));
+        let (state, _directory) = proof_test_state(&gateway);
         let targets = ["/v1/responses?future=a%2Fb&x=", "/v1/responses?"];
         for target in targets {
             let (mut writer, mut output) = tokio::io::duplex(16_384);
@@ -7998,27 +8041,27 @@ mod tests {
             output.read_to_end(&mut Vec::new()).await.unwrap();
         }
         let (captured, _) = server.await.unwrap();
-        let mut nonces = std::collections::HashSet::new();
         for (request, target) in captured.iter().zip(targets) {
             assert_eq!(request.target, format!("/prefix{target}"));
-            let headers = proof_headers(request);
-            assert_eq!(headers.len(), 1, "client proof must not be relayed");
-            verify_proof(
-                &saiai_proof(&state),
-                headers[0],
-                "POST",
-                &request.target,
-                "MOCK_ONLY_GATEWAY",
+            // Signed once per attempt: the Gateway route, the wire target
+            // and the credential actually sent; nothing inbound is relayed.
+            assert_eq!(
+                proof_headers(request),
+                [test_signature(
+                    "post",
+                    &gateway,
+                    &request.target,
+                    "MOCK_ONLY_GATEWAY"
+                )]
             );
-            assert!(nonces.insert(headers[0].split('.').nth(3).unwrap().to_string()));
+            assert!(header_value(&request.headers, "x-saiai-client-proof").is_none());
         }
     }
 
     #[tokio::test]
     async fn desktop_placeholder_uses_anthropic_route_and_signs_replaced_key() {
         let (base_url, server) = capture_gateway_requests(1, 0).await;
-        let (mut state, directory) =
-            proof_test_state(&base_url, &base_url, Some("MOCK_ONLY_CLAUDE_KEY"));
+        let (mut state, directory) = proof_test_state(&base_url);
         state.claude_route = Some(
             validate_route(
                 "Claude",
@@ -8072,18 +8115,20 @@ mod tests {
         );
         assert!(header_value(&request.headers, "cookie").is_none());
         assert!(header_value(&request.headers, "x-api-key").is_none());
-        verify_proof(
-            &saiai_proof(&state),
-            proof_headers(request)[0],
-            "POST",
-            &request.target,
-            "MOCK_ONLY_CLAUDE_KEY",
+        assert_eq!(
+            proof_headers(request),
+            [test_signature(
+                "post",
+                &base_url,
+                &request.target,
+                "MOCK_ONLY_CLAUDE_KEY"
+            )]
         );
     }
 
     #[tokio::test]
     async fn claude_unknown_control_and_foreign_org_are_local_errors() {
-        let (state, directory) = proof_test_state("http://127.0.0.1:1", "http://127.0.0.1:1", None);
+        let (state, directory) = proof_test_state("http://127.0.0.1:1");
         crate::claude_desktop::Identity::prepare(directory.path()).unwrap();
         for (path, expected) in [
             ("/api/unknown", "501"),
@@ -8113,8 +8158,7 @@ mod tests {
     #[tokio::test]
     async fn claude_client_bearer_is_the_signed_api_key() {
         let (base_url, server) = capture_gateway_requests(1, 0).await;
-        let (state, _directory) =
-            proof_test_state(&base_url, &base_url, Some("MOCK_ONLY_CLAUDE_KEY"));
+        let (state, _directory) = proof_test_state(&base_url);
         let (mut writer, mut output) = tokio::io::duplex(16_384);
         forward_to_gateway(
             &state,
@@ -8133,101 +8177,15 @@ mod tests {
             header_value(&captured[0].headers, "authorization"),
             Some("Bearer MOCK_ONLY_CLAUDE_KEY")
         );
-        let headers = proof_headers(&captured[0]);
-        assert_eq!(headers.len(), 1);
-        verify_proof(
-            &saiai_proof(&state),
-            headers[0],
-            "POST",
-            "/v1/messages?beta=true",
-            "MOCK_ONLY_CLAUDE_KEY",
-        );
-    }
-
-    #[tokio::test]
-    async fn unenrolled_gateway_requests_stay_unsigned_and_drop_client_proofs() {
-        // Not enrolled; a non-Bearer credential; a Bearer of another
-        // (unenrolled) user on the same Gateway.
-        // An unknown Bearer is enrolled on demand in the background.
-        for (enrolled, authorization, enrolls) in [
-            (None, "Bearer MOCK_ONLY_CLIENT", 1),
-            (Some("MOCK_ONLY_GATEWAY"), "Basic MOCK", 0),
-            (Some("MOCK_ONLY_GATEWAY"), "Bearer MOCK_ONLY_OTHER_USER", 1),
-        ] {
-            let (base_url, server) = capture_gateway_requests(1, enrolls).await;
-            let (state, _directory) = proof_test_state(&base_url, &base_url, enrolled);
-            let (mut writer, mut output) = tokio::io::duplex(16_384);
-            forward_to_gateway(
-                &state,
-                &mut writer,
-                proof_request("/v1/messages", authorization),
-                true,
-                GatewayRoute::Anthropic,
-                CredentialPolicy::Preserve,
-            )
-            .await
-            .unwrap();
-            drop(writer);
-            output.read_to_end(&mut Vec::new()).await.unwrap();
-            let (captured, enrollments) = timeout(Duration::from_secs(5), server)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(proof_headers(&captured[0]).is_empty());
-            assert_eq!(enrollments.len(), enrolls);
-            for enrollment in enrollments {
-                assert_eq!(
-                    header_value(&enrollment.headers, "authorization"),
-                    Some(authorization)
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn device_pem_loads_in_background_after_state_creation() {
-        let (base_url, server) = capture_gateway_requests(0, 1).await;
-        let (ca_cert_pem, ca_key_pem) = test_ca();
-        let directory = tempfile::tempdir().unwrap();
-        let state = Arc::new(
-            State::new(Config {
-                listen: "127.0.0.1:0".into(),
-                base_url,
-                api_key: "MOCK_ONLY_GATEWAY".into(),
-                claude: None,
-                codex: None,
-                ca_cert_pem,
-                ca_key_pem,
-                verbose: false,
-                chatgpt_chat_passthrough: true,
-                desktop_browser_use: true,
-                gateway_state_dir: Some(directory.path().to_path_buf()),
-                desktop_config_root: Some(directory.path().to_path_buf()),
-                upstream_proxy: None,
-            })
-            .unwrap(),
-        );
-        // No disk work happens before the listener starts.
-        assert!(state.gateway_session.get().is_none());
-        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
-        state.start_gateway_session();
-        let (_, enrollments) = timeout(Duration::from_secs(5), server)
-            .await
-            .unwrap()
-            .unwrap();
         assert_eq!(
-            header_value(&enrollments[0].headers, "authorization"),
-            Some("Bearer MOCK_ONLY_GATEWAY")
+            proof_headers(&captured[0]),
+            [test_signature(
+                "post",
+                &base_url,
+                "/v1/messages?beta=true",
+                "MOCK_ONLY_CLAUDE_KEY"
+            )]
         );
-        assert!(
-            state
-                .gateway_session
-                .get()
-                .and_then(|session| session.as_any().downcast_ref::<SaiaiSession>())
-                .and_then(SaiaiSession::proof)
-                .is_some()
-        );
-        assert!(directory.path().join("client-device-key").exists());
     }
 
     #[test]

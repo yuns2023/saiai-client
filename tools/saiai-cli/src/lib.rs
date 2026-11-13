@@ -52,6 +52,9 @@ mod contract_desktop_tests;
 mod desktop_product;
 mod environment_scope;
 mod gateway;
+// The kernel's test Gateway extension (unit-test runtime fallback).
+#[cfg(test)]
+mod gateway_test;
 // SAIAI Gateway extension; only the program entry point names it.
 #[doc(hidden)]
 pub mod gateway_saiai;

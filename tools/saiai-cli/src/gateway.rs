@@ -150,9 +150,6 @@ pub struct SignInput<'a> {
 pub trait GatewaySession: Send + Sync {
     /// Header name/value pairs to add to this attempt.
     fn sign(&self, input: &SignInput<'_>) -> Vec<(String, String)>;
-
-    #[cfg(test)]
-    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// A Gateway without extra protocol: nothing is loaded, signed or stored.
@@ -169,11 +166,6 @@ struct NoGatewaySession;
 impl GatewaySession for NoGatewaySession {
     fn sign(&self, _input: &SignInput<'_>) -> Vec<(String, String)> {
         Vec::new()
-    }
-
-    #[cfg(test)]
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
@@ -354,10 +346,6 @@ mod tests {
     impl GatewaySession for Scripted {
         fn sign(&self, _input: &SignInput<'_>) -> Vec<(String, String)> {
             self.0.clone()
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
         }
     }
 

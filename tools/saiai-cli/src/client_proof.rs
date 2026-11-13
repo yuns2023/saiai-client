@@ -382,10 +382,11 @@ impl std::fmt::Debug for ClientProof {
 
 impl ClientProof {
     /// Loads (or creates) the device key and per-Gateway device records under
-    /// `dir`. An unreadable key is replaced by a new one, i.e. a new device.
+    /// `dir`, for a program reporting version `test-version` (tests; the
+    /// release version is checked by the SAIAI wire contract tests).
     #[cfg(test)]
     pub fn load(dir: &Path) -> Result<Self> {
-        Self::load_for_version(dir, env!("CARGO_PKG_VERSION"))
+        Self::load_for_version(dir, "test-version")
     }
 
     /// [`load`](Self::load) for a program that reports `client_version`.
@@ -1151,7 +1152,7 @@ mod tests {
         let body: Value =
             serde_json::from_str(&request[request.find("\r\n\r\n").unwrap() + 4..]).unwrap();
         assert_eq!(body["public_key"], proof.public_key.as_str());
-        assert_eq!(body["client_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["client_version"], "test-version");
         assert_eq!(body["os"], std::env::consts::OS);
         assert_eq!(body["arch"], std::env::consts::ARCH);
         let reloaded = ClientProof::load(directory.path()).unwrap();
