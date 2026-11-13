@@ -3767,6 +3767,8 @@ fn local_proxy_chatgpt_spki(listen: &str) -> Result<String> {
 // `AppConfig::deserialize` (`remote = "Self"`); the trait impls after the
 // struct name the brand's config type in shape errors, which derived code
 // would take from the Rust type name.
+// Fields: keep in sync with `APP_CONFIG_FIELDS` and the hand-written
+// `AppConfigVisitor::visit_seq`.
 #[derive(Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(remote = "Self")]
 struct AppConfig {
@@ -4046,6 +4048,8 @@ fn proxy_runtime_config_changed(previous: Option<&AppConfig>, current: &AppConfi
 }
 
 /// Field order of an array-form config.json (the struct's field order).
+/// Keep in sync with the `AppConfig` fields and `AppConfigVisitor::visit_seq`
+/// (`app_config_field_order_is_consistent` checks all three).
 const APP_CONFIG_FIELDS: &[&str] = &[
     "version",
     "base_url",
@@ -4108,6 +4112,7 @@ impl<'de> serde::de::Visitor<'de> for AppConfigVisitor {
 
     // As derived code reads an array: fields in order, a defaulted field may
     // be missing at the end, a missing required one is a length error.
+    // Keep in sync with the `AppConfig` fields and `APP_CONFIG_FIELDS`.
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<AppConfig, A::Error> {
         let brand = self.0;
         let required_error =
@@ -10218,6 +10223,143 @@ HTTPS_PROXY="http://127.0.0.1:1111"
                     r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
                 ),
             ),
+            // Field-level edge cases, same source release.
+            (
+                r#"[2,"u","k","l","c","kp"]"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"kp","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k","l","c","kp",false]"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"kp","chatgpt_chat_passthrough":false,"desktop_browser_use":true,"providers":{}}"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k","l","c","kp",false,false]"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"kp","chatgpt_chat_passthrough":false,"desktop_browser_use":false,"providers":{}}"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k","l","c","kp",false,false,"direct"]"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"kp","chatgpt_chat_passthrough":false,"desktop_browser_use":false,"upstream_proxy":"direct","providers":{}}"#,
+                ),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","chatgpt_chat_passthrough":null}"#,
+                Err(r#"invalid type: null, expected a boolean at line 1 column 105"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","chatgpt_chat_passthrough":"yes"}"#,
+                Err(r#"invalid type: string "yes", expected a boolean at line 1 column 106"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","desktop_browser_use":null}"#,
+                Err(r#"invalid type: null, expected a boolean at line 1 column 100"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","desktop_browser_use":"no"}"#,
+                Err(r#"invalid type: string "no", expected a boolean at line 1 column 100"#),
+            ),
+            (
+                r#"[2,"u","k","l","c","kp",null]"#,
+                Err(r#"invalid type: null, expected a boolean at line 1 column 28"#),
+            ),
+            (
+                r#"[2,"u","k","l","c","kp",true,"x"]"#,
+                Err(r#"invalid type: string "x", expected a boolean at line 1 column 32"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":null}"#,
+                Err(r#"invalid type: null, expected a string at line 1 column 92"#),
+            ),
+            (
+                r#"[2,"u","k","l","c",null]"#,
+                Err(r#"invalid type: null, expected a string at line 1 column 23"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","providers":null}"#,
+                Err(
+                    r#"invalid type: null, expected struct ProviderCredentials at line 1 column 90"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k","l","c","kp",true,true,null,null]"#,
+                Err(
+                    r#"invalid type: null, expected struct ProviderCredentials at line 1 column 43"#,
+                ),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
+                ),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","upstream_proxy":null}"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
+                ),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","upstream_proxy":"direct"}"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"upstream_proxy":"direct","providers":{}}"#,
+                ),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","upstream_proxy":5}"#,
+                Err(r#"invalid type: integer `5`, expected a string at line 1 column 92"#),
+            ),
+            (
+                r#"[2,"u","k","l","c","kp",true,true,5]"#,
+                Err(r#"invalid type: integer `5`, expected a string at line 1 column 35"#),
+            ),
+            (
+                r#"{"version":null,"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}"#,
+                Err(r#"invalid type: null, expected u32 at line 1 column 15"#),
+            ),
+            (
+                r#"{"upstream_proxy":null,"upstream_proxy":"direct","version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}"#,
+                Err(r#"duplicate field `upstream_proxy` at line 1 column 39"#),
+            ),
+            (
+                r#"{"providers":{},"upstream_proxy":"direct","desktop_browser_use":false,"chatgpt_chat_passthrough":false,"ca_key_path":"kp","ca_cert_path":"c","listen":"l","api_key":"k","base_url":"u","version":2}"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"kp","chatgpt_chat_passthrough":false,"desktop_browser_use":false,"upstream_proxy":"direct","providers":{}}"#,
+                ),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","extra":{"a":[1,{"b":null}]},"more":[1,[2,{}]]}"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k","l","c",]"#,
+                Err(r#"trailing comma at line 1 column 20"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c",}"#,
+                Err(r#"trailing comma at line 1 column 75"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"} {}"#,
+                Err(r#"trailing characters at line 1 column 76"#),
+            ),
+            (
+                r#"[2,"u","k","l","c"] 1"#,
+                Err(r#"trailing characters at line 1 column 21"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}
+
+  null"#,
+                Err(r#"trailing characters at line 3 column 3"#),
+            ),
         ];
         for (input, expected) in cases {
             let actual = serde_json::from_str::<AppConfig>(input)
@@ -10229,6 +10371,55 @@ HTTPS_PROXY="http://127.0.0.1:1111"
                 "{input:?}"
             );
         }
+    }
+
+    /// The struct's field order, `APP_CONFIG_FIELDS` and the array reader
+    /// agree: an object serializes its keys in that order, and the same
+    /// values as an array read back the same config.
+    #[test]
+    fn app_config_field_order_is_consistent() {
+        let object = serde_json::json!({
+            "version": 7,
+            "base_url": "https://gateway.example.test",
+            "api_key": "TEST_ONLY_KEY",
+            "listen": "127.0.0.1:19908",
+            "ca_cert_path": "/tmp/ca.crt",
+            "ca_key_path": "/tmp/ca.key",
+            "chatgpt_chat_passthrough": false,
+            "desktop_browser_use": true,
+            "upstream_proxy": "direct",
+            "providers": {}
+        });
+        let config: AppConfig = serde_json::from_value(object).unwrap();
+        let serialized = serde_json::to_value(&config).unwrap();
+        let keys: Vec<&str> = serialized
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        // serde_json keeps insertion order only with preserve_order; compare
+        // the serialized text instead for the struct's field order.
+        let text = serde_json::to_string(&config).unwrap();
+        let mut positions: Vec<usize> = APP_CONFIG_FIELDS
+            .iter()
+            .map(|field| text.find(&format!("\"{field}\":")).unwrap())
+            .collect();
+        let sorted = {
+            let mut copy = positions.clone();
+            copy.sort_unstable();
+            copy
+        };
+        assert_eq!(positions, sorted, "{text}");
+        positions.dedup();
+        assert_eq!(positions.len(), APP_CONFIG_FIELDS.len());
+        assert_eq!(keys.len(), APP_CONFIG_FIELDS.len());
+        let array: Vec<Value> = APP_CONFIG_FIELDS
+            .iter()
+            .map(|field| serialized[*field].clone())
+            .collect();
+        let from_array: AppConfig = serde_json::from_value(Value::Array(array)).unwrap();
+        assert!(from_array == config);
     }
 
     /// The config type name in shape errors is the brand's.

@@ -2544,3 +2544,37 @@ fn call_arguments_finds_standalone_named_arguments() {
         ]
     );
 }
+
+/// The SAIAI side reaches the kernel only through the crate root's public
+/// items (`crate::X`), never a kernel module path (`crate::module::X`), so it
+/// can move out of the library unchanged. Tests in these files included.
+#[test]
+fn saiai_side_uses_only_the_public_kernel_root() {
+    const SAIAI_SIDE: [&str; 3] = ["client_proof", "gateway_saiai", "brand_saiai"];
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    for module in SAIAI_SIDE {
+        let file = format!("{module}.rs");
+        let text = strip_rust_comments(&fs::read_to_string(root.join(&file)).unwrap());
+        let mut seen = 0;
+        for pattern in ["crate::", "super::"] {
+            for (index, _) in text.match_indices(pattern) {
+                let rest = &text[index + pattern.len()..];
+                let name: String = rest
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                    .collect();
+                // A lowercase name followed by `::` is a module path;
+                // `crate::Type::method` names a public root item.
+                let module = name.starts_with(|ch: char| ch.is_ascii_lowercase());
+                if module && rest[name.len()..].starts_with("::") {
+                    assert!(
+                        SAIAI_SIDE.contains(&name.as_str()),
+                        "{file} reaches into kernel module `{name}`: {pattern}{name}::"
+                    );
+                }
+                seen += 1;
+            }
+        }
+        assert!(seen > 0, "{file}: no crate paths found; scanner broken?");
+    }
+}

@@ -692,9 +692,9 @@ impl ClientSource for reqwest::Client {
     }
 }
 
-impl ClientSource for Arc<dyn crate::gateway::GatewayHttp> {
+impl ClientSource for Arc<dyn crate::GatewayHttp> {
     async fn client_for(&self, url: &str) -> Result<reqwest::Client> {
-        crate::gateway::GatewayHttp::client_for(&**self, url).await
+        crate::GatewayHttp::client_for(&**self, url).await
     }
 }
 
@@ -816,7 +816,7 @@ mod tests {
             ("http://gw.example/v1/x?a=%2Fb&a=a+b", "/v1/x?a=%2Fb&a=a+b"),
         ] {
             assert_eq!(
-                crate::gateway::wire_target(&Url::parse(url).unwrap()),
+                crate::wire_target(&Url::parse(url).unwrap()),
                 target,
                 "{url}"
             );

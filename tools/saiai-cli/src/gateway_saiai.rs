@@ -7,7 +7,7 @@
 //! on-demand enrollment, and every problem leaves requests unsigned.
 
 use crate::client_proof::{self, ClientProof};
-use crate::gateway::{
+use crate::{
     ConfiguredRoute, GatewayExtension, GatewayHttp, GatewaySession, GatewayStart,
     NativeChatProtocol, SignInput, StateFile,
 };

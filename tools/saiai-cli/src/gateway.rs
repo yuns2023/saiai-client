@@ -56,7 +56,9 @@ pub trait GatewayExtension: std::any::Any + Send + Sync {
 /// files derived from it that are also its own.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StateFile {
-    /// Plain basename: ASCII letters, digits, `.`, `-` and `_`, not `.`/`..`.
+    /// Plain basename: ASCII letters, digits, `.`, `-` and `_`, not `.`/`..`,
+    /// not ending in `.`, not a reserved Windows device name, and short
+    /// enough that its backup and atomic-write names fit in 255 bytes.
     pub name: &'static str,
     /// `<name>.bak-…` copies belong to it as well.
     pub backups: bool,
@@ -264,8 +266,21 @@ pub(crate) fn validate_extension(extension: &dyn GatewayExtension) -> Result<()>
             || (stem.len() == 4
                 && (stem.starts_with("COM") || stem.starts_with("LPT"))
                 && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+        // The longest name the program derives from it must still fit a
+        // 255-byte file name: `<name>.bak-<15-digit timestamp>` and
+        // `.<name>.<temp infix>-<pid up to 10 digits>-<32 hex digits>`.
+        let infix = crate::brand::brand().config.temp_file_infix;
+        let derived = [
+            (file.backups, ".bak-".len() + 15),
+            (file.atomic_temporaries, 2 + infix.len() + 1 + 10 + 1 + 32),
+        ]
+        .iter()
+        .filter(|(used, _)| *used)
+        .map(|(_, extra)| *extra)
+        .max()
+        .unwrap_or(0);
         let valid = !name.is_empty()
-            && name.len() <= 255
+            && name.len() + derived <= 255
             && !name.ends_with('.')
             && !reserved
             && name
@@ -448,6 +463,27 @@ mod state_file_tests {
         assert!(bare.owns("device.key", "tmp"));
         assert!(!bare.owns("device.key.bak-1", "tmp"));
         assert!(!bare.owns(".device.key.tmp-1-a", "tmp"));
+    }
+
+    /// With the SAIAI infix (9 bytes) an atomic-write leftover adds 55
+    /// bytes, a backup 20: the longest allowed names are 200 and 235.
+    #[test]
+    fn state_file_names_leave_room_for_derived_names() {
+        let named = |length: usize, backups, atomic_temporaries| {
+            let name: &'static str = Box::leak("x".repeat(length).into_boxed_str());
+            let files: &'static [StateFile] = Box::leak(Box::new([StateFile {
+                name,
+                backups,
+                atomic_temporaries,
+            }]));
+            validate_extension(&Files(files))
+        };
+        named(200, true, true).unwrap();
+        assert!(named(201, true, true).is_err());
+        named(235, true, false).unwrap();
+        assert!(named(236, true, false).is_err());
+        named(255, false, false).unwrap();
+        assert!(named(256, false, false).is_err());
     }
 
     #[test]
