@@ -615,10 +615,22 @@ fn proxy_signs_gateway_requests_and_strips_inbound_proofs() {
     );
 }
 
+/// Kills a spawned proxy however the test ends.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// The running proxy answers the certificate control request that
-/// `saiai desktop` and `doctor` send: a fixed host, a fixed status line and
-/// header name, and one base64 SHA-256 SPKI pin per managed Desktop host, the
-/// first being the leaf actually served for `api.openai.com`.
+/// `saiai desktop` sends: a fixed host, a fixed status line and header name,
+/// and one base64 SHA-256 SPKI pin per managed Desktop host, the first being
+/// the leaf actually served for `api.openai.com`. On Linux the client side is
+/// exercised too: `saiai desktop` reads the pins over the same request and
+/// passes them to the Desktop executable.
 #[test]
 fn certificate_control_endpoint_is_frozen() {
     use base64::Engine as _;
@@ -637,24 +649,27 @@ fn certificate_control_endpoint_is_frozen() {
     let ca = std::fs::read(config["ca_cert_path"].as_str().unwrap()).unwrap();
     let log = sandbox.home.with_file_name("control-proxy.log");
     let file = std::fs::File::create(&log).unwrap();
-    let mut proxy = sandbox
-        .command(&[])
-        .env("SAIAI_UPSTREAM_PROXY", "direct")
-        .stdout(file.try_clone().unwrap())
-        .stderr(file)
-        .spawn()
-        .unwrap();
+    let proxy = KillOnDrop(
+        sandbox
+            .command(&[])
+            .env("SAIAI_UPSTREAM_PROXY", "direct")
+            .stdout(file.try_clone().unwrap())
+            .stderr(file)
+            .spawn()
+            .unwrap(),
+    );
 
     let connect = |host: &str| -> Option<(std::net::TcpStream, String)> {
         let mut tcp = std::net::TcpStream::connect(&listen).ok()?;
         tcp.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+        tcp.set_write_timeout(Some(Duration::from_secs(10))).ok()?;
         tcp.write_all(
             format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n").as_bytes(),
         )
         .ok()?;
         let mut head = Vec::new();
         let mut byte = [0_u8; 1];
-        while !head.ends_with(b"\r\n\r\n") {
+        while !head.ends_with(b"\r\n\r\n") && head.len() < 4096 {
             tcp.read_exact(&mut byte).ok()?;
             head.push(byte[0]);
         }
@@ -695,8 +710,30 @@ fn certificate_control_endpoint_is_frozen() {
                 .encode(Sha256::digest(certificate.public_key().raw)),
         )
     });
-    let _ = proxy.kill();
-    let _ = proxy.wait();
+    // The Linux launcher with a stand-in Desktop executable that records
+    // its arguments.
+    #[cfg(target_os = "linux")]
+    let launched = control.as_ref().map(|_| {
+        use std::os::unix::fs::PermissionsExt;
+        let recorder = sandbox.home.with_file_name("desktop-recorder.sh");
+        let recorded = sandbox.home.with_file_name("desktop-args.txt");
+        std::fs::write(
+            &recorder,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                recorded.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        sandbox.run(
+            sandbox
+                .command(&["desktop"])
+                .env("SAIAI_CHATGPT_BIN", &recorder),
+        );
+        std::fs::read_to_string(&recorded).unwrap()
+    });
+    drop(proxy);
     let head = control.unwrap_or_else(|| {
         panic!(
             "no control response within 60 s; proxy log:\n{}",
@@ -717,6 +754,12 @@ fn certificate_control_endpoint_is_frozen() {
         assert_eq!(digest.len(), 32, "{pin}");
     }
     assert_eq!(served.as_deref(), Some(pins[0]), "{head:?}");
+    #[cfg(target_os = "linux")]
+    {
+        let launched = launched.unwrap();
+        let expected = format!("--ignore-certificate-errors-spki-list={}", pins.join(","));
+        assert!(launched.lines().any(|line| line == expected), "{launched}");
+    }
 }
 
 /// `saiai uninstall --dry-run --yes` prints the plan under the SAIAI heading
