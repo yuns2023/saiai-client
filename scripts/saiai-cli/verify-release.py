@@ -104,12 +104,16 @@ def rust_string_literal(source: str, index: int) -> tuple[int, str] | None:
             continue
         escape = source[position + 1 : position + 2]
         hex_byte = re.match(r"x([0-9a-fA-F]{2})", source[position + 1 :])
-        unicode = re.match(r"u\{([0-9a-fA-F_]{1,8})\}", source[position + 1 :])
+        unicode = re.match(r"u\{([0-9a-fA-F_]+)\}", source[position + 1 :])
         if hex_byte:
             decoded.append(chr(int(hex_byte.group(1), 16)))
             position += 1 + hex_byte.end()
-        elif unicode and unicode.group(1).replace("_", ""):
-            decoded.append(chr(int(unicode.group(1).replace("_", ""), 16)))
+        elif unicode:
+            digits = unicode.group(1).replace("_", "")
+            value = int(digits, 16) if 1 <= len(digits) <= 6 else -1
+            if not (0 <= value <= 0x10FFFF and not 0xD800 <= value <= 0xDFFF):
+                raise UnreadableRustLiteral(f"invalid unicode escape \\u{{{unicode.group(1)}}}")
+            decoded.append(chr(value))
             position += 1 + unicode.end()
         elif escape == "\n":
             position += 2
@@ -139,7 +143,9 @@ def rust_macro_invocations(source: str, names: str) -> list[tuple[str, str]]:
         literal = rust_string_literal(source, index)
         if literal:
             return literal[0]
-        char = re.match(r"'(?:\\.|[^\\'])'", source[index:])
+        char = re.match(
+            r"b?'(?:\\x[0-9a-fA-F]{2}|\\u\{[0-9a-fA-F_]+\}|\\.|[^\\'])'", source[index:]
+        )
         return index + char.end() if char else None
 
     found = []

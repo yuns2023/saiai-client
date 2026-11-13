@@ -195,6 +195,9 @@ class OptionalClaudeContractTests(unittest.TestCase):
             'eprintln /* note */ !("{token}");', 'eprintln! /* note */ ("{token}");',
             '/* outer /* inner */ " */\neprintln!("{token}");',
             'eprintln!(/* lead */ "{}", token);',
+            # A quote inside a (byte) char literal does not start a string.
+            'let quote = b\'"\';\neprintln!("{token}x");', 'let quote = \'"\';\neprintln!("{token}x");',
+            'let quote = \'\\x22\';\neprintln!("{token}x");',
             # A format string that is not a literal.
             'eprintln!(concat!("{tok", "en}"));', 'eprintln!(MESSAGE);',
         ):
@@ -207,16 +210,18 @@ class OptionalClaudeContractTests(unittest.TestCase):
         self.verify(launcher=self.inject('// eprintln!("{token}") in a comment is not code\nconst NOTE: &str = "eprintln!(\\"{token}\\")";'))
 
     def test_accepts_underscored_unicode_escape(self) -> None:
-        self.verify(launcher=self.inject('eprintln!("notice \\u{4_1}");'))
+        self.verify(launcher=self.inject('eprintln!("notice \\u{4_1} \\u{4________1}");'))
 
     def test_rejects_unreadable_literals_with_a_clear_message(self) -> None:
-        for behavior in ('eprintln!("\\xZZ");', 'eprintln!("\\u{12");', 'eprintln!("\\q");'):
+        for behavior in ('eprintln!("\\xZZ");', 'eprintln!("\\u{12");', 'eprintln!("\\q");',
+                         'eprintln!("\\u{110000}");', 'eprintln!("\\u{D800}");', 'eprintln!("\\u{1234567}");'):
             with self.subTest(behavior=behavior):
                 with self.assertRaisesRegex(AssertionError, "unreadable"):
                     self.verify(launcher=self.inject(behavior))
 
     def test_rejects_stdout_in_any_delimiter(self) -> None:
-        for behavior in ('println!["plain"];', 'print!{"plain"}', 'println /* x */ !("plain");'):
+        for behavior in ('println!["plain"];', 'print!{"plain"}', 'println /* x */ !("plain");',
+                         'let quote = b\'"\';\nprintln!("plain");'):
             with self.subTest(behavior=behavior):
                 with self.assertRaisesRegex(AssertionError, "stdout"):
                     self.verify(launcher=self.inject(behavior))
