@@ -50,84 +50,135 @@ def load_generator():
     return module
 
 
+class UnreadableRustLiteral(ValueError):
+    pass
+
+
+def rust_trivia_end(source: str, index: int) -> int:
+    """Index after the whitespace and (nested) comments starting at `index`."""
+    while index < len(source):
+        if source[index].isspace():
+            index += 1
+        elif source.startswith("//", index):
+            newline = source.find("\n", index)
+            index = len(source) if newline < 0 else newline
+        elif source.startswith("/*", index):
+            depth = 0
+            while index < len(source):
+                if source.startswith("/*", index):
+                    depth += 1
+                    index += 2
+                elif source.startswith("*/", index):
+                    depth -= 1
+                    index += 2
+                    if depth == 0:
+                        break
+                else:
+                    index += 1
+        else:
+            break
+    return index
+
+
 def rust_string_literal(source: str, index: int) -> tuple[int, str] | None:
-    """(end, decoded text) of the Rust string literal starting at `index`."""
+    """(end, decoded text) of the Rust string literal starting at `index`;
+    raises UnreadableRustLiteral for an escape Rust would not accept."""
     raw = re.match(r'b?r(#*)"', source[index:])
     if raw:
         body = index + raw.end()
         terminator = '"' + raw.group(1)
         end = source.find(terminator, body)
-        end = len(source) if end < 0 else end
+        if end < 0:
+            raise UnreadableRustLiteral("unterminated raw string")
         return end + len(terminator), source[body:end]
     plain = re.match(r'b?"', source[index:])
     if not plain:
         return None
     position = index + plain.end()
     decoded = []
+    simple = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", "\\": "\\", '"': '"', "'": "'"}
     while position < len(source) and source[position] != '"':
         if source[position] != "\\":
             decoded.append(source[position])
             position += 1
             continue
         escape = source[position + 1 : position + 2]
-        if escape == "x":
-            decoded.append(chr(int(source[position + 2 : position + 4], 16)))
-            position += 4
-        elif escape == "u":
-            close = source.index("}", position)
-            decoded.append(chr(int(source[position + 3 : close], 16)))
-            position = close + 1
+        hex_byte = re.match(r"x([0-9a-fA-F]{2})", source[position + 1 :])
+        unicode = re.match(r"u\{([0-9a-fA-F_]{1,8})\}", source[position + 1 :])
+        if hex_byte:
+            decoded.append(chr(int(hex_byte.group(1), 16)))
+            position += 1 + hex_byte.end()
+        elif unicode and unicode.group(1).replace("_", ""):
+            decoded.append(chr(int(unicode.group(1).replace("_", ""), 16)))
+            position += 1 + unicode.end()
         elif escape == "\n":
             position += 2
             while position < len(source) and source[position] in " \t\r\n":
                 position += 1
-        else:
-            decoded.append({"n": "\n", "t": "\t", "r": "\r", "0": "\0"}.get(escape, escape))
+        elif escape in simple:
+            decoded.append(simple[escape])
             position += 2
+        else:
+            raise UnreadableRustLiteral(f"unsupported escape \\{escape}")
+    if position >= len(source):
+        raise UnreadableRustLiteral("unterminated string")
     return position + 1, "".join(decoded)
 
 
 def rust_macro_invocations(source: str, names: str) -> list[tuple[str, str]]:
     """(name, arguments) of every `name!(…)`, `name![…]` or `name!{…}` call in
-    code (not in comments or literals), with any path prefix or spacing."""
-    pattern = re.compile(r"\b(" + names + r")\s*!\s*([(\[{])")
+    code (not in comments or literals), with any path prefix and any
+    whitespace or comments between the name, `!` and the delimiter."""
+    name_pattern = re.compile(r"\b(" + names + r")\b")
     closers = {"(": ")", "[": "]", "{": "}"}
+
+    def skip_literal(index: int) -> int | None:
+        previous = source[index - 1] if index else " "
+        if previous.isalnum() or previous == "_":
+            return None
+        literal = rust_string_literal(source, index)
+        if literal:
+            return literal[0]
+        char = re.match(r"'(?:\\.|[^\\'])'", source[index:])
+        return index + char.end() if char else None
+
     found = []
     position = 0
     while position < len(source):
-        if source.startswith("//", position):
-            newline = source.find("\n", position)
-            position = len(source) if newline < 0 else newline
+        after_trivia = rust_trivia_end(source, position)
+        if after_trivia != position:
+            position = after_trivia
             continue
-        if source.startswith("/*", position):
-            end = source.find("*/", position + 2)
-            position = len(source) if end < 0 else end + 2
+        skipped = skip_literal(position)
+        if skipped is not None:
+            position = skipped
             continue
+        call = name_pattern.match(source, position)
         previous = source[position - 1] if position else " "
-        literal = None if previous.isalnum() or previous == "_" else rust_string_literal(source, position)
-        if literal:
-            position = literal[0]
-            continue
-        char = re.match(r"'(?:\\.|[^\\'])'", source[position:])
-        if char:
-            position += char.end()
-            continue
-        call = pattern.match(source, position)
         if call and not (previous.isalnum() or previous == "_"):
-            stack = [closers[call.group(2)]]
-            index = call.end()
-            while index < len(source) and stack:
-                inner = rust_string_literal(source, index)
-                if inner and not (source[index - 1].isalnum() or source[index - 1] == "_"):
-                    index = inner[0]
-                    continue
-                if source[index] in closers:
-                    stack.append(closers[source[index]])
-                elif source[index] == stack[-1]:
-                    stack.pop()
-                index += 1
-            found.append((call.group(1), source[call.end() : index - 1]))
-            position = index
+            bang = rust_trivia_end(source, call.end())
+            opening = rust_trivia_end(source, bang + 1) if source.startswith("!", bang) else -1
+            if opening >= 0 and opening < len(source) and source[opening] in closers:
+                stack = [closers[source[opening]]]
+                index = opening + 1
+                while index < len(source) and stack:
+                    after = rust_trivia_end(source, index)
+                    if after != index:
+                        index = after
+                        continue
+                    inner = skip_literal(index)
+                    if inner is not None:
+                        index = inner
+                        continue
+                    if source[index] in closers:
+                        stack.append(closers[source[index]])
+                    elif source[index] == stack[-1]:
+                        stack.pop()
+                    index += 1
+                found.append((call.group(1), source[opening + 1 : index - 1]))
+                position = index
+                continue
+            position = call.end()
             continue
         position += 1
     return found
@@ -230,9 +281,16 @@ def verify_claude_launcher(main: str) -> None:
     # Every delimiter form counts, and the format string is judged after its
     # escapes are decoded (`"\x7btoken\x7d"` is the capture `{token}`).
     brand_argument = r"\s*,\s*(?:brand_product\s*=\s*BRAND\.product_name|brand_binary\s*=\s*BRAND\.binary_name)"
-    for name, arguments in rust_macro_invocations(production, r"e?print(?:ln)?|dbg"):
+    try:
+        invocations = rust_macro_invocations(production, r"e?print(?:ln)?|dbg")
+    except UnreadableRustLiteral as error:
+        require(False, f"optional Claude launcher has an unreadable string literal: {error}")
+    for name, arguments in invocations:
         require(not name.startswith("print"), "Claude diagnostics must not use stdout")
-        literal = rust_string_literal(arguments, len(arguments) - len(arguments.lstrip()))
+        try:
+            literal = rust_string_literal(arguments, rust_trivia_end(arguments, 0))
+        except UnreadableRustLiteral as error:
+            require(False, f"optional Claude diagnostics have an unreadable format string: {error}")
         rest = arguments[literal[0]:] if literal else ""
         bound_arguments = re.fullmatch(r"((?:" + brand_argument + r")*)\s*,?\s*", rest)
         format_text = literal[1] if literal else ""

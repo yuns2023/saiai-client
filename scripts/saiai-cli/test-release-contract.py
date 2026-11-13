@@ -191,6 +191,10 @@ class OptionalClaudeContractTests(unittest.TestCase):
             # Escapes that decode to a format capture.
             'eprintln!("\\x7btoken\\x7d");', 'eprintln!("\\u{7b}token\\u{7d}");',
             'eprintln!("{brand_product}\\x7btoken}", brand_product = BRAND.product_name);',
+            # Comments between tokens and nested block comments.
+            'eprintln /* note */ !("{token}");', 'eprintln! /* note */ ("{token}");',
+            '/* outer /* inner */ " */\neprintln!("{token}");',
+            'eprintln!(/* lead */ "{}", token);',
             # A format string that is not a literal.
             'eprintln!(concat!("{tok", "en}"));', 'eprintln!(MESSAGE);',
         ):
@@ -202,8 +206,17 @@ class OptionalClaudeContractTests(unittest.TestCase):
         self.verify(launcher=self.inject('eprintln!["plain notice; braces \\x41 decoded"];'))
         self.verify(launcher=self.inject('// eprintln!("{token}") in a comment is not code\nconst NOTE: &str = "eprintln!(\\"{token}\\")";'))
 
+    def test_accepts_underscored_unicode_escape(self) -> None:
+        self.verify(launcher=self.inject('eprintln!("notice \\u{4_1}");'))
+
+    def test_rejects_unreadable_literals_with_a_clear_message(self) -> None:
+        for behavior in ('eprintln!("\\xZZ");', 'eprintln!("\\u{12");', 'eprintln!("\\q");'):
+            with self.subTest(behavior=behavior):
+                with self.assertRaisesRegex(AssertionError, "unreadable"):
+                    self.verify(launcher=self.inject(behavior))
+
     def test_rejects_stdout_in_any_delimiter(self) -> None:
-        for behavior in ('println!["plain"];', 'print!{"plain"}'):
+        for behavior in ('println!["plain"];', 'print!{"plain"}', 'println /* x */ !("plain");'):
             with self.subTest(behavior=behavior):
                 with self.assertRaisesRegex(AssertionError, "stdout"):
                     self.verify(launcher=self.inject(behavior))
