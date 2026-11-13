@@ -9978,6 +9978,132 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         }
     }
 
+    /// config.json shapes and their exact results, frozen from the release
+    /// before the configuration type was renamed: every error names the type
+    /// as earlier releases did, including array-form length errors, with
+    /// serde_json's line and column.
+    #[test]
+    fn config_json_shapes_and_diagnostics_are_frozen() {
+        let cases: &[(&str, Result<&str, &str>)] = &[
+            (
+                r#"1"#,
+                Err(r#"invalid type: integer `1`, expected struct SaiaiConfig at line 1 column 1"#),
+            ),
+            (
+                r#""x""#,
+                Err(r#"invalid type: string "x", expected struct SaiaiConfig at line 1 column 3"#),
+            ),
+            (
+                r#"true"#,
+                Err(
+                    r#"invalid type: boolean `true`, expected struct SaiaiConfig at line 1 column 4"#,
+                ),
+            ),
+            (
+                r#"null"#,
+                Err(r#"invalid type: null, expected struct SaiaiConfig at line 1 column 4"#),
+            ),
+            (
+                r#"1.5"#,
+                Err(
+                    r#"invalid type: floating point `1.5`, expected struct SaiaiConfig at line 1 column 3"#,
+                ),
+            ),
+            (
+                r#"[]"#,
+                Err(
+                    r#"invalid length 0, expected struct SaiaiConfig with 10 elements at line 1 column 2"#,
+                ),
+            ),
+            (
+                r#"[2]"#,
+                Err(
+                    r#"invalid length 1, expected struct SaiaiConfig with 10 elements at line 1 column 3"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k","l","c"]"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k","l","c","kp",true,false,null,{}]"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"kp","chatgpt_chat_passthrough":true,"desktop_browser_use":false,"providers":{}}"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k","l","c","kp",true,false,null,{},1]"#,
+                Err(r#"trailing characters at line 1 column 44"#),
+            ),
+            (
+                r#"["2"]"#,
+                Err(r#"invalid type: string "2", expected u32 at line 1 column 4"#),
+            ),
+            (
+                r#"{}"#,
+                Err(r#"missing field `version` at line 1 column 2"#),
+            ),
+            (
+                r#"{"version":2}"#,
+                Err(r#"missing field `base_url` at line 1 column 13"#),
+            ),
+            (
+                r#"{"version":2,"version":3,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}"#,
+                Err(r#"duplicate field `version` at line 1 column 22"#),
+            ),
+            (
+                r#"{"version":"2","base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}"#,
+                Err(r#"invalid type: string "2", expected u32 at line 1 column 14"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","extra":1}"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
+                ),
+            ),
+            (
+                r#"
+
+   null"#,
+                Err(r#"invalid type: null, expected struct SaiaiConfig at line 3 column 7"#),
+            ),
+            (
+                r#"
+  [
+ 2,
+ "u"
+ ]"#,
+                Err(
+                    r#"invalid length 2, expected struct SaiaiConfig with 10 elements at line 5 column 2"#,
+                ),
+            ),
+            (
+                r#"{
+  "version": 2
+}"#,
+                Err(r#"missing field `base_url` at line 3 column 1"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
+                ),
+            ),
+        ];
+        for (input, expected) in cases {
+            let actual = serde_json::from_str::<AppConfig>(input)
+                .map(|config| serde_json::to_string(&config).unwrap())
+                .map_err(|error| error.to_string());
+            assert_eq!(
+                actual.as_deref().map_err(String::as_str),
+                *expected,
+                "{input:?}"
+            );
+        }
+    }
+
     /// A config.json whose root is not an object reports the same serde
     /// diagnostic as before the configuration type was renamed.
     #[test]
