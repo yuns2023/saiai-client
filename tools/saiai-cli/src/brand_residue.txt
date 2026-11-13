@@ -1,123 +1,22 @@
-claude_desktop.rs	"Claude Desktop {} is untested (supported: {VERSION}); set SAIAI_CLAUDE_DESKTOP_ALLOW_UNTESTED=1 to override",
-claude_desktop.rs	"invalid or stale Claude Desktop listener receipt; run `saiai restart` in this environment, then retry `saiai desktop claude`"
-claude_desktop.rs	"listener is not the dedicated Claude Desktop entry; run `saiai restart` in this environment, then retry `saiai desktop claude`"
-claude_desktop.rs	.context("Claude Desktop listener does not authenticate with this environment's CA; run `saiai restart` in this environment, then retry `saiai desktop claude`")?;
-claude_desktop.rs	.context("Claude Desktop listener is unavailable; run `saiai restart` in this environment, then retry `saiai desktop claude`")?,
-claude_desktop.rs	bail!("SAIAI Claude route is not configured; run the SAIAI Claude setup first");
-claude_desktop.rs	bail!("saiai desktop claude supports Linux only; macOS and Windows are not supported");
 claude_desktop.rs	fn verified_endpoint(root: &Path, cfg: &crate::SaiaiConfig) -> Result<(String, String)> {
 claude_desktop.rs	let cfg = crate::read_saiai_config()?;
 claude_desktop.rs	let cfg = crate::read_saiai_config()?;
 claude_desktop.rs	let config_root = crate::saiai_config_dir()?;
 claude_desktop.rs	let root = crate::saiai_config_dir()?;
-claude_launcher.rs	"Starting Claude with SAIAI child environment; explicit Claude settings still apply."
-claude_launcher.rs	.context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
-claude_launcher.rs	.context("SAIAI local proxy is not configured; run the SAIAI Claude setup first")?;
-claude_launcher.rs	.context("failed to start the SAIAI local proxy service")?;
-claude_launcher.rs	.context("invalid SAIAI local proxy listen address")?;
 claude_launcher.rs	CLAUDE_STREAM_IDLE_TIMEOUT_MS, SaiaiConfig, ensure_local_proxy_running_with_start, home_dir,
-claude_launcher.rs	Command::new(env::current_exe().context("failed to resolve SAIAI executable")?);
-claude_launcher.rs	bail!("SAIAI Claude Key is missing; rerun the SAIAI Claude setup");
-claude_launcher.rs	bail!("SAIAI Claude route is not configured; run the SAIAI Claude setup first");
-claude_launcher.rs	bail!("SAIAI local proxy must listen on a nonzero loopback port");
-claude_launcher.rs	bail!("SAIAI local proxy service failed to start ({status})");
 claude_launcher.rs	fn apply_environment(command: &mut Command, config: &SaiaiConfig, token: &str) {
 claude_launcher.rs	fn claude_token(config: &SaiaiConfig) -> Result<&str> {
 claude_launcher.rs	let config = read_saiai_config()
 claude_launcher.rs	read_runtime_ca, read_saiai_config, warn_claude_settings_overrides,
-codex_daemon.rs	"WARNING: Codex daemon runs app-server {running}, newer than this CLI and the package a restart would launch; left running to avoid a downgrade. To reload SAIAI settings, upgrade Codex, then run `saiai init-codex` again."
-codex_daemon.rs	"finish Codex tasks, then run `codex app-server daemon restart`; meanwhile use `saiai codex`";
-codex_daemon.rs	.map_err(|_| anyhow!("SAIAI proxy configuration is unavailable"))?;
-codex_daemon.rs	const MANUAL_UPDATE: &str = "finish Codex tasks, then run `codex app-server daemon update --from-cli -y`; meanwhile use `saiai codex`";
-codex_daemon.rs	const PINNED_NOTE: &str = "the daemon now follows this CLI package instead of its own updater; re-run `saiai init-codex` after upgrading Codex, or run `codex app-server daemon update` to return to official daemon updates";
-codex_daemon.rs	format!("running app-server {app_server} ignores include_environment_context_time; upgrade Codex to {minimum}+, then run `saiai init-codex`"),
-codex_daemon.rs	let cfg = crate::read_saiai_config()
-codex_daemon.rs	println!("Codex daemon refresh skipped (SAIAI_SKIP_START=1).");
-codex_diagnostics.rs	format!("CLI {version} does not support turning off time reporting via include_environment_context_time; upgrade Codex to {MIN_TIME_TOGGLE_VERSION_TEXT}+ and re-run `saiai init-codex`. Desktop and VS Code embedded Codex backends are not checked here"),
-codex_diagnostics.rs	format!("{version}; independent of SAIAI and Desktop app-server versions"),
-environment_scope.rs	"both Claude and Codex environments are selected; use saiai --environment claude|codex|default <command>"
+codex_daemon.rs	let cfg = crate::read_saiai_config().map_err(|_| {
 environment_scope.rs	.arg(crate::saiai_config_dir()?);
-environment_scope.rs	eprintln!("SAIAI environment: {}", scope.directory.display());
 environment_scope.rs	let Ok(config) = serde_json::from_slice::<crate::SaiaiConfig>(&raw) else {
-lib.rs	"Already current: saiai {} (remote saiai {remote_version})",
-lib.rs	"ChatGPT.app or Codex.app was not found in /Applications or ~/Applications; install an official Desktop app or set SAIAI_DESKTOP_BIN"
-lib.rs	"Claude settings warning: {} contains legacy Claude Code overrides: {}; remove these entries before launching Claude Code with SAIAI",
-lib.rs	"Claude updater downloads now follow the SAIAI upstream proxy ({} updated)",
-lib.rs	"Desktop managed profile changed; run `saiai init-codex` and retry after normal Quit"
-lib.rs	"Desktop state is absent; run `saiai init-codex` before launching Desktop",
-lib.rs	"NOTE {}: `{CODEX_ENVIRONMENT_CONTEXT_TIME_KEY}` was not false; SAIAI manages this key and set it to false so Codex does not report the local timezone and date.",
-lib.rs	"OpenAI Codex/ChatGPT Desktop was not found in standard application directories; install the official Desktop app or set SAIAI_DESKTOP_BIN"
-lib.rs	"Optional editor-wide setup requires VSCode's certificate loader to trust the SAIAI CA; editor settings were preserved. Provider-specific CA configuration remains available. On Windows, --trust-vscode-ca explicitly authorizes CurrentUser Root trust; TLS verification will not be disabled."
-lib.rs	"SAIAI CA entry is absent from the current user's NSS database; rerun `saiai init-codex` or use `saiai desktop codex`",
-lib.rs	"SAIAI Desktop currently supports Codex only; ordinary ChatGPT history and settings are not supported. Use `saiai desktop codex`."
-lib.rs	"SAIAI Desktop integration is currently implemented for Linux, macOS, and Windows only"
-lib.rs	"SAIAI Desktop scope: Codex only; the official ChatGPT sidebar, ordinary Chat history, and settings are not supported."
-lib.rs	"SAIAI LaunchAgent was started but is not listening on {} yet; check `saiai logs`.",
-lib.rs	"SAIAI background proxy exited during startup with {status}; inspect {}",
-lib.rs	"SAIAI background proxy exited during startup with {status}; inspect {}",
-lib.rs	"SAIAI config is obsolete; initialize {} again with the one-command setup",
-lib.rs	"SAIAI does not modify the login Keychain. A directly launched official App needs a user-approved SAIAI CA trust root; otherwise use `saiai desktop codex` (managed per-process SPKI pin)",
-lib.rs	"SAIAI local-proxy OAuth configuration is ready; run `saiai codex`. Fully quit and reopen VSCode after its editor setup succeeds."
-lib.rs	"Trusted the SAIAI CA in the current user's NSS database for direct Linux Desktop (no system trust store or dialog)."
-lib.rs	"Trusting this installation's SAIAI CA in Windows CurrentUser\\Root. Other applications of this Windows user also trust it; the system proxy and TLS verification are unchanged."
-lib.rs	"Update staged (not yet installed): {}. After this command exits, run `saiai --version` to confirm; a failed replacement is reported there.",
-lib.rs	"VSCode's certificate loader recognizes the SAIAI CA. TLS verification remains enabled; fully quit and reopen the editor to load the new route."
-lib.rs	"WARN Claude settings: {} contains legacy Claude Code overrides: {}. Remove these entries before launching Claude Code with SAIAI.",
-lib.rs	"WARN Previous SAIAI update has not completed; check again shortly. Status: {}",
-lib.rs	"WARN Previous SAIAI update {status}. Details: {}",
-lib.rs	"WARN SAIAI client was updated and the local proxy remains reachable, but its automatic service refresh reported: {err:#}. Run `saiai restart` later to retry the refresh."
-lib.rs	"WARN direct Linux Desktop trust could not be updated ({err:#}); Codex CLI remains configured, and `saiai desktop codex` remains the supported isolated fallback."
-lib.rs	"WARN direct Linux Desktop trust was not installed because certutil is unavailable; install libnss3-tools, rerun `saiai init-codex`, or use `saiai desktop codex`."
-lib.rs	"WARN environment: {key} is set in this shell. For SAIAI local proxy mode, remove conflicting proxy variables before launching Claude Code: unset {CLAUDE_PROXY_ENV_UNSET_KEYS}"
-lib.rs	"WARN environment: {key} is set in this shell. For SAIAI local proxy mode, unset it before launching Claude Code: unset {CONFLICTING_ENV_UNSET_KEYS}"
-lib.rs	"WARN {} does not set `{CODEX_ENVIRONMENT_CONTEXT_TIME_KEY} = false`; Codex may report the local timezone. Run `saiai init-codex`, then fully quit and reopen Desktop.",
-lib.rs	"WARN {}: the ChatGPT access token expired at {expired}; if Codex asks you to sign in, quit it and run `saiai init-codex` to switch to the SAIAI local-proxy login.",
-lib.rs	"`saiai uninstall` covers every SAIAI environment; remove the environment selector\n\n{USAGE}"
-lib.rs	"a SAIAI process is listening, but it is not the managed background process and systemd --user is unavailable: {systemd_error}"
-lib.rs	"certutil is unavailable; install libnss3-tools and rerun `saiai init-codex`, or use `saiai desktop codex`",
-lib.rs	"configured SAIAI CA {} did not contain a PEM certificate",
-lib.rs	"configured and matches SAIAI config",
-lib.rs	"could not resolve the current user's NSS database; use `saiai desktop codex`",
-lib.rs	"custom provider configuration remains; run `saiai init-codex` to remove it",
-lib.rs	"direct endpoint override remains; run `saiai init-codex` to migrate it",
-lib.rs	"does not match SAIAI config api_key",
-lib.rs	"failed to read {}; run `saiai init-codex` first",
-lib.rs	"failed to read {}; run the SAIAI setup command first",
-lib.rs	"failed to stop managed SAIAI background process {}",
-lib.rs	"local proxy closed before the reused sidecar probe; restart the proxy with `saiai restart`",
-lib.rs	"local proxy did not keep the sidecar TLS connection alive; restart the proxy with `saiai restart`",
-lib.rs	"missing; run `saiai init-codex` before using an external Codex app-server",
-lib.rs	"missing; run `saiai init-codex` to configure the local proxy route",
-lib.rs	"not running; systemd --user unavailable ({err}); `saiai start` will use the managed background fallback"
-lib.rs	"other SAIAI CAs",
-lib.rs	"packaged Windows Desktop needs a configured Codex account; run `saiai init-codex` first",
-lib.rs	"packaged Windows Desktop needs the current SAIAI Codex profile; run `saiai vscode` or `saiai init-codex` and retry"
-lib.rs	"permission profile visibility is disabled; rerun `saiai init-codex` or use `saiai desktop codex`",
-lib.rs	"re-run `saiai init-codex`"
-lib.rs	"relaunch `saiai desktop codex`"
-lib.rs	"running SAIAI proxy does not expose a Desktop certificate pin; run `saiai restart` and retry",
-lib.rs	"stale managed background state for pid {}; run `saiai start`",
-lib.rs	"systemd and managed background instances are both active; run `saiai restart`",
-lib.rs	"the ChatGPT access token in {} expired at {}; Codex shows its sign-in page if the login can no longer be refreshed. Quit Codex and run `saiai init-codex` to switch to the SAIAI local-proxy login.",
-lib.rs	"timed out recording SAIAI background process identity; inspect {}",
-lib.rs	"timed out waiting for SAIAI background proxy at {addr}; inspect {}",
-lib.rs	"upstream proxy set to {}; run `saiai restart` to apply it to the running service",
-lib.rs	"visibility state is missing or invalid; rerun `saiai init-codex` or use `saiai desktop codex`",
-lib.rs	"warning: legacy SAIAI Desktop lease found, but the current Windows proxy was changed externally; preserving the current proxy"
 lib.rs	"{SAIAI_CHATGPT_TIMEZONE_ENV} does not exist in {}",
 lib.rs	"{SAIAI_CHATGPT_TIMEZONE_ENV} is not a zoneinfo file: {}",
-lib.rs	"{} changed while SAIAI was replacing its expired login and was left unchanged; quit Codex and rerun `saiai init-codex`",
-lib.rs	"{} contains {}; remove these entries before launching Claude Code with SAIAI",
-lib.rs	"{} has no ChatGPT OAuth access token; run `codex login` before `saiai codex`",
-lib.rs	"{} is missing; time reporting is not turned off for the isolated Desktop profile. Relaunch `saiai desktop codex` to recreate it",
-lib.rs	"{} is not in ChatGPT token mode; first-phase `saiai codex` does not accept API-key-only auth",
-lib.rs	"{} other SAIAI CA(s) are trusted in Windows root stores ({}); they may belong to another SAIAI instance or an earlier installation, so confirm before removing them",
-lib.rs	"{} still exists; rerun `saiai init ...` to remove stale OAuth state",
 lib.rs	&& let Ok(existing) = serde_json::from_str::<SaiaiConfig>(&raw)
 lib.rs	&saiai_config.config.listen,
 lib.rs	&saiai_config_dir()?,
 lib.rs	&saiai_config_dir()?,
-lib.rs	("SAIAI egress", health_base),
 lib.rs	) -> Result<SaiaiConfigUpdate> {
 lib.rs	) -> Result<SaiaiConfigUpdate> {
 lib.rs	.and_then(|raw| serde_json::from_str::<SaiaiConfig>(&raw).ok());
@@ -125,52 +24,16 @@ lib.rs	.any(ListenPortOwner::is_saiai))
 lib.rs	.any(|arg| arg == SAIAI_LINUX_BACKGROUND_COMMAND.as_bytes()))
 lib.rs	.arg(SAIAI_LINUX_BACKGROUND_COMMAND)
 lib.rs	.arg(SAIAI_WINDOWS_BACKGROUND_COMMAND)
-lib.rs	.context("SAIAI CA path is not valid UTF-8")?,
-lib.rs	.context("SAIAI installation CA is invalid; rerun the one-command SAIAI setup")?;
-lib.rs	.context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
-lib.rs	.context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
-lib.rs	.context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
-lib.rs	.context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
-lib.rs	.context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
-lib.rs	.context("SAIAI local proxy is not configured; run `saiai init-codex` first")?;
-lib.rs	.context("SAIAI local proxy is not configured; run the SAIAI setup first")?;
-lib.rs	.context("SAIAI local proxy returned an invalid Desktop certificate pin")?;
-lib.rs	.context("cannot verify legacy SAIAI worker identity")?;
-lib.rs	.context("failed to allocate a loopback port for the SAIAI local proxy")?;
-lib.rs	.context("failed to create SAIAI installation CA parameters")?;
-lib.rs	.context("failed to detach SAIAI background proxy session");
-lib.rs	.context("failed to import the SAIAI CA into the Desktop NSS database")?;
-lib.rs	.context("failed to inspect SAIAI background proxy")?
-lib.rs	.context("failed to inspect SAIAI background proxy")?
-lib.rs	.context("failed to parse configured SAIAI CA PEM")?;
-lib.rs	.context("failed to resolve SAIAI config parent directory")?;
-lib.rs	.context("failed to resolve SAIAI executable directory")?
-lib.rs	.context("failed to self-sign SAIAI installation CA")?;
-lib.rs	.context("failed to start SAIAI background proxy")?;
-lib.rs	.context("failed to start SAIAI background proxy")?;
-lib.rs	.context("failed to trust configured SAIAI CA")?;
-lib.rs	.context("generated SAIAI installation CA did not validate")?;
 lib.rs	.env(BRAND.env.home, &saiai_home)
 lib.rs	.env(BRAND.env.home, &saiai_home)
 lib.rs	.env(BRAND.env.home, saiai_config_dir()?)
 lib.rs	.unwrap_or(saiai_config_dir()?);
-lib.rs	.with_context(|| format!("SAIAI background log is unavailable at {}", path.display()))?;
-lib.rs	.with_context(|| format!("failed to connect to SAIAI local proxy at {listen}"))?;
 lib.rs	.with_context(|| format!("failed to create {}", saiai_home.display()))?;
 lib.rs	.with_context(|| format!("failed to create {}", saiai_home.display()))?;
-lib.rs	.with_context(|| format!("failed to read SAIAI CA certificate {}", cfg.ca_cert_path))?;
-lib.rs	.with_context(|| format!("failed to read SAIAI CA key {}", cfg.ca_key_path))?;
-lib.rs	.with_context(|| format!("failed to remove stale SAIAI state for pid {}", state.pid))?;
 lib.rs	.with_context(|| format!("{SAIAI_CHATGPT_TIMEZONE_ENV} must be valid UTF-8"))?
 lib.rs	<string>{saiai_home}</string>\n\
 lib.rs	<string>{saiai_home}</string>\n\
-lib.rs	Description=SAIAI local Claude Code proxy\n\
-lib.rs	Err(err) => report.error("SAIAI health", format!("{err:#}")),
-lib.rs	Err(error) => report.warn("other SAIAI CAs", format!("could not inspect: {error:#}")),
-lib.rs	Err(error) => return Err(error).context("cannot inspect SAIAI environments"),
-lib.rs	Err(error).context("failed to lock SAIAI initialization")
 lib.rs	Ok(SaiaiConfigUpdate {
-lib.rs	Ok(false) => report.warn("VSCode certificate loader", "does not trust the SAIAI CA; provider-specific CA settings do not establish editor-host trust"),
 lib.rs	Ok(saiai_config_dir()?
 lib.rs	Ok(saiai_config_dir()?.join(SAIAI_CONFIG_FILENAME.get()))
 lib.rs	Ok(saiai_config_dir()?.join(SAIAI_LINUX_PID_FILENAME.get()))
@@ -179,8 +42,6 @@ lib.rs	Ok(saiai_config_dir()?.join(SAIAI_SERVICE_LOG_FILENAME.get()))
 lib.rs	Ok(saiai_config_dir()?.join(SAIAI_SERVICE_LOG_FILENAME.get()))
 lib.rs	Ok(saiai_config_dir()?.join(SAIAI_WINDOWS_PID_FILENAME.get()))
 lib.rs	Ok(saiai_dir) => {
-lib.rs	Ok(status) => report.ok("SAIAI health", status),
-lib.rs	Ok(true) => report.ok("VSCode certificate loader", "recognizes the current SAIAI CA; this is not a live UI or model-request test"),
 lib.rs	SAIAI_LINUX_BACKGROUND_COMMAND => {
 lib.rs	SAIAI_LINUX_BACKGROUND_COMMAND,
 lib.rs	SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME.get(),
@@ -188,31 +49,10 @@ lib.rs	SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME.get(),
 lib.rs	SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME.get(),
 lib.rs	SAIAI_WINDOWS_BACKGROUND_COMMAND => {
 lib.rs	SAIAI_WINDOWS_BACKGROUND_COMMAND,
-lib.rs	Set-Content -LiteralPath $statusPath -Value 'pending: stopping SAIAI processes' -Encoding UTF8\r\n\
 lib.rs	Some(saiai_config_dir()?)
-lib.rs	Stop the existing process, or if it is a SAIAI service run `saiai stop` first.",
 lib.rs	acquire_linux_service_lock_at(&saiai_config_dir()?)
 lib.rs	apply_claude_local_proxy_env(&mut env_obj, &saiai_config.config.listen, &ca_path);
 lib.rs	async fn check_local_proxy_mitm(cfg: &SaiaiConfig) -> Result<String> {
-lib.rs	bail!("SAIAI doctor found {} error(s)", self.errors);
-lib.rs	bail!("SAIAI local proxy configuration is obsolete; rerun the one-command SAIAI setup");
-lib.rs	bail!("SAIAI local proxy did not accept the certificate identity request");
-lib.rs	bail!("SAIAI local proxy did not become reachable at {listen}")
-lib.rs	bail!("SAIAI local proxy returned an empty Desktop certificate pin");
-lib.rs	bail!("SAIAI local proxy returned an invalid Desktop certificate pin length");
-lib.rs	bail!("certutil failed to import the SAIAI CA into the Desktop NSS database");
-lib.rs	bail!("downloaded binary did not report a SAIAI version: {candidate_version:?}");
-lib.rs	bail!("invalid SAIAI background state in {}", path.display());
-lib.rs	bail!("refusing non-regular SAIAI lock path {}", path.display())
-lib.rs	bail!("refusing non-regular SAIAI log path {}", log_path.display())
-lib.rs	bail!("refusing non-regular SAIAI log path {}", path.display());
-lib.rs	bail!("refusing non-regular SAIAI state path {}", path.display());
-lib.rs	bail!("saiai logs currently supports Linux, macOS, and Windows only");
-lib.rs	bail!("saiai restart currently supports Linux, macOS, and Windows only");
-lib.rs	bail!("saiai start currently supports Linux, macOS, and Windows only");
-lib.rs	bail!("saiai status currently supports Linux, macOS, and Windows only");
-lib.rs	bail!("saiai stop currently supports Linux, macOS, and Windows only");
-lib.rs	bail!("saiai update currently supports Linux, macOS, and Windows assets only");
 lib.rs	bail!("{SAIAI_CHATGPT_TIMEZONE_ENV} must be an IANA timezone such as America/Los_Angeles");
 lib.rs	cfg: &SaiaiConfig,
 lib.rs	cfg: &SaiaiConfig,
@@ -239,8 +79,6 @@ lib.rs	const SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME: BrandValue<&'static str> =
 lib.rs	const SAIAI_SERVICE_LOG_FILENAME: BrandValue<&'static str> =
 lib.rs	const SAIAI_WINDOWS_BACKGROUND_COMMAND: &str = "__run-background-proxy";
 lib.rs	const SAIAI_WINDOWS_PID_FILENAME: BrandValue<&'static str> =
-lib.rs	file.lock().context("cannot lock selected SAIAI service")?;
-lib.rs	file.lock().context("failed to lock SAIAI initialization")?;
 lib.rs	fn check_codex_config(report: &mut DoctorReport, cfg: Option<&SaiaiConfig>, required: bool) {
 lib.rs	fn check_provider_route(report: &mut DoctorReport, cfg: &SaiaiConfig, provider: ProviderKind) {
 lib.rs	fn check_saiai_config(report: &mut DoctorReport, cfg: &SaiaiConfig) {
@@ -263,18 +101,10 @@ lib.rs	fn start_linux_background_proxy(cfg: &SaiaiConfig) -> Result<u32> {
 lib.rs	fn update_saiai_provider_config(
 lib.rs	fn update_saiai_provider_config_at(
 lib.rs	fn write_saiai_config_at(path: &Path, config: &SaiaiConfig) -> Result<()> {
-lib.rs	format!("SAIAI CA entry is present in {}", db_dir.display()),
-lib.rs	format!("non-SAIAI process on {addr}: {summary}"),
-lib.rs	format!("not reachable at http://{addr} ({err}); start it with `saiai start`"),
-lib.rs	format!("{err:#}; start it with `saiai start`"),
-lib.rs	format!("{} differs from SAIAI config CA path", value),
 lib.rs	fs::create_dir_all(&saiai_home)
 lib.rs	fs::create_dir_all(&saiai_home)
-lib.rs	fs::create_dir_all(saiai_config_dir()?).context("failed to create SAIAI config directory")?;
+lib.rs	fs::create_dir_all(saiai_config_dir()?).with_context(|| {
 lib.rs	gateway_state_dir: saiai_config_dir().ok(),
-lib.rs	if ($actualHash -cne $expectedHash) {{ throw \"Installed SAIAI binary hash mismatch: $actualHash\" }}\r\n\
-lib.rs	if ($null -ne $lastError) {{ throw \"Could not replace SAIAI binary after 120 attempts: $($lastError.Exception.Message)\" }}\r\n\
-lib.rs	if ($process.ExitCode -ne 0) {{ throw \"SAIAI $verb exited with $($process.ExitCode)\" }}\r\n\
 lib.rs	if cfg.version != SAIAI_CONFIG_VERSION.get() || cfg.ca_key_path.trim().is_empty() {
 lib.rs	if cfg.version == SAIAI_CONFIG_VERSION.get() {
 lib.rs	if config.version != SAIAI_CONFIG_VERSION.get()
@@ -290,11 +120,11 @@ lib.rs	let ca_cert_path = config_dir.join(SAIAI_CA_FILENAME.get());
 lib.rs	let ca_key_path = config_dir.join(SAIAI_CA_KEY_FILENAME.get());
 lib.rs	let cfg = match read_saiai_config() {
 lib.rs	let cfg = match read_saiai_config() {
-lib.rs	let cfg = read_saiai_config()
-lib.rs	let cfg = read_saiai_config()
-lib.rs	let cfg = read_saiai_config().context("SAIAI local proxy is not configured")?;
-lib.rs	let cfg = read_saiai_config().context("SAIAI local proxy is not configured")?;
-lib.rs	let cfg = read_saiai_config().context("SAIAI local proxy is not configured")?;
+lib.rs	let cfg = read_saiai_config().with_context(|| {
+lib.rs	let cfg = read_saiai_config().with_context(|| {
+lib.rs	let cfg = read_saiai_config().with_context(|| {
+lib.rs	let cfg = read_saiai_config().with_context(|| {
+lib.rs	let cfg = read_saiai_config().with_context(|| {
 lib.rs	let cfg = read_saiai_config()?;
 lib.rs	let cfg = read_saiai_config()?;
 lib.rs	let cfg = read_saiai_config()?;
@@ -305,10 +135,9 @@ lib.rs	let config = read_saiai_config()?;
 lib.rs	let config = serde_json::from_str::<SaiaiConfig>(&raw).ok()?;
 lib.rs	let config_dir = saiai_config_dir()?;
 lib.rs	let config_path = config_dir.join(SAIAI_CONFIG_FILENAME.get());
-lib.rs	let config_path = saiai_config_path().context("failed to resolve SAIAI config path")?;
+lib.rs	let config_path = saiai_config_path().with_context(|| {
 lib.rs	let content = render_launchd_plist(&exe, &saiai_home, &working_dir, &log_path)?;
 lib.rs	let content = render_user_service(&exe, &saiai_home, &working_dir)?;
-lib.rs	let current_exe = env::current_exe().context("failed to resolve current saiai executable")?;
 lib.rs	let default_ca_key_path = ca_dir.join(SAIAI_CA_KEY_FILENAME.get());
 lib.rs	let default_ca_path = ca_dir.join(SAIAI_CA_FILENAME.get());
 lib.rs	let desktop_codex = saiai_dir.join("desktop").join("codex");
@@ -316,15 +145,9 @@ lib.rs	let desktop_root = saiai_config_dir()?.join("desktop");
 lib.rs	let desktop_root = saiai_config_dir()?.join("desktop");
 lib.rs	let desktop_root = saiai_config_dir()?.join("desktop");
 lib.rs	let directory = saiai_config_dir()?;
-lib.rs	let exe = env::current_exe().context("failed to resolve current saiai executable")?;
-lib.rs	let exe = env::current_exe().context("failed to resolve current saiai executable")?;
-lib.rs	let exe = env::current_exe().context("failed to resolve current saiai executable")?;
-lib.rs	let exe = env::current_exe().context("failed to resolve current saiai executable")?;
-lib.rs	let key = KeyPair::generate().context("failed to generate SAIAI installation CA key")?;
 lib.rs	let mut cfg = read_saiai_config()?;
 lib.rs	let mut config = SaiaiConfig {
 lib.rs	let mut config = existing.unwrap_or_else(|| SaiaiConfig {
-lib.rs	let mut data = serde_json::to_vec_pretty(state).context("failed to serialize SAIAI state")?;
 lib.rs	let mut paths = vec![scope.root.join(SAIAI_CONFIG_FILENAME.get())];
 lib.rs	let own = scope.directory.join(SAIAI_CONFIG_FILENAME.get());
 lib.rs	let path = dir.join(SAIAI_LINUX_LOCK_FILENAME.get());
@@ -333,7 +156,6 @@ lib.rs	let path = dir.join(SAIAI_WINDOWS_PID_FILENAME.get());
 lib.rs	let path = saiai_config_path().ok()?;
 lib.rs	let path = saiai_config_path()?;
 lib.rs	let path = saiai_config_path()?;
-lib.rs	let pid = i32::try_from(state.pid).context("SAIAI background pid is out of range")?;
 lib.rs	let raw = env::var_os(SAIAI_CHATGPT_TIMEZONE_ENV.get());
 lib.rs	let saiai_config = update_saiai_provider_config(
 lib.rs	let saiai_home = absolute_existing_or_raw(saiai_config_dir()?);
@@ -345,7 +167,6 @@ lib.rs	let saiai_home = xml_escape(&path_to_string(saiai_home)?);
 lib.rs	let stale = stale_saiai_ca_thumbprints(&listing, &current);
 lib.rs	let state_path = dir.join(SAIAI_LINUX_PID_FILENAME.get());
 lib.rs	let updated = update_saiai_provider_config_at(
-lib.rs	let value = serde_json::to_value(config).context("failed to serialize SAIAI config")?;
 lib.rs	linux_background_state_at(&saiai_config_dir()?)
 lib.rs	linux_background_state_matches_at(state, &saiai_config_dir()?, environment_scope::isolated())
 lib.rs	lock_windows_service_at(&saiai_config_dir()?)
@@ -355,86 +176,20 @@ lib.rs	match read_saiai_config() {
 lib.rs	match saiai_config_dir() {
 lib.rs	paths.push(entry.path().join(SAIAI_CONFIG_FILENAME.get()));
 lib.rs	println!(" {}", saiai_config_path()?.display());
-lib.rs	println!("Already current: saiai {}", runtime::version());
-lib.rs	println!("Current: saiai {}", runtime::version());
-lib.rs	println!("Latest: saiai {remote_version}");
-lib.rs	println!("Logs: saiai logs");
-lib.rs	println!("Logs: saiai logs");
-lib.rs	println!("Logs: saiai logs");
-lib.rs	println!("Managed SAIAI service was active; restart was scheduled automatically.");
-lib.rs	println!("Managed SAIAI service was active; restarted automatically.");
-lib.rs	println!("Restored the Windows proxy left by a legacy SAIAI Desktop lease.");
-lib.rs	println!("SAIAI LaunchAgent started.");
-lib.rs	println!("SAIAI LaunchAgent stopped.");
-lib.rs	println!("SAIAI background proxy is not running.");
-lib.rs	println!("SAIAI background proxy started or refreshed.");
-lib.rs	println!("SAIAI background proxy started or refreshed.");
-lib.rs	println!("SAIAI background proxy stopped.");
-lib.rs	println!("SAIAI background proxy stopped.");
-lib.rs	println!("SAIAI background proxy stopped.");
-lib.rs	println!("SAIAI configured Claude Code for local proxy mode.");
-lib.rs	println!("SAIAI configured Codex for local-proxy OAuth mode.");
-lib.rs	println!("SAIAI configured the Codex VSCode extension for local proxy mode.");
-lib.rs	println!("SAIAI local proxy left running; binary and runtime configuration are unchanged.");
-lib.rs	println!("SAIAI local proxy start skipped (SAIAI_SKIP_START=1).");
-lib.rs	println!("SAIAI local proxy started or refreshed after configuration update.");
-lib.rs	println!("SAIAI service is not running.");
-lib.rs	println!("SAIAI service was not active; run `saiai start` when needed.");
-lib.rs	println!("SAIAI user service started or refreshed.");
-lib.rs	println!("SAIAI user service stopped and disabled.");
-lib.rs	println!("Starting ChatGPT Desktop through the SAIAI local proxy.");
-lib.rs	println!("Starting ChatGPT Desktop through the SAIAI local proxy.");
-lib.rs	println!("Starting Codex through the SAIAI local proxy.");
-lib.rs	println!("Starting OpenAI Desktop through the SAIAI local proxy.");
-lib.rs	println!("Starting packaged OpenAI Desktop through the SAIAI local proxy.");
-lib.rs	println!("Status: saiai status");
-lib.rs	println!("Status: saiai status");
-lib.rs	println!("Status: saiai status");
 lib.rs	println!("config: {}", saiai_config_path()?.display());
 lib.rs	println!("config: {}", saiai_config_path()?.display());
 lib.rs	println!("config: {}", saiai_config_path()?.display());
 lib.rs	pub mod gateway_saiai;
-lib.rs	report.error("configured CA key", "missing; rerun SAIAI setup");
 lib.rs	report.ok("config version", SAIAI_CONFIG_VERSION.get().to_string());
-lib.rs	report.warn("Codex route", "SAIAI config is unavailable");
-lib.rs	report.warn("service", "not installed; run `saiai start` to install it");
-lib.rs	return Err(err).context("failed to restart the active SAIAI service");
-lib.rs	return Err(error).with_context(|| format!("failed to signal SAIAI process {pid}"));
-lib.rs	run_service_start().context("failed to start or refresh the SAIAI local proxy")?;
-lib.rs	saiai # run the local proxy (Claude Code and Codex)
-lib.rs	saiai --environment claude|codex|default <command> # select a proxy environment
-lib.rs	saiai --verbose # run local proxy with request logs
-lib.rs	saiai --version # print version
-lib.rs	saiai claude [-- <claude arguments>] # launch Claude with a child-only SAIAI environment
-lib.rs	saiai codex [-- <codex arguments>] # launch Codex through SAIAI local proxy
-lib.rs	saiai desktop [codex|claude] [-- <Desktop arguments>] # Claude: Linux Code only
-lib.rs	saiai doctor --desktop claude # check Claude Desktop adapter
-lib.rs	saiai doctor [claude|codex] # check proxy and product config
-lib.rs	saiai init --base-url <base_url> --api-key <api_key> # initialize Claude Code
-lib.rs	saiai init <base_url> <api_key> # initialize Claude Code
-lib.rs	saiai init-codex --base-url <base_url> --api-key <api_key> [--websockets]
-lib.rs	saiai init-codex <base_url> <api_key> [--websockets] # initialize Codex CLI
-lib.rs	saiai logs # follow user service logs
-lib.rs	saiai restart # restart user service
-lib.rs	saiai start # install and start user service
-lib.rs	saiai status # show user service status
-lib.rs	saiai stop # stop and disable user service
-lib.rs	saiai uninstall [--yes] [--dry-run] [--forget-unknown-environments] # remove SAIAI services, settings, data and program
-lib.rs	saiai update # update this client binary
-lib.rs	saiai upstream-proxy [system|direct|http://host:port] # show or set the proxy SAIAI itself uses
-lib.rs	saiai vscode # configure the Codex VSCode extension for SAIAI
 lib.rs	saiai_config_dir()?
 lib.rs	saiai_home: &Path,
 lib.rs	schema_version: SAIAI_LINUX_BACKGROUND_STATE_VERSION,
-lib.rs	serde_json::from_slice(&raw).context("invalid SAIAI environment configuration")?;
-lib.rs	start().context("failed to start the SAIAI local proxy")?;
 lib.rs	start_managed_service_after_initialization(saiai_config.changed || ca_changed)?;
 lib.rs	stop_linux_background_proxy_at(&saiai_config_dir()?, environment_scope::isolated())
 lib.rs	struct SaiaiConfig {
 lib.rs	struct SaiaiConfigUpdate {
 lib.rs	systemd_quote(&format!("{}={saiai_home}", BRAND.env.home))?,
-lib.rs	systemd_quote(&saiai_home)?
-lib.rs	throw \"SAIAI $verb did not exit within 30 seconds\"\r\n\
+lib.rs	systemd_quote(&saiai_home)?,
 lib.rs	update_saiai_provider_config_at(&path, provider, credential, ca_paths)
 lib.rs	version: SAIAI_CONFIG_VERSION.get(),
 lib.rs	version: SAIAI_CONFIG_VERSION.get(),
@@ -443,62 +198,16 @@ lib.rs	write_saiai_config_at(&config_path, &migrated)?;
 lib.rs	write_saiai_config_at(&saiai_config_path()?, &cfg)?;
 lib.rs	write_saiai_config_at(path, &config)?;
 lib.rs	} else if linux_configured_listen_has_saiai_owner()? {
-local_proxy.rs	.context("failed to load SAIAI CA")?;
-local_proxy.rs	.context("failed to parse SAIAI CA certificate")?;
-local_proxy.rs	.context("failed to validate installation-specific SAIAI CA")?;
-local_proxy.rs	.map_err(|_| anyhow::anyhow!("failed to parse SAIAI CA certificate PEM"))?;
-local_proxy.rs	.map_err(|_| anyhow::anyhow!("failed to parse SAIAI CA certificate"))?;
-local_proxy.rs	Url::parse(&base).with_context(|| format!("invalid {name} SAIAI base URL: {base}"))?;
 local_proxy.rs	async fn forward_to_saiai<W>(
 local_proxy.rs	async fn forward_to_saiai_with_preferences_path<W>(
-local_proxy.rs	bail!("SAIAI CA key does not match the CA certificate");
-local_proxy.rs	bail!("{name} SAIAI API key is required");
-local_proxy.rs	bail!("{name} SAIAI base URL host is required");
-local_proxy.rs	eprintln!("saiai local proxy listening on http://{}", state.listen);
-local_proxy.rs	eprintln!("saiai local proxy stopped");
 local_proxy.rs	forward_to_saiai(
 local_proxy.rs	forward_to_saiai(
 local_proxy.rs	forward_to_saiai_with_preferences_path(
-local_proxy.rs	let ca_key = KeyPair::from_pem(ca_key_pem).context("failed to parse SAIAI CA key")?;
-local_proxy.rs	scheme => bail!("{name} SAIAI base URL must use http or https, got {scheme}"),
-local_proxy_claude.rs	"login_state_user_email_context_present; close Desktop and relaunch saiai desktop claude to clear isolated login identity"
-uninstall.rs	" - Claude Code: log in again (`claude`, then /login). SAIAI did not change ~/.claude.json, .credentials.json or oauthAccount."
-uninstall.rs	" - If you use the Codex app-server daemon, run `codex app-server daemon update`; it may still be pinned to the SAIAI setup."
-uninstall.rs	"SAIAI home is reached through a symbolic link; no SAIAI data inside it is deleted (its services are still stopped), delete it yourself"
-uninstall.rs	"SAIAI uninstall is incomplete: {failed} item(s) failed or were skipped. Fix the failure and rerun `saiai uninstall`."
-uninstall.rs	"changed since the plan was shown; not a known SAIAI CA".into(),
-uninstall.rs	"generic Claude Code settings; may have been set by SAIAI".into(),
-uninstall.rs	"generic Codex settings; may have been set by SAIAI".into(),
-uninstall.rs	"is a symbolic link; SAIAI does not follow it. Remove the link and rerun"
-uninstall.rs	"is shared by several SAIAI configurations that would remove different values; clean it manually".into(),
-uninstall.rs	"its directory is a symbolic link; SAIAI does not follow it. Remove the link and rerun"
-uninstall.rs	"managed for {proxy}, which is not a configured SAIAI proxy"
-uninstall.rs	"no SAIAI configuration was found to verify that SAIAI wrote it"
-uninstall.rs	"remove SAIAI CA {thumbprint} from Windows CurrentUser\\Root (Windows may ask you to confirm)"
-uninstall.rs	"remove {} (only the SAIAI managed block remains)",
-uninstall.rs	"remove {} (only the SAIAI placeholder login remains)",
-uninstall.rs	"the SAIAI managed block has no END marker; not changed".into(),
-uninstall.rs	"value differs from what SAIAI wrote"
-uninstall.rs	"{error:#}; it cannot identify a process. Close any remaining SAIAI proxy, delete the state file, then rerun"
-uninstall.rs	"{error:#}; it cannot identify a process. Stop any remaining SAIAI proxy, delete the state file, then rerun"
-uninstall.rs	"{} still exists (a running copy is removed a few seconds after this window's command exits). Rerun after a few seconds: `irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai uninstall` (it downloads a temporary client, since the installed one is gone)",
-uninstall.rs	"{}: keys SAIAI removed during setup (base_url, openai_base_url, chatgpt_base_url, model_providers, features.responses_websockets[_v2])",
 uninstall.rs	&& !(exclude_saiai_ca && name.starts_with(BRAND.certificates.ca_backup_prefix))
 uninstall.rs	&& !saiai_config
 uninstall.rs	.is_some_and(|name| name == crate::SAIAI_CONFIG_FILENAME.get())
 uninstall.rs	.is_some_and(|name| name.starts_with(crate::SAIAI_CA_FILENAME.get()))
-uninstall.rs	Outcome::Kept("not a SAIAI configuration".into()),
-uninstall.rs	Outcome::Kept("not a SAIAI environment (no SAIAI config.json)".into()),
-uninstall.rs	Outcome::Kept("not a known SAIAI CA".into()),
-uninstall.rs	Outcome::Kept("not the SAIAI placeholder login".into()),
-uninstall.rs	Outcome::Kept("value differs from what SAIAI wrote".into()),
 uninstall.rs	SAIAI_HOME_FILES.iter().map(BrandValue::get).any(|file| {
-uninstall.rs	Self::Data => "SAIAI data",
-uninstall.rs	bail!("certutil could not delete the SAIAI certificate");
-uninstall.rs	bail!("changed since the plan was shown; not modified. Rerun `saiai uninstall`");
-uninstall.rs	bail!("disappeared since the plan was shown; rerun `saiai uninstall`");
-uninstall.rs	bail!("the SAIAI certificate is still present after deletion");
-uninstall.rs	const PLAN_MARKER: &str = "SAIAI uninstall plan";
 uninstall.rs	crate::SAIAI_CA_FILENAME,
 uninstall.rs	crate::SAIAI_CA_FILENAME.get(),
 uninstall.rs	crate::SAIAI_CA_KEY_FILENAME,
@@ -512,38 +221,14 @@ uninstall.rs	fn collect_backups(dir: &Path, exclude_saiai_ca: bool, plan: &mut P
 uninstall.rs	fn is_saiai_config(config: &Value) -> bool {
 uninstall.rs	for name in SAIAI_HOME_DIRS {
 uninstall.rs	for path in matching_files(root, is_saiai_home_file)? {
-uninstall.rs	format!("edit {}: remove the SAIAI managed block", env_label)
-uninstall.rs	format!("edit {}: remove {listed}the SAIAI marker", label),
-uninstall.rs	format!("env.{key} (SAIAI API key {})", mask_secret(value))
 uninstall.rs	format!("{}.bak-", crate::SAIAI_CA_FILENAME.get()),
 uninstall.rs	format!("{}.bak-", crate::SAIAI_CA_KEY_FILENAME.get()),
 uninstall.rs	instance.has_config = is_saiai_config(&config);
 uninstall.rs	let raw = match fs::read(instance.dir.join(crate::SAIAI_CONFIG_FILENAME.get())) {
 uninstall.rs	let saiai_config = discovery.instances.first().is_some_and(|i| i.has_config);
-uninstall.rs	println!("SAIAI data and the program are removed only if every earlier step succeeds.");
-uninstall.rs	println!("SAIAI home: {}", discovery.root.display());
 uninstall.rs	pub(crate) const SAIAI_HOME_DIRS: &[&str] = &["log-followers", "desktop"];
 uninstall.rs	pub(crate) const SAIAI_HOME_FILES: &[BrandValue<&'static str>] = &[
 uninstall.rs	pub(crate) fn is_saiai_home_file(name: &str) -> bool {
 uninstall.rs	version.as_u64() == Some(u64::from(crate::SAIAI_CONFIG_VERSION.get()))
 uninstall.rs	|| !is_saiai_home_file(name)
 uninstall.rs	} else if name == crate::SAIAI_CONFIG_FILENAME.get()
-upstream_proxy.rs	" (ignored {} pointing at this SAIAI proxy)",
-upstream_proxy.rs	"upstream proxy {endpoint} requires authentication (407); SAIAI supports Basic credentials in the proxy URL"
-upstream_proxy.rs	Endpoint::parse(value).with_context(|| format!("{name} in the SAIAI environment"))?;
-upstream_proxy.rs	Err("proxy auto-configuration returned this SAIAI proxy itself".to_string())
-upstream_proxy.rs	let message = "the configured upstream proxy is this SAIAI proxy itself".to_string();
-upstream_tls.rs	"warning: SAIAI installation CA is unreadable; trusting only bundled root certificates"
-vscode.rs	"Windows may show a Security Warning for the existing SAIAI CA (SHA-256: {hash}). Confirm that certificate within 90 seconds to finish VSCode setup."
-vscode.rs	.context("SAIAI ownership marker disappeared during removal")?;
-vscode.rs	bail!("VSCode settings contain multiple SAIAI ownership markers");
-vscode.rs	bail!("VSCode settings contain multiple SAIAI ownership markers");
-vscode.rs	bail!("VSCode's certificate loader could not verify the SAIAI CA");
-vscode.rs	bail!("VSCode's {key} is not configured for the current SAIAI proxy");
-windows_background.rs	.context("cannot read SAIAI process creation time");
-windows_background.rs	.context("cannot terminate selected SAIAI process");
-windows_background.rs	bail!("selected SAIAI process did not exit after termination");
-windows_background.rs	return Err(error).context("cannot inspect SAIAI process identity");
-windows_desktop_runtime.rs	"Cannot safely reuse the running OpenAI Desktop. Use its normal File > Quit, then retry `saiai desktop codex`. No Desktop process was stopped."
-windows_desktop_runtime.rs	"Official Codex package changed or is not ready. Wait for its update to finish, then retry `saiai desktop codex`; if Desktop is open, use normal File > Quit first. No Desktop process was stopped or adopted."
-windows_desktop_runtime.rs	.context("Another SAIAI Desktop launch is in progress; retry after it finishes")?;

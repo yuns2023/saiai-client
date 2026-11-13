@@ -1,5 +1,6 @@
 //! Hold a Windows process handle while checking identity and terminating it.
 //! PID reuse must never turn one environment's stop into another one's stop.
+use crate::brand::BRAND;
 use anyhow::{Context, Result, bail};
 use std::ffi::c_void;
 
@@ -44,7 +45,12 @@ impl Process {
             if error.raw_os_error() == Some(87) {
                 return Ok(None);
             }
-            return Err(error).context("cannot inspect SAIAI process identity");
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot inspect {brand_product} process identity",
+                    brand_product = BRAND.product_name
+                )
+            });
         }
         let mut process = Self {
             handle,
@@ -60,8 +66,12 @@ impl Process {
         if unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) }
             == 0
         {
-            return Err(std::io::Error::last_os_error())
-                .context("cannot read SAIAI process creation time");
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "cannot read {brand_product} process creation time",
+                    brand_product = BRAND.product_name
+                )
+            });
         }
         process.created = (u64::from(created.high) << 32) | u64::from(created.low);
         Ok(Some(process))
@@ -76,11 +86,18 @@ impl Process {
             return Ok(());
         }
         if unsafe { TerminateProcess(self.handle, 0) } == 0 && self.running() {
-            return Err(std::io::Error::last_os_error())
-                .context("cannot terminate selected SAIAI process");
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "cannot terminate selected {brand_product} process",
+                    brand_product = BRAND.product_name
+                )
+            });
         }
         if unsafe { WaitForSingleObject(self.handle, 10_000) } != 0 {
-            bail!("selected SAIAI process did not exit after termination");
+            bail!(
+                "selected {brand_product} process did not exit after termination",
+                brand_product = BRAND.product_name
+            );
         }
         Ok(())
     }

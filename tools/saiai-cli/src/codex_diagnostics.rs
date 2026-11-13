@@ -1,3 +1,4 @@
+use crate::brand::BRAND;
 use crate::{DoctorReport, codex_config_dir, codex_process_command};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -41,7 +42,10 @@ pub(crate) fn check(report: &mut DoctorReport) {
     };
     report.ok(
         "Codex CLI version",
-        format!("{version}; independent of SAIAI and Desktop app-server versions"),
+        format!(
+            "{version}; independent of {brand_product} and Desktop app-server versions",
+            brand_product = BRAND.product_name
+        ),
     );
     match supports_environment_context_time_toggle(&version) {
         Some(true) => report.ok(
@@ -50,7 +54,7 @@ pub(crate) fn check(report: &mut DoctorReport) {
         ),
         Some(false) => report.warn(
             "Codex time reporting support",
-            format!("CLI {version} does not support turning off time reporting via include_environment_context_time; upgrade Codex to {MIN_TIME_TOGGLE_VERSION_TEXT}+ and re-run `saiai init-codex`. Desktop and VS Code embedded Codex backends are not checked here"),
+            format!("CLI {version} does not support turning off time reporting via include_environment_context_time; upgrade Codex to {MIN_TIME_TOGGLE_VERSION_TEXT}+ and re-run `{brand_binary} init-codex`. Desktop and VS Code embedded Codex backends are not checked here", brand_binary = BRAND.binary_name),
         ),
         None => report.warn(
             "Codex time reporting support",

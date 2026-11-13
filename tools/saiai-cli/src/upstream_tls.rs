@@ -12,6 +12,7 @@
 //! The configs mirror what reqwest 0.12 and tokio-tungstenite 0.27 build by
 //! default, so only the trusted roots change, not the TLS parameters.
 
+use crate::brand::BRAND;
 use rustls::RootCertStore;
 use rustls::client::ClientConfig;
 use rustls::crypto::CryptoProvider;
@@ -173,7 +174,8 @@ fn build_root_store(
     };
     let Some(excluded) = installation_ca_ders(installation_ca_pem) else {
         eprintln!(
-            "warning: SAIAI installation CA is unreadable; trusting only bundled root certificates"
+            "warning: {brand_product} installation CA is unreadable; trusting only bundled root certificates",
+            brand_product = BRAND.product_name
         );
         return roots;
     };

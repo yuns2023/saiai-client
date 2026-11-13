@@ -1,6 +1,6 @@
 //! `saiai uninstall`: a read-only discovery builds the plan; execution removes
 //! only SAIAI-created files and values exactly equal to what SAIAI wrote.
-use crate::brand::{BRAND, BrandValue};
+use crate::brand::{BRAND, BrandText, BrandValue};
 use crate::{environment_scope, vscode};
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value};
@@ -15,7 +15,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use toml_edit::DocumentMut;
 
-const PLAN_MARKER: &str = "SAIAI uninstall plan";
+const PLAN_MARKER: BrandText = BrandText(|| {
+    format!(
+        "{brand_product} uninstall plan",
+        brand_product = BRAND.product_name
+    )
+});
 #[cfg(windows)]
 const RELAUNCH_FLAG: &str = "--relaunched-from";
 const ENVIRONMENTS_DIR: &str = "environments";
@@ -99,15 +104,17 @@ const AREAS: [Area; 7] = [
 ];
 
 impl Area {
-    fn label(self) -> &'static str {
+    fn label(self) -> std::borrow::Cow<'static, str> {
         match self {
-            Self::Services => "Services",
-            Self::Claude => "Claude Code",
-            Self::Codex => "Codex",
-            Self::VSCode => "VSCode",
-            Self::Certificates => "Certificates",
-            Self::Data => "SAIAI data",
-            Self::Program => "Program",
+            Self::Services => "Services".into(),
+            Self::Claude => "Claude Code".into(),
+            Self::Codex => "Codex".into(),
+            Self::VSCode => "VSCode".into(),
+            Self::Certificates => "Certificates".into(),
+            Self::Data => {
+                format!("{brand_product} data", brand_product = BRAND.product_name).into()
+            }
+            Self::Program => "Program".into(),
         }
     }
 
@@ -223,9 +230,10 @@ impl Plan {
                         existing.clone_from(replacement);
                     } else if replacement.is_some() && existing != replacement {
                         item.action = Action::None;
-                        item.outcome = Outcome::Failed(
-                            "is shared by several SAIAI configurations that would remove different values; clean it manually".into(),
-                        );
+                        item.outcome = Outcome::Failed(format!(
+                            "is shared by several {brand_product} configurations that would remove different values; clean it manually",
+                            brand_product = BRAND.product_name
+                        ));
                     }
                 }
                 return;
@@ -892,9 +900,15 @@ fn plan_claude(discovery: &Discovery, product: &ProductDir, plan: &mut Plan) {
             Some(settings) => {
                 let removal = claude_settings_removal(&settings, &owned);
                 let modified_reason = if product.candidates.is_empty() {
-                    "no SAIAI configuration was found to verify that SAIAI wrote it"
+                    format!(
+                        "no {brand_product} configuration was found to verify that {brand_product} wrote it",
+                        brand_product = BRAND.product_name
+                    )
                 } else {
-                    "value differs from what SAIAI wrote"
+                    format!(
+                        "value differs from what {brand_product} wrote",
+                        brand_product = BRAND.product_name
+                    )
                 };
                 if !removal.removed.is_empty() {
                     let described = removal
@@ -903,7 +917,11 @@ fn plan_claude(discovery: &Discovery, product: &ProductDir, plan: &mut Plan) {
                         .map(|key| {
                             if key == "CLAUDE_CODE_OAUTH_TOKEN" {
                                 let value = settings["env"][key].as_str().unwrap_or_default();
-                                format!("env.{key} (SAIAI API key {})", mask_secret(value))
+                                format!(
+                                    "env.{key} ({brand_product} API key {})",
+                                    mask_secret(value),
+                                    brand_product = BRAND.product_name
+                                )
                             } else {
                                 format!("env.{key}")
                             }
@@ -924,16 +942,17 @@ fn plan_claude(discovery: &Discovery, product: &ProductDir, plan: &mut Plan) {
                     plan.note(
                         Area::Claude,
                         format!("{}: env.{}", label, removal.modified.join(", env.")),
-                        Outcome::Kept(modified_reason.into()),
+                        Outcome::Kept(modified_reason.clone()),
                     );
                 }
                 if !removal.generic.is_empty() {
                     plan.note(
                         Area::Claude,
                         format!("{}: env.{}", label, removal.generic.join(", env.")),
-                        Outcome::Kept(
-                            "generic Claude Code settings; may have been set by SAIAI".into(),
-                        ),
+                        Outcome::Kept(format!(
+                            "generic Claude Code settings; may have been set by {brand_product}",
+                            brand_product = BRAND.product_name
+                        )),
                     );
                 }
             }
@@ -1058,33 +1077,34 @@ fn plan_codex(_discovery: &Discovery, product: &ProductDir, plan: &mut Plan) {
                 env_label.clone(),
                 Outcome::Failed(format!("{error:#}")),
             ),
-            Ok(Some(original)) => match String::from_utf8(original.clone()) {
-                Err(_) => plan.note(
-                    Area::Codex,
-                    env_label.clone(),
-                    Outcome::Failed("is not valid UTF-8; not changed".into()),
-                ),
-                Ok(raw) => {
-                    let stripped = crate::strip_codex_ide_env_block(&raw);
-                    if !stripped.complete {
-                        plan.note(
+            Ok(Some(original)) => {
+                match String::from_utf8(original.clone()) {
+                    Err(_) => plan.note(
+                        Area::Codex,
+                        env_label.clone(),
+                        Outcome::Failed("is not valid UTF-8; not changed".into()),
+                    ),
+                    Ok(raw) => {
+                        let stripped = crate::strip_codex_ide_env_block(&raw);
+                        if !stripped.complete {
+                            plan.note(
                             Area::Codex,
                             env_label.clone(),
                             Outcome::Failed(
-                                "the SAIAI managed block has no END marker; not changed".into(),
+                                format!("the {brand_product} managed block has no END marker; not changed", brand_product = BRAND.product_name),
                             ),
                         );
-                    } else if stripped.content != raw {
-                        let delete = stripped.content.trim().is_empty() && !env_linked;
-                        plan.act(
+                        } else if stripped.content != raw {
+                            let delete = stripped.content.trim().is_empty() && !env_linked;
+                            plan.act(
                             Area::Codex,
                             if delete {
                                 format!(
-                                    "remove {} (only the SAIAI managed block remains)",
-                                    env_label
+                                    "remove {} (only the {brand_product} managed block remains)",
+                                    env_label, brand_product = BRAND.product_name
                                 )
                             } else {
-                                format!("edit {}: remove the SAIAI managed block", env_label)
+                                format!("edit {}: remove the {brand_product} managed block", env_label, brand_product = BRAND.product_name)
                             },
                             Action::Edit {
                                 path: env_path.clone(),
@@ -1092,9 +1112,10 @@ fn plan_codex(_discovery: &Discovery, product: &ProductDir, plan: &mut Plan) {
                                 replacement: (!delete).then(|| stripped.content.into_bytes()),
                             },
                         );
+                        }
                     }
                 }
-            },
+            }
         }
     }
 
@@ -1121,8 +1142,8 @@ fn plan_codex(_discovery: &Discovery, product: &ProductDir, plan: &mut Plan) {
                             Area::Codex,
                             if delete {
                                 format!(
-                                    "remove {} (only the SAIAI placeholder login remains)",
-                                    auth_label
+                                    "remove {} (only the {brand_product} placeholder login remains)",
+                                    auth_label, brand_product = BRAND.product_name
                                 )
                             } else {
                                 format!("edit {}: remove {}", auth_label, removed.join(", "))
@@ -1139,7 +1160,10 @@ fn plan_codex(_discovery: &Discovery, product: &ProductDir, plan: &mut Plan) {
                     } => plan.note(
                         Area::Codex,
                         format!("{}: tokens", auth_label),
-                        Outcome::Kept("not the SAIAI placeholder login".into()),
+                        Outcome::Kept(format!(
+                            "not the {brand_product} placeholder login",
+                            brand_product = BRAND.product_name
+                        )),
                     ),
                     AuthRemoval::Unchanged { .. } => {}
                 },
@@ -1160,9 +1184,10 @@ fn plan_codex(_discovery: &Discovery, product: &ProductDir, plan: &mut Plan) {
                         plan.note(
                             Area::Codex,
                             format!("{}: {}", path.display(), kept.join(", ")),
-                            Outcome::Kept(
-                                "generic Codex settings; may have been set by SAIAI".into(),
-                            ),
+                            Outcome::Kept(format!(
+                                "generic Codex settings; may have been set by {brand_product}",
+                                brand_product = BRAND.product_name
+                            )),
                         );
                     }
                 }
@@ -1177,8 +1202,8 @@ fn plan_codex(_discovery: &Discovery, product: &ProductDir, plan: &mut Plan) {
             plan.note(
                 Area::Codex,
                 format!(
-                    "{}: keys SAIAI removed during setup (base_url, openai_base_url, chatgpt_base_url, model_providers, features.responses_websockets[_v2])",
-                    product.dir.display()
+                    "{}: keys {brand_product} removed during setup (base_url, openai_base_url, chatgpt_base_url, model_providers, features.responses_websockets[_v2])",
+                    product.dir.display(), brand_product = BRAND.product_name
                 ),
                 Outcome::Kept(
                     "not restored; the config.toml.bak-* backups next to it hold earlier versions"
@@ -1227,7 +1252,8 @@ fn plan_vscode(discovery: &Discovery, plan: &mut Plan) {
                 Area::VSCode,
                 label.clone(),
                 Outcome::Kept(format!(
-                    "managed for {proxy}, which is not a configured SAIAI proxy"
+                    "managed for {proxy}, which is not a configured {brand_product} proxy",
+                    brand_product = BRAND.product_name
                 )),
             ),
             Ok(vscode::ManagedRemoval::Owned {
@@ -1241,7 +1267,11 @@ fn plan_vscode(discovery: &Discovery, plan: &mut Plan) {
                 }
                 plan.act(
                     Area::VSCode,
-                    format!("edit {}: remove {listed}the SAIAI marker", label),
+                    format!(
+                        "edit {}: remove {listed}the {brand_product} marker",
+                        label,
+                        brand_product = BRAND.product_name
+                    ),
                     Action::Edit {
                         path: path.clone(),
                         original,
@@ -1252,7 +1282,10 @@ fn plan_vscode(discovery: &Discovery, plan: &mut Plan) {
                     plan.note(
                         Area::VSCode,
                         format!("{}: {}", label, kept.join(", ")),
-                        Outcome::Kept("value differs from what SAIAI wrote".into()),
+                        Outcome::Kept(format!(
+                            "value differs from what {brand_product} wrote",
+                            brand_product = BRAND.product_name
+                        )),
                     );
                 }
             }
@@ -1422,7 +1455,10 @@ fn plan_nss(files: &[PathBuf], plan: &mut Plan) {
         NssDecision::Keep => plan.note(
             Area::Certificates,
             label,
-            Outcome::Kept("not a known SAIAI CA".into()),
+            Outcome::Kept(format!(
+                "not a known {brand_product} CA",
+                brand_product = BRAND.product_name
+            )),
         ),
     }
 }
@@ -1477,8 +1513,7 @@ fn plan_data(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
             Area::Data,
             root.display().to_string(),
             Outcome::Kept(
-                "SAIAI home is reached through a symbolic link; no SAIAI data inside it is deleted (its services are still stopped), delete it yourself"
-                    .into(),
+                format!("{brand_product} home is reached through a symbolic link; no {brand_product} data inside it is deleted (its services are still stopped), delete it yourself", brand_product = BRAND.product_name),
             ),
         );
     } else if root.is_dir() {
@@ -1492,7 +1527,10 @@ fn plan_data(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
                 plan.note(
                     Area::Data,
                     path.display().to_string(),
-                    Outcome::Kept("not a SAIAI configuration".into()),
+                    Outcome::Kept(format!(
+                        "not a {brand_product} configuration",
+                        brand_product = BRAND.product_name
+                    )),
                 );
                 continue;
             }
@@ -1518,7 +1556,10 @@ fn plan_data(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
                 plan.note(
                     Area::Data,
                     label,
-                    Outcome::Kept("not a SAIAI environment (no SAIAI config.json)".into()),
+                    Outcome::Kept(format!(
+                        "not a {brand_product} environment (no {brand_product} config.json)",
+                        brand_product = BRAND.product_name
+                    )),
                 );
             }
         }
@@ -1717,7 +1758,7 @@ fn plan_services(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
                 Area::Services,
                 format!("background proxy state of {}", instance.dir.display()),
                 Outcome::Failed(format!(
-                    "{error:#}; it cannot identify a process. Stop any remaining SAIAI proxy, delete the state file, then rerun"
+                    "{error:#}; it cannot identify a process. Stop any remaining {brand_product} proxy, delete the state file, then rerun", brand_product = BRAND.product_name
                 )),
             ),
         }
@@ -1853,7 +1894,7 @@ fn plan_services(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
                 Area::Services,
                 followers_dir.display().to_string(),
                 Outcome::Failed(
-                    "is a symbolic link; SAIAI does not follow it. Remove the link and rerun"
+                    format!("is a symbolic link; {brand_product} does not follow it. Remove the link and rerun", brand_product = BRAND.product_name)
                         .into(),
                 ),
             );
@@ -1889,7 +1930,7 @@ fn plan_services(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
                 Area::Services,
                 format!("background proxy state of {}", instance.dir.display()),
                 Outcome::Failed(format!(
-                    "{error:#}; it cannot identify a process. Close any remaining SAIAI proxy, delete the state file, then rerun"
+                    "{error:#}; it cannot identify a process. Close any remaining {brand_product} proxy, delete the state file, then rerun", brand_product = BRAND.product_name
                 )),
             ),
         }
@@ -1983,7 +2024,7 @@ fn plan_windows_certificates(
                     Area::Certificates,
                     lease.display().to_string(),
                     Outcome::Failed(
-                        "its directory is a symbolic link; SAIAI does not follow it. Remove the link and rerun"
+                        format!("its directory is a symbolic link; {brand_product} does not follow it. Remove the link and rerun", brand_product = BRAND.product_name)
                             .into(),
                     ),
                 );
@@ -2066,7 +2107,7 @@ ConvertTo-Json -Compress -InputObject $present
         plan.act(
             Area::Certificates,
             format!(
-                "remove SAIAI CA {thumbprint} from Windows CurrentUser\\Root (Windows may ask you to confirm)"
+                "remove {brand_product} CA {thumbprint} from Windows CurrentUser\\Root (Windows may ask you to confirm)", brand_product = BRAND.product_name
             ),
             Action::RootCa(thumbprint.to_string()),
         );
@@ -2140,8 +2181,9 @@ fn execute_user_path(
 ) -> Result<Outcome> {
     if directory.exists() {
         return Ok(Outcome::Kept(format!(
-            "{} still exists (a running copy is removed a few seconds after this window's command exits). Rerun after a few seconds: `irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai uninstall` (it downloads a temporary client, since the installed one is gone)",
-            directory.display()
+            "{} still exists (a running copy is removed a few seconds after this window's command exits). Rerun after a few seconds: `{brand_windows_setup} uninstall` (it downloads a temporary client, since the installed one is gone)",
+            directory.display(),
+            brand_windows_setup = BRAND.update.windows_setup_command
         )));
     }
     const SCRIPT: &str = r#"
@@ -2320,10 +2362,16 @@ fn file_mode(path: &Path) -> u32 {
 
 fn execute_edit(path: &Path, original: &[u8], replacement: Option<&[u8]>) -> Result<Outcome> {
     let Some(current) = read_existing(path)? else {
-        bail!("disappeared since the plan was shown; rerun `saiai uninstall`");
+        bail!(
+            "disappeared since the plan was shown; rerun `{brand_binary} uninstall`",
+            brand_binary = BRAND.binary_name
+        );
     };
     if current != original {
-        bail!("changed since the plan was shown; not modified. Rerun `saiai uninstall`");
+        bail!(
+            "changed since the plan was shown; not modified. Rerun `{brand_binary} uninstall`",
+            brand_binary = BRAND.binary_name
+        );
     }
     match replacement {
         Some(bytes) => crate::write_bytes_atomic(path, bytes, file_mode(path))?,
@@ -2399,9 +2447,10 @@ fn execute_nss(db: &str, known: &BTreeSet<String>) -> Result<Outcome> {
         return Ok(Outcome::Absent);
     };
     if nss_decision(&exported, known) != NssDecision::Remove {
-        return Ok(Outcome::Kept(
-            "changed since the plan was shown; not a known SAIAI CA".into(),
-        ));
+        return Ok(Outcome::Kept(format!(
+            "changed since the plan was shown; not a known {brand_product} CA",
+            brand_product = BRAND.product_name
+        )));
     }
     for _ in 0..certificate_fingerprints(&exported).len() {
         let status = std::process::Command::new("certutil")
@@ -2418,11 +2467,17 @@ fn execute_nss(db: &str, known: &BTreeSet<String>) -> Result<Outcome> {
             .status()
             .context("failed to run certutil")?;
         if !status.success() {
-            bail!("certutil could not delete the SAIAI certificate");
+            bail!(
+                "certutil could not delete the {brand_product} certificate",
+                brand_product = BRAND.product_name
+            );
         }
     }
     if certutil_export(db)?.is_some() {
-        bail!("the SAIAI certificate is still present after deletion");
+        bail!(
+            "the {brand_product} certificate is still present after deletion",
+            brand_product = BRAND.product_name
+        );
     }
     Ok(Outcome::Done)
 }
@@ -2632,7 +2687,11 @@ fn print_result(item: &Item) {
 
 fn print_plan(discovery: &Discovery, plan: &Plan) {
     println!("{PLAN_MARKER}");
-    println!("SAIAI home: {}", discovery.root.display());
+    println!(
+        "{brand_product} home: {}",
+        discovery.root.display(),
+        brand_product = BRAND.product_name
+    );
     for area in AREAS {
         let items = plan
             .items
@@ -2660,7 +2719,10 @@ fn print_plan(discovery: &Discovery, plan: &Plan) {
         .any(|item| item.area.gated() && item.outcome == Outcome::Pending)
     {
         println!();
-        println!("SAIAI data and the program are removed only if every earlier step succeeds.");
+        println!(
+            "{brand_product} data and the program are removed only if every earlier step succeeds.",
+            brand_product = BRAND.product_name
+        );
     }
 }
 
@@ -2717,11 +2779,13 @@ fn print_summary(plan: &Plan) {
     }
     println!("Next steps:");
     println!(
-        "  - Claude Code: log in again (`claude`, then /login). SAIAI did not change ~/.claude.json, .credentials.json or oauthAccount."
+        "  - Claude Code: log in again (`claude`, then /login). {brand_product} did not change ~/.claude.json, .credentials.json or oauthAccount.",
+        brand_product = BRAND.product_name
     );
     println!("  - Codex: run `codex login` to sign in again.");
     println!(
-        "  - If you use the Codex app-server daemon, run `codex app-server daemon update`; it may still be pinned to the SAIAI setup."
+        "  - If you use the Codex app-server daemon, run `codex app-server daemon update`; it may still be pinned to the {brand_product} setup.",
+        brand_product = BRAND.product_name
     );
     println!(
         "  - Close and reopen running Claude Code, Codex, Codex Desktop and VSCode windows; they keep the old settings until restarted."
@@ -2736,7 +2800,9 @@ fn finish(plan: &Plan) -> Result<()> {
         .count();
     if failed > 0 {
         bail!(
-            "SAIAI uninstall is incomplete: {failed} item(s) failed or were skipped. Fix the failure and rerun `saiai uninstall`."
+            "{brand_product} uninstall is incomplete: {failed} item(s) failed or were skipped. Fix the failure and rerun `{brand_binary} uninstall`.",
+            brand_binary = BRAND.binary_name,
+            brand_product = BRAND.product_name
         );
     }
     Ok(())

@@ -1,4 +1,5 @@
 //! Linux Claude Desktop's isolated local login. Gateway credentials never enter this profile.
+use crate::brand::BRAND;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -67,7 +68,7 @@ async fn bind_listener(root: &Path, main_listen: &str) -> Result<tokio::net::Tcp
 fn read_endpoint(root: &Path, main_listen: &str) -> Result<std::net::SocketAddr> {
     let endpoint: ProxyEndpoint = serde_json::from_slice(
         &fs::read(root.join("desktop/claude/state/proxy.json"))
-            .context("Claude Desktop listener is unavailable; run `saiai restart` in this environment, then retry `saiai desktop claude`")?,
+            .with_context(|| format!("Claude Desktop listener is unavailable; run `{brand_binary} restart` in this environment, then retry `{brand_binary} desktop claude`", brand_binary = BRAND.binary_name))?,
     )?;
     if endpoint.main_listen != main_listen
         || !endpoint.listen.ip().is_loopback()
@@ -75,7 +76,8 @@ fn read_endpoint(root: &Path, main_listen: &str) -> Result<std::net::SocketAddr>
         || endpoint.listen.to_string() == main_listen
     {
         bail!(
-            "invalid or stale Claude Desktop listener receipt; run `saiai restart` in this environment, then retry `saiai desktop claude`"
+            "invalid or stale Claude Desktop listener receipt; run `{brand_binary} restart` in this environment, then retry `{brand_binary} desktop claude`",
+            brand_binary = BRAND.binary_name
         );
     }
     Ok(endpoint.listen)
@@ -90,11 +92,12 @@ fn verified_endpoint(root: &Path, cfg: &crate::SaiaiConfig) -> Result<(String, S
         .enable_all()
         .build()?;
     runtime.block_on(crate::connect_local_proxy_tls(&desktop_cfg))
-        .context("Claude Desktop listener does not authenticate with this environment's CA; run `saiai restart` in this environment, then retry `saiai desktop claude`")?;
+        .with_context(|| format!("Claude Desktop listener does not authenticate with this environment's CA; run `{brand_binary} restart` in this environment, then retry `{brand_binary} desktop claude`", brand_binary = BRAND.binary_name))?;
     let pins = crate::local_proxy_chatgpt_spki(&listen)?;
     if pins.split(',').count() != 2 {
         bail!(
-            "listener is not the dedicated Claude Desktop entry; run `saiai restart` in this environment, then retry `saiai desktop claude`"
+            "listener is not the dedicated Claude Desktop entry; run `{brand_binary} restart` in this environment, then retry `{brand_binary} desktop claude`",
+            brand_binary = BRAND.binary_name
         );
     }
     Ok((listen, pins))
@@ -216,8 +219,9 @@ pub(crate) fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
 pub(crate) fn check_version(version: &str, allow_untested: bool) -> Result<()> {
     if version.trim() != VERSION && !allow_untested {
         bail!(
-            "Claude Desktop {} is untested (supported: {VERSION}); set SAIAI_CLAUDE_DESKTOP_ALLOW_UNTESTED=1 to override",
-            version.trim()
+            "Claude Desktop {} is untested (supported: {VERSION}); set {brand_allow_untested_env}=1 to override",
+            version.trim(),
+            brand_allow_untested_env = BRAND.env.claude_desktop_allow_untested
         );
     }
     Ok(())
@@ -304,7 +308,10 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = args;
-        bail!("saiai desktop claude supports Linux only; macOS and Windows are not supported");
+        bail!(
+            "{brand_binary} desktop claude supports Linux only; macOS and Windows are not supported",
+            brand_binary = BRAND.binary_name
+        );
     }
     #[cfg(target_os = "linux")]
     {
@@ -366,7 +373,10 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         }
         let cfg = crate::read_saiai_config()?;
         if !cfg.providers.is_empty() && cfg.providers.claude.is_none() {
-            bail!("SAIAI Claude route is not configured; run the SAIAI Claude setup first");
+            bail!(
+                "{brand_product} Claude route is not configured; run the {brand_product} Claude setup first",
+                brand_product = BRAND.product_name
+            );
         }
         crate::read_runtime_ca(&cfg)?;
         Identity::prepare(&config_root)?;

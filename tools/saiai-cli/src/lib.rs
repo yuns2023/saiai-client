@@ -61,7 +61,7 @@ mod windows_background;
 #[cfg(any(windows, test))]
 mod windows_desktop_runtime;
 
-use brand::{BRAND, BrandValue};
+use brand::{BRAND, BrandText, BrandValue};
 pub use brand::{
     Brand, CertificateNames, ClientProofNames, ConfigNames, EnvironmentNames, GatewayProtocolNames,
     OwnershipMarkers, PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
@@ -77,34 +77,40 @@ const ANTHROPIC_HOST: &str = "api.anthropic.com";
 #[cfg(target_os = "linux")]
 const SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME: BrandValue<&'static str> =
     BrandValue(|brand| brand.certificates.nss_nickname);
-const USAGE: &str = "\
+const USAGE: BrandText = BrandText(|| {
+    format!(
+        "\
 Usage:
-  saiai --environment claude|codex|default <command>              # select a proxy environment
-  saiai                                                           # run the local proxy (Claude Code and Codex)
-  saiai --verbose                                                 # run local proxy with request logs
-  saiai start                                                     # install and start user service
-  saiai stop                                                      # stop and disable user service
-  saiai status                                                    # show user service status
-  saiai logs                                                      # follow user service logs
-  saiai update                                                    # update this client binary
-  saiai restart                                                   # restart user service
-  saiai doctor [claude|codex]                                    # check proxy and product config
-  saiai --version                                                 # print version
-  saiai init <base_url> <api_key>                                 # initialize Claude Code
-  saiai init-codex <base_url> <api_key> [--websockets]            # initialize Codex CLI
-  saiai claude [-- <claude arguments>]                            # launch Claude with a child-only SAIAI environment
-  saiai codex [-- <codex arguments>]                              # launch Codex through SAIAI local proxy
-  saiai vscode                                                    # configure the Codex VSCode extension for SAIAI
-  saiai desktop [codex|claude] [-- <Desktop arguments>]         # Claude: Linux Code only
-  saiai doctor --desktop claude                                  # check Claude Desktop adapter
-  saiai uninstall [--yes] [--dry-run] [--forget-unknown-environments]  # remove SAIAI services, settings, data and program
-  saiai upstream-proxy [system|direct|http://host:port]         # show or set the proxy SAIAI itself uses
-  saiai init       --base-url <base_url> --api-key <api_key>      # initialize Claude Code
-  saiai init-codex --base-url <base_url> --api-key <api_key> [--websockets]
+  {brand_binary} --environment claude|codex|default <command>              # select a proxy environment
+  {brand_binary}                                                           # run the local proxy (Claude Code and Codex)
+  {brand_binary} --verbose                                                 # run local proxy with request logs
+  {brand_binary} start                                                     # install and start user service
+  {brand_binary} stop                                                      # stop and disable user service
+  {brand_binary} status                                                    # show user service status
+  {brand_binary} logs                                                      # follow user service logs
+  {brand_binary} update                                                    # update this client binary
+  {brand_binary} restart                                                   # restart user service
+  {brand_binary} doctor [claude|codex]                                    # check proxy and product config
+  {brand_binary} --version                                                 # print version
+  {brand_binary} init <base_url> <api_key>                                 # initialize Claude Code
+  {brand_binary} init-codex <base_url> <api_key> [--websockets]            # initialize Codex CLI
+  {brand_binary} claude [-- <claude arguments>]                            # launch Claude with a child-only {brand_product} environment
+  {brand_binary} codex [-- <codex arguments>]                              # launch Codex through {brand_product} local proxy
+  {brand_binary} vscode                                                    # configure the Codex VSCode extension for {brand_product}
+  {brand_binary} desktop [codex|claude] [-- <Desktop arguments>]         # Claude: Linux Code only
+  {brand_binary} doctor --desktop claude                                  # check Claude Desktop adapter
+  {brand_binary} uninstall [--yes] [--dry-run] [--forget-unknown-environments]  # remove {brand_product} services, settings, data and program
+  {brand_binary} upstream-proxy [system|direct|http://host:port]         # show or set the proxy {brand_product} itself uses
+  {brand_binary} init       --base-url <base_url> --api-key <api_key>      # initialize Claude Code
+  {brand_binary} init-codex --base-url <base_url> --api-key <api_key> [--websockets]
 Initialization uses provider-specific CA files and preserves VSCode editor settings.
 Use --configure-vscode-editor with init/init-codex to opt into the editor-wide proxy.
 On Windows, --trust-vscode-ca also opts into CurrentUser Root trust and editor setup;
-use it only after consenting to this user-wide trust.";
+use it only after consenting to this user-wide trust.",
+        brand_binary = BRAND.binary_name,
+        brand_product = BRAND.product_name
+    )
+});
 
 const SAIAI_CA_FILENAME: BrandValue<&'static str> =
     BrandValue(|brand| brand.certificates.ca_cert_filename);
@@ -305,7 +311,9 @@ pub fn run(distribution: &'static Brand, context: RuntimeContext) -> Result<()> 
     let command = parse_command(&args)?;
     if matches!(command, Command::Uninstall(_)) && selector.is_some() {
         bail!(
-            "`saiai uninstall` covers every SAIAI environment; remove the environment selector\n\n{USAGE}"
+            "`{brand_binary} uninstall` covers every {brand_product} environment; remove the environment selector\n\n{USAGE}",
+            brand_binary = BRAND.binary_name,
+            brand_product = BRAND.product_name
         );
     }
     environment_scope::initialize(&command, selector)?;
@@ -655,8 +663,12 @@ fn ensure_installation_ca(cert_path: &Path, key_path: &Path, timestamp: &str) ->
     backup_if_exists(cert_path, timestamp)?;
     backup_if_exists(key_path, timestamp)?;
     let (cert_pem, key_pem) = generate_installation_ca()?;
-    local_proxy::validate_tls_config(&cert_pem, &key_pem)
-        .context("generated SAIAI installation CA did not validate")?;
+    local_proxy::validate_tls_config(&cert_pem, &key_pem).with_context(|| {
+        format!(
+            "generated {brand_product} installation CA did not validate",
+            brand_product = BRAND.product_name
+        )
+    })?;
     write_bytes_atomic(cert_path, cert_pem.as_bytes(), 0o644)
         .with_context(|| format!("failed to write {}", cert_path.display()))?;
     write_bytes_atomic(key_path, key_pem.as_bytes(), 0o600)
@@ -665,9 +677,18 @@ fn ensure_installation_ca(cert_path: &Path, key_path: &Path, timestamp: &str) ->
 }
 
 fn generate_installation_ca() -> Result<(String, String)> {
-    let key = KeyPair::generate().context("failed to generate SAIAI installation CA key")?;
-    let mut params = CertificateParams::new(Vec::<String>::new())
-        .context("failed to create SAIAI installation CA parameters")?;
+    let key = KeyPair::generate().with_context(|| {
+        format!(
+            "failed to generate {brand_product} installation CA key",
+            brand_product = BRAND.product_name
+        )
+    })?;
+    let mut params = CertificateParams::new(Vec::<String>::new()).with_context(|| {
+        format!(
+            "failed to create {brand_product} installation CA parameters",
+            brand_product = BRAND.product_name
+        )
+    })?;
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let mut distinguished_name = DistinguishedName::new();
     // A per-installation suffix keeps a regenerated CA from sharing its
@@ -682,15 +703,23 @@ fn generate_installation_ca() -> Result<(String, String)> {
     );
     distinguished_name.push(DnType::OrganizationName, BRAND.certificates.ca_organization);
     params.distinguished_name = distinguished_name;
-    let certificate = params
-        .self_signed(&key)
-        .context("failed to self-sign SAIAI installation CA")?;
+    let certificate = params.self_signed(&key).with_context(|| {
+        format!(
+            "failed to self-sign {brand_product} installation CA",
+            brand_product = BRAND.product_name
+        )
+    })?;
     Ok((certificate.pem(), key.serialize_pem()))
 }
 
 fn lock_initialization() -> Result<fs::File> {
     let file = open_initialization_lock()?;
-    file.lock().context("failed to lock SAIAI initialization")?;
+    file.lock().with_context(|| {
+        format!(
+            "failed to lock {brand_product} initialization",
+            brand_product = BRAND.product_name
+        )
+    })?;
     Ok(file)
 }
 
@@ -700,9 +729,12 @@ fn try_lock_initialization() -> Result<Option<fs::File>> {
     match file.try_lock() {
         Ok(()) => Ok(Some(file)),
         Err(fs::TryLockError::WouldBlock) => Ok(None),
-        Err(fs::TryLockError::Error(error)) => {
-            Err(error).context("failed to lock SAIAI initialization")
-        }
+        Err(fs::TryLockError::Error(error)) => Err(error).with_context(|| {
+            format!(
+                "failed to lock {brand_product} initialization",
+                brand_product = BRAND.product_name
+            )
+        }),
     }
 }
 
@@ -741,7 +773,12 @@ fn init_claude(args: InitArgs) -> Result<()> {
 
     fs::create_dir_all(claude_dir)
         .with_context(|| format!("failed to create {}", claude_dir.display()))?;
-    fs::create_dir_all(saiai_config_dir()?).context("failed to create SAIAI config directory")?;
+    fs::create_dir_all(saiai_config_dir()?).with_context(|| {
+        format!(
+            "failed to create {brand_product} config directory",
+            brand_product = BRAND.product_name
+        )
+    })?;
 
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S%.9f").to_string();
     backup_if_exists(settings_path, &timestamp)?;
@@ -776,7 +813,10 @@ fn init_claude(args: InitArgs) -> Result<()> {
     state.insert("hasCompletedOnboarding".to_string(), Value::Bool(true));
     write_json_object(state_path, Value::Object(state))?;
 
-    println!("SAIAI configured Claude Code for local proxy mode.");
+    println!(
+        "{brand_product} configured Claude Code for local proxy mode.",
+        brand_product = BRAND.product_name
+    );
     println!("Updated:");
     println!("  {}", settings_path.display());
     println!("  {}", state_path.display());
@@ -827,7 +867,10 @@ fn init_codex(args: InitArgs) -> Result<()> {
         args.trust_vscode_ca,
     );
 
-    println!("SAIAI configured Codex for local-proxy OAuth mode.");
+    println!(
+        "{brand_product} configured Codex for local-proxy OAuth mode.",
+        brand_product = BRAND.product_name
+    );
     println!("Updated:");
     println!("  {}", config_path.display());
     println!("  {}", oauth_init.auth_path.display());
@@ -847,7 +890,9 @@ fn init_codex(args: InitArgs) -> Result<()> {
         );
     }
     println!(
-        "SAIAI local-proxy OAuth configuration is ready; run `saiai codex`. Fully quit and reopen VSCode after its editor setup succeeds."
+        "{brand_product} local-proxy OAuth configuration is ready; run `{brand_binary} codex`. Fully quit and reopen VSCode after its editor setup succeeds.",
+        brand_binary = BRAND.binary_name,
+        brand_product = BRAND.product_name
     );
     start_managed_service_after_initialization(proxy_init.config_changed)?;
     codex_daemon::after_initialization(&codex_dir);
@@ -1013,10 +1058,19 @@ fn run_codex(args: &[String]) -> Result<()> {
     // terminals, and Windows npm installs expose a .cmd shim that Rust's
     // Command cannot execute directly.
     let mut command = codex_process_command().context("failed to resolve Codex executable")?;
-    let cfg = read_saiai_config()
-        .context("SAIAI local proxy is not configured; run `saiai init-codex` first")?;
-    let _runtime_ca = read_runtime_ca(&cfg)
-        .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
+    let cfg = read_saiai_config().with_context(|| {
+        format!(
+            "{brand_product} local proxy is not configured; run `{brand_binary} init-codex` first",
+            brand_binary = BRAND.binary_name,
+            brand_product = BRAND.product_name
+        )
+    })?;
+    let _runtime_ca = read_runtime_ca(&cfg).with_context(|| {
+        format!(
+            "{brand_product} local proxy CA is unavailable; rerun the {brand_product} setup",
+            brand_product = BRAND.product_name
+        )
+    })?;
     let files = prepare_codex_oauth_files(&codex_dir, false)?;
     ensure_codex_local_proxy_auth(&auth_path)?;
     validate_codex_oauth_auth(&auth_path)?;
@@ -1056,7 +1110,10 @@ fn run_codex(args: &[String]) -> Result<()> {
         }
     }
 
-    println!("Starting Codex through the SAIAI local proxy.");
+    println!(
+        "Starting Codex through the {brand_product} local proxy.",
+        brand_product = BRAND.product_name
+    );
     println!("  CODEX_HOME={}", codex_dir.display());
     println!("  proxy={proxy}");
     println!(
@@ -1188,10 +1245,18 @@ fn configure_vscode() -> Result<()> {
     fs::create_dir_all(&codex_dir)
         .with_context(|| format!("failed to create {}", codex_dir.display()))?;
     let auth_path = codex_dir.join("auth.json");
-    let cfg = read_saiai_config()
-        .context("SAIAI local proxy is not configured; run the SAIAI setup first")?;
-    let _runtime_ca = read_runtime_ca(&cfg)
-        .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
+    let cfg = read_saiai_config().with_context(|| {
+        format!(
+            "{brand_product} local proxy is not configured; run the {brand_product} setup first",
+            brand_product = BRAND.product_name
+        )
+    })?;
+    let _runtime_ca = read_runtime_ca(&cfg).with_context(|| {
+        format!(
+            "{brand_product} local proxy CA is unavailable; rerun the {brand_product} setup",
+            brand_product = BRAND.product_name
+        )
+    })?;
 
     let files = prepare_codex_oauth_files(&codex_dir, true)?;
     ensure_codex_local_proxy_auth(&auth_path)?;
@@ -1201,7 +1266,10 @@ fn configure_vscode() -> Result<()> {
     configure_vscode_editor_proxy(&cfg.listen, Path::new(&cfg.ca_cert_path))?;
     ensure_local_proxy_running(&cfg.listen)?;
 
-    println!("SAIAI configured the Codex VSCode extension for local proxy mode.");
+    println!(
+        "{brand_product} configured the Codex VSCode extension for local proxy mode.",
+        brand_product = BRAND.product_name
+    );
     println!("  CODEX_HOME={}", codex_dir.display());
     println!("  environment={}", env_path.display());
     println!("  proxy=http://{}", cfg.listen);
@@ -1254,7 +1322,8 @@ fn configure_vscode_editor_proxy_with_consent(
     #[cfg(windows)]
     let trusted = if !trusted && trust_vscode_ca {
         println!(
-            "Trusting this installation's SAIAI CA in Windows CurrentUser\\Root. Other applications of this Windows user also trust it; the system proxy and TLS verification are unchanged."
+            "Trusting this installation's {brand_product} CA in Windows CurrentUser\\Root. Other applications of this Windows user also trust it; the system proxy and TLS verification are unchanged.",
+            brand_product = BRAND.product_name
         );
         vscode::trust_windows_current_user_ca(ca_cert)?;
         vscode::certificate_trust(&home, ca_cert)?
@@ -1265,7 +1334,8 @@ fn configure_vscode_editor_proxy_with_consent(
     let _ = trust_vscode_ca;
     if !trusted {
         bail!(
-            "Optional editor-wide setup requires VSCode's certificate loader to trust the SAIAI CA; editor settings were preserved. Provider-specific CA configuration remains available. On Windows, --trust-vscode-ca explicitly authorizes CurrentUser Root trust; TLS verification will not be disabled."
+            "Optional editor-wide setup requires VSCode's certificate loader to trust the {brand_product} CA; editor settings were preserved. Provider-specific CA configuration remains available. On Windows, --trust-vscode-ca explicitly authorizes CurrentUser Root trust; TLS verification will not be disabled.",
+            brand_product = BRAND.product_name
         );
     }
     let changed = vscode::configure(&home, listen)?;
@@ -1274,7 +1344,8 @@ fn configure_vscode_editor_proxy_with_consent(
         changed.len()
     );
     println!(
-        "VSCode's certificate loader recognizes the SAIAI CA. TLS verification remains enabled; fully quit and reopen the editor to load the new route."
+        "VSCode's certificate loader recognizes the {brand_product} CA. TLS verification remains enabled; fully quit and reopen the editor to load the new route.",
+        brand_product = BRAND.product_name
     );
     Ok(())
 }
@@ -1567,8 +1638,10 @@ fn write_codex_local_proxy_auth_at(
                 let expired = format_epoch_seconds(expires_at);
                 if existing == ExistingCodexAuth::Keep {
                     eprintln!(
-                        "WARN {}: the ChatGPT access token expired at {expired}; if Codex asks you to sign in, quit it and run `saiai init-codex` to switch to the SAIAI local-proxy login.",
-                        path.display()
+                        "WARN {}: the ChatGPT access token expired at {expired}; if Codex asks you to sign in, quit it and run `{brand_binary} init-codex` to switch to the {brand_product} local-proxy login.",
+                        path.display(),
+                        brand_binary = BRAND.binary_name,
+                        brand_product = BRAND.product_name
                     );
                     return Ok(());
                 }
@@ -1585,8 +1658,10 @@ fn write_codex_local_proxy_auth_at(
                     .with_context(|| format!("failed to re-read {}", path.display()))?;
                 if current != original {
                     bail!(
-                        "{} changed while SAIAI was replacing its expired login and was left unchanged; quit Codex and rerun `saiai init-codex`",
-                        path.display()
+                        "{} changed while {brand_product} was replacing its expired login and was left unchanged; quit Codex and rerun `{brand_binary} init-codex`",
+                        path.display(),
+                        brand_binary = BRAND.binary_name,
+                        brand_product = BRAND.product_name
                     );
                 }
                 expired_backup = Some(backup);
@@ -1738,9 +1813,9 @@ fn codex_auth_expiry_warning(path: &Path) -> Result<Option<String>> {
     };
     Ok((expires_at <= Utc::now().timestamp()).then(|| {
         format!(
-            "the ChatGPT access token in {} expired at {}; Codex shows its sign-in page if the login can no longer be refreshed. Quit Codex and run `saiai init-codex` to switch to the SAIAI local-proxy login.",
+            "the ChatGPT access token in {} expired at {}; Codex shows its sign-in page if the login can no longer be refreshed. Quit Codex and run `{brand_binary} init-codex` to switch to the {brand_product} local-proxy login.",
             path.display(),
-            format_epoch_seconds(expires_at)
+            format_epoch_seconds(expires_at), brand_binary = BRAND.binary_name, brand_product = BRAND.product_name
         )
     }))
 }
@@ -1751,12 +1826,15 @@ fn run_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
     }
     if !product.has_adapter() {
         bail!(
-            "SAIAI Desktop currently supports Codex only; ordinary ChatGPT history and settings are not supported. Use `saiai desktop codex`."
+            "{brand_product} Desktop currently supports Codex only; ordinary ChatGPT history and settings are not supported. Use `{brand_binary} desktop codex`.",
+            brand_binary = BRAND.binary_name,
+            brand_product = BRAND.product_name
         );
     }
 
     println!(
-        "SAIAI Desktop scope: Codex only; the official ChatGPT sidebar, ordinary Chat history, and settings are not supported."
+        "{brand_product} Desktop scope: Codex only; the official ChatGPT sidebar, ordinary Chat history, and settings are not supported.",
+        brand_product = BRAND.product_name
     );
 
     #[cfg(target_os = "linux")]
@@ -1778,16 +1856,26 @@ fn run_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
     {
         let _ = args;
         bail!(
-            "SAIAI Desktop integration is currently implemented for Linux, macOS, and Windows only"
+            "{brand_product} Desktop integration is currently implemented for Linux, macOS, and Windows only",
+            brand_product = BRAND.product_name
         );
     }
 }
 
 #[cfg(target_os = "linux")]
 fn run_linux_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
-    let cfg = read_saiai_config().context("SAIAI local proxy is not configured")?;
-    let _runtime_ca = read_runtime_ca(&cfg)
-        .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
+    let cfg = read_saiai_config().with_context(|| {
+        format!(
+            "{brand_product} local proxy is not configured",
+            brand_product = BRAND.product_name
+        )
+    })?;
+    let _runtime_ca = read_runtime_ca(&cfg).with_context(|| {
+        format!(
+            "{brand_product} local proxy CA is unavailable; rerun the {brand_product} setup",
+            brand_product = BRAND.product_name
+        )
+    })?;
     ensure_local_proxy_running(&cfg.listen)?;
 
     let desktop_root = saiai_config_dir()?.join("desktop");
@@ -1866,7 +1954,10 @@ fn run_linux_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
         command.env("TZ", timezone);
     }
 
-    println!("Starting ChatGPT Desktop through the SAIAI local proxy.");
+    println!(
+        "Starting ChatGPT Desktop through the {brand_product} local proxy.",
+        brand_product = BRAND.product_name
+    );
     println!("  product={}", product.label());
     println!("  CODEX_HOME={}", desktop_codex.display());
     println!("  user-data-dir={}", desktop_user_data.display());
@@ -1886,9 +1977,18 @@ fn run_linux_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn run_macos_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
-    let cfg = read_saiai_config().context("SAIAI local proxy is not configured")?;
-    let _runtime_ca = read_runtime_ca(&cfg)
-        .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
+    let cfg = read_saiai_config().with_context(|| {
+        format!(
+            "{brand_product} local proxy is not configured",
+            brand_product = BRAND.product_name
+        )
+    })?;
+    let _runtime_ca = read_runtime_ca(&cfg).with_context(|| {
+        format!(
+            "{brand_product} local proxy CA is unavailable; rerun the {brand_product} setup",
+            brand_product = BRAND.product_name
+        )
+    })?;
     ensure_local_proxy_running(&cfg.listen)?;
 
     let packaged_bundle = if resolve_macos_desktop_override()?.is_none() {
@@ -1958,7 +2058,10 @@ fn run_macos_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
         command.env("TZ", timezone);
     }
 
-    println!("Starting ChatGPT Desktop through the SAIAI local proxy.");
+    println!(
+        "Starting ChatGPT Desktop through the {brand_product} local proxy.",
+        brand_product = BRAND.product_name
+    );
     println!("  product={}", product.label());
     println!("  application={}", executable.display());
     println!("  CODEX_HOME={}", desktop_codex.display());
@@ -2034,7 +2137,8 @@ fn resolve_macos_chatgpt_executable() -> Result<PathBuf> {
         }
     }
     bail!(
-        "ChatGPT.app or Codex.app was not found in /Applications or ~/Applications; install an official Desktop app or set SAIAI_DESKTOP_BIN"
+        "ChatGPT.app or Codex.app was not found in /Applications or ~/Applications; install an official Desktop app or set {brand_desktop_bin_env}",
+        brand_desktop_bin_env = BRAND.env.desktop_bin
     )
 }
 
@@ -2221,9 +2325,18 @@ fn macos_packaged_desktop_bundle_process_running(bundle: &Path) -> Result<bool> 
 
 #[cfg(target_os = "windows")]
 fn run_windows_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
-    let cfg = read_saiai_config().context("SAIAI local proxy is not configured")?;
-    let _runtime_ca = read_runtime_ca(&cfg)
-        .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
+    let cfg = read_saiai_config().with_context(|| {
+        format!(
+            "{brand_product} local proxy is not configured",
+            brand_product = BRAND.product_name
+        )
+    })?;
+    let _runtime_ca = read_runtime_ca(&cfg).with_context(|| {
+        format!(
+            "{brand_product} local proxy CA is unavailable; rerun the {brand_product} setup",
+            brand_product = BRAND.product_name
+        )
+    })?;
     if resolve_windows_desktop_override()?.is_none()
         && let Some(package) = resolve_windows_packaged_desktop()?
     {
@@ -2292,7 +2405,10 @@ fn run_windows_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
         command.env("TZ", timezone);
     }
 
-    println!("Starting OpenAI Desktop through the SAIAI local proxy.");
+    println!(
+        "Starting OpenAI Desktop through the {brand_product} local proxy.",
+        brand_product = BRAND.product_name
+    );
     println!("  product={}", product.label());
     println!("  application={}", executable.display());
     println!("  CODEX_HOME={}", desktop_codex.display());
@@ -2337,20 +2453,21 @@ fn run_windows_packaged_desktop(
     let env_path = codex_home.join(".env");
     let current_env = fs::read_to_string(&env_path).with_context(|| {
         format!(
-            "failed to read {}; run `saiai init-codex` first",
-            env_path.display()
+            "failed to read {}; run `{brand_binary} init-codex` first",
+            env_path.display(),
+            brand_binary = BRAND.binary_name
         )
     })?;
     if !current_env.contains(CODEX_IDE_ENV_BEGIN.get())
         || current_env != merge_codex_ide_env(&current_env, &cfg.listen, &cfg.ca_cert_path)
     {
         bail!(
-            "packaged Windows Desktop needs the current SAIAI Codex profile; run `saiai vscode` or `saiai init-codex` and retry"
+            "packaged Windows Desktop needs the current {brand_product} Codex profile; run `{brand_binary} vscode` or `{brand_binary} init-codex` and retry",
+            brand_binary = BRAND.binary_name,
+            brand_product = BRAND.product_name
         );
     }
-    validate_codex_oauth_auth(&codex_home.join("auth.json")).context(
-        "packaged Windows Desktop needs a configured Codex account; run `saiai init-codex` first",
-    )?;
+    validate_codex_oauth_auth(&codex_home.join("auth.json")).with_context(|| format!("packaged Windows Desktop needs a configured Codex account; run `{brand_binary} init-codex` first", brand_binary = BRAND.binary_name))?;
     match codex_auth_expiry_warning(&codex_home.join("auth.json")) {
         Ok(None) => {}
         Ok(Some(warning)) => eprintln!("WARN {warning}"),
@@ -2364,8 +2481,9 @@ fn run_windows_packaged_desktop(
         Ok(CodexEnvironmentContextTime::Disabled)
     ) {
         eprintln!(
-            "WARN {} does not set `{CODEX_ENVIRONMENT_CONTEXT_TIME_KEY} = false`; Codex may report the local timezone. Run `saiai init-codex`, then fully quit and reopen Desktop.",
-            codex_home.join("config.toml").display()
+            "WARN {} does not set `{CODEX_ENVIRONMENT_CONTEXT_TIME_KEY} = false`; Codex may report the local timezone. Run `{brand_binary} init-codex`, then fully quit and reopen Desktop.",
+            codex_home.join("config.toml").display(),
+            brand_binary = BRAND.binary_name
         );
     }
     let session_id = command_output(
@@ -2488,7 +2606,10 @@ fn run_windows_packaged_desktop(
         windows_desktop_runtime::write_receipt(&directory, &observed)?;
     }
     let pid = observed.window.process_id;
-    println!("Starting packaged OpenAI Desktop through the SAIAI local proxy.");
+    println!(
+        "Starting packaged OpenAI Desktop through the {brand_product} local proxy.",
+        brand_product = BRAND.product_name
+    );
     println!("  product={}", product.label());
     println!("  app_id={}", package.app_id);
     println!("  pid={pid}");
@@ -2520,7 +2641,8 @@ fn windows_packaged_profile(
         || current_env != merge_codex_ide_env(&current_env, &cfg.listen, &cfg.ca_cert_path)
     {
         bail!(
-            "Desktop managed profile changed; run `saiai init-codex` and retry after normal Quit"
+            "Desktop managed profile changed; run `{brand_binary} init-codex` and retry after normal Quit",
+            brand_binary = BRAND.binary_name
         );
     }
     validate_codex_oauth_auth(&codex_home.join("auth.json"))?;
@@ -2670,10 +2792,14 @@ fn restore_legacy_windows_packaged_proxy_lease_at(marker_path: &Path) -> Result<
     let current = windows_read_internet_proxy()?;
     if windows_proxy_matches_managed(&current, &marker.managed_server) {
         windows_write_internet_proxy(&marker.previous)?;
-        println!("Restored the Windows proxy left by a legacy SAIAI Desktop lease.");
+        println!(
+            "Restored the Windows proxy left by a legacy {brand_product} Desktop lease.",
+            brand_product = BRAND.product_name
+        );
     } else {
         eprintln!(
-            "warning: legacy SAIAI Desktop lease found, but the current Windows proxy was changed externally; preserving the current proxy"
+            "warning: legacy {brand_product} Desktop lease found, but the current Windows proxy was changed externally; preserving the current proxy",
+            brand_product = BRAND.product_name
         );
     }
     for thumbprint in &marker.added_ca_thumbprints {
@@ -2835,7 +2961,8 @@ fn resolve_windows_desktop_executable() -> Result<PathBuf> {
         return Ok(path);
     }
     bail!(
-        "OpenAI Codex/ChatGPT Desktop was not found in standard application directories; install the official Desktop app or set SAIAI_DESKTOP_BIN"
+        "OpenAI Codex/ChatGPT Desktop was not found in standard application directories; install the official Desktop app or set {brand_desktop_bin_env}",
+        brand_desktop_bin_env = BRAND.env.desktop_bin
     )
 }
 
@@ -2949,13 +3076,16 @@ fn ensure_direct_linux_desktop_trust(ca_cert: &Path) {
     })();
     match result {
         Ok(true) => println!(
-            "Trusted the SAIAI CA in the current user's NSS database for direct Linux Desktop (no system trust store or dialog)."
+            "Trusted the {brand_product} CA in the current user's NSS database for direct Linux Desktop (no system trust store or dialog).",
+            brand_product = BRAND.product_name
         ),
         Ok(false) => eprintln!(
-            "WARN direct Linux Desktop trust was not installed because certutil is unavailable; install libnss3-tools, rerun `saiai init-codex`, or use `saiai desktop codex`."
+            "WARN direct Linux Desktop trust was not installed because certutil is unavailable; install libnss3-tools, rerun `{brand_binary} init-codex`, or use `{brand_binary} desktop codex`.",
+            brand_binary = BRAND.binary_name
         ),
         Err(err) => eprintln!(
-            "WARN direct Linux Desktop trust could not be updated ({err:#}); Codex CLI remains configured, and `saiai desktop codex` remains the supported isolated fallback."
+            "WARN direct Linux Desktop trust could not be updated ({err:#}); Codex CLI remains configured, and `{brand_binary} desktop codex` remains the supported isolated fallback.",
+            brand_binary = BRAND.binary_name
         ),
     }
 }
@@ -3001,14 +3131,25 @@ fn ensure_nss_ca(home: &Path, ca_cert: &Path) -> Result<bool> {
             "C,,",
             "-a",
             "-i",
-            ca_cert
-                .to_str()
-                .context("SAIAI CA path is not valid UTF-8")?,
+            ca_cert.to_str().with_context(|| {
+                format!(
+                    "{brand_product} CA path is not valid UTF-8",
+                    brand_product = BRAND.product_name
+                )
+            })?,
         ])
         .status()
-        .context("failed to import the SAIAI CA into the Desktop NSS database")?;
+        .with_context(|| {
+            format!(
+                "failed to import the {brand_product} CA into the Desktop NSS database",
+                brand_product = BRAND.product_name
+            )
+        })?;
     if !status.success() {
-        bail!("certutil failed to import the SAIAI CA into the Desktop NSS database");
+        bail!(
+            "certutil failed to import the {brand_product} CA into the Desktop NSS database",
+            brand_product = BRAND.product_name
+        );
     }
     Ok(true)
 }
@@ -3033,14 +3174,14 @@ fn check_direct_linux_desktop_trust(report: &mut DoctorReport) {
     if !nss_certutil_available() {
         report.warn(
             "direct Linux Desktop trust",
-            "certutil is unavailable; install libnss3-tools and rerun `saiai init-codex`, or use `saiai desktop codex`",
+            format!("certutil is unavailable; install libnss3-tools and rerun `{brand_binary} init-codex`, or use `{brand_binary} desktop codex`", brand_binary = BRAND.binary_name),
         );
         return;
     }
     let Some(home) = home_dir() else {
         report.warn(
             "direct Linux Desktop trust",
-            "could not resolve the current user's NSS database; use `saiai desktop codex`",
+            format!("could not resolve the current user's NSS database; use `{brand_binary} desktop codex`", brand_binary = BRAND.binary_name),
         );
         return;
     };
@@ -3061,12 +3202,16 @@ fn check_direct_linux_desktop_trust(report: &mut DoctorReport) {
     if present {
         report.ok(
             "direct Linux Desktop trust",
-            format!("SAIAI CA entry is present in {}", db_dir.display()),
+            format!(
+                "{brand_product} CA entry is present in {}",
+                db_dir.display(),
+                brand_product = BRAND.product_name
+            ),
         );
     } else {
         report.warn(
             "direct Linux Desktop trust",
-            "SAIAI CA entry is absent from the current user's NSS database; rerun `saiai init-codex` or use `saiai desktop codex`",
+            format!("{brand_product} CA entry is absent from the current user's NSS database; rerun `{brand_binary} init-codex` or use `{brand_binary} desktop codex`", brand_binary = BRAND.binary_name, brand_product = BRAND.product_name),
         );
     }
 }
@@ -3081,7 +3226,7 @@ fn check_direct_macos_desktop_trust(report: &mut DoctorReport) {
     // no-Keychain fallback.
     report.warn(
         "direct macOS Desktop trust",
-        "SAIAI does not modify the login Keychain. A directly launched official App needs a user-approved SAIAI CA trust root; otherwise use `saiai desktop codex` (managed per-process SPKI pin)",
+        format!("{brand_product} does not modify the login Keychain. A directly launched official App needs a user-approved {brand_product} CA trust root; otherwise use `{brand_binary} desktop codex` (managed per-process SPKI pin)", brand_binary = BRAND.binary_name, brand_product = BRAND.product_name),
     );
 }
 
@@ -3151,7 +3296,10 @@ fn check_desktop_permission_visibility(report: &mut DoctorReport) {
     if !path.is_file() {
         report.warn(
             "Desktop permission selector",
-            "Desktop state is absent; run `saiai init-codex` before launching Desktop",
+            format!(
+                "Desktop state is absent; run `{brand_binary} init-codex` before launching Desktop",
+                brand_binary = BRAND.binary_name
+            ),
         );
         return;
     }
@@ -3174,11 +3322,11 @@ fn check_desktop_permission_visibility(report: &mut DoctorReport) {
         ),
         Some(false) => report.warn(
             "Desktop permission selector",
-            "permission profile visibility is disabled; rerun `saiai init-codex` or use `saiai desktop codex`",
+            format!("permission profile visibility is disabled; rerun `{brand_binary} init-codex` or use `{brand_binary} desktop codex`", brand_binary = BRAND.binary_name),
         ),
         None => report.warn(
             "Desktop permission selector",
-            "visibility state is missing or invalid; rerun `saiai init-codex` or use `saiai desktop codex`",
+            format!("visibility state is missing or invalid; rerun `{brand_binary} init-codex` or use `{brand_binary} desktop codex`", brand_binary = BRAND.binary_name),
         ),
     }
 }
@@ -3294,8 +3442,9 @@ fn validate_codex_oauth_auth(path: &Path) -> Result<()> {
     let auth_mode = auth.get("auth_mode").and_then(Value::as_str).unwrap_or("");
     if !matches!(auth_mode, "chatgpt" | "chatgptAuthTokens") {
         bail!(
-            "{} is not in ChatGPT token mode; first-phase `saiai codex` does not accept API-key-only auth",
-            path.display()
+            "{} is not in ChatGPT token mode; first-phase `{brand_binary} codex` does not accept API-key-only auth",
+            path.display(),
+            brand_binary = BRAND.binary_name
         );
     }
     let access_token = auth
@@ -3306,8 +3455,9 @@ fn validate_codex_oauth_auth(path: &Path) -> Result<()> {
         .unwrap_or("");
     if access_token.trim().is_empty() {
         bail!(
-            "{} has no ChatGPT OAuth access token; run `codex login` before `saiai codex`",
-            path.display()
+            "{} has no ChatGPT OAuth access token; run `codex login` before `{brand_binary} codex`",
+            path.display(),
+            brand_binary = BRAND.binary_name
         );
     }
     Ok(())
@@ -3376,8 +3526,9 @@ fn prepare_codex_oauth_files(codex_dir: &Path, persist_system_proxy: bool) -> Re
         clean_codex_oauth_document(&mut document);
         if disable_codex_environment_context_time(&mut document) {
             println!(
-                "NOTE {}: `{CODEX_ENVIRONMENT_CONTEXT_TIME_KEY}` was not false; SAIAI manages this key and set it to false so Codex does not report the local timezone and date.",
-                path.display()
+                "NOTE {}: `{CODEX_ENVIRONMENT_CONTEXT_TIME_KEY}` was not false; {brand_product} manages this key and set it to false so Codex does not report the local timezone and date.",
+                path.display(),
+                brand_product = BRAND.product_name
             );
         }
         if persist_system_proxy {
@@ -3525,7 +3676,12 @@ fn ensure_local_proxy_running_with_start(
         }
         return Ok(());
     }
-    start().context("failed to start the SAIAI local proxy")?;
+    start().with_context(|| {
+        format!(
+            "failed to start the {brand_product} local proxy",
+            brand_product = BRAND.product_name
+        )
+    })?;
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
         if TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
@@ -3536,7 +3692,10 @@ fn ensure_local_proxy_running_with_start(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    bail!("SAIAI local proxy did not become reachable at {listen}")
+    bail!(
+        "{brand_product} local proxy did not become reachable at {listen}",
+        brand_product = BRAND.product_name
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -3544,8 +3703,13 @@ fn local_proxy_chatgpt_spki(listen: &str) -> Result<String> {
     let addr = listen
         .parse::<SocketAddr>()
         .with_context(|| format!("invalid local proxy listen address {listen}"))?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
-        .with_context(|| format!("failed to connect to SAIAI local proxy at {listen}"))?;
+    let mut stream =
+        TcpStream::connect_timeout(&addr, Duration::from_secs(2)).with_context(|| {
+            format!(
+                "failed to connect to {brand_product} local proxy at {listen}",
+                brand_product = BRAND.product_name
+            )
+        })?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     stream
@@ -3566,7 +3730,10 @@ fn local_proxy_chatgpt_spki(listen: &str) -> Result<String> {
         .nth(1)
         .is_some_and(|code| code == "200")
     {
-        bail!("SAIAI local proxy did not accept the certificate identity request");
+        bail!(
+            "{brand_product} local proxy did not accept the certificate identity request",
+            brand_product = BRAND.product_name
+        );
     }
     let mut spki = None;
     loop {
@@ -3582,19 +3749,28 @@ fn local_proxy_chatgpt_spki(listen: &str) -> Result<String> {
             spki = Some(value.trim().to_string());
         }
     }
-    let spki = spki.context(
-        "running SAIAI proxy does not expose a Desktop certificate pin; run `saiai restart` and retry",
-    )?;
+    let spki = spki.with_context(|| format!("running {brand_product} proxy does not expose a Desktop certificate pin; run `{brand_binary} restart` and retry", brand_binary = BRAND.binary_name, brand_product = BRAND.product_name))?;
     let pins = spki.split(',').collect::<Vec<_>>();
     if pins.is_empty() || pins.iter().any(|pin| pin.trim().is_empty()) {
-        bail!("SAIAI local proxy returned an empty Desktop certificate pin");
+        bail!(
+            "{brand_product} local proxy returned an empty Desktop certificate pin",
+            brand_product = BRAND.product_name
+        );
     }
     for pin in pins {
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(pin.trim())
-            .context("SAIAI local proxy returned an invalid Desktop certificate pin")?;
+            .with_context(|| {
+                format!(
+                    "{brand_product} local proxy returned an invalid Desktop certificate pin",
+                    brand_product = BRAND.product_name
+                )
+            })?;
         if decoded.len() != 32 {
-            bail!("SAIAI local proxy returned an invalid Desktop certificate pin length");
+            bail!(
+                "{brand_product} local proxy returned an invalid Desktop certificate pin length",
+                brand_product = BRAND.product_name
+            );
         }
     }
     Ok(spki)
@@ -3658,7 +3834,14 @@ fn other_environment_listeners() -> Result<Vec<String>> {
             }
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("cannot inspect SAIAI environments"),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot inspect {brand_product} environments",
+                    brand_product = BRAND.product_name
+                )
+            });
+        }
     }
     let own = scope.directory.join(SAIAI_CONFIG_FILENAME.get());
     let mut reserved = Vec::new();
@@ -3670,8 +3853,12 @@ fn other_environment_listeners() -> Result<Vec<String>> {
                 return Err(error).context("cannot read another environment's port reservation");
             }
         };
-        let value: Value =
-            serde_json::from_slice(&raw).context("invalid SAIAI environment configuration")?;
+        let value: Value = serde_json::from_slice(&raw).with_context(|| {
+            format!(
+                "invalid {brand_product} environment configuration",
+                brand_product = BRAND.product_name
+            )
+        })?;
         if let Some(listen) = value["listen"].as_str() {
             reserved.push(listen.to_string());
         }
@@ -3731,8 +3918,12 @@ fn select_local_proxy_listen(existing: Option<&str>) -> Result<String> {
     }
 
     for _ in 0..128 {
-        let listener = StdTcpListener::bind(("127.0.0.1", 0))
-            .context("failed to allocate a loopback port for the SAIAI local proxy")?;
+        let listener = StdTcpListener::bind(("127.0.0.1", 0)).with_context(|| {
+            format!(
+                "failed to allocate a loopback port for the {brand_product} local proxy",
+                brand_product = BRAND.product_name
+            )
+        })?;
         let listen = listener.local_addr()?.to_string();
         if !reserved.contains(&listen) {
             return Ok(listen);
@@ -3806,8 +3997,9 @@ fn update_saiai_provider_config_at(
             config.ca_key_path = key.display().to_string();
         } else {
             bail!(
-                "SAIAI config is obsolete; initialize {} again with the one-command setup",
-                provider.name()
+                "{brand_product} config is obsolete; initialize {} again with the one-command setup",
+                provider.name(),
+                brand_product = BRAND.product_name
             );
         }
     }
@@ -3981,8 +4173,9 @@ fn run_upstream_proxy_command(value: Option<String>) -> Result<()> {
     cfg.upstream_proxy = (!value.eq_ignore_ascii_case("system")).then(|| value.to_string());
     write_saiai_config_at(&saiai_config_path()?, &cfg)?;
     println!(
-        "upstream proxy set to {}; run `saiai restart` to apply it to the running service",
-        upstream_proxy::describe_setting(cfg.upstream_proxy.as_deref())
+        "upstream proxy set to {}; run `{brand_binary} restart` to apply it to the running service",
+        upstream_proxy::describe_setting(cfg.upstream_proxy.as_deref()),
+        brand_binary = BRAND.binary_name
     );
     Ok(())
 }
@@ -4027,14 +4220,27 @@ fn installation_ca_pem(cfg: &SaiaiConfig) -> String {
 
 fn read_runtime_ca(cfg: &SaiaiConfig) -> Result<(String, String)> {
     if cfg.version != SAIAI_CONFIG_VERSION.get() || cfg.ca_key_path.trim().is_empty() {
-        bail!("SAIAI local proxy configuration is obsolete; rerun the one-command SAIAI setup");
+        bail!(
+            "{brand_product} local proxy configuration is obsolete; rerun the one-command {brand_product} setup",
+            brand_product = BRAND.product_name
+        );
     }
-    let cert_pem = fs::read_to_string(&cfg.ca_cert_path)
-        .with_context(|| format!("failed to read SAIAI CA certificate {}", cfg.ca_cert_path))?;
-    let key_pem = fs::read_to_string(&cfg.ca_key_path)
-        .with_context(|| format!("failed to read SAIAI CA key {}", cfg.ca_key_path))?;
+    let cert_pem = fs::read_to_string(&cfg.ca_cert_path).with_context(|| {
+        format!(
+            "failed to read {brand_product} CA certificate {}",
+            cfg.ca_cert_path,
+            brand_product = BRAND.product_name
+        )
+    })?;
+    let key_pem = fs::read_to_string(&cfg.ca_key_path).with_context(|| {
+        format!(
+            "failed to read {brand_product} CA key {}",
+            cfg.ca_key_path,
+            brand_product = BRAND.product_name
+        )
+    })?;
     local_proxy::validate_tls_config(&cert_pem, &key_pem)
-        .context("SAIAI installation CA is invalid; rerun the one-command SAIAI setup")?;
+        .with_context(|| format!("{brand_product} installation CA is invalid; rerun the one-command {brand_product} setup", brand_product = BRAND.product_name))?;
     Ok((cert_pem, key_pem))
 }
 
@@ -4057,7 +4263,10 @@ fn run_service_start() -> Result<()> {
             } else {
                 run_systemctl(&["start", &environment_scope::service_name()])?;
             }
-            println!("SAIAI user service started or refreshed.");
+            println!(
+                "{brand_product} user service started or refreshed.",
+                brand_product = BRAND.product_name
+            );
             println!("Service: {}", service_path.display());
         }
         Err(systemd_error) => {
@@ -4065,14 +4274,23 @@ fn run_service_start() -> Result<()> {
                 "WARN systemd --user unavailable; using a managed background process: {systemd_error}"
             );
             let pid = start_linux_background_proxy(&cfg)?;
-            println!("SAIAI background proxy started or refreshed.");
+            println!(
+                "{brand_product} background proxy started or refreshed.",
+                brand_product = BRAND.product_name
+            );
             println!("Service manager: background process");
             println!("PID: {pid}");
         }
     }
     println!("Listening: http://{}", cfg.listen);
-    println!("Status: saiai status");
-    println!("Logs: saiai logs");
+    println!(
+        "Status: {brand_binary} status",
+        brand_binary = BRAND.binary_name
+    );
+    println!(
+        "Logs: {brand_binary} logs",
+        brand_binary = BRAND.binary_name
+    );
     Ok(())
 }
 
@@ -4104,15 +4322,26 @@ fn run_service_start() -> Result<()> {
     // listener instead of racing it and reallocating the port.
     if !wait_for_local_listener(&cfg.listen, MACOS_LISTENER_READY_TIMEOUT) {
         eprintln!(
-            "SAIAI LaunchAgent was started but is not listening on {} yet; check `saiai logs`.",
-            cfg.listen
+            "{brand_product} LaunchAgent was started but is not listening on {} yet; check `{brand_binary} logs`.",
+            cfg.listen,
+            brand_binary = BRAND.binary_name,
+            brand_product = BRAND.product_name
         );
     }
-    println!("SAIAI LaunchAgent started.");
+    println!(
+        "{brand_product} LaunchAgent started.",
+        brand_product = BRAND.product_name
+    );
     println!("Service: {}", plist_path.display());
     println!("Listening: http://{}", cfg.listen);
-    println!("Status: saiai status");
-    println!("Logs: saiai logs");
+    println!(
+        "Status: {brand_binary} status",
+        brand_binary = BRAND.binary_name
+    );
+    println!(
+        "Logs: {brand_binary} logs",
+        brand_binary = BRAND.binary_name
+    );
     Ok(())
 }
 
@@ -4149,17 +4378,29 @@ fn run_service_start() -> Result<()> {
     }
     ensure_listen_available(&cfg.listen)?;
     let pid = start_windows_background_proxy()?;
-    println!("SAIAI background proxy started or refreshed.");
+    println!(
+        "{brand_product} background proxy started or refreshed.",
+        brand_product = BRAND.product_name
+    );
     println!("PID: {pid}");
     println!("Listening: http://{}", cfg.listen);
-    println!("Status: saiai status");
-    println!("Logs: saiai logs");
+    println!(
+        "Status: {brand_binary} status",
+        brand_binary = BRAND.binary_name
+    );
+    println!(
+        "Logs: {brand_binary} logs",
+        brand_binary = BRAND.binary_name
+    );
     Ok(())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn run_service_start() -> Result<()> {
-    bail!("saiai start currently supports Linux, macOS, and Windows only");
+    bail!(
+        "{brand_binary} start currently supports Linux, macOS, and Windows only",
+        brand_binary = BRAND.binary_name
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -4169,22 +4410,38 @@ fn run_service_stop() -> Result<()> {
     match ensure_systemd_user_available() {
         Ok(()) => {
             if stop_systemd_user_service_if_present()? {
-                println!("SAIAI user service stopped and disabled.");
+                println!(
+                    "{brand_product} user service stopped and disabled.",
+                    brand_product = BRAND.product_name
+                );
             } else if background_stopped {
-                println!("SAIAI background proxy stopped.");
+                println!(
+                    "{brand_product} background proxy stopped.",
+                    brand_product = BRAND.product_name
+                );
             } else {
-                println!("SAIAI service is not running.");
+                println!(
+                    "{brand_product} service is not running.",
+                    brand_product = BRAND.product_name
+                );
             }
         }
         Err(systemd_error) => {
             if background_stopped {
-                println!("SAIAI background proxy stopped.");
+                println!(
+                    "{brand_product} background proxy stopped.",
+                    brand_product = BRAND.product_name
+                );
             } else if linux_configured_listen_has_saiai_owner()? {
                 bail!(
-                    "a SAIAI process is listening, but it is not the managed background process and systemd --user is unavailable: {systemd_error}"
+                    "a {brand_product} process is listening, but it is not the managed background process and systemd --user is unavailable: {systemd_error}",
+                    brand_product = BRAND.product_name
                 );
             } else {
-                println!("SAIAI background proxy is not running.");
+                println!(
+                    "{brand_product} background proxy is not running.",
+                    brand_product = BRAND.product_name
+                );
             }
         }
     }
@@ -4197,7 +4454,10 @@ fn run_service_stop() -> Result<()> {
     let plist_path = launchd_plist_path()?;
     let plist = plist_path.display().to_string();
     let _ = run_launchctl(&["bootout", &domain, &plist]);
-    println!("SAIAI LaunchAgent stopped.");
+    println!(
+        "{brand_product} LaunchAgent stopped.",
+        brand_product = BRAND.product_name
+    );
     Ok(())
 }
 
@@ -4205,13 +4465,19 @@ fn run_service_stop() -> Result<()> {
 fn run_service_stop() -> Result<()> {
     let _service_lock = lock_windows_service()?;
     stop_windows_background_proxy()?;
-    println!("SAIAI background proxy stopped.");
+    println!(
+        "{brand_product} background proxy stopped.",
+        brand_product = BRAND.product_name
+    );
     Ok(())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn run_service_stop() -> Result<()> {
-    bail!("saiai stop currently supports Linux, macOS, and Windows only");
+    bail!(
+        "{brand_binary} stop currently supports Linux, macOS, and Windows only",
+        brand_binary = BRAND.binary_name
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -4347,7 +4613,10 @@ fn run_service_status() -> Result<()> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn run_service_status() -> Result<()> {
-    bail!("saiai status currently supports Linux, macOS, and Windows only");
+    bail!(
+        "{brand_binary} status currently supports Linux, macOS, and Windows only",
+        brand_binary = BRAND.binary_name
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -4429,7 +4698,10 @@ fn run_service_logs() -> Result<()> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn run_service_logs() -> Result<()> {
-    bail!("saiai logs currently supports Linux, macOS, and Windows only");
+    bail!(
+        "{brand_binary} logs currently supports Linux, macOS, and Windows only",
+        brand_binary = BRAND.binary_name
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -4451,7 +4723,10 @@ fn run_service_restart() -> Result<()> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn run_service_restart() -> Result<()> {
-    bail!("saiai restart currently supports Linux, macOS, and Windows only");
+    bail!(
+        "{brand_binary} restart currently supports Linux, macOS, and Windows only",
+        brand_binary = BRAND.binary_name
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -4517,7 +4792,11 @@ fn update_refresh_failure_is_recoverable(proxy_reachable: bool) -> bool {
 
 fn start_managed_service_after_initialization(config_changed: bool) -> Result<()> {
     if should_skip_initialization_proxy_start(env::var(BRAND.env.skip_start).ok().as_deref()) {
-        println!("SAIAI local proxy start skipped (SAIAI_SKIP_START=1).");
+        println!(
+            "{brand_product} local proxy start skipped ({brand_skip_start_env}=1).",
+            brand_product = BRAND.product_name,
+            brand_skip_start_env = BRAND.env.skip_start
+        );
         return Ok(());
     }
     let binary_changed =
@@ -4530,11 +4809,22 @@ fn start_managed_service_after_initialization(config_changed: bool) -> Result<()
         managed_service_active,
         proxy_reachable,
     ) {
-        println!("SAIAI local proxy left running; binary and runtime configuration are unchanged.");
+        println!(
+            "{brand_product} local proxy left running; binary and runtime configuration are unchanged.",
+            brand_product = BRAND.product_name
+        );
         return Ok(());
     }
-    run_service_start().context("failed to start or refresh the SAIAI local proxy")?;
-    println!("SAIAI local proxy started or refreshed after configuration update.");
+    run_service_start().with_context(|| {
+        format!(
+            "failed to start or refresh the {brand_product} local proxy",
+            brand_product = BRAND.product_name
+        )
+    })?;
+    println!(
+        "{brand_product} local proxy started or refreshed after configuration update.",
+        brand_product = BRAND.product_name
+    );
     Ok(())
 }
 
@@ -4555,7 +4845,12 @@ fn run_update() -> Result<()> {
     let cfg = read_saiai_config()?;
     let asset = current_platform_asset_name()?;
     let (manifest_url, url) = update_urls(&cfg.base_url, &asset);
-    let current_exe = env::current_exe().context("failed to resolve current saiai executable")?;
+    let current_exe = env::current_exe().with_context(|| {
+        format!(
+            "failed to resolve current {brand_binary} executable",
+            brand_binary = BRAND.binary_name
+        )
+    })?;
     let current_exe = fs::canonicalize(&current_exe).unwrap_or_else(|_| current_exe.clone());
     let parent = current_exe
         .parent()
@@ -4570,7 +4865,11 @@ fn run_update() -> Result<()> {
         .with_context(|| format!("failed to read {}", current_exe.display()))?;
     let current_sha256 = sha256_hex(&current_bytes);
 
-    println!("Current: saiai {}", runtime::version());
+    println!(
+        "Current: {brand_binary} {}",
+        runtime::version(),
+        brand_binary = BRAND.binary_name
+    );
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -4592,16 +4891,24 @@ fn run_update() -> Result<()> {
             bail!("manifest asset {asset} has invalid sha256 {expected:?}");
         }
 
-        println!("Latest: saiai {remote_version}");
+        println!(
+            "Latest: {brand_binary} {remote_version}",
+            brand_binary = BRAND.binary_name
+        );
         if ordering == Ordering::Less {
             println!(
-                "Already current: saiai {} (remote saiai {remote_version})",
-                runtime::version()
+                "Already current: {brand_binary} {} (remote {brand_binary} {remote_version})",
+                runtime::version(),
+                brand_binary = BRAND.binary_name
             );
             return Ok(());
         }
         if ordering == Ordering::Equal && current_sha256 == expected {
-            println!("Already current: saiai {}", runtime::version());
+            println!(
+                "Already current: {brand_binary} {}",
+                runtime::version(),
+                brand_binary = BRAND.binary_name
+            );
             return Ok(());
         }
         if ordering == Ordering::Equal {
@@ -4639,7 +4946,10 @@ fn run_update() -> Result<()> {
         .is_some_and(|rest| rest.starts_with(' '))
     {
         let _ = fs::remove_file(&candidate_path);
-        bail!("downloaded binary did not report a SAIAI version: {candidate_version:?}");
+        bail!(
+            "downloaded binary did not report a {brand_product} version: {candidate_version:?}",
+            brand_product = BRAND.product_name
+        );
     }
 
     if current_bytes == bytes {
@@ -4658,8 +4968,9 @@ fn run_update() -> Result<()> {
 
     #[cfg(target_os = "windows")]
     println!(
-        "Update staged (not yet installed): {}. After this command exits, run `saiai --version` to confirm; a failed replacement is reported there.",
-        candidate_version.trim()
+        "Update staged (not yet installed): {}. After this command exits, run `{brand_binary} --version` to confirm; a failed replacement is reported there.",
+        candidate_version.trim(),
+        brand_binary = BRAND.binary_name
     );
     #[cfg(not(target_os = "windows"))]
     println!("Updated: {}", candidate_version.trim());
@@ -4675,26 +4986,46 @@ fn run_update() -> Result<()> {
                 // as a failed update when the local proxy remains reachable.
                 if update_refresh_failure_is_recoverable(configured_local_proxy_reachable()) {
                     eprintln!(
-                        "WARN SAIAI client was updated and the local proxy remains reachable, but its automatic service refresh reported: {err:#}. Run `saiai restart` later to retry the refresh."
+                        "WARN {brand_product} client was updated and the local proxy remains reachable, but its automatic service refresh reported: {err:#}. Run `{brand_binary} restart` later to retry the refresh.",
+                        brand_binary = BRAND.binary_name,
+                        brand_product = BRAND.product_name
                     );
                 } else {
-                    return Err(err).context("failed to restart the active SAIAI service");
+                    return Err(err).with_context(|| {
+                        format!(
+                            "failed to restart the active {brand_product} service",
+                            brand_product = BRAND.product_name
+                        )
+                    });
                 }
             } else {
-                println!("Managed SAIAI service was active; restarted automatically.");
+                println!(
+                    "Managed {brand_product} service was active; restarted automatically.",
+                    brand_product = BRAND.product_name
+                );
             }
         }
         #[cfg(target_os = "windows")]
-        println!("Managed SAIAI service was active; restart was scheduled automatically.");
+        println!(
+            "Managed {brand_product} service was active; restart was scheduled automatically.",
+            brand_product = BRAND.product_name
+        );
     } else {
-        println!("SAIAI service was not active; run `saiai start` when needed.");
+        println!(
+            "{brand_product} service was not active; run `{brand_binary} start` when needed.",
+            brand_binary = BRAND.binary_name,
+            brand_product = BRAND.product_name
+        );
     }
     Ok(())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn run_update() -> Result<()> {
-    bail!("saiai update currently supports Linux, macOS, and Windows assets only");
+    bail!(
+        "{brand_binary} update currently supports Linux, macOS, and Windows assets only",
+        brand_binary = BRAND.binary_name
+    );
 }
 
 fn run_doctor(target: DoctorTarget) -> Result<()> {
@@ -4714,7 +5045,12 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
         check_persistent_env_conflicts(&mut report);
     }
 
-    let config_path = saiai_config_path().context("failed to resolve SAIAI config path")?;
+    let config_path = saiai_config_path().with_context(|| {
+        format!(
+            "failed to resolve {brand_product} config path",
+            brand_product = BRAND.product_name
+        )
+    })?;
     let cfg = match read_saiai_config() {
         Ok(cfg) => {
             report.ok("config", config_path.display().to_string());
@@ -4790,7 +5126,10 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
             Ok(status) => report.ok("local proxy MITM", status),
             Err(err) if is_local_proxy_connect_error(&err) => report.warn(
                 "local proxy MITM",
-                format!("{err:#}; start it with `saiai start`"),
+                format!(
+                    "{err:#}; start it with `{brand_binary} start`",
+                    brand_binary = BRAND.binary_name
+                ),
             ),
             Err(err) => report.error("local proxy MITM", format!("{err:#}")),
         }
@@ -4811,17 +5150,29 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
             report.error("upstream proxy", message);
         }
         for (label, url) in [
-            ("SAIAI egress", health_base),
-            ("Claude downloads egress", "https://downloads.claude.ai"),
+            (
+                format!("{brand_product} egress", brand_product = BRAND.product_name),
+                health_base,
+            ),
+            (
+                "Claude downloads egress".to_string(),
+                "https://downloads.claude.ai",
+            ),
         ] {
             match upstream_proxy::route_for_url_blocking(&egress.upstream, url) {
-                Ok(route) => report.ok(label, format!("{url} {route}")),
-                Err(error) => report.error(label, format!("{url}: {error:#}")),
+                Ok(route) => report.ok(&label, format!("{url} {route}")),
+                Err(error) => report.error(&label, format!("{url}: {error:#}")),
             }
         }
         match runtime.block_on(check_gateway_health(health_base, &egress)) {
-            Ok(status) => report.ok("SAIAI health", status),
-            Err(err) => report.error("SAIAI health", format!("{err:#}")),
+            Ok(status) => report.ok(
+                &format!("{brand_product} health", brand_product = BRAND.product_name),
+                status,
+            ),
+            Err(err) => report.error(
+                &format!("{brand_product} health", brand_product = BRAND.product_name),
+                format!("{err:#}"),
+            ),
         }
     }
 
@@ -4868,8 +5219,8 @@ fn check_vscode_editor_config(report: &mut DoctorReport, cfg: &SaiaiConfig) {
         return;
     }
     match vscode::certificate_trust(&home, Path::new(&cfg.ca_cert_path)) {
-        Ok(true) => report.ok("VSCode certificate loader", "recognizes the current SAIAI CA; this is not a live UI or model-request test"),
-        Ok(false) => report.warn("VSCode certificate loader", "does not trust the SAIAI CA; provider-specific CA settings do not establish editor-host trust"),
+        Ok(true) => report.ok("VSCode certificate loader", format!("recognizes the current {brand_product} CA; this is not a live UI or model-request test", brand_product = BRAND.product_name)),
+        Ok(false) => report.warn("VSCode certificate loader", format!("does not trust the {brand_product} CA; provider-specific CA settings do not establish editor-host trust", brand_product = BRAND.product_name)),
         Err(error) => report.warn("VSCode certificate loader", error.to_string()),
     }
 }
@@ -4908,7 +5259,11 @@ impl DoctorReport {
             self.errors, self.warnings
         );
         if self.errors > 0 {
-            bail!("SAIAI doctor found {} error(s)", self.errors);
+            bail!(
+                "{brand_product} doctor found {} error(s)",
+                self.errors,
+                brand_product = BRAND.product_name
+            );
         }
         Ok(())
     }
@@ -4938,12 +5293,14 @@ const CLAUDE_SETTINGS_LEGACY_ENV_OVERRIDES: [&str; 9] = [
 fn warn_process_env_conflicts() {
     for key in process_env_conflicts() {
         eprintln!(
-            "WARN environment: {key} is set in this shell. For SAIAI local proxy mode, unset it before launching Claude Code: unset {CONFLICTING_ENV_UNSET_KEYS}"
+            "WARN environment: {key} is set in this shell. For {brand_product} local proxy mode, unset it before launching Claude Code: unset {CONFLICTING_ENV_UNSET_KEYS}",
+            brand_product = BRAND.product_name
         );
     }
     for key in process_proxy_env_conflicts(&format!("http://{DEFAULT_LOCAL_PROXY_LISTEN}")) {
         eprintln!(
-            "WARN environment: {key} is set in this shell. For SAIAI local proxy mode, remove conflicting proxy variables before launching Claude Code: unset {CLAUDE_PROXY_ENV_UNSET_KEYS}"
+            "WARN environment: {key} is set in this shell. For {brand_product} local proxy mode, remove conflicting proxy variables before launching Claude Code: unset {CLAUDE_PROXY_ENV_UNSET_KEYS}",
+            brand_product = BRAND.product_name
         );
     }
 }
@@ -4960,9 +5317,10 @@ fn warn_claude_settings_overrides() {
 fn warn_claude_settings_overrides_for_paths(paths: &ClaudeConfigPaths) {
     match claude_settings_override_locations_from_disk(paths) {
         Ok(locations) if !locations.is_empty() => eprintln!(
-            "WARN Claude settings: {} contains legacy Claude Code overrides: {}. Remove these entries before launching Claude Code with SAIAI.",
+            "WARN Claude settings: {} contains legacy Claude Code overrides: {}. Remove these entries before launching Claude Code with {brand_product}.",
             paths.settings_path.display(),
-            format_claude_settings_override_locations(&locations)
+            format_claude_settings_override_locations(&locations),
+            brand_product = BRAND.product_name
         ),
         Ok(_) => {}
         Err(err) => eprintln!(
@@ -4976,9 +5334,10 @@ fn print_claude_settings_overrides_for_status() {
     match resolve_claude_config_paths() {
         Ok(paths) => match claude_settings_override_locations_from_disk(&paths) {
             Ok(locations) if !locations.is_empty() => println!(
-                "Claude settings warning: {} contains legacy Claude Code overrides: {}; remove these entries before launching Claude Code with SAIAI",
+                "Claude settings warning: {} contains legacy Claude Code overrides: {}; remove these entries before launching Claude Code with {brand_product}",
                 paths.settings_path.display(),
-                format_claude_settings_override_locations(&locations)
+                format_claude_settings_override_locations(&locations),
+                brand_product = BRAND.product_name
             ),
             Ok(_) => {}
             Err(err) => println!(
@@ -5521,7 +5880,7 @@ fn check_saiai_config(report: &mut DoctorReport, cfg: &SaiaiConfig) {
                 Ok(_) => report.ok("local proxy", format!("reachable at http://{addr}")),
                 Err(err) => report.warn(
                     "local proxy",
-                    format!("not reachable at http://{addr} ({err}); start it with `saiai start`"),
+                    format!("not reachable at http://{addr} ({err}); start it with `{brand_binary} start`", brand_binary = BRAND.binary_name),
                 ),
             }
         }
@@ -5533,7 +5892,13 @@ fn check_saiai_config(report: &mut DoctorReport, cfg: &SaiaiConfig) {
     #[cfg(target_os = "windows")]
     check_stale_windows_saiai_cas(report, &ca_path);
     if cfg.ca_key_path.trim().is_empty() {
-        report.error("configured CA key", "missing; rerun SAIAI setup");
+        report.error(
+            "configured CA key",
+            format!(
+                "missing; rerun {brand_product} setup",
+                brand_product = BRAND.product_name
+            ),
+        );
     } else {
         report.ok(
             "configured CA key",
@@ -5589,9 +5954,9 @@ fn check_claude_config(
         report.warn(
             "Claude overrides",
             format!(
-                "{} contains {}; remove these entries before launching Claude Code with SAIAI",
+                "{} contains {}; remove these entries before launching Claude Code with {brand_product}",
                 paths.settings_path.display(),
-                format_claude_settings_override_locations(&overrides)
+                format_claude_settings_override_locations(&overrides), brand_product = BRAND.product_name
             ),
         );
     }
@@ -5613,7 +5978,11 @@ fn check_claude_config(
             {
                 report.warn(
                     "NODE_EXTRA_CA_CERTS",
-                    format!("{} differs from SAIAI config CA path", value),
+                    format!(
+                        "{} differs from {brand_product} config CA path",
+                        value,
+                        brand_product = BRAND.product_name
+                    ),
                 );
             }
             check_ca_cert(report, "NODE_EXTRA_CA_CERTS", &path);
@@ -5627,12 +5996,18 @@ fn check_claude_config(
                 if value == provider_route(cfg, ProviderKind::Claude).1 {
                     report.ok(
                         "CLAUDE_CODE_OAUTH_TOKEN",
-                        "configured and matches SAIAI config",
+                        format!(
+                            "configured and matches {brand_product} config",
+                            brand_product = BRAND.product_name
+                        ),
                     );
                 } else {
                     report.error(
                         "CLAUDE_CODE_OAUTH_TOKEN",
-                        "does not match SAIAI config api_key",
+                        format!(
+                            "does not match {brand_product} config api_key",
+                            brand_product = BRAND.product_name
+                        ),
                     );
                 }
             } else {
@@ -5647,8 +6022,9 @@ fn check_claude_config(
         report.warn(
             "Claude credentials",
             format!(
-                "{} still exists; rerun `saiai init ...` to remove stale OAuth state",
-                paths.credentials_path.display()
+                "{} still exists; rerun `{brand_binary} init ...` to remove stale OAuth state",
+                paths.credentials_path.display(),
+                brand_binary = BRAND.binary_name
             ),
         );
     } else {
@@ -5722,7 +6098,7 @@ fn check_codex_config(report: &mut DoctorReport, cfg: Option<&SaiaiConfig>, requ
                     {
                         report.warn(
                             "Codex base_url",
-                            "direct endpoint override remains; run `saiai init-codex` to migrate it",
+                            format!("direct endpoint override remains; run `{brand_binary} init-codex` to migrate it", brand_binary = BRAND.binary_name),
                         );
                     } else {
                         report.ok("Codex base_url", "no direct root endpoint override");
@@ -5730,7 +6106,7 @@ fn check_codex_config(report: &mut DoctorReport, cfg: Option<&SaiaiConfig>, requ
                     if document.get("model_providers").is_some() {
                         report.warn(
                             "Codex providers",
-                            "custom provider configuration remains; run `saiai init-codex` to remove it",
+                            format!("custom provider configuration remains; run `{brand_binary} init-codex` to remove it", brand_binary = BRAND.binary_name),
                         );
                     } else {
                         report.ok("Codex providers", "no custom provider compatibility route");
@@ -5773,16 +6149,25 @@ fn check_codex_config(report: &mut DoctorReport, cfg: Option<&SaiaiConfig>, requ
     } else if required {
         report.error(
             "Codex .env",
-            "missing; run `saiai init-codex` to configure the local proxy route",
+            format!(
+                "missing; run `{brand_binary} init-codex` to configure the local proxy route",
+                brand_binary = BRAND.binary_name
+            ),
         );
     } else {
         report.warn(
             "Codex .env",
-            "missing; run `saiai init-codex` before using an external Codex app-server",
+            format!("missing; run `{brand_binary} init-codex` before using an external Codex app-server", brand_binary = BRAND.binary_name),
         );
     }
     if cfg.is_none() {
-        report.warn("Codex route", "SAIAI config is unavailable");
+        report.warn(
+            "Codex route",
+            format!(
+                "{brand_product} config is unavailable",
+                brand_product = BRAND.product_name
+            ),
+        );
     }
     check_codex_environment_context_time(report, &codex_dir);
 }
@@ -5837,8 +6222,8 @@ fn check_codex_environment_context_time(report: &mut DoctorReport, codex_dir: &P
             report.warn(
                 LABEL,
                 format!(
-                    "{} is missing; time reporting is not turned off for the isolated Desktop profile. Relaunch `saiai desktop codex` to recreate it",
-                    config_path.display()
+                    "{} is missing; time reporting is not turned off for the isolated Desktop profile. Relaunch `{brand_binary} desktop codex` to recreate it",
+                    config_path.display(), brand_binary = BRAND.binary_name
                 ),
             );
         }
@@ -5850,9 +6235,15 @@ fn check_codex_environment_context_time(report: &mut DoctorReport, codex_dir: &P
             }
         };
         let remedy = if isolated_desktop {
-            "relaunch `saiai desktop codex`"
+            format!(
+                "relaunch `{brand_binary} desktop codex`",
+                brand_binary = BRAND.binary_name
+            )
         } else {
-            "re-run `saiai init-codex`"
+            format!(
+                "re-run `{brand_binary} init-codex`",
+                brand_binary = BRAND.binary_name
+            )
         };
         for path in paths {
             let path_text = path.display();
@@ -5910,16 +6301,22 @@ fn check_stale_windows_saiai_cas(report: &mut DoctorReport, ca_path: &Path) {
             let stale = stale_saiai_ca_thumbprints(&listing, &current);
             if !stale.is_empty() {
                 report.warn(
-                    "other SAIAI CAs",
+                    &format!("other {brand_product} CAs", brand_product = BRAND.product_name),
                     format!(
-                        "{} other SAIAI CA(s) are trusted in Windows root stores ({}); they may belong to another SAIAI instance or an earlier installation, so confirm before removing them",
+                        "{} other {brand_product} CA(s) are trusted in Windows root stores ({}); they may belong to another {brand_product} instance or an earlier installation, so confirm before removing them",
                         stale.len(),
-                        stale.join(", ")
+                        stale.join(", "), brand_product = BRAND.product_name
                     ),
                 );
             }
         }
-        Err(error) => report.warn("other SAIAI CAs", format!("could not inspect: {error:#}")),
+        Err(error) => report.warn(
+            &format!(
+                "other {brand_product} CAs",
+                brand_product = BRAND.product_name
+            ),
+            format!("could not inspect: {error:#}"),
+        ),
     }
 }
 
@@ -6037,8 +6434,10 @@ fn ensure_listen_available(listen: &str) -> Result<()> {
             };
             bail!(
                 "local proxy listen address {addr} is already in use by {}. \
-Stop the existing process, or if it is a SAIAI service run `saiai stop` first.",
-                owner_summary
+Stop the existing process, or if it is a {brand_product} service run `{brand_binary} stop` first.",
+                owner_summary,
+                brand_binary = BRAND.binary_name,
+                brand_product = BRAND.product_name
             )
         }
         Err(err) => bail!("local proxy listen address {addr} is not available: {err}"),
@@ -6056,7 +6455,10 @@ fn check_listen_owner(report: &mut DoctorReport, addr: SocketAddr) {
     } else {
         report.warn(
             "listen owner",
-            format!("non-SAIAI process on {addr}: {summary}"),
+            format!(
+                "non-{brand_product} process on {addr}: {summary}",
+                brand_product = BRAND.product_name
+            ),
         );
     }
 }
@@ -6279,14 +6681,10 @@ async fn check_local_proxy_mitm(cfg: &SaiaiConfig) -> Result<String> {
         b"GET /api/claude_code/policy_limits HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: close\r\n\r\n",
     )
     .await
-    .context(
-        "local proxy closed before the reused sidecar probe; restart the proxy with `saiai restart`",
-    )?;
+    .with_context(|| format!("local proxy closed before the reused sidecar probe; restart the proxy with `{brand_binary} restart`", brand_binary = BRAND.binary_name))?;
     let policy_head = read_http_response_head(&mut tls, "sidecar policy_limits response")
         .await
-        .context(
-            "local proxy did not keep the sidecar TLS connection alive; restart the proxy with `saiai restart`",
-        )?;
+        .with_context(|| format!("local proxy did not keep the sidecar TLS connection alive; restart the proxy with `{brand_binary} restart`", brand_binary = BRAND.binary_name))?;
     let policy_status = http_status_code(&policy_head)?;
     if policy_status != 200 {
         bail!("sidecar policy_limits probe returned HTTP {policy_status}, expected 200");
@@ -6303,19 +6701,28 @@ fn load_ca_root_store(path: &Path) -> Result<rustls::RootCertStore> {
     let mut cursor = std::io::Cursor::new(ca_bytes);
     let certs = rustls_pemfile::certs(&mut cursor)
         .collect::<std::result::Result<Vec<_>, _>>()
-        .context("failed to parse configured SAIAI CA PEM")?;
+        .with_context(|| {
+            format!(
+                "failed to parse configured {brand_product} CA PEM",
+                brand_product = BRAND.product_name
+            )
+        })?;
     if certs.is_empty() {
         bail!(
-            "configured SAIAI CA {} did not contain a PEM certificate",
-            path.display()
+            "configured {brand_product} CA {} did not contain a PEM certificate",
+            path.display(),
+            brand_product = BRAND.product_name
         );
     }
 
     let mut roots = rustls::RootCertStore::empty();
     for cert in certs {
-        roots
-            .add(cert)
-            .context("failed to trust configured SAIAI CA")?;
+        roots.add(cert).with_context(|| {
+            format!(
+                "failed to trust configured {brand_product} CA",
+                brand_product = BRAND.product_name
+            )
+        })?;
     }
     Ok(roots)
 }
@@ -6391,7 +6798,7 @@ fn check_service_config(report: &mut DoctorReport) {
             if ensure_systemd_user_available().is_ok() && service_is_active().unwrap_or(false) {
                 report.warn(
                     "service manager",
-                    "systemd and managed background instances are both active; run `saiai restart`",
+                    format!("systemd and managed background instances are both active; run `{brand_binary} restart`", brand_binary = BRAND.binary_name),
                 );
             }
             return;
@@ -6399,8 +6806,9 @@ fn check_service_config(report: &mut DoctorReport) {
         Ok(Some(state)) => report.warn(
             "service state",
             format!(
-                "stale managed background state for pid {}; run `saiai start`",
-                state.pid
+                "stale managed background state for pid {}; run `{brand_binary} start`",
+                state.pid,
+                brand_binary = BRAND.binary_name
             ),
         ),
         Ok(None) => {}
@@ -6411,7 +6819,7 @@ fn check_service_config(report: &mut DoctorReport) {
         report.warn(
             "service",
             format!(
-                "not running; systemd --user unavailable ({err}); `saiai start` will use the managed background fallback"
+                "not running; systemd --user unavailable ({err}); `{brand_binary} start` will use the managed background fallback", brand_binary = BRAND.binary_name
             ),
         );
         return;
@@ -6428,7 +6836,13 @@ fn check_service_config(report: &mut DoctorReport) {
         }
     };
     if load_state == "not-found" || load_state.is_empty() {
-        report.warn("service", "not installed; run `saiai start` to install it");
+        report.warn(
+            "service",
+            format!(
+                "not installed; run `{brand_binary} start` to install it",
+                brand_binary = BRAND.binary_name
+            ),
+        );
         return;
     }
     report.ok("service load", load_state);
@@ -6825,16 +7239,16 @@ function Invoke-{id}Command([string]$verb) {{\r\n\
     try {{\r\n\
         if (-not $process.WaitForExit(30000)) {{\r\n\
             try {{ $process.Kill() }} catch {{}}\r\n\
-            throw \"SAIAI $verb did not exit within 30 seconds\"\r\n\
+            throw \"{brand_product} $verb did not exit within 30 seconds\"\r\n\
         }}\r\n\
-        if ($process.ExitCode -ne 0) {{ throw \"SAIAI $verb exited with $($process.ExitCode)\" }}\r\n\
+        if ($process.ExitCode -ne 0) {{ throw \"{brand_product} $verb exited with $($process.ExitCode)\" }}\r\n\
     }} finally {{ $process.Dispose() }}\r\n\
 }}\r\n\
 try {{\r\n\
     Set-Content -LiteralPath $statusPath -Value 'pending: waiting for updater' -Encoding UTF8\r\n\
     Wait-Process -Id {pid} -Timeout 30 -ErrorAction SilentlyContinue\r\n\
     if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ throw 'Updater process did not exit within 30 seconds' }}\r\n\
-    Set-Content -LiteralPath $statusPath -Value 'pending: stopping SAIAI processes' -Encoding UTF8\r\n\
+    Set-Content -LiteralPath $statusPath -Value 'pending: stopping {brand_product} processes' -Encoding UTF8\r\n\
     Invoke-{id}Command 'stop'\r\n\
     $stopped = $true\r\n\
     Set-Content -LiteralPath $statusPath -Value 'pending: replacing binary' -Encoding UTF8\r\n\
@@ -6851,7 +7265,7 @@ try {{\r\n\
             if ($attempt -lt 120) {{ Start-Sleep -Milliseconds 250 }}\r\n\
         }}\r\n\
     }}\r\n\
-    if ($null -ne $lastError) {{ throw \"Could not replace SAIAI binary after 120 attempts: $($lastError.Exception.Message)\" }}\r\n\
+    if ($null -ne $lastError) {{ throw \"Could not replace {brand_product} binary after 120 attempts: $($lastError.Exception.Message)\" }}\r\n\
     Set-Content -LiteralPath $statusPath -Value 'pending: verifying binary' -Encoding UTF8\r\n\
     $stream = [IO.File]::OpenRead($currentExe)\r\n\
     try {{\r\n\
@@ -6859,7 +7273,7 @@ try {{\r\n\
         try {{ $actualHash = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }}\r\n\
         finally {{ $sha.Dispose() }}\r\n\
     }} finally {{ $stream.Dispose() }}\r\n\
-    if ($actualHash -cne $expectedHash) {{ throw \"Installed SAIAI binary hash mismatch: $actualHash\" }}\r\n\
+    if ($actualHash -cne $expectedHash) {{ throw \"Installed {brand_product} binary hash mismatch: $actualHash\" }}\r\n\
     if ($restartService) {{\r\n\
         Set-Content -LiteralPath $statusPath -Value 'pending: restarting proxy' -Encoding UTF8\r\n\
         Invoke-{id}Command 'restart'\r\n\
@@ -6880,6 +7294,7 @@ try {{\r\n\
         if restart_service { "true" } else { "false" },
         powershell_quote_path(script_path)?,
         id = script_brand::identifier_prefix(),
+        brand_product = BRAND.product_name,
     ))
 }
 
@@ -6887,7 +7302,12 @@ try {{\r\n\
 fn windows_update_status_path(current_exe: &Path) -> Result<PathBuf> {
     Ok(current_exe
         .parent()
-        .context("failed to resolve SAIAI executable directory")?
+        .with_context(|| {
+            format!(
+                "failed to resolve {brand_product} executable directory",
+                brand_product = BRAND.product_name
+            )
+        })?
         .join(BRAND.update.status_filename))
 }
 
@@ -6903,13 +7323,15 @@ fn warn_incomplete_windows_update() {
     let status = status.trim_start_matches('\u{feff}').trim();
     if status.starts_with("failed:") {
         eprintln!(
-            "WARN Previous SAIAI update {status}. Details: {}",
-            path.display()
+            "WARN Previous {brand_product} update {status}. Details: {}",
+            path.display(),
+            brand_product = BRAND.product_name
         );
     } else if status.starts_with("pending") {
         eprintln!(
-            "WARN Previous SAIAI update has not completed; check again shortly. Status: {}",
-            path.display()
+            "WARN Previous {brand_product} update has not completed; check again shortly. Status: {}",
+            path.display(),
+            brand_product = BRAND.product_name
         );
     }
 }
@@ -6942,7 +7364,12 @@ fn write_user_service() -> Result<PathBuf> {
     fs::create_dir_all(&service_dir)
         .with_context(|| format!("failed to create {}", service_dir.display()))?;
 
-    let exe = env::current_exe().context("failed to resolve current saiai executable")?;
+    let exe = env::current_exe().with_context(|| {
+        format!(
+            "failed to resolve current {brand_binary} executable",
+            brand_binary = BRAND.binary_name
+        )
+    })?;
     let saiai_home = absolute_existing_or_raw(saiai_config_dir()?);
     let working_dir = home_dir().context("failed to resolve home directory")?;
     let service_path = service_dir.join(environment_scope::service_name());
@@ -6959,7 +7386,7 @@ fn render_user_service(exe: &Path, saiai_home: &Path, working_dir: &Path) -> Res
     let working_dir = path_to_string(working_dir)?;
     Ok(format!(
         "[Unit]\n\
-Description=SAIAI local Claude Code proxy\n\
+Description={brand_product} local Claude Code proxy\n\
 After=network-online.target\n\
 Wants=network-online.target\n\
 \n\
@@ -6978,7 +7405,8 @@ WantedBy=default.target\n",
         systemd_quote(&format!("{}={saiai_home}", BRAND.env.home))?,
         systemd_path_setting(&working_dir)?,
         systemd_quote(&exe)?,
-        systemd_quote(&saiai_home)?
+        systemd_quote(&saiai_home)?,
+        brand_product = BRAND.product_name
     ))
 }
 
@@ -7067,7 +7495,12 @@ fn write_launchd_plist() -> Result<LaunchdPlist> {
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let exe = env::current_exe().context("failed to resolve current saiai executable")?;
+    let exe = env::current_exe().with_context(|| {
+        format!(
+            "failed to resolve current {brand_binary} executable",
+            brand_binary = BRAND.binary_name
+        )
+    })?;
     let exe = absolute_existing_or_raw(exe);
     let saiai_home = absolute_existing_or_raw(saiai_config_dir()?);
     let working_dir = home_dir().context("failed to resolve home directory")?;
@@ -7211,8 +7644,12 @@ fn run_linux_background_proxy_worker() -> Result<()> {
     // `start_linux_background_proxy`, so it is not a process-group leader and
     // can safely detach from the invoking terminal session.
     if unsafe { libc::setsid() } == -1 {
-        return Err(std::io::Error::last_os_error())
-            .context("failed to detach SAIAI background proxy session");
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to detach {brand_product} background proxy session",
+                brand_product = BRAND.product_name
+            )
+        });
     }
     run_local_proxy(false)
 }
@@ -7230,7 +7667,11 @@ fn start_linux_background_proxy(cfg: &SaiaiConfig) -> Result<u32> {
     let log_path = linux_service_log_path()?;
     match fs::symlink_metadata(&log_path) {
         Ok(metadata) if !metadata.file_type().is_file() => {
-            bail!("refusing non-regular SAIAI log path {}", log_path.display())
+            bail!(
+                "refusing non-regular {brand_product} log path {}",
+                log_path.display(),
+                brand_product = BRAND.product_name
+            )
         }
         Ok(_) => {}
         Err(err) if err.kind() == ErrorKind::NotFound => {}
@@ -7254,7 +7695,12 @@ fn start_linux_background_proxy(cfg: &SaiaiConfig) -> Result<u32> {
         .try_clone()
         .with_context(|| format!("failed to clone {}", log_path.display()))?;
 
-    let exe = env::current_exe().context("failed to resolve current saiai executable")?;
+    let exe = env::current_exe().with_context(|| {
+        format!(
+            "failed to resolve current {brand_binary} executable",
+            brand_binary = BRAND.binary_name
+        )
+    })?;
     let mut child = ProcessCommand::new(exe)
         .arg(SAIAI_LINUX_BACKGROUND_COMMAND)
         .env(BRAND.env.home, &saiai_home)
@@ -7264,18 +7710,26 @@ fn start_linux_background_proxy(cfg: &SaiaiConfig) -> Result<u32> {
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()
-        .context("failed to start SAIAI background proxy")?;
+        .with_context(|| {
+            format!(
+                "failed to start {brand_product} background proxy",
+                brand_product = BRAND.product_name
+            )
+        })?;
     let pid = child.id();
     let startup = (|| -> Result<u32> {
         let identity_deadline = std::time::Instant::now() + Duration::from_secs(1);
         let identity = loop {
-            if let Some(status) = child
-                .try_wait()
-                .context("failed to inspect SAIAI background proxy")?
-            {
+            if let Some(status) = child.try_wait().with_context(|| {
+                format!(
+                    "failed to inspect {brand_product} background proxy",
+                    brand_product = BRAND.product_name
+                )
+            })? {
                 bail!(
-                    "SAIAI background proxy exited during startup with {status}; inspect {}",
-                    log_path.display()
+                    "{brand_product} background proxy exited during startup with {status}; inspect {}",
+                    log_path.display(),
+                    brand_product = BRAND.product_name
                 );
             }
             if let Some(identity) = linux_process_identity(pid)?
@@ -7285,8 +7739,9 @@ fn start_linux_background_proxy(cfg: &SaiaiConfig) -> Result<u32> {
             }
             if std::time::Instant::now() >= identity_deadline {
                 bail!(
-                    "timed out recording SAIAI background process identity; inspect {}",
-                    log_path.display()
+                    "timed out recording {brand_product} background process identity; inspect {}",
+                    log_path.display(),
+                    brand_product = BRAND.product_name
                 );
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -7305,13 +7760,16 @@ fn start_linux_background_proxy(cfg: &SaiaiConfig) -> Result<u32> {
             .with_context(|| format!("invalid local proxy listen address {:?}", cfg.listen))?;
         let ready_deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if let Some(status) = child
-                .try_wait()
-                .context("failed to inspect SAIAI background proxy")?
-            {
+            if let Some(status) = child.try_wait().with_context(|| {
+                format!(
+                    "failed to inspect {brand_product} background proxy",
+                    brand_product = BRAND.product_name
+                )
+            })? {
                 bail!(
-                    "SAIAI background proxy exited during startup with {status}; inspect {}",
-                    log_path.display()
+                    "{brand_product} background proxy exited during startup with {status}; inspect {}",
+                    log_path.display(),
+                    brand_product = BRAND.product_name
                 );
             }
             let owns_listener = listen_port_owners(addr)
@@ -7324,8 +7782,9 @@ fn start_linux_background_proxy(cfg: &SaiaiConfig) -> Result<u32> {
             }
             if std::time::Instant::now() >= ready_deadline {
                 bail!(
-                    "timed out waiting for SAIAI background proxy at {addr}; inspect {}",
-                    log_path.display()
+                    "timed out waiting for {brand_product} background proxy at {addr}; inspect {}",
+                    log_path.display(),
+                    brand_product = BRAND.product_name
                 );
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -7354,8 +7813,13 @@ fn stop_linux_background_proxy_at(dir: &Path, isolated: bool) -> Result<bool> {
         return Ok(false);
     };
     if !linux_background_state_matches_at(&state, dir, isolated)? {
-        fs::remove_file(&state_path)
-            .with_context(|| format!("failed to remove stale SAIAI state for pid {}", state.pid))?;
+        fs::remove_file(&state_path).with_context(|| {
+            format!(
+                "failed to remove stale {brand_product} state for pid {}",
+                state.pid,
+                brand_product = BRAND.product_name
+            )
+        })?;
         return Ok(false);
     }
 
@@ -7383,8 +7847,9 @@ fn stop_linux_background_proxy_at(dir: &Path, isolated: bool) -> Result<bool> {
         std::thread::sleep(Duration::from_millis(50));
     }
     bail!(
-        "failed to stop managed SAIAI background process {}",
-        state.pid
+        "failed to stop managed {brand_product} background process {}",
+        state.pid,
+        brand_product = BRAND.product_name
     )
 }
 
@@ -7398,11 +7863,21 @@ fn signal_linux_background_process(
     if !linux_background_state_matches_at(state, dir, isolated)? {
         return Ok(());
     }
-    let pid = i32::try_from(state.pid).context("SAIAI background pid is out of range")?;
+    let pid = i32::try_from(state.pid).with_context(|| {
+        format!(
+            "{brand_product} background pid is out of range",
+            brand_product = BRAND.product_name
+        )
+    })?;
     if unsafe { libc::kill(pid, signal) } == -1 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error).with_context(|| format!("failed to signal SAIAI process {pid}"));
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to signal {brand_product} process {pid}",
+                    brand_product = BRAND.product_name
+                )
+            });
         }
     }
     Ok(())
@@ -7424,7 +7899,11 @@ fn linux_background_state_at(dir: &Path) -> Result<Option<LinuxBackgroundState>>
         }
     };
     if !metadata.file_type().is_file() {
-        bail!("refusing non-regular SAIAI state path {}", path.display());
+        bail!(
+            "refusing non-regular {brand_product} state path {}",
+            path.display(),
+            brand_product = BRAND.product_name
+        );
     }
     let raw =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -7434,14 +7913,23 @@ fn linux_background_state_at(dir: &Path) -> Result<Option<LinuxBackgroundState>>
         || state.pid <= 1
         || state.start_time_ticks == 0
     {
-        bail!("invalid SAIAI background state in {}", path.display());
+        bail!(
+            "invalid {brand_product} background state in {}",
+            path.display(),
+            brand_product = BRAND.product_name
+        );
     }
     Ok(Some(state))
 }
 
 #[cfg(target_os = "linux")]
 fn write_linux_background_state(state: &LinuxBackgroundState) -> Result<()> {
-    let mut data = serde_json::to_vec_pretty(state).context("failed to serialize SAIAI state")?;
+    let mut data = serde_json::to_vec_pretty(state).with_context(|| {
+        format!(
+            "failed to serialize {brand_product} state",
+            brand_product = BRAND.product_name
+        )
+    })?;
     data.push(b'\n');
     write_bytes_atomic(&linux_background_state_path()?, &data, 0o600)
 }
@@ -7545,7 +8033,11 @@ fn acquire_linux_service_lock_at(dir: &Path) -> Result<LinuxServiceLock> {
     let path = dir.join(SAIAI_LINUX_LOCK_FILENAME.get());
     match fs::symlink_metadata(&path) {
         Ok(metadata) if !metadata.file_type().is_file() => {
-            bail!("refusing non-regular SAIAI lock path {}", path.display())
+            bail!(
+                "refusing non-regular {brand_product} lock path {}",
+                path.display(),
+                brand_product = BRAND.product_name
+            )
         }
         Ok(_) => {}
         Err(err) if err.kind() == ErrorKind::NotFound => {}
@@ -7585,10 +8077,19 @@ fn linux_service_log_path() -> Result<PathBuf> {
 #[cfg(target_os = "linux")]
 fn run_linux_background_logs() -> Result<()> {
     let path = linux_service_log_path()?;
-    let metadata = fs::symlink_metadata(&path)
-        .with_context(|| format!("SAIAI background log is unavailable at {}", path.display()))?;
+    let metadata = fs::symlink_metadata(&path).with_context(|| {
+        format!(
+            "{brand_product} background log is unavailable at {}",
+            path.display(),
+            brand_product = BRAND.product_name
+        )
+    })?;
     if !metadata.file_type().is_file() {
-        bail!("refusing non-regular SAIAI log path {}", path.display());
+        bail!(
+            "refusing non-regular {brand_product} log path {}",
+            path.display(),
+            brand_product = BRAND.product_name
+        );
     }
     let status = ProcessCommand::new("tail")
         .args(["-n", "80", "-f", "--"])
@@ -7633,7 +8134,12 @@ fn start_windows_background_proxy() -> Result<u32> {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
 
-    let exe = env::current_exe().context("failed to resolve current saiai executable")?;
+    let exe = env::current_exe().with_context(|| {
+        format!(
+            "failed to resolve current {brand_binary} executable",
+            brand_binary = BRAND.binary_name
+        )
+    })?;
     let saiai_home = saiai_config_dir()?;
     fs::create_dir_all(&saiai_home)
         .with_context(|| format!("failed to create {}", saiai_home.display()))?;
@@ -7658,7 +8164,12 @@ fn start_windows_background_proxy() -> Result<u32> {
         .stderr(Stdio::from(stderr))
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
         .spawn()
-        .context("failed to start SAIAI background proxy")?;
+        .with_context(|| {
+            format!(
+                "failed to start {brand_product} background proxy",
+                brand_product = BRAND.product_name
+            )
+        })?;
     let pid = child.id();
     let result = (|| -> Result<u32> {
         let process = windows_background::Process::open(pid, false)?
@@ -7777,7 +8288,7 @@ fn legacy_windows_worker_matches(pid: u32, executables: &[PathBuf]) -> Result<bo
         .args(["-NoProfile", "-NonInteractive", "-Command",
             &script_brand::render(r#"$ErrorActionPreference='Stop'; $p=Get-CimInstance Win32_Process -Filter ('ProcessId = '+$env:@@ENV@@CHECK_PID); if (!$p) { exit 1 }; $actual=$p.ExecutablePath -replace '^\\\\\?\\',''; $expected=@($env:@@ENV@@CHECK_EXE -split "`n" | Where-Object { ($_ -replace '^\\\\\?\\','') -ieq $actual }); if ($expected.Count -gt 0 -and $p.CommandLine -match '\s__run-background-proxy\s*$') { exit 0 }; exit 1"#)])
         .stdout(Stdio::null()).stderr(Stdio::null()).status()
-        .context("cannot verify legacy SAIAI worker identity")?;
+        .with_context(|| format!("cannot verify legacy {brand_product} worker identity", brand_product = BRAND.product_name))?;
     Ok(output.success())
 }
 
@@ -7856,7 +8367,12 @@ fn lock_windows_service_at(dir: &Path) -> Result<fs::File> {
         .write(true)
         .truncate(false)
         .open(dir.join(BRAND.service.lock_filename))?;
-    file.lock().context("cannot lock selected SAIAI service")?;
+    file.lock().with_context(|| {
+        format!(
+            "cannot lock selected {brand_product} service",
+            brand_product = BRAND.product_name
+        )
+    })?;
     Ok(file)
 }
 
@@ -8100,8 +8616,9 @@ fn migrate_legacy_claude_no_proxy(settings_path: &Path, listen: &str) -> Result<
     backup_if_exists(settings_path, &timestamp)?;
     write_json_object(settings_path, Value::Object(settings))?;
     eprintln!(
-        "Claude updater downloads now follow the SAIAI upstream proxy ({} updated)",
-        settings_path.display()
+        "Claude updater downloads now follow the {brand_product} upstream proxy ({} updated)",
+        settings_path.display(),
+        brand_product = BRAND.product_name
     );
     Ok(())
 }
@@ -8233,11 +8750,19 @@ fn saiai_config_path() -> Result<PathBuf> {
 }
 
 fn write_saiai_config_at(path: &Path, config: &SaiaiConfig) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("failed to resolve SAIAI config parent directory")?;
+    let parent = path.parent().with_context(|| {
+        format!(
+            "failed to resolve {brand_product} config parent directory",
+            brand_product = BRAND.product_name
+        )
+    })?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    let value = serde_json::to_value(config).context("failed to serialize SAIAI config")?;
+    let value = serde_json::to_value(config).with_context(|| {
+        format!(
+            "failed to serialize {brand_product} config",
+            brand_product = BRAND.product_name
+        )
+    })?;
     write_json_object(path, value)
 }
 
@@ -8245,8 +8770,9 @@ fn read_saiai_config() -> Result<SaiaiConfig> {
     let path = saiai_config_path()?;
     let raw = fs::read_to_string(&path).with_context(|| {
         format!(
-            "failed to read {}; run the SAIAI setup command first",
-            path.display()
+            "failed to read {}; run the {brand_product} setup command first",
+            path.display(),
+            brand_product = BRAND.product_name
         )
     })?;
     serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))

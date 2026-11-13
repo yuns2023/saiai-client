@@ -1881,6 +1881,10 @@ fn saiai_brand_values_are_frozen() {
     assert_eq!(update.candidate_prefix, ".saiai-update-");
     assert_eq!(update.backup_prefix, "saiai.bak-");
     assert_eq!(update.status_filename, ".saiai-update-status.txt");
+    assert_eq!(
+        update.windows_setup_command,
+        "irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai"
+    );
     let markers = &brand.markers;
     assert_eq!(
         markers.codex_ide_env_begin,
@@ -2239,7 +2243,7 @@ fn kept_after() {}
 
 /// Brand placeholders in production format strings, the SAIAI text each one
 /// stands for, and the named argument that must bind it in the same call.
-const BRAND_TEXT_TOKENS: [(&str, &str, &str); 5] = [
+const BRAND_TEXT_TOKENS: [(&str, &str, &str); 6] = [
     (
         "{brand_product}",
         "SAIAI",
@@ -2259,6 +2263,11 @@ const BRAND_TEXT_TOKENS: [(&str, &str, &str); 5] = [
         "{brand_desktop_bin_env}",
         "SAIAI_DESKTOP_BIN",
         "brand_desktop_bin_env = BRAND.env.desktop_bin",
+    ),
+    (
+        "{brand_windows_setup}",
+        "irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai",
+        "brand_windows_setup = BRAND.update.windows_setup_command",
     ),
     (
         "{brand_allow_untested_env}",
@@ -2386,6 +2395,20 @@ fn rendered_brand_text() -> Vec<(String, String)> {
 
 #[test]
 fn brand_text_renders_the_frozen_saiai_bytes() {
+    // The placeholders stand for these SAIAI values only if the brand has them.
+    let brand = crate::brand::brand();
+    for (token, saiai, _) in BRAND_TEXT_TOKENS {
+        let value = match token {
+            "{brand_product}" => brand.product_name,
+            "{brand_binary}" => brand.binary_name,
+            "{brand_skip_start_env}" => brand.env.skip_start,
+            "{brand_desktop_bin_env}" => brand.env.desktop_bin,
+            "{brand_windows_setup}" => brand.update.windows_setup_command,
+            "{brand_allow_untested_env}" => brand.env.claude_desktop_allow_untested,
+            other => panic!("unknown brand placeholder {other}"),
+        };
+        assert_eq!(value, saiai, "{token}");
+    }
     let mut golden: Vec<(String, String)> = BRAND_TEXT_GOLDEN
         .lines()
         .filter(|line| !line.is_empty())
