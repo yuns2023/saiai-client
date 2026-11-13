@@ -958,6 +958,15 @@ fn has_metavariable(stream: proc_macro2::TokenStream) -> bool {
     })
 }
 
+/// The kernel's own `macro_rules!` macros, name and exact rules. A macro can
+/// take apart the tokens it is given and rebuild them (keep a checked
+/// `include_str!` name, swap its argument), which no token scan can follow;
+/// a new macro is reviewed and registered here instead.
+const KERNEL_MACROS: &[(&str, &str)] = &[(
+    "eprintln",
+    "{ ($($arg:tt)*) => { ::std::eprintln!(\"[{}] {}\", chrono::Utc::now().to_rfc3339(), format_args!($($arg)*)); }; }",
+)];
+
 fn token_references(tokens: &[proc_macro2::TokenTree], found: &mut Vec<Result<String, String>>) {
     use proc_macro2::Delimiter::Bracket;
     for (index, token) in tokens.iter().enumerate() {
@@ -980,6 +989,36 @@ fn token_references(tokens: &[proc_macro2::TokenTree], found: &mut Vec<Result<St
                     }
                     let inline = is_inline_module(tokens, at + 1);
                     attribute_paths(group.stream(), inline, found);
+                }
+            }
+            proc_macro2::TokenTree::Ident(ident)
+                if ident_name(ident) == "macro_rules" && is_punct(tokens.get(index + 1), '!') =>
+            {
+                let registered = match (tokens.get(index + 2), tokens.get(index + 3)) {
+                    (
+                        Some(proc_macro2::TokenTree::Ident(name)),
+                        Some(proc_macro2::TokenTree::Group(rules)),
+                    ) => KERNEL_MACROS.iter().any(|(known, text)| {
+                        ident_name(name) == *known
+                            && text
+                                .parse::<proc_macro2::TokenStream>()
+                                .unwrap()
+                                .to_string()
+                                == proc_macro2::TokenStream::from(proc_macro2::TokenTree::Group(
+                                    rules.clone(),
+                                ))
+                                .to_string()
+                    }),
+                    _ => false,
+                };
+                if !registered {
+                    found.push(Err(format!(
+                        "macro_rules! {} (not registered in KERNEL_MACROS)",
+                        tokens
+                            .get(index + 2)
+                            .map(ToString::to_string)
+                            .unwrap_or_default()
+                    )));
                 }
             }
             // These names may appear only as a direct call (never passed to
@@ -1147,6 +1186,8 @@ mod documented;
         "macro_rules! m { ($h:tt $d:tt) => { $h [path = \"../../outside.rs\"] mod outside; }; }\nm!(#[doc = \"placeholder\"]);",
         "macro_rules! m { ($h:tt $d:tt $p:ident) => { $h [$p = \"../../outside.rs\"] mod outside; }; }\nm!(#[doc = \"x\"] path);",
         "macro_rules! m { ($h:tt $d:tt $b:tt) => { $h $b mod outside; }; }\nm!(#[doc = \"x\"] [path = \"../../outside.rs\"]);",
+        "macro_rules! load { ($r:ident ! $d:tt) => { $r!(\"../../outside.txt\") }; }\nconst T: &str = load!(include_str!(\"lib.rs\"));",
+        "macro_rules! eprintln { ($($arg:tt)*) => { include_str!($($arg)*) }; }",
         "const X: &str = \"unterminated;",
     ] {
         let references = file_references(refused);
