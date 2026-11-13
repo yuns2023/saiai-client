@@ -839,9 +839,7 @@ fn rust_literal_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
             continue;
         }
         if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
-            index = text[index + 2..]
-                .find("*/")
-                .map_or(bytes.len(), |end| index + 2 + end + 2);
+            index = block_comment_end(text, index);
             continue;
         }
         let raw_start = byte == b'r'
@@ -895,6 +893,30 @@ fn rust_literal_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
     ranges
 }
 
+/// End of the (possibly nested) block comment starting at `start`.
+fn block_comment_end(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut depth = 0_usize;
+    let mut index = start;
+    while index + 1 < bytes.len() {
+        match (bytes[index], bytes[index + 1]) {
+            (b'/', b'*') => {
+                depth += 1;
+                index += 2;
+            }
+            (b'*', b'/') => {
+                depth -= 1;
+                index += 2;
+                if depth == 0 {
+                    return index;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    bytes.len()
+}
+
 fn literal_mask(text: &str) -> Vec<bool> {
     let mut mask = vec![false; text.len()];
     for range in rust_literal_ranges(text) {
@@ -916,9 +938,7 @@ fn strip_rust_comments(text: &str) -> String {
             continue;
         }
         if !in_literal(index) && text[index..].starts_with("/*") {
-            index = text[index..]
-                .find("*/")
-                .map_or(text.len(), |end| index + end + 2);
+            index = block_comment_end(text, index);
             continue;
         }
         let ch = text[index..].chars().next().unwrap();
@@ -943,20 +963,24 @@ fn remove_rust_test_items(text: &str) -> String {
             continue;
         }
         let mut index = start + "#[cfg(test)]".len();
-        let mut depth = 0_usize;
+        // Braces end an item body; `;` ends an item only outside any
+        // bracket, so `fn f(x: [u8; 1])` is not cut at the array length.
+        let (mut braces, mut nested) = (0_usize, 0_usize);
         let mut end = text.len();
         while index < text.len() {
             if !in_literal(index) {
                 match text.as_bytes()[index] {
-                    b'{' => depth += 1,
+                    b'(' | b'[' => nested += 1,
+                    b')' | b']' => nested = nested.saturating_sub(1),
+                    b'{' => braces += 1,
                     b'}' => {
-                        depth = depth.saturating_sub(1);
-                        if depth == 0 {
+                        braces = braces.saturating_sub(1);
+                        if braces == 0 && nested == 0 {
                             end = index + 1;
                             break;
                         }
                     }
-                    b';' if depth == 0 => {
+                    b';' if braces == 0 && nested == 0 => {
                         end = index + 1;
                         break;
                     }
@@ -1044,6 +1068,9 @@ ${SAIAI_E:-x} "$SAIAI_F" %SAIAI_G% const SAIAI_NOT_ENV: &str = "x"; "__SAIAI_NUL
     let rust = "fn a() { let _ = \"// not a comment SAIAI_KEEP\"; }
 // env::var(\"SAIAI_COMMENT\")
 /* env::var(\"SAIAI_BLOCK\") */
+/* outer /* inner */ env::var(\"SAIAI_NESTED\") */
+#[cfg(test)]
+fn sized(_: [u8; 1]) { env::var(\"SAIAI_TEST_ARRAY\"); }
 #[cfg(test)]
 fn helper() { env::var(\"SAIAI_TEST_FN\"); }
 #[cfg(test)]
@@ -1286,7 +1313,7 @@ fn windows_desktop_runtime_directory_is_frozen() {
         .find_map(|line| line.strip_prefix("runtime_directory="))
         .expect("observer reports runtime_directory");
     let script = format!(
-        "$ErrorActionPreference='Stop'; $base=[Environment]::GetFolderPath('LocalApplicationData'); $value={line}; $base; $value"
+        "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.Encoding]::UTF8; $base=[Environment]::GetFolderPath('LocalApplicationData'); $value={line}; $base; $value"
     );
     let output = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
