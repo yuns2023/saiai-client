@@ -2600,13 +2600,31 @@ fn kernel_module_paths(text: &str, private: &[String]) -> Vec<String> {
                     found.push(format!("{root}{name}"));
                 }
                 // An alias of the root would hide later module paths.
-                if name == "self" && head[name.len()..].trim_start().starts_with("as ") {
+                let next: String = head[name.len()..]
+                    .trim_start()
+                    .chars()
+                    .take_while(|ch| ident(*ch))
+                    .collect();
+                if name == "self" && next == "as" {
                     found.push(format!("{root}{{self as …}}"));
                 }
             }
         }
     }
-    let words: Vec<&str> = compact.split_whitespace().collect();
+    // Identifier and punctuation tokens, whatever the spacing.
+    let mut words = Vec::new();
+    let mut rest = compact.as_str();
+    while let Some(ch) = rest.chars().next() {
+        let length = if ident(ch) {
+            rest.find(|ch: char| !ident(ch)).unwrap_or(rest.len())
+        } else {
+            ch.len_utf8()
+        };
+        if !ch.is_whitespace() {
+            words.push(&rest[..length]);
+        }
+        rest = &rest[length..];
+    }
     for window in words.windows(3) {
         if matches!(window, ["use" | "crate", "crate" | "super" | "self", "as"]) {
             found.push(format!("{} {} as", window[0], window[1]));
@@ -2631,6 +2649,9 @@ fn kernel_module_path_scanner_sees_aliases_groups_and_spacing() {
         "use crate::{self as c};\nc::gateway::X",
         "use super as parent;",
         "extern crate self as root;",
+        "use crate::{self as\n    c};\nc::gateway::X",
+        "fn f() {};use crate as c;",
+        "use\tcrate\tas\tc;",
     ] {
         assert!(!kernel_module_paths(text, &private).is_empty(), "{text}");
     }
