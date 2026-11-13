@@ -198,7 +198,7 @@ mod tests {
         let error =
             finish_stop(Some(os_error(ERROR_ACCESS_DENIED)), |_| Wait::TimedOut).unwrap_err();
         assert_eq!(os_code(&error), Some(ERROR_ACCESS_DENIED));
-        assert_eq!(error.to_string(), "cannot terminate selected SAIAI process");
+        assert_eq!(error.to_string(), "cannot terminate selected KTEST process");
     }
 
     #[test]
@@ -222,13 +222,13 @@ mod tests {
             assert_eq!(os_code(&error), Some(6));
             assert_eq!(
                 error.to_string(),
-                "cannot wait for selected SAIAI process to exit"
+                "cannot wait for selected KTEST process to exit"
             );
         }
         let error = finish_stop(None, |_| Wait::TimedOut).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "selected SAIAI process did not exit after termination"
+            "selected KTEST process did not exit after termination"
         );
     }
 

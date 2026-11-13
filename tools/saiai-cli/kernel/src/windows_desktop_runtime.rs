@@ -703,12 +703,12 @@ mod tests {
         for encoded in [
             "TEST_ONLY_PRIVATE_STDOUT",
             "{\"reason\":\"live_actor_inspection_required\",\"category\":\"ObjectNotFound\"}",
-            "SAIAI_DESKTOP_HELPER_FAILURE:{\"reason\":\"TEST_ONLY_PRIVATE\",\"category\":\"ObjectNotFound\"}",
-            "SAIAI_DESKTOP_HELPER_FAILURE:{\"reason\":\"live_actor_inspection_required\",\"category\":\"TEST_ONLY_PRIVATE\"}",
-            "SAIAI_DESKTOP_HELPER_FAILURE:{\"reason\":\"live_actor_inspection_required\",\"category\":\"ObjectNotFound\",\"secret\":\"TEST_ONLY_PRIVATE\"}",
-            "SAIAI_DESKTOP_HELPER_FAILURE:{\"reason\":\"live_actor_inspection_required\"}",
-            "SAIAI_DESKTOP_HELPER_FAILURE:not-json",
-            "SAIAI_DESKTOP_HELPER_FAILURE:{\"reason\":\"live_actor_inspection_required\",\"category\":\"ObjectNotFound\"}\nTEST_ONLY_PRIVATE_STDOUT",
+            "KTEST_DESKTOP_HELPER_FAILURE:{\"reason\":\"TEST_ONLY_PRIVATE\",\"category\":\"ObjectNotFound\"}",
+            "KTEST_DESKTOP_HELPER_FAILURE:{\"reason\":\"live_actor_inspection_required\",\"category\":\"TEST_ONLY_PRIVATE\"}",
+            "KTEST_DESKTOP_HELPER_FAILURE:{\"reason\":\"live_actor_inspection_required\",\"category\":\"ObjectNotFound\",\"secret\":\"TEST_ONLY_PRIVATE\"}",
+            "KTEST_DESKTOP_HELPER_FAILURE:{\"reason\":\"live_actor_inspection_required\"}",
+            "KTEST_DESKTOP_HELPER_FAILURE:not-json",
+            "KTEST_DESKTOP_HELPER_FAILURE:{\"reason\":\"live_actor_inspection_required\",\"category\":\"ObjectNotFound\"}\nTEST_ONLY_PRIVATE_STDOUT",
         ] {
             assert!(helper_failure_diagnostic(encoded.as_bytes()).is_none());
         }
@@ -721,7 +721,7 @@ mod tests {
         let source = include_str!("windows_desktop_inspect.ps1");
         let script = helper_script(source);
         assert!(script.contains(source));
-        assert!(script.contains("[Console]::Out.WriteLine('SAIAI_DESKTOP_HELPER_FAILURE:'"));
+        assert!(script.contains("[Console]::Out.WriteLine('KTEST_DESKTOP_HELPER_FAILURE:'"));
         assert!(script.contains("exit 1"));
         for forbidden in ["Write-Error", "$_ |", "$_.ToString()", "Stop-Process"] {
             assert!(!script.contains(forbidden));
@@ -1430,8 +1430,8 @@ mod tests {
     #[cfg(windows)]
     fn assert_native_private_runtime(directory: &Path) {
         let verified = powershell(
-            r#"$ErrorActionPreference='Stop';$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;$acl=Get-Acl -LiteralPath $env:SAIAI_RUNTIME_DIRECTORY;$rules=@($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]));if($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value -or -not $acl.AreAccessRulesProtected -or $rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $sid.Value -or [string]$rules[0].AccessControlType -ne 'Allow' -or [string]$rules[0].FileSystemRights -ne 'FullControl'){throw 'private_current_user_runtime_required'};'verified'"#,
-            &[("SAIAI_RUNTIME_DIRECTORY", directory.as_os_str())],
+            r#"$ErrorActionPreference='Stop';$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;$acl=Get-Acl -LiteralPath $env:KTEST_RUNTIME_DIRECTORY;$rules=@($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]));if($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value -or -not $acl.AreAccessRulesProtected -or $rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $sid.Value -or [string]$rules[0].AccessControlType -ne 'Allow' -or [string]$rules[0].FileSystemRights -ne 'FullControl'){throw 'private_current_user_runtime_required'};'verified'"#,
+            &[("KTEST_RUNTIME_DIRECTORY", directory.as_os_str())],
         )
         .unwrap();
         assert_eq!(verified.trim(), "verified");
@@ -1457,8 +1457,8 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let directory = parent.path().join("inherited-runtime");
         let created = powershell(
-            r#"$ErrorActionPreference='Stop';try{$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;$security=[Security.AccessControl.DirectorySecurity]::new();$security.SetOwner($sid);$security.SetAccessRuleProtection($false,$true);$security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'));[IO.Directory]::CreateDirectory($env:SAIAI_RUNTIME_DIRECTORY,$security)|Out-Null;[IO.Directory]::SetAccessControl($env:SAIAI_RUNTIME_DIRECTORY,$security);$acl=Get-Acl -LiteralPath $env:SAIAI_RUNTIME_DIRECTORY;if($acl.AreAccessRulesProtected){throw 'inherited_fixture_required'};'created'}catch{'fixture_failed:'+ $_.FullyQualifiedErrorId}"#,
-            &[("SAIAI_RUNTIME_DIRECTORY", directory.as_os_str())],
+            r#"$ErrorActionPreference='Stop';try{$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;$security=[Security.AccessControl.DirectorySecurity]::new();$security.SetOwner($sid);$security.SetAccessRuleProtection($false,$true);$security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'));[IO.Directory]::CreateDirectory($env:KTEST_RUNTIME_DIRECTORY,$security)|Out-Null;[IO.Directory]::SetAccessControl($env:KTEST_RUNTIME_DIRECTORY,$security);$acl=Get-Acl -LiteralPath $env:KTEST_RUNTIME_DIRECTORY;if($acl.AreAccessRulesProtected){throw 'inherited_fixture_required'};'created'}catch{'fixture_failed:'+ $_.FullyQualifiedErrorId}"#,
+            &[("KTEST_RUNTIME_DIRECTORY", directory.as_os_str())],
         )
         .unwrap();
         assert_eq!(created.trim(), "created");
@@ -1526,12 +1526,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn native_observer_rebuilds_only_after_confirmed_actor_exit() {
-        let script = include_str!("windows_desktop_inspect_tests.ps1").replace(
-            "__OBSERVER_SOURCE__",
-            &base64::engine::general_purpose::STANDARD.encode(crate::script_brand::render(
-                include_str!("windows_desktop_inspect.ps1"),
-            )),
-        );
+        let script = crate::script_brand::render(include_str!("windows_desktop_inspect_tests.ps1"))
+            .replace(
+                "__OBSERVER_SOURCE__",
+                &base64::engine::general_purpose::STANDARD.encode(crate::script_brand::render(
+                    include_str!("windows_desktop_inspect.ps1"),
+                )),
+            );
         let output = powershell(&script, &[]).unwrap();
         let cases: Vec<serde_json::Value> = serde_json::from_str(output.trim()).unwrap();
         assert_eq!(cases.len(), 40);

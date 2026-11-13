@@ -10,7 +10,7 @@
 //!
 //! Changing a value strands existing installations of that distribution
 //! (orphaned directories, services, certificates, pins or markers), so the
-//! SAIAI values are frozen by the SAIAI program's contract tests.
+//! each distribution freezes its values in its own contract tests.
 //!
 //! Value constraints (not checked at run time):
 //! - file and directory names are single path components without separators;
@@ -156,10 +156,10 @@ fn uninstalled_brand() -> &'static Brand {
 }
 
 // Unit tests call library functions without going through `run`; they see
-// the SAIAI values, which the golden contract tests expect.
+// the kernel's test brand.
 #[cfg(test)]
 fn uninstalled_brand() -> &'static Brand {
-    &crate::brand_saiai::SAIAI_BRAND
+    &crate::brand_test::KTEST_BRAND
 }
 
 /// `BRAND.field` reads the installed brand (see [`brand`]).
@@ -409,8 +409,8 @@ mod tests {
     /// replaced: plain, padded, debug-quoted and as an error message.
     #[test]
     fn brand_text_prints_like_the_string_it_renders() {
-        const TEXT: BrandText = BrandText(|| "SAIAI \"local\" proxy".to_string());
-        let text = "SAIAI \"local\" proxy";
+        const TEXT: BrandText = BrandText(|| "KTEST \"local\" proxy".to_string());
+        let text = "KTEST \"local\" proxy";
         assert_eq!(format!("{TEXT}"), format!("{text}"));
         assert_eq!(format!("[{TEXT:>30}]"), format!("[{text:>30}]"));
         assert_eq!(format!("{TEXT:?}"), format!("{text:?}"));
@@ -418,70 +418,70 @@ mod tests {
         assert_eq!(format!("{:#}", anyhow::anyhow!(TEXT)), text);
     }
 
-    // A local slot: these tests never touch the process-wide brand (contract
-    // tests install the SAIAI brand there).
+    // A local slot: these tests never touch the process-wide brand, which
+    // other tests in this process may read.
     #[test]
     fn install_accepts_the_same_brand_and_rejects_another_without_overwriting() {
         static OTHER: Brand = Brand {
             binary_name: "other",
-            ..crate::brand_saiai::SAIAI_VALUES
+            ..crate::brand_test::KTEST_VALUES
         };
-        let saiai = &crate::brand_saiai::SAIAI_BRAND;
+        let ktest = &crate::brand_test::KTEST_BRAND;
         let slot = OnceLock::new();
-        install_into(&slot, saiai).unwrap();
-        install_into(&slot, saiai).unwrap();
+        install_into(&slot, ktest).unwrap();
+        install_into(&slot, ktest).unwrap();
         let error = install_into(&slot, &OTHER).unwrap_err();
-        assert!(error.to_string().contains("saiai"), "{error}");
-        assert!(std::ptr::eq(*slot.get().unwrap(), saiai));
+        assert!(error.to_string().contains("ktest"), "{error}");
+        assert!(std::ptr::eq(*slot.get().unwrap(), ktest));
     }
 
     #[test]
     fn an_unsafe_brand_is_rejected_before_it_occupies_the_slot() {
-        use crate::brand_saiai::SAIAI_VALUES;
+        use crate::brand_test::KTEST_VALUES;
         static BAD_DIRECTORY: Brand = Brand {
-            windows_app_dir_name: "SAIAI'; Remove-Item",
-            ..SAIAI_VALUES
+            windows_app_dir_name: "KTEST'; Remove-Item",
+            ..KTEST_VALUES
         };
         static BAD_PREFIX: Brand = Brand {
             scripts: ScriptNames {
                 env_prefix: "SA$AI_",
-                identifier_prefix: "Saiai",
+                identifier_prefix: "Ktest",
             },
-            ..SAIAI_VALUES
+            ..KTEST_VALUES
         };
         static BAD_ENV: Brand = Brand {
             env: EnvironmentNames {
-                home: "SAIAI HOME",
-                ..SAIAI_VALUES.env
+                home: "KTEST HOME",
+                ..KTEST_VALUES.env
             },
-            ..SAIAI_VALUES
+            ..KTEST_VALUES
         };
         // Names embedded verbatim in JSON answers and messages.
         static BAD_PRODUCT: Brand = Brand {
-            product_name: "SAIAI\"}",
-            ..SAIAI_VALUES
+            product_name: "KTEST\"}",
+            ..KTEST_VALUES
         };
         static BAD_BINARY: Brand = Brand {
-            binary_name: "saiai start",
-            ..SAIAI_VALUES
+            binary_name: "ktest start",
+            ..KTEST_VALUES
         };
         static DIGIT_TYPE_NAME: Brand = Brand {
             config: ConfigNames {
                 type_name: "1Config",
-                ..SAIAI_VALUES.config
+                ..KTEST_VALUES.config
             },
-            ..SAIAI_VALUES
+            ..KTEST_VALUES
         };
         static BAD_SYNTHETIC: Brand = Brand {
             placeholders: PlaceholderIdentities {
-                synthetic_id_prefix: "Saiai-local",
-                ..SAIAI_VALUES.placeholders
+                synthetic_id_prefix: "Ktest-local",
+                ..KTEST_VALUES.placeholders
             },
-            ..SAIAI_VALUES
+            ..KTEST_VALUES
         };
         static EMPTY_PRODUCT: Brand = Brand {
             product_name: "",
-            ..SAIAI_VALUES
+            ..KTEST_VALUES
         };
         for brand in [
             &BAD_DIRECTORY,
@@ -498,6 +498,6 @@ mod tests {
             assert!(slot.get().is_none());
         }
         let slot = OnceLock::new();
-        install_into(&slot, &crate::brand_saiai::SAIAI_BRAND).unwrap();
+        install_into(&slot, &crate::brand_test::KTEST_BRAND).unwrap();
     }
 }

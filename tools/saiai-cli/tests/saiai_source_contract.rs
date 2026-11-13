@@ -797,63 +797,409 @@ fn only_the_extension_side_uses_the_client_proof_protocol() {
     }
 }
 
-/// Kernel production lines that still contain `saiai` (any case), one
-/// `file<TAB>line` per occurrence, whitespace collapsed (the SAIAI program's
-/// own sources may name SAIAI). The test requires the list to equal the code
-/// exactly; that it only ever shrinks is enforced by review of this file's
-/// diff, not by the test. Empty since the SAIAI extension left the kernel
-/// (C4c).
-const SAIAI_RESIDUE: &str = include_str!("data/brand_residue.txt");
-
-fn saiai_residue_lines() -> Vec<String> {
-    let mut lines = Vec::new();
-    let kernel = kernel_files();
-    for (file, text) in cli_sources() {
-        if !kernel.contains(&file) {
-            continue;
-        }
-        for line in text.lines() {
-            if line.to_ascii_lowercase().contains("saiai") {
-                let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
-                lines.push(format!("{file}\t{line}"));
+/// Every file below `kernel/`, recursively, and every symbolic link found
+/// there (not followed). A local build directory `kernel/target` is skipped.
+fn kernel_tree() -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
+    fn walk(
+        dir: &Path,
+        top: bool,
+        files: &mut Vec<std::path::PathBuf>,
+        links: &mut Vec<std::path::PathBuf>,
+    ) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let kind = fs::symlink_metadata(&path).unwrap().file_type();
+            if kind.is_symlink() {
+                links.push(path);
+            } else if kind.is_dir() {
+                if !(top && path.file_name().is_some_and(|name| name == "target")) {
+                    walk(&path, false, files, links);
+                }
+            } else {
+                files.push(path);
             }
         }
     }
-    lines.sort();
-    lines
+    let (mut files, mut links) = (Vec::new(), Vec::new());
+    let kernel = Path::new(env!("CARGO_MANIFEST_DIR")).join("kernel");
+    walk(&kernel, true, &mut files, &mut links);
+    files.sort();
+    (files, links)
+}
+
+/// Registered exceptions to the kernel's SAIAI-free rule:
+/// `(path below kernel/, whitespace-collapsed line)`, each with its reason.
+/// Empty: the kernel is distribution-neutral.
+const KERNEL_SAIAI_EXCEPTIONS: &[(&str, &str)] = &[];
+
+/// No file below `kernel/` (code, tests, comments, scripts, manifest) spells
+/// `saiai` in any case: the directory can stand alone as a public
+/// repository, and every SAIAI value reaches the kernel through the brand
+/// and Gateway extension the program passes in.
+///
+/// Hidden files are scanned like any other: they ship with the directory.
+/// If `kernel/` later becomes a git submodule, skip only its git metadata
+/// (the `.git` file or directory), never hidden files in general.
+#[test]
+fn the_kernel_directory_never_names_saiai() {
+    let kernel = Path::new(env!("CARGO_MANIFEST_DIR")).join("kernel");
+    let (files, _) = kernel_tree();
+    assert!(files.iter().any(|file| file.ends_with("Cargo.toml")));
+    assert!(files.iter().any(|file| file.ends_with("lib.rs")));
+    let mut found = Vec::new();
+    for file in &files {
+        let relative = file
+            .strip_prefix(&kernel)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let bytes = fs::read(file).unwrap();
+        if relative.to_ascii_lowercase().contains("saiai") {
+            found.push(format!("{relative}\t(file name)"));
+        }
+        for line in String::from_utf8_lossy(&bytes).lines() {
+            if !line.to_ascii_lowercase().contains("saiai") {
+                continue;
+            }
+            let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !KERNEL_SAIAI_EXCEPTIONS.contains(&(relative.as_str(), line.as_str())) {
+                found.push(format!("{relative}\t{line}"));
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "kernel/ names SAIAI (read the value from Brand, use the test brand in tests):\n{}",
+        found.join("\n")
+    );
+}
+
+/// `"name.ext"`: a plain string literal naming a sibling file (letters,
+/// digits, `_`, `-`, `.`, not only dots).
+fn sibling_name(token: &proc_macro2::TokenTree) -> Option<String> {
+    let proc_macro2::TokenTree::Literal(literal) = token else {
+        return None;
+    };
+    let text = literal.to_string();
+    let name = text.strip_prefix('"')?.strip_suffix('"')?;
+    let plain = !name.is_empty()
+        && !name.chars().all(|ch| ch == '.')
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'));
+    plain.then(|| name.to_string())
+}
+
+/// An identifier's name without a raw `r#` prefix.
+fn ident_name(ident: &proc_macro2::Ident) -> String {
+    let text = ident.to_string();
+    text.strip_prefix("r#").unwrap_or(&text).to_string()
+}
+
+fn is_ident(token: Option<&proc_macro2::TokenTree>, name: &str) -> bool {
+    matches!(token, Some(proc_macro2::TokenTree::Ident(ident)) if ident_name(ident) == name)
+}
+
+fn is_punct(token: Option<&proc_macro2::TokenTree>, ch: char) -> bool {
+    matches!(token, Some(proc_macro2::TokenTree::Punct(punct)) if punct.as_char() == ch)
+}
+
+fn is_group(token: Option<&proc_macro2::TokenTree>, delimiter: proc_macro2::Delimiter) -> bool {
+    matches!(token, Some(proc_macro2::TokenTree::Group(group)) if group.delimiter() == delimiter)
+}
+
+/// Whether the item starting at `tokens[at]` (outer attributes skipped) is
+/// an inline `mod name { ... }`.
+fn is_inline_module(tokens: &[proc_macro2::TokenTree], mut at: usize) -> bool {
+    use proc_macro2::Delimiter::{Brace, Bracket, Parenthesis};
+    while is_punct(tokens.get(at), '#') && is_group(tokens.get(at + 1), Bracket) {
+        at += 2;
+    }
+    if is_ident(tokens.get(at), "pub") {
+        at += 1;
+        if is_group(tokens.get(at), Parenthesis) {
+            at += 1;
+        }
+    }
+    is_ident(tokens.get(at), "mod") && is_group(tokens.get(at + 2), Brace)
+}
+
+/// `path = ...` values inside one attribute body (any depth, so
+/// `cfg_attr(..., path = ...)` counts). `inline` is whether the attribute
+/// annotates an inline module.
+fn attribute_paths(
+    body: proc_macro2::TokenStream,
+    inline: bool,
+    found: &mut Vec<Result<String, String>>,
+) {
+    let tokens: Vec<_> = body.into_iter().collect();
+    for (index, token) in tokens.iter().enumerate() {
+        if let proc_macro2::TokenTree::Group(group) = token {
+            attribute_paths(group.stream(), inline, found);
+        }
+        if is_ident(Some(token), "path") && is_punct(tokens.get(index + 1), '=') {
+            let value = tokens.get(index + 2);
+            let name = value
+                .and_then(sibling_name)
+                .filter(|name| name.ends_with(".rs") && !inline);
+            found.push(name.ok_or_else(|| {
+                format!(
+                    "path = {}{}",
+                    value.map(ToString::to_string).unwrap_or_default(),
+                    if inline { " on an inline module" } else { "" }
+                )
+            }));
+        }
+    }
+}
+
+/// Whether `stream` contains a `$` (a `macro_rules!` metavariable).
+fn has_metavariable(stream: proc_macro2::TokenStream) -> bool {
+    stream.into_iter().any(|token| match token {
+        proc_macro2::TokenTree::Punct(punct) => punct.as_char() == '$',
+        proc_macro2::TokenTree::Group(group) => has_metavariable(group.stream()),
+        _ => false,
+    })
+}
+
+/// The kernel's own `macro_rules!` macros, name and exact rules. A macro can
+/// take apart the tokens it is given and rebuild them (keep a checked
+/// `include_str!` name, swap its argument), which no token scan can follow;
+/// a new macro is reviewed and registered here instead.
+const KERNEL_MACROS: &[(&str, &str)] = &[(
+    "eprintln",
+    "{ ($($arg:tt)*) => { ::std::eprintln!(\"[{}] {}\", chrono::Utc::now().to_rfc3339(), format_args!($($arg)*)); }; }",
+)];
+
+fn token_references(tokens: &[proc_macro2::TokenTree], found: &mut Vec<Result<String, String>>) {
+    use proc_macro2::Delimiter::Bracket;
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            proc_macro2::TokenTree::Punct(punct) if punct.as_char() == '#' => {
+                let mut at = index + 1;
+                if is_punct(tokens.get(at), '!') {
+                    at += 1;
+                }
+                // A `#` that does not start a complete attribute (`# $tokens`,
+                // a `#` passed to a macro) or an attribute a macro assembles
+                // (`#[$attr]`) could carry a `path` this scan cannot see.
+                if !is_group(tokens.get(at), Bracket) {
+                    found.push(Err("# without an attribute body".to_string()));
+                } else if let Some(proc_macro2::TokenTree::Group(group)) = tokens.get(at)
+                    && group.delimiter() == Bracket
+                {
+                    if has_metavariable(group.stream()) {
+                        found.push(Err(format!("#{group} (macro-generated attribute)")));
+                    }
+                    let inline = is_inline_module(tokens, at + 1);
+                    attribute_paths(group.stream(), inline, found);
+                }
+            }
+            proc_macro2::TokenTree::Ident(ident)
+                if ident_name(ident) == "macro_rules" && is_punct(tokens.get(index + 1), '!') =>
+            {
+                let registered = match (tokens.get(index + 2), tokens.get(index + 3)) {
+                    (
+                        Some(proc_macro2::TokenTree::Ident(name)),
+                        Some(proc_macro2::TokenTree::Group(rules)),
+                    ) => KERNEL_MACROS.iter().any(|(known, text)| {
+                        ident_name(name) == *known
+                            && text
+                                .parse::<proc_macro2::TokenStream>()
+                                .unwrap()
+                                .to_string()
+                                == proc_macro2::TokenStream::from(proc_macro2::TokenTree::Group(
+                                    rules.clone(),
+                                ))
+                                .to_string()
+                    }),
+                    _ => false,
+                };
+                if !registered {
+                    found.push(Err(format!(
+                        "macro_rules! {} (not registered in KERNEL_MACROS)",
+                        tokens
+                            .get(index + 2)
+                            .map(ToString::to_string)
+                            .unwrap_or_default()
+                    )));
+                }
+            }
+            // These names may appear only as a direct call (never passed to
+            // another macro, aliased or imported, which this scan cannot follow).
+            proc_macro2::TokenTree::Ident(ident)
+                if ["include", "include_str", "include_bytes"]
+                    .contains(&ident_name(ident).as_str()) =>
+            {
+                let call = is_punct(tokens.get(index + 1), '!');
+                let argument = match tokens.get(index + 2) {
+                    Some(proc_macro2::TokenTree::Group(group))
+                        if call && ident_name(ident) != "include" =>
+                    {
+                        let inner: Vec<_> = group.stream().into_iter().collect();
+                        match inner.as_slice() {
+                            [only] => sibling_name(only),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                found.push(argument.ok_or_else(|| {
+                    format!(
+                        "{ident}!{}",
+                        tokens
+                            .get(index + 2)
+                            .map(ToString::to_string)
+                            .unwrap_or_default()
+                    )
+                }));
+            }
+            _ => {}
+        }
+        if let proc_macro2::TokenTree::Group(group) = token {
+            // A bracket that is not an attribute body may still become one:
+            // a macro can keep a `#` and swap the bracket after it. So its
+            // `path = ...` follows the attribute rule, and a macro-built
+            // bracket (`[$tokens]`) is refused.
+            let before = |back: usize| index.checked_sub(back).and_then(|i| tokens.get(i));
+            let attribute_body =
+                is_punct(before(1), '#') || (is_punct(before(1), '!') && is_punct(before(2), '#'));
+            if group.delimiter() == Bracket && !attribute_body {
+                if has_metavariable(group.stream()) {
+                    found.push(Err(format!("{group} (macro-generated bracket)")));
+                }
+                let mut paths = Vec::new();
+                attribute_paths(group.stream(), false, &mut paths);
+                found.extend(paths);
+            }
+            // Every group, attribute bodies included: function bodies, macro
+            // arguments (`format!(.., include_str!(..))`), `#[doc = include_str!(..)]`.
+            token_references(&group.stream().into_iter().collect::<Vec<_>>(), found);
+        }
+    }
+}
+
+/// File references in Rust source `text`, read from its tokens (comments
+/// and the contents of string literals are not code): every `include!`,
+/// `include_str!` and `include_bytes!` call and every `path = ...` inside an
+/// attribute (`#[path]`, `#[cfg_attr(..., path = ...)]`). `Ok(name)` is a
+/// sibling file name (a `.rs` file for `path`); `Err(form)` is anything else
+/// (another directory, escapes, raw strings, computed paths, `include!`, or
+/// a `path` on an inline module), which the kernel does not use. Source that
+/// does not lex is one `Err`.
+fn file_references(text: &str) -> Vec<Result<String, String>> {
+    let mut found = Vec::new();
+    match text.parse::<proc_macro2::TokenStream>() {
+        Ok(stream) => token_references(&stream.into_iter().collect::<Vec<_>>(), &mut found),
+        Err(error) => found.push(Err(format!("does not lex: {error}"))),
+    }
+    found
+}
+
+/// Kernel sources reference only sibling files inside `kernel/` (plain
+/// file-name literals, no directories, escapes or computed paths), and
+/// `kernel/` holds no symbolic links, so the directory builds and tests on
+/// its own.
+#[test]
+fn kernel_sources_reference_no_file_outside_the_kernel() {
+    let (files, links) = kernel_tree();
+    assert!(links.is_empty(), "symbolic links in kernel/: {links:?}");
+    let mut checked = 0;
+    for file in files {
+        if file.extension().is_none_or(|extension| extension != "rs") {
+            continue;
+        }
+        let text = fs::read_to_string(&file).unwrap();
+        for reference in file_references(&text) {
+            checked += 1;
+            match reference {
+                Ok(name) if file.parent().unwrap().join(&name).is_file() => {}
+                Ok(name) => panic!("{} references missing file {name:?}", file.display()),
+                Err(form) => panic!(
+                    "{} uses a file reference the kernel does not allow (only sibling file-name literals): {form}",
+                    file.display()
+                ),
+            }
+        }
+    }
+    // The kernel embeds its helper scripts with include_str! and its split
+    // modules with #[path].
+    assert!(checked > 0);
 }
 
 #[test]
-fn saiai_names_outside_the_brand_only_shrink() {
-    let mut expected: Vec<String> = SAIAI_RESIDUE
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect();
-    expected.sort();
-    let actual = saiai_residue_lines();
-    let added: Vec<_> = actual
-        .iter()
-        .filter(|line| !expected.contains(line))
-        .collect();
-    let removed: Vec<_> = expected
-        .iter()
-        .filter(|line| !actual.contains(line))
-        .collect();
-    assert!(
-        added.is_empty() && removed.is_empty() && actual == expected,
-        "SAIAI name residue changed.\nNew (read the value from Brand instead):\n{}\nGone (delete from brand_residue.txt):\n{}",
-        added
-            .iter()
-            .map(|line| line.as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        removed
-            .iter()
-            .map(|line| line.as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
+fn kernel_file_reference_scanner_sees_every_form() {
+    let allowed = r##"
+#[path = "y.rs"]
+mod y;
+#[cfg(test)]
+#[path="z_tests.rs"] pub(crate) mod z;
+const A: &str = include_str!("a.ps1");
+const B: &[u8] = include_bytes! ( "b.js" );
+fn f() { let _ = format!("{}", include_str!("c.txt")); }
+my_include_str!("ignored");
+fn g() { let path = "../ignored"; }
+// include_str!("../comment") and #[path = "../comment.rs"]
+/* #[path = "../block.rs"] */
+const EXAMPLE: &str = r#"#[path = "../../example.rs"]"#;
+#[doc = "the path = value"]
+mod documented;
+"##;
+    assert_eq!(
+        file_references(allowed),
+        vec![
+            Ok("y.rs".to_string()),
+            Ok("z_tests.rs".to_string()),
+            Ok("a.ps1".to_string()),
+            Ok("b.js".to_string()),
+            Ok("c.txt".to_string()),
+        ]
     );
+    for refused in [
+        "#[path = \"../../src/x.rs\"]\nmod x;",
+        "#[ path = \"../../outside.rs\"]\nmod x;",
+        "#[path/**/= \"../../outside.rs\"]\nmod x;",
+        "#[cfg_attr(unix, path = \"../outside.rs\")]\nmod x;",
+        "#[cfg_attr(test, doc = r#\"\" ]\"#, path = \"../../outside.rs\")]\nmod x;",
+        "#[path = \"fragment.inc\"]\nmod fragment;",
+        "#[path = \"x.rs\"]\nmod x { }",
+        "#[path = \"x.rs\"]\n#[doc = \"]\"]\nmod x {}",
+        "#[path = \"x.rs\"]\npub (crate) mod x {}",
+        "#[path = \"..\"]\nmod inner {\n}",
+        "const X: &str = include_str ! (\"../../outside.txt\");",
+        "const X: &str = include_str/**/!(\"../../outside.txt\");",
+        "const X: &str = include_str!(\"..\\x2f..\\x2foutside.txt\");",
+        "const X: &str = include_str!(r\"outside.txt\");",
+        "const X: &[u8] = include_bytes!(concat!(env!(\"OUT_DIR\"), \"/c\"));",
+        "include!(\"fragment.rs\");",
+        "const X: &str = include_str!(\"sub/x.txt\");",
+        "const X: &str = include_str!(\"..\");",
+        "fn f() { g(include_str!(\"../x\")); }",
+        "#[doc = include_str!(\"../../outside.md\")]\npub struct Example;",
+        "#[cfg_attr(doc, doc = include_str!(\"../outside.md\"))]\npub struct Example;",
+        "const X: &str = r#include_str!(\"../../outside.txt\");",
+        "#[r#path = \"../outside.rs\"]\nmod x;",
+        "macro_rules! load { ($r:ident, $f:literal) => { $r!($f) }; }\nconst X: &str = load!(include_str, \"../../outside.txt\");",
+        "use std::include_str as read;\nconst X: &str = read!(\"../x\");",
+        "macro_rules! m { ($a:meta) => { #[$a] mod outside; }; }\nm!(path = \"../../outside.rs\");",
+        "macro_rules! m { ($($a:tt)*) => { # $($a)* mod outside; }; }\nm!([path = \"../../outside.rs\"]);",
+        "macro_rules! m { ($p:literal) => { #[path = $p] mod outside; }; }\nm!(\"../../outside.rs\");",
+        "macro_rules! m { ($($t:tt)*) => { $($t)* }; }\nm!(#[path = \"../outside.rs\"] mod outside;);",
+        "const X: &[u8] = ::core::include_bytes!(\"../x\");",
+        "macro_rules! m { ($h:tt) => { $h [path = \"../../outside.rs\"] mod outside; }; }\nm!(#);",
+        "macro_rules! m { ($h:tt $d:tt) => { $h [path = \"../../outside.rs\"] mod outside; }; }\nm!(#[doc = \"placeholder\"]);",
+        "macro_rules! m { ($h:tt $d:tt $p:ident) => { $h [$p = \"../../outside.rs\"] mod outside; }; }\nm!(#[doc = \"x\"] path);",
+        "macro_rules! m { ($h:tt $d:tt $b:tt) => { $h $b mod outside; }; }\nm!(#[doc = \"x\"] [path = \"../../outside.rs\"]);",
+        "macro_rules! load { ($r:ident ! $d:tt) => { $r!(\"../../outside.txt\") }; }\nconst T: &str = load!(include_str!(\"lib.rs\"));",
+        "macro_rules! eprintln { ($($arg:tt)*) => { include_str!($($arg)*) }; }",
+        "const X: &str = \"unterminated;",
+    ] {
+        let references = file_references(refused);
+        assert!(
+            references.iter().any(Result::is_err),
+            "{refused}: {references:?}"
+        );
+    }
 }
 
 #[test]

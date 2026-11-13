@@ -1,5 +1,5 @@
-//! `saiai uninstall`: a read-only discovery builds the plan; execution removes
-//! only SAIAI-created files and values exactly equal to what SAIAI wrote.
+//! `uninstall`: a read-only discovery builds the plan; execution removes
+//! only files the program created and values exactly equal to what it wrote.
 use crate::brand::{BRAND, BrandText, BrandValue};
 use crate::{environment_scope, vscode};
 use anyhow::{Context, Result, bail};
@@ -300,7 +300,7 @@ struct Instance {
     ca_cert: Option<String>,
     claude_keys: Vec<String>,
     matched: bool,
-    /// config.json exists; `has_config` when it is a SAIAI configuration.
+    /// config.json exists; `has_config` when it is a configuration of this program.
     config_present: bool,
     has_config: bool,
     product_dir: Option<PathBuf>,
@@ -571,7 +571,7 @@ fn read_instance(
     instance
 }
 
-/// Fields every SAIAI config.json carries (version 2, or the version-less v1 shape).
+/// Fields every config.json of this program carries (version 2, or the version-less v1 shape).
 fn is_app_config(config: &Value) -> bool {
     let text = |key: &str| config.get(key).is_some_and(Value::is_string);
     config.is_object()
@@ -586,8 +586,8 @@ fn is_app_config(config: &Value) -> bool {
         }
 }
 
-/// An `environments/<name>` directory SAIAI created: a real directory holding
-/// a SAIAI config.json, or only the product-dir record.
+/// An `environments/<name>` directory the program created: a real directory
+/// holding its config.json, or only the product-dir record.
 fn owned_environment(instance: &Instance) -> bool {
     if !fs::symlink_metadata(&instance.dir).is_ok_and(|meta| meta.is_dir()) {
         return false;
@@ -595,7 +595,7 @@ fn owned_environment(instance: &Instance) -> bool {
     if instance.has_config {
         return true;
     }
-    // Without a config, only an environment holding nothing but SAIAI files.
+    // Without a config, only an environment holding nothing but program files.
     let Ok(entries) = fs::read_dir(&instance.dir) else {
         return false;
     };
@@ -665,7 +665,7 @@ fn build_plan(discovery: &Discovery, args: &Args) -> Result<Plan> {
             );
         }
     }
-    // Its config.json is the only evidence of what SAIAI wrote into that
+    // Its config.json is the only evidence of what the program wrote into that
     // project, so keep it unless the user explicitly gives up on the project.
     for instance in discovery
         .instances
@@ -2008,7 +2008,7 @@ fn plan_windows_certificates(
                 .dir
                 .join(crate::WINDOWS_PACKAGED_PROXY_LEASE_FILENAME),
         ] {
-            // The lease's directories below SAIAI home must not be links.
+            // The lease's directories below the program home must not be links.
             if lease
                 .ancestors()
                 .skip(1)
@@ -2851,23 +2851,23 @@ mod tests {
 
     fn owned() -> ClaudeOwned {
         ClaudeOwned {
-            api_keys: vec!["TEST_ONLY_SAIAI_CLAUDE_KEY".into()],
+            api_keys: vec!["TEST_ONLY_KTEST_CLAUDE_KEY".into()],
             proxies: vec!["http://127.0.0.1:41000".into()],
-            ca_paths: vec!["/home/u/.claude/saiai-ca.crt".into()],
+            ca_paths: vec!["/home/u/.claude/ktest-ca.crt".into()],
         }
     }
 
     #[test]
-    fn claude_env_removes_only_exact_saiai_values() {
+    fn claude_env_removes_only_exact_program_values() {
         let settings = json!({
             "theme": "dark",
             "env": {
-                "CLAUDE_CODE_OAUTH_TOKEN": "TEST_ONLY_SAIAI_CLAUDE_KEY",
+                "CLAUDE_CODE_OAUTH_TOKEN": "TEST_ONLY_KTEST_CLAUDE_KEY",
                 "http_proxy": "http://127.0.0.1:41000",
                 "https_proxy": "http://127.0.0.1:7890",
                 "all_proxy": "http://127.0.0.1:41000",
                 "no_proxy": crate::DEFAULT_NO_PROXY,
-                "NODE_EXTRA_CA_CERTS": "/home/u/.claude/saiai-ca.crt",
+                "NODE_EXTRA_CA_CERTS": "/home/u/.claude/ktest-ca.crt",
                 "ENABLE_TOOL_SEARCH": "true",
                 "USER_VALUE": "1"
             }
@@ -2900,7 +2900,7 @@ mod tests {
 
     #[test]
     fn claude_env_object_is_removed_only_when_empty() {
-        let settings = json!({"env": {"CLAUDE_CODE_OAUTH_TOKEN": "TEST_ONLY_SAIAI_CLAUDE_KEY"}});
+        let settings = json!({"env": {"CLAUDE_CODE_OAUTH_TOKEN": "TEST_ONLY_KTEST_CLAUDE_KEY"}});
         let removal = claude_settings_removal(settings.as_object().unwrap(), &owned());
         assert_eq!(Value::Object(removal.settings), json!({}));
         let foreign = json!({"env": {"CLAUDE_CODE_OAUTH_TOKEN": "TEST_ONLY_USER_TOKEN"}});
@@ -3026,93 +3026,93 @@ mod tests {
 
     #[test]
     fn user_path_filter_removes_only_the_default_directory() {
-        let dir = r"C:\Users\u\AppData\Local\SAIAI\bin";
+        let dir = r"C:\Users\u\AppData\Local\KTEST\bin";
         assert_eq!(
             remove_path_entries(
-                r"C:\Tools;c:\users\U\appdata\local\saiai\BIN\;%USERPROFILE%\bin",
+                r"C:\Tools;c:\users\U\appdata\local\ktest\BIN\;%USERPROFILE%\bin",
                 dir
             ),
             Some(r"C:\Tools;%USERPROFILE%\bin".into())
         );
         assert_eq!(remove_path_entries(dir, dir), Some(String::new()));
         assert_eq!(
-            remove_path_entries(r"C:\Tools;;C:\Users\u\AppData\Local\SAIAI\bin2", dir),
+            remove_path_entries(r"C:\Tools;;C:\Users\u\AppData\Local\KTEST\bin2", dir),
             None
         );
     }
 
     #[test]
-    fn install_directory_filter_matches_only_saiai_program_files() {
+    fn install_directory_filter_matches_only_program_files() {
         for name in [
-            "saiai",
-            "saiai.exe",
-            "saiai-previous",
-            "saiai-previous.exe",
-            "saiai.bak-20261030-010203",
-            "saiai.bak-20261030-010203.exe",
-            ".saiai-update-1-2.exe",
-            ".saiai-update-status.txt",
-            ".saiai.install.AbC123",
-            ".saiai.replace.0123.bak",
+            "ktest",
+            "ktest.exe",
+            "ktest-previous",
+            "ktest-previous.exe",
+            "ktest.bak-20261030-010203",
+            "ktest.bak-20261030-010203.exe",
+            ".ktest-update-1-2.exe",
+            ".ktest-update-status.txt",
+            ".ktest.install.AbC123",
+            ".ktest.replace.0123.bak",
         ] {
             assert!(is_program_file(name), "{name}");
         }
         for name in [
             "claude",
-            "saiai-other",
-            "saiai.sh",
-            "my-saiai",
-            ".saiai",
-            "saiai.bak",
+            "ktest-other",
+            "ktest.sh",
+            "my-ktest",
+            ".ktest",
+            "ktest.bak",
         ] {
             assert!(!is_program_file(name), "{name}");
         }
     }
 
     #[test]
-    fn saiai_home_filter_matches_only_known_files() {
+    fn program_home_filter_matches_only_known_files() {
         for name in [
             "config.json",
             "config.json.bak-20261030-010203",
-            "saiai-ca.key.bak-1",
+            "ktest-ca.key.bak-1",
             "test-gateway-state.json.bak-1",
-            ".test-gateway-state.json.saiai-tmp-1-abc",
-            ".config.json.saiai-tmp-1-abc",
-            "saiai.log",
+            ".test-gateway-state.json.ktest-tmp-1-abc",
+            ".config.json.ktest-tmp-1-abc",
+            "ktest.log",
         ] {
             assert!(is_app_home_file(name), "{name}");
         }
         for name in ["notes.txt", "config.json.orig", "environments", "desktop"] {
             assert!(!is_app_home_file(name), "{name}");
         }
-        assert!(is_claude_ca_file("saiai-ca.crt.bak-1"));
+        assert!(is_claude_ca_file("ktest-ca.crt.bak-1"));
         assert!(!is_claude_ca_file("settings.json"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn service_file_names_follow_the_saiai_pattern() {
-        assert!(is_service_file_name("saiai.service", "saiai", ".service"));
+    fn service_file_names_follow_the_program_pattern() {
+        assert!(is_service_file_name("ktest.service", "ktest", ".service"));
         assert!(is_service_file_name(
-            "saiai-0123456789abcdef01234567.service",
-            "saiai",
+            "ktest-0123456789abcdef01234567.service",
+            "ktest",
             ".service"
         ));
         assert!(!is_service_file_name(
-            "saiai-other.service",
-            "saiai",
+            "ktest-other.service",
+            "ktest",
             ".service"
         ));
-        assert!(!is_service_file_name("saiaix.service", "saiai", ".service"));
+        assert!(!is_service_file_name("ktestx.service", "ktest", ".service"));
         assert!(is_service_file_name(
-            "top.saiai.local-proxy.plist",
-            "top.saiai.local-proxy",
+            "invalid.ktest.local-proxy.plist",
+            "invalid.ktest.local-proxy",
             ".plist"
         ));
     }
 
     #[test]
-    fn saiai_configuration_shapes_are_recognized() {
+    fn program_configuration_shapes_are_recognized() {
         for config in [
             json!({"version": 2, "listen": "127.0.0.1:1", "ca_cert_path": "/ca", "base_url": "u", "api_key": "k"}),
             json!({"version": 1, "listen": "127.0.0.1:1", "ca_cert_path": "/ca"}),

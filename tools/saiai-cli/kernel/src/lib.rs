@@ -30,12 +30,9 @@ use url::Url;
 use uuid::Uuid;
 
 mod brand;
-// TRANSITIONAL — MUST BE REMOVED BEFORE THE KERNEL LEAVES THIS REPOSITORY
-// (C4d switches unit tests to a neutral test brand): unit tests include the
-// SAIAI program's brand values, outside this package, as the fallback brand.
+// The kernel's test brand (unit-test fallback brand).
 #[cfg(test)]
-#[path = "../../src/brand_saiai.rs"]
-mod brand_saiai;
+mod brand_test;
 mod claude_desktop;
 mod claude_desktop_fixtures;
 mod claude_launcher;
@@ -131,7 +128,7 @@ const DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12
 const LEGACY_DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local,downloads.claude.ai";
 const CONFIG_FILENAME: BrandValue<&'static str> = BrandValue(|brand| brand.config.filename);
 
-// `saiai codex` owns these variables only in the Codex child process. The
+// The `codex` command owns these variables only in the Codex child process. The
 // invoking shell and the user's system environment are never modified.
 const CODEX_MANAGED_ENV: &[&str] = &[
     "OPENAI_API_KEY",
@@ -183,7 +180,7 @@ const CHATGPT_TIMEZONE_ENV: BrandValue<&'static str> =
 
 // Codex >= 0.163.0 omits the machine timezone and current date from the
 // model-visible <environment_context> only when this top-level key is false.
-// SAIAI manages it in every Codex profile it prepares.
+// The program manages it in every Codex profile it prepares.
 const CODEX_ENVIRONMENT_CONTEXT_TIME_KEY: &str = "include_environment_context_time";
 
 // Remove stale routing, authentication, model, proxy, and CA values before
@@ -692,7 +689,7 @@ fn generate_installation_ca() -> Result<(String, String)> {
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let mut distinguished_name = DistinguishedName::new();
     // A per-installation suffix keeps a regenerated CA from sharing its
-    // subject name with a stale SAIAI CA left in an OS trust store.
+    // subject name with a stale installation CA of this program left in an OS trust store.
     let suffix: String = Sha256::digest(key.public_key_der())[..4]
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -1044,7 +1041,7 @@ fn codex_proxy_gateway_root(base_url: &str) -> Result<String> {
     Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
-/// Launch the real Codex executable with a child-only SAIAI proxy environment.
+/// Launch the real Codex executable with a child-only local proxy environment.
 ///
 /// This mode deliberately keeps Codex's built-in OpenAI provider and ChatGPT
 /// OAuth credential. The local proxy changes the network route and performs
@@ -1369,7 +1366,7 @@ struct StrippedCodexIdeEnv {
 }
 
 /// Remove only the managed BEGIN/END block lines, byte-for-byte preserving the
-/// rest. The blank separator SAIAI writes before a trailing block goes too.
+/// rest. The blank separator the program writes before a trailing block goes too.
 fn strip_codex_ide_env_block(raw: &str) -> StrippedCodexIdeEnv {
     let lines = raw.split_inclusive('\n').collect::<Vec<_>>();
     let mut keep = vec![true; lines.len()];
@@ -1493,14 +1490,14 @@ fn codex_launcher_args(args: &[String]) -> Vec<String> {
     }
     // Codex defaults OTEL metrics to its hosted Statsig endpoint at
     // ab.chatgpt.com. That non-model control plane can be unreachable on the
-    // same networks that require SAIAI and should not delay or add errors to
+    // same networks that require this proxy and should not delay or add errors to
     // a local-proxy model session. Keep this child-only and honor an explicit
     // caller override.
     if !codex_args_override_config_key(args, "otel.metrics_exporter") {
         launch_args.push("-c".to_string());
         launch_args.push("otel.metrics_exporter=\"none\"".to_string());
     }
-    // A synthetic SAIAI identity cannot authenticate Codex's hosted Apps MCP
+    // The synthetic local identity cannot authenticate Codex's hosted Apps MCP
     // endpoint. Disable that optional control plane for this launcher so it
     // does not emit a misleading startup failure. A caller can explicitly
     // re-enable it and that later argument wins.
@@ -1522,7 +1519,7 @@ fn codex_launcher_args(args: &[String]) -> Vec<String> {
 fn codex_respect_system_proxy_enabled() -> bool {
     // On Windows and macOS the feature gives platform system-proxy discovery
     // precedence over HTTP_PROXY/HTTPS_PROXY. A DIRECT system decision
-    // therefore bypasses the child-only SAIAI proxy environment. Reqwest and
+    // therefore bypasses the child-only local proxy environment. Reqwest and
     // Tungstenite both honor those variables in transport-default mode.
     // Linux has no platform resolver, so the feature only falls back to the
     // same variables there; keep it off too, because Codex 0.167+ lists
@@ -1591,11 +1588,11 @@ fn codex_args_override_config_key(args: &[String], expected_key: &str) -> bool {
 enum ExistingCodexAuth {
     /// Keep it; warn when its access token has expired.
     Keep,
-    /// `saiai init-codex`: back up and replace it once its access token has
+    /// `init-codex`: back up and replace it once its access token has
     /// expired. Desktop shows its sign-in page when the refresh token behind
-    /// an expired login has been revoked, and SAIAI cannot check that offline.
+    /// an expired login has been revoked, and the program cannot check that offline.
     ReplaceExpired,
-    /// Always write the SAIAI placeholder.
+    /// Always write the local placeholder.
     Replace,
 }
 
@@ -1672,7 +1669,7 @@ fn write_codex_local_proxy_auth_at(
 
     auth.insert(
         "auth_mode".to_string(),
-        // Codex owns refresh-token rotation in `chatgpt` mode. SAIAI's
+        // Codex owns refresh-token rotation in `chatgpt` mode. The program's
         // synthetic local identity is supplied by an external host and must
         // never be sent to the provider refresh endpoint, so use Codex's
         // dedicated external-token mode instead.
@@ -1921,7 +1918,7 @@ fn run_linux_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
     for name in CODEX_MANAGED_ENV {
         command.env_remove(*name);
     }
-    // Do not pass the SAIAI control variable into Electron. If configured,
+    // Do not pass the program's control variable into Electron. If configured,
     // apply the validated IANA timezone only to this Desktop child process.
     command.env_remove(CHATGPT_TIMEZONE_ENV.get());
     command
@@ -2029,7 +2026,7 @@ fn run_macos_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
     let mut command = ProcessCommand::new(&executable);
     command.args(launch_args);
     // See the Linux launcher: Desktop diagnostics must not inherit a fragile
-    // terminal pipe from the SAIAI wrapper.
+    // terminal pipe from the program's wrapper.
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2473,8 +2470,8 @@ fn run_windows_packaged_desktop(
         Ok(Some(warning)) => eprintln!("WARN {warning}"),
         Err(err) => eprintln!("WARN could not check the Codex login expiry: {err:#}"),
     }
-    // The packaged Desktop reads the standard profile that `saiai init-codex`
-    // and `saiai vscode` prepare; this launcher never rewrites it. Point at the
+    // The packaged Desktop reads the standard profile that the `init-codex`
+    // and `vscode` commands prepare; this launcher never rewrites it. Point at the
     // fix instead of silently launching with Codex time reporting enabled.
     if !matches!(
         read_codex_environment_context_time(&codex_home.join("config.toml")),
@@ -3351,7 +3348,7 @@ fn copy_real_codex_oauth_auth(source: &Path, target: &Path) -> Result<bool> {
         .unwrap_or("");
     // API-key-only legacy auth is a valid source for Desktop local-proxy
     // mode. It has no OAuth token to copy; the caller will create an isolated
-    // SAIAI placeholder instead of requiring `saiai codex` first.
+    // local placeholder instead of requiring the `codex` command first.
     if access_token.trim().is_empty()
         || is_codex_placeholder_access_token(access_token)
         || codex_access_token_is_expired(access_token, Utc::now().timestamp())
@@ -3785,7 +3782,7 @@ struct AppConfig {
     #[serde(default = "default_true")]
     desktop_browser_use: bool,
     /// `system` (default when absent), `direct`, or an http:// proxy URL for
-    /// SAIAI's own egress; see `upstream_proxy`.
+    /// the program's own egress; see `upstream_proxy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     upstream_proxy: Option<String>,
     #[serde(default)]
@@ -5132,7 +5129,7 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
         format!("{} {} ({target:?})", BRAND.binary_name, runtime::version()),
     );
     check_current_binary(&mut report);
-    // These checks apply Claude Code's conflict rules; SAIAI-managed Codex
+    // These checks apply Claude Code's conflict rules; program-managed Codex
     // launchers set their own child-only routing environment.
     if check_claude {
         check_process_env_conflicts(&mut report);
@@ -6367,8 +6364,8 @@ fn check_codex_environment_context_time(report: &mut DoctorReport, codex_dir: &P
     }
 }
 
-// Another SAIAI CA left trusted in a Windows root store is harmless for
-// leaves that carry an authority key identifier, but older SAIAI leaves did
+// Another installation CA of this program left trusted in a Windows root store is harmless for
+// leaves that carry an authority key identifier, but older leaves did
 // not, and clients that build chains by subject name then fail with a
 // signature error. Report it; removal stays a user decision.
 /// Lists root CAs whose subject carries this brand's CA organization.
@@ -9359,7 +9356,7 @@ base_url = "https://third-party.example/v1"
 
 [model_providers.OpenAI]
 name = "Old OpenAI"
-base_url = "https://test.saiai.top"
+base_url = "https://test.ktest.test"
 wire_api = "chat"
 env_key = "OPENAI_API_KEY"
 experimental_bearer_token = "stale-token"
@@ -9433,11 +9430,11 @@ requires_openai_auth = true
             "USER_SETTING=keep\nHTTP_PROXY=http://127.0.0.1:19908\n",
         );
         let proxy_init = CodexLocalProxyInit {
-            config_path: codex.path().join("saiai-config.json"),
+            config_path: codex.path().join("ktest-config.json"),
             config_changed: true,
             listen: "127.0.0.1:31234".to_string(),
-            ca_cert_path: PathBuf::from("/tmp/saiai-ca.crt"),
-            ca_key_path: PathBuf::from("/tmp/saiai-ca.key"),
+            ca_cert_path: PathBuf::from("/tmp/ktest-ca.crt"),
+            ca_key_path: PathBuf::from("/tmp/ktest-ca.key"),
         };
 
         let initialized = configure_codex_oauth_local_proxy(codex.path(), &proxy_init).unwrap();
@@ -9571,8 +9568,8 @@ include_environment_context_time = true
     #[test]
     fn scopes_direct_desktop_nss_database_to_the_current_user_home() {
         assert_eq!(
-            nss_database_dir(Path::new("/tmp/saiai-user")),
-            PathBuf::from("/tmp/saiai-user/.pki/nssdb")
+            nss_database_dir(Path::new("/tmp/ktest-user")),
+            PathBuf::from("/tmp/ktest-user/.pki/nssdb")
         );
     }
 
@@ -9599,12 +9596,12 @@ export HTTP_PROXY=https://old-proxy.example
 CUSTOM_BASE_URL=https://unrelated.example/v1
 OPENAI_API_KEY=remove-me
 
-# BEGIN SAIAI CODEX IDE (managed)
+# BEGIN KTEST CODEX IDE (managed)
 HTTPS_PROXY="http://127.0.0.1:1111"
-# END SAIAI CODEX IDE (managed)
+# END KTEST CODEX IDE (managed)
 "#;
 
-        let merged = merge_codex_ide_env(raw, "127.0.0.1:19908", "/tmp/SAIAI CA/saiai-ca.crt");
+        let merged = merge_codex_ide_env(raw, "127.0.0.1:19908", "/tmp/KTEST CA/ktest-ca.crt");
 
         assert!(merged.contains("# user comment\nUSER_SETTING=keep-me"));
         assert!(!merged.contains("old-proxy"));
@@ -9614,10 +9611,10 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert_eq!(merged.matches(CODEX_IDE_ENV_END.get()).count(), 1);
         assert!(merged.contains("HTTP_PROXY=\"http://127.0.0.1:19908\""));
         assert!(merged.contains("http_proxy=\"http://127.0.0.1:19908\""));
-        assert!(merged.contains("SSL_CERT_FILE=\"/tmp/SAIAI CA/saiai-ca.crt\""));
+        assert!(merged.contains("SSL_CERT_FILE=\"/tmp/KTEST CA/ktest-ca.crt\""));
         assert!(!merged.contains("OPENAI_API_KEY="));
         assert_eq!(
-            merge_codex_ide_env(&merged, "127.0.0.1:19908", "/tmp/SAIAI CA/saiai-ca.crt",),
+            merge_codex_ide_env(&merged, "127.0.0.1:19908", "/tmp/KTEST CA/ktest-ca.crt",),
             merged
         );
     }
@@ -9659,7 +9656,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert_eq!(created_tokens["refresh_token"].as_str(), Some(""));
         assert_eq!(
             created_tokens["account_id"].as_str(),
-            Some("saiai-local-proxy-account")
+            Some("ktest-local-proxy-account")
         );
         let token_payload = created_tokens["id_token"]
             .as_str()
@@ -9693,7 +9690,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
 
         write_str(
             &path,
-            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"saiai-local-proxy-placeholder-old","refresh_token":"old","account_id":"old"},"unrelated":"keep"}"#,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"ktest-local-proxy-placeholder-old","refresh_token":"old","account_id":"old"},"unrelated":"keep"}"#,
         );
         ensure_codex_local_proxy_auth(&path).unwrap();
         let upgraded = load_json_object(&path).unwrap();
@@ -9855,7 +9852,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert!(backup_files(dir.path()).is_empty());
         let warning = codex_auth_expiry_warning(&path).unwrap().unwrap();
         assert!(warning.contains("1970-01-01 00:00:00 UTC"), "{warning}");
-        assert!(warning.contains("saiai init-codex"), "{warning}");
+        assert!(warning.contains("ktest init-codex"), "{warning}");
 
         write_str(&path, "not json");
         assert!(codex_auth_expiry_warning(&path).is_err());
@@ -10179,7 +10176,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         let error = validate_chatgpt_timezone_name("../etc/passwd").unwrap_err();
         assert_eq!(
             error.to_string(),
-            "SAIAI_CHATGPT_TIMEZONE must be an IANA timezone such as America/Los_Angeles"
+            "KTEST_CHATGPT_TIMEZONE must be an IANA timezone such as America/Los_Angeles"
         );
     }
 
@@ -10191,11 +10188,11 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         for (value, message) in [
             (
                 "Mars/Olympus_Mons",
-                "SAIAI_CHATGPT_TIMEZONE does not exist in /usr/share/zoneinfo/Mars/Olympus_Mons",
+                "KTEST_CHATGPT_TIMEZONE does not exist in /usr/share/zoneinfo/Mars/Olympus_Mons",
             ),
             (
                 "America",
-                "SAIAI_CHATGPT_TIMEZONE is not a zoneinfo file: /usr/share/zoneinfo/America",
+                "KTEST_CHATGPT_TIMEZONE is not a zoneinfo file: /usr/share/zoneinfo/America",
             ),
         ] {
             let error = validate_chatgpt_timezone(value).unwrap_err();
@@ -10345,9 +10342,9 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         static ACME: brand::Brand = brand::Brand {
             config: brand::ConfigNames {
                 type_name: "AcmeConfig",
-                ..crate::brand_saiai::SAIAI_VALUES.config
+                ..crate::brand_test::KTEST_VALUES.config
             },
-            ..crate::brand_saiai::SAIAI_VALUES
+            ..crate::brand_test::KTEST_VALUES
         };
         for (input, message) in [
             (
@@ -10369,7 +10366,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     }
 
     #[test]
-    fn existing_saiai_config_defaults_chatgpt_passthrough_on() {
+    fn existing_program_config_defaults_chatgpt_passthrough_on() {
         let config: AppConfig = serde_json::from_value(serde_json::json!({
             "version": CONFIG_VERSION.get(),
             "base_url": "https://gateway.example.test",
@@ -10432,8 +10429,8 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             base_url: "https://claude.example.test".to_string(),
             api_key: "TEST_ONLY_CLAUDE_KEY".to_string(),
             listen: "127.0.0.1:19908".to_string(),
-            ca_cert_path: "/tmp/saiai-ca.crt".to_string(),
-            ca_key_path: "/tmp/saiai-ca.key".to_string(),
+            ca_cert_path: "/tmp/ktest-ca.crt".to_string(),
+            ca_key_path: "/tmp/ktest-ca.key".to_string(),
             chatgpt_chat_passthrough: true,
             desktop_browser_use: true,
             upstream_proxy: None,
@@ -10590,11 +10587,11 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     }
 
     #[test]
-    fn updates_only_selected_saiai_provider_config() {
+    fn updates_only_selected_program_provider_config() {
         let temporary = tempfile::tempdir().unwrap();
         let config_path = temporary.path().join(CONFIG_FILENAME.get());
-        let cert_path = temporary.path().join("saiai-ca.crt");
-        let key_path = temporary.path().join("saiai-ca.key");
+        let cert_path = temporary.path().join("ktest-ca.crt");
+        let key_path = temporary.path().join("ktest-ca.key");
         let _initial = update_app_provider_config_at(
             &config_path,
             ProviderKind::Claude,
@@ -10819,7 +10816,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     #[test]
     fn loads_generated_ca_into_rustls_roots() {
         let dir = tempfile::tempdir().unwrap();
-        let ca_path = dir.path().join("saiai-ca.crt");
+        let ca_path = dir.path().join("ktest-ca.crt");
         let (ca_cert_pem, _) = generate_installation_ca().unwrap();
         fs::write(&ca_path, ca_cert_pem).unwrap();
         load_ca_root_store(&ca_path).unwrap();
@@ -10830,7 +10827,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     }
 
     #[test]
-    fn reports_each_other_saiai_ca_once() {
+    fn reports_each_other_program_ca_once() {
         let listing = "AAA CurrentUser current\r\nBBB CurrentUser old\nBBB CurrentUser old\n\nBBB LocalMachine old\nCCC\n";
         assert_eq!(
             stale_app_ca_thumbprints(listing, "current"),
@@ -10851,10 +10848,10 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params
             .distinguished_name
-            .push(DnType::CommonName, "SAIAI local installation CA");
+            .push(DnType::CommonName, "KTEST local installation CA");
         params
             .distinguished_name
-            .push(DnType::OrganizationName, "SAIAI");
+            .push(DnType::OrganizationName, "KTEST");
         let cert_pem = params.self_signed(&key).unwrap().pem();
         fs::write(&cert_path, &cert_pem).unwrap();
         fs::write(&key_path, key.serialize_pem()).unwrap();
@@ -10876,7 +10873,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         let (second, _) = generate_installation_ca().unwrap();
         let first = common_name(&first).unwrap();
         assert!(
-            format!("{first:?}").contains("SAIAI local installation CA "),
+            format!("{first:?}").contains("KTEST local installation CA "),
             "{first:?}"
         );
         assert_ne!(Some(first), common_name(&second));
@@ -11009,13 +11006,13 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     #[test]
     fn renders_user_service_without_secrets() {
         let unit = render_user_service(
-            Path::new("/home/test/.local/bin/saiai"),
-            Path::new("/home/test/.saiai"),
+            Path::new("/home/test/.local/bin/ktest"),
+            Path::new("/home/test/.ktest"),
             Path::new("/home/test"),
         )
         .unwrap();
-        assert!(unit.contains("ExecStart=\"/home/test/.local/bin/saiai\""));
-        assert!(unit.contains("Environment=\"SAIAI_HOME=/home/test/.saiai\""));
+        assert!(unit.contains("ExecStart=\"/home/test/.local/bin/ktest\""));
+        assert!(unit.contains("Environment=\"KTEST_HOME=/home/test/.ktest\""));
         assert!(unit.contains("WorkingDirectory=/home/test"));
         assert!(!unit.contains("api_key"));
         assert!(!unit.contains("sk-"));
@@ -11037,7 +11034,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     fn parses_proc_stat_with_closing_parenthesis_in_command() {
         let mut fields = vec!["S"; 19];
         fields.push("4242");
-        let raw = format!("123 (saiai worker ) name) {}", fields.join(" "));
+        let raw = format!("123 (ktest worker ) name) {}", fields.join(" "));
         assert_eq!(
             parse_linux_proc_stat(&raw).unwrap(),
             LinuxProcessIdentity {
@@ -11075,8 +11072,8 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     #[test]
     fn quotes_windows_package_activation_arguments() {
         assert_eq!(
-            windows_quote_activation_arg(r"--user-data-dir=C:\Users\Test User\SAIAI"),
-            r#""--user-data-dir=C:\Users\Test User\SAIAI""#
+            windows_quote_activation_arg(r"--user-data-dir=C:\Users\Test User\KTEST"),
+            r#""--user-data-dir=C:\Users\Test User\KTEST""#
         );
         assert_eq!(windows_quote_activation_arg("a\"b"), r#""a\"b""#);
         assert_eq!(windows_quote_activation_arg("ends\\"), r#""ends\\""#);
@@ -11149,9 +11146,9 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     fn formats_listen_port_owners_without_command_args() {
         let owners = vec![ListenPortOwner {
             pid: 42,
-            name: "saiai".to_string(),
+            name: "ktest".to_string(),
         }];
-        assert_eq!(format_listen_owners(&owners), "pid 42 (saiai)");
+        assert_eq!(format_listen_owners(&owners), "pid 42 (ktest)");
         assert!(owners[0].is_app());
     }
 
@@ -11251,30 +11248,30 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         let mut elf_x86 = vec![0u8; 64];
         elf_x86[..4].copy_from_slice(b"\x7FELF");
         elf_x86[18..20].copy_from_slice(&62u16.to_le_bytes());
-        validate_update_asset(&elf_x86, "saiai-linux-x86_64").unwrap();
-        assert!(validate_update_asset(&elf_x86, "saiai-linux-aarch64-wrong").is_err());
+        validate_update_asset(&elf_x86, "ktest-linux-x86_64").unwrap();
+        assert!(validate_update_asset(&elf_x86, "ktest-linux-aarch64-wrong").is_err());
 
         let mut macho = vec![0u8; 64];
         macho[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
         macho[4..8].copy_from_slice(&0x0100_000c_u32.to_le_bytes());
-        validate_update_asset(&macho, "saiai-macos-aarch64").unwrap();
-        assert!(validate_update_asset(&macho, "saiai-macos-x86_64").is_err());
+        validate_update_asset(&macho, "ktest-macos-aarch64").unwrap();
+        assert!(validate_update_asset(&macho, "ktest-macos-x86_64").is_err());
 
         let mut pe = vec![0u8; 256];
         pe[..2].copy_from_slice(b"MZ");
         pe[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
         pe[0x80..0x84].copy_from_slice(b"PE\0\0");
         pe[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
-        validate_update_asset(&pe, "saiai-windows-x86_64.exe").unwrap();
-        assert!(validate_update_asset(&pe, "saiai-windows-aarch64.exe").is_err());
+        validate_update_asset(&pe, "ktest-windows-x86_64.exe").unwrap();
+        assert!(validate_update_asset(&pe, "ktest-windows-aarch64.exe").is_err());
 
         let expected_current_asset = match (std::env::consts::OS, std::env::consts::ARCH) {
-            ("linux", "x86_64") => "saiai-linux-x86_64",
-            ("linux", "aarch64") => "saiai-linux-aarch64",
-            ("macos", "x86_64") => "saiai-macos-x86_64",
-            ("macos", "aarch64") => "saiai-macos-aarch64",
-            ("windows", "x86_64") => "saiai-windows-x86_64.exe",
-            ("windows", "aarch64") => "saiai-windows-aarch64.exe",
+            ("linux", "x86_64") => "ktest-linux-x86_64",
+            ("linux", "aarch64") => "ktest-linux-aarch64",
+            ("macos", "x86_64") => "ktest-macos-x86_64",
+            ("macos", "aarch64") => "ktest-macos-aarch64",
+            ("windows", "x86_64") => "ktest-windows-x86_64.exe",
+            ("windows", "aarch64") => "ktest-windows-aarch64.exe",
             (os, arch) => panic!("unexpected test platform {os}/{arch}"),
         };
         assert_eq!(
@@ -11291,7 +11288,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             Ordering::Greater
         );
         assert_eq!(
-            compare_versions("saiai 0.7.0", "0.7").unwrap(),
+            compare_versions("ktest 0.7.0", "0.7").unwrap(),
             Ordering::Equal
         );
         assert_eq!(compare_versions("v0.6.1", "0.7.0").unwrap(), Ordering::Less);
@@ -11306,8 +11303,8 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     #[test]
     fn computes_sha256_hex() {
         assert_eq!(
-            sha256_hex(b"saiai"),
-            "6fea1fb5062fe02a6c45282f53fe6e35645dde10ecb69414f3fa0a79e0b09482"
+            sha256_hex(b"ktest"),
+            "f99508d99958eb7daae533d096bdbc68e428c53032d8a69549951a456f04f7af"
         );
     }
 
@@ -11316,13 +11313,13 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         let args = vec![
             "init".to_string(),
             "--base-url".to_string(),
-            "https://api.saiai.top".to_string(),
+            "https://api.ktest.test".to_string(),
             "--api-key".to_string(),
             "sk-test".to_string(),
         ];
         match parse_command(&args).unwrap() {
             Command::Init(init) => {
-                assert_eq!(init.base_url, "https://api.saiai.top");
+                assert_eq!(init.base_url, "https://api.ktest.test");
                 assert_eq!(init.api_key, "sk-test");
                 assert!(!init.trust_vscode_ca);
                 assert!(!init.configure_vscode_editor);
@@ -11393,7 +11390,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         apply_claude_local_proxy_env(
             &mut env_obj,
             "127.0.0.1:19908",
-            Path::new("/tmp/saiai-ca.crt"),
+            Path::new("/tmp/ktest-ca.crt"),
         );
 
         assert!(env_obj.get("ANTHROPIC_BASE_URL").is_none());
@@ -11411,7 +11408,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert!(!json_str(&env_obj, "no_proxy").contains("downloads.claude.ai"));
         assert_eq!(
             json_str(&env_obj, "NODE_EXTRA_CA_CERTS"),
-            "/tmp/saiai-ca.crt"
+            "/tmp/ktest-ca.crt"
         );
     }
 
@@ -11458,7 +11455,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
                 assert!(!body.contains(call), "{call} in:\n{body}");
             }
         }
-        // `saiai init` remains the Claude setup path that reports both kinds.
+        // `ktest init` remains the Claude setup path that reports both kinds.
         let init_claude = top_level_fn_bodies(main, "init_claude(")[0];
         assert!(init_claude.contains("warn_process_env_conflicts();"));
         assert!(init_claude.contains("warn_claude_settings_overrides_for_paths("));

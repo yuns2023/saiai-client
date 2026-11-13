@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 $resolver = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__RESOLVER_SOURCE__'))
-$root = 'C:\SAIAI-TEST-ONLY'
+$root = 'C:\KERNEL-TEST-ONLY'
 $reports = @()
 foreach ($case in @('absent','valid','multiple','foreign_publisher','not_store','not_ready','unsigned')) {
     $reports += & {

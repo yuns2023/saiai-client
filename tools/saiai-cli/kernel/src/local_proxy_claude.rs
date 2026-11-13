@@ -811,13 +811,13 @@ mod tests {
             CredentialPolicy::DesktopPlaceholder
         );
         assert_eq!(
-            classify_credential(&["Bearer ordinary-saiai-key"], Some(&id.access_token)).unwrap(),
+            classify_credential(&["Bearer ordinary-ktest-key"], Some(&id.access_token)).unwrap(),
             CredentialPolicy::Preserve
         );
         for auth in [
             "Bearer sk-ant-real",
-            "Bearer saiai-desktop-claude-foreign",
-            "Bearer saiai-local-proxy-placeholder-other",
+            "Bearer ktest-desktop-claude-foreign",
+            "Bearer ktest-local-proxy-placeholder-other",
         ] {
             assert!(classify_credential(&[auth], Some(&id.access_token)).is_err());
         }
@@ -830,7 +830,7 @@ mod tests {
             "authorization",
             "x-api-key",
             "proxy-authorization",
-            "x-saiai-client-proof",
+            "x-ktest-client-proof",
             "referer",
             "x-account-id",
         ] {

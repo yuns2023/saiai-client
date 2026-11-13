@@ -34,7 +34,7 @@ impl DesktopProduct {
 
     pub const fn has_adapter(self) -> bool {
         // The official Desktop executable remains branded ChatGPT, but the
-        // SAIAI OpenAI Desktop contract covers only its Codex surface.
+        // OpenAI Desktop contract of this program covers only its Codex surface.
         // Ordinary Chat has a distinct account/history/settings protocol and
         // must not be implied by a working Codex launcher.
         matches!(self, Self::Codex | Self::Claude)

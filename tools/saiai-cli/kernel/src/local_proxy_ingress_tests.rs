@@ -227,7 +227,7 @@ async fn main_preserves_provider_and_reserved_bearers_and_does_not_inspect_email
     .unwrap();
     let state = Arc::new(state);
     let body = r#"{"system":"The user's email address is fixture@example.invalid"}"#;
-    let tokens = ["sk-ant-MOCK_ONLY", "saiai-desktop-claude-FOREIGN"];
+    let tokens = ["sk-ant-MOCK_ONLY", "ktest-desktop-claude-FOREIGN"];
     for token in tokens {
         let raw = format!(
             "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nAuthorization: Bearer {token}\r\nCookie: original-cookie\r\nx-api-key: original-key\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
@@ -328,7 +328,7 @@ async fn desktop_classification_works_without_client_proof_storage() {
                 .starts_with(&format!("HTTP/1.1 {code}"))
         );
     }
-    for token in ["sk-ant-MOCK_ONLY", "saiai-desktop-claude-FOREIGN"] {
+    for token in ["sk-ant-MOCK_ONLY", "ktest-desktop-claude-FOREIGN"] {
         let response = tls_request(Arc::clone(&state), EntryPoint::ClaudeDesktop, ANTHROPIC_HOST,
             format!("POST /v1/messages HTTP/1.1\r\nAuthorization: Bearer {token}\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{{}}").as_bytes()).await;
         assert!(response.starts_with(b"HTTP/1.1 401"));
@@ -340,13 +340,13 @@ async fn certificate_control_identifies_the_entry_without_changing_main_bytes() 
     for (entry, count) in [(EntryPoint::Main, 4), (EntryPoint::ClaudeDesktop, 2)] {
         let (mut stream, task) = connection(state(None, None), entry).await;
         stream
-            .write_all(b"CONNECT certificate.saiai.local:443 HTTP/1.1\r\n\r\n")
+            .write_all(b"CONNECT certificate.ktest.local:443 HTTP/1.1\r\n\r\n")
             .await
             .unwrap();
         let response = String::from_utf8(head(&mut stream).await).unwrap();
         let pins = response
             .lines()
-            .find_map(|l| l.strip_prefix("x-saiai-leaf-spki-sha256: "))
+            .find_map(|l| l.strip_prefix("x-ktest-leaf-spki-sha256: "))
             .unwrap();
         assert_eq!(pins.split(',').count(), count);
         task.await.unwrap().unwrap();
@@ -397,7 +397,7 @@ async fn run_without_desktop_identity_keeps_only_main_entry_and_creates_no_deskt
     .await
     .unwrap();
     stream
-        .write_all(b"CONNECT certificate.saiai.local:443 HTTP/1.1\r\n\r\n")
+        .write_all(b"CONNECT certificate.ktest.local:443 HTTP/1.1\r\n\r\n")
         .await
         .unwrap();
     // A control response proves run() has completed listener setup.
@@ -511,10 +511,10 @@ async fn desktop_never_injects_the_route_key_without_its_placeholder() {
     let state = state(Some(root.path()), None);
     for headers in [
         "Connection: close\r\n",
-        "x-api-key: saiai-desktop-claude-FOREIGN\r\nConnection: close\r\n",
+        "x-api-key: ktest-desktop-claude-FOREIGN\r\nConnection: close\r\n",
         "x-api-key: MOCK_ONLY\r\nCookie: sessionKey=MOCK_ONLY\r\nConnection: close\r\n",
-        "Authorization: Bearer ordinary-saiai-key\r\nConnection: close\r\n",
-        "Authorization: Bearer ordinary-saiai-key\r\nConnection: authorization, close\r\n",
+        "Authorization: Bearer ordinary-ktest-key\r\nConnection: close\r\n",
+        "Authorization: Bearer ordinary-ktest-key\r\nConnection: authorization, close\r\n",
     ] {
         for path in ["/v1/messages", "/v1/messages/count_tokens", "/v1/models"] {
             let response = tls_request(
@@ -647,14 +647,14 @@ async fn no_gateway_extension_stores_and_signs_nothing() {
         Arc::clone(&state),
         EntryPoint::Main,
         ANTHROPIC_HOST,
-        b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nx-saiai-client-proof: v1.MOCK_SPOOFED\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
+        b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nx-ktest-client-proof: v1.MOCK_SPOOFED\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
     )
     .await;
     assert!(response.starts_with(b"HTTP/1.1 200"));
     let (requests, enrollments) = server.await.unwrap();
     assert!(enrollments.is_empty());
     assert_eq!(
-        header_value(&requests[0].headers, "x-saiai-client-proof"),
+        header_value(&requests[0].headers, "x-ktest-client-proof"),
         None
     );
     assert_eq!(fs::read_dir(state_dir.path()).unwrap().count(), 0);
@@ -674,13 +674,13 @@ async fn reserved_headers_are_stripped_before_any_session_starts() {
         Arc::clone(&state),
         EntryPoint::Main,
         ANTHROPIC_HOST,
-        b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nX-SAIAI-Client-Proof: v1.MOCK_SPOOFED\r\nX-Test-Gateway-Signature: MOCK_SPOOFED\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
+        b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nX-KTEST-Client-Proof: v1.MOCK_SPOOFED\r\nX-Test-Gateway-Signature: MOCK_SPOOFED\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
     )
     .await;
     assert!(response.starts_with(b"HTTP/1.1 200"));
     let (requests, _) = server.await.unwrap();
     for name in [
-        "x-saiai-client-proof",
+        "x-ktest-client-proof",
         crate::gateway_test::SIGNATURE_HEADER,
     ] {
         assert_eq!(header_value(&requests[0].headers, name), None, "{name}");
@@ -1421,8 +1421,8 @@ async fn no_chat_relay_never_parses_the_device_cookie_nor_reads_preferences() {
     }
 }
 
-/// Byte goldens of the Claude Desktop listener's own answers (frozen from
-/// the SAIAI build before their names moved to `Brand`). The organization
+/// Byte goldens of the Claude Desktop listener's own answers, with the test
+/// brand's names (a distribution freezes its own bytes). The organization
 /// id is a random UUID (`Identity::prepare`): only its format is frozen.
 #[tokio::test]
 async fn claude_desktop_local_answers_are_byte_identical() {
@@ -1436,7 +1436,7 @@ async fn claude_desktop_local_answers_are_byte_identical() {
     .await;
     assert_eq!(
         String::from_utf8(response).unwrap(),
-        "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 104\r\nContent-Type: application/json\r\n\r\n{\"error\":\"desktop_identity_missing\",\"message\":\"Run saiai desktop claude to initialize this environment\"}"
+        "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 104\r\nContent-Type: application/json\r\n\r\n{\"error\":\"desktop_identity_missing\",\"message\":\"Run ktest desktop claude to initialize this environment\"}"
     );
 
     let id = crate::claude_desktop::Identity::prepare(root.path()).unwrap();
@@ -1467,7 +1467,7 @@ async fn claude_desktop_local_answers_are_byte_identical() {
         String::from_utf8(response)
             .unwrap()
             .replace(org.as_str(), "<ORG-UUID>"),
-        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 312\r\nContent-Type: application/json\r\n\r\n{\"account\":{\"display_name\":\"SAIAI Local Code\",\"email_address\":\"\"},\"organization\":{\"active_flags\":[],\"capabilities\":[\"chat\",\"claude_pro\",\"claude_code\"],\"created_at\":\"2026-01-01T00:00:00Z\",\"name\":\"SAIAI Local Code\",\"rate_limit_tier\":\"default_claude_ai\",\"settings\":{},\"uuid\":\"<ORG-UUID>\"}}"
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 312\r\nContent-Type: application/json\r\n\r\n{\"account\":{\"display_name\":\"KTEST Local Code\",\"email_address\":\"\"},\"organization\":{\"active_flags\":[],\"capabilities\":[\"chat\",\"claude_pro\",\"claude_code\"],\"created_at\":\"2026-01-01T00:00:00Z\",\"name\":\"KTEST Local Code\",\"rate_limit_tier\":\"default_claude_ai\",\"settings\":{},\"uuid\":\"<ORG-UUID>\"}}"
     );
 
     let response = tls_request(
@@ -1483,7 +1483,7 @@ async fn claude_desktop_local_answers_are_byte_identical() {
     .await;
     assert_eq!(
         String::from_utf8(response).unwrap(),
-        "HTTP/1.1 501 Not Implemented\r\nConnection: close\r\nContent-Length: 120\r\nContent-Type: application/json\r\n\r\n{\"error\":{\"message\":\"This Desktop control endpoint is unavailable through SAIAI.\",\"type\":\"desktop_control_unsupported\"}}"
+        "HTTP/1.1 501 Not Implemented\r\nConnection: close\r\nContent-Length: 120\r\nContent-Type: application/json\r\n\r\n{\"error\":{\"message\":\"This Desktop control endpoint is unavailable through KTEST.\",\"type\":\"desktop_control_unsupported\"}}"
     );
 
     fs::write(
@@ -1500,6 +1500,6 @@ async fn claude_desktop_local_answers_are_byte_identical() {
     .await;
     assert_eq!(
         String::from_utf8(response).unwrap(),
-        "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 124\r\nContent-Type: application/json\r\n\r\n{\"error\":\"desktop_identity_invalid\",\"message\":\"Repair the isolated Desktop identity file and relaunch saiai desktop claude\"}"
+        "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 124\r\nContent-Type: application/json\r\n\r\n{\"error\":\"desktop_identity_invalid\",\"message\":\"Repair the isolated Desktop identity file and relaunch ktest desktop claude\"}"
     );
 }

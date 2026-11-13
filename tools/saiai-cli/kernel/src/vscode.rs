@@ -670,7 +670,7 @@ fn parse_document(raw: &str) -> Result<Document> {
 
 const MANAGED_NO_PROXY: [&str; 3] = ["localhost", "127.0.0.1", ".local"];
 
-/// The editor proxy URL SAIAI writes for a listen address, if it is valid.
+/// The editor proxy URL the program writes for a listen address, if it is valid.
 pub fn managed_proxy_url(listen: &str) -> Option<String> {
     proxy_url(listen).ok()
 }
@@ -678,7 +678,7 @@ pub fn managed_proxy_url(listen: &str) -> Option<String> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum ManagedRemoval {
     NotManaged,
-    /// The SAIAI marker names a proxy that is not one of the given instances.
+    /// The program's marker names a proxy that is not one of the given instances.
     OtherProxy(String),
     Owned {
         content: String,
@@ -687,7 +687,7 @@ pub enum ManagedRemoval {
     },
 }
 
-/// Remove only values identical to what SAIAI writes for the marker's proxy,
+/// Remove only values identical to what the program writes for the marker's proxy,
 /// plus the marker itself. Other text, comments and formatting are preserved.
 pub fn remove_managed_proxy(raw: &str, proxies: &[String]) -> Result<ManagedRemoval> {
     let document = match parse_document(raw) {
@@ -726,7 +726,7 @@ pub fn remove_managed_proxy(raw: &str, proxies: &[String]) -> Result<ManagedRemo
                 expected.as_object_mut().unwrap().remove(key);
                 removed.push(key);
             }
-            // SAIAI writes http.noProxy only when the user had none.
+            // The program writes http.noProxy only when the user had none.
             Some(_) if key != "http.noProxy" => kept.push(key),
             Some(_) => {}
             None => {}
@@ -1062,7 +1062,7 @@ mod tests {
                 parse_document(&content).unwrap().parsed,
                 parse_document(original).unwrap().parsed
             );
-            assert!(!content.contains("SAIAI"));
+            assert!(!content.contains("KTEST"));
             assert!(!content.contains("http."));
             for comment in ["保留用户设置", "/* user */", "// keep me"] {
                 assert_eq!(content.contains(comment), original.contains(comment));
@@ -1101,7 +1101,7 @@ mod tests {
         );
         for raw in [
             "{\"http.proxy\": \"http://127.0.0.1:53940\"}",
-            "{\"description\": \"// SAIAI managed VSCode proxy: http://127.0.0.1:53940\"}",
+            "{\"description\": \"// KTEST managed VSCode proxy: http://127.0.0.1:53940\"}",
             "not json at all",
         ] {
             assert_eq!(
@@ -1113,7 +1113,7 @@ mod tests {
         assert!(remove_managed_proxy(&broken, &proxies()).is_err());
         let twice = merge_settings("{}", LISTEN).unwrap().replacen(
             '{',
-            "{\n // SAIAI managed VSCode proxy: http://127.0.0.1:53940",
+            "{\n // KTEST managed VSCode proxy: http://127.0.0.1:53940",
             1,
         );
         assert!(remove_managed_proxy(&twice, &proxies()).is_err());
@@ -1121,14 +1121,14 @@ mod tests {
 
     #[test]
     fn vscode_uninstall_handles_members_on_shared_lines() {
-        let raw = "{\"a\": 1, \"http.proxy\": \"http://127.0.0.1:53940\", \"b\": 2 // SAIAI managed VSCode proxy: http://127.0.0.1:53940\n}";
+        let raw = "{\"a\": 1, \"http.proxy\": \"http://127.0.0.1:53940\", \"b\": 2 // KTEST managed VSCode proxy: http://127.0.0.1:53940\n}";
         let (content, removed, _) = removal(raw);
         assert_eq!(removed, vec!["http.proxy"]);
         assert_eq!(
             parse_document(&content).unwrap().parsed,
             json!({"a": 1, "b": 2})
         );
-        let last = "{\"a\": 1,\n // SAIAI managed VSCode proxy: http://127.0.0.1:53940\n \"http.proxy\": \"http://127.0.0.1:53940\"\n}\n";
+        let last = "{\"a\": 1,\n // KTEST managed VSCode proxy: http://127.0.0.1:53940\n \"http.proxy\": \"http://127.0.0.1:53940\"\n}\n";
         assert_eq!(removal(last).0, "{\"a\": 1\n}\n");
     }
 
@@ -1225,12 +1225,12 @@ fn editor_diagnostics_require_an_actual_managed_proxy_marker() {
         r#"{"http.proxy": "http://127.0.0.1:19908"}"#
     ));
     assert!(!has_managed_proxy(
-        r#"{"description": "// SAIAI managed VSCode proxy: http://127.0.0.1:19908"}"#
+        r#"{"description": "// KTEST managed VSCode proxy: http://127.0.0.1:19908"}"#
     ));
     assert!(has_managed_proxy(
-        "{\n // SAIAI managed VSCode proxy: http://127.0.0.1:19908\n}\n"
+        "{\n // KTEST managed VSCode proxy: http://127.0.0.1:19908\n}\n"
     ));
     assert!(has_managed_proxy(
-        "{\n // SAIAI managed VSCode proxy: http://127.0.0.1:19908\n broken json\n"
+        "{\n // KTEST managed VSCode proxy: http://127.0.0.1:19908\n broken json\n"
     ));
 }

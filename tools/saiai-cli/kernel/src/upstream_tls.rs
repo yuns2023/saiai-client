@@ -1,9 +1,9 @@
-//! TLS trust for connections from SAIAI to the Gateway.
+//! TLS trust for connections from the program to the Gateway.
 //!
 //! Corporate networks that decrypt HTTPS re-sign every certificate with a
 //! company CA that is trusted by the operating system but absent from the
 //! bundled webpki roots. Upstream connections therefore trust the union of the
-//! bundled roots and the platform store. The installation-specific SAIAI CA is
+//! bundled roots and the platform store. The installation-specific CA is
 //! always removed from that union: it may sit in the platform store (Windows
 //! trust setup) or in SSL_CERT_FILE (child-process environment), and it must
 //! never be able to vouch for the Gateway. When that CA cannot be identified,
@@ -19,7 +19,7 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::CertificateDer;
 use std::sync::{Arc, OnceLock};
 
-/// Loaded once per process: a CA installed later needs a SAIAI restart.
+/// Loaded once per process: a CA installed later needs a program restart.
 fn native_roots() -> &'static [CertificateDer<'static>] {
     static ROOTS: OnceLock<Vec<CertificateDer<'static>>> = OnceLock::new();
     ROOTS.get_or_init(|| {
@@ -37,7 +37,7 @@ fn native_roots() -> &'static [CertificateDer<'static>] {
 }
 
 // rustls_native_certs::load_native_certs() reads only SSL_CERT_FILE/SSL_CERT_DIR
-// when either is set, and SAIAI points SSL_CERT_FILE at its own CA for Codex
+// when either is set, and the program points SSL_CERT_FILE at its own CA for Codex
 // and its child shells. Those files are therefore added to the platform store
 // here instead of replacing it.
 fn load_ssl_cert_env_roots(certs: &mut Vec<CertificateDer<'static>>, errors: &mut Vec<String>) {
@@ -153,7 +153,7 @@ fn load_platform_roots(certs: &mut Vec<CertificateDer<'static>>, errors: &mut Ve
 }
 
 /// Every certificate in the PEM, or None unless all of them parse as CA
-/// certificates: an unrecognised entry could hide the real SAIAI CA.
+/// certificates: an unrecognised entry could hide the real installation CA.
 fn installation_ca_ders(installation_ca_pem: &str) -> Option<Vec<CertificateDer<'static>>> {
     let ders = rustls_pemfile::certs(&mut std::io::Cursor::new(installation_ca_pem.as_bytes()))
         .collect::<Result<Vec<_>, _>>()
@@ -188,7 +188,7 @@ fn build_root_store(
     roots
 }
 
-/// `installation_ca_pem` is the SAIAI CA certificate PEM. If it holds no
+/// `installation_ca_pem` is the installation CA certificate PEM. If it holds no
 /// certificate, system roots are skipped rather than risk trusting that CA.
 pub(crate) fn upstream_root_store(installation_ca_pem: &str) -> RootCertStore {
     build_root_store(native_roots(), installation_ca_pem)
@@ -254,14 +254,14 @@ mod tests {
     #[test]
     fn root_store_trusts_system_roots_except_the_installation_ca() {
         let (_, corporate) = self_signed_ca("Corporate Inspection CA");
-        let (saiai_pem, saiai) = self_signed_ca("SAIAI Local CA");
+        let (ktest_pem, ktest) = self_signed_ca("KTEST Local CA");
 
-        let roots = build_root_store(&[corporate.clone(), saiai.clone()], &saiai_pem);
+        let roots = build_root_store(&[corporate.clone(), ktest.clone()], &ktest_pem);
 
         let mut expected = bundled_roots();
         expected.push(anchor(&corporate));
         assert_eq!(roots.roots, expected);
-        assert!(!roots.roots.contains(&anchor(&saiai)));
+        assert!(!roots.roots.contains(&anchor(&ktest)));
     }
 
     #[test]
@@ -277,10 +277,10 @@ mod tests {
 
     #[test]
     fn root_store_ignores_unparsable_system_certificates() {
-        let (saiai_pem, _) = self_signed_ca("SAIAI Local CA");
+        let (ktest_pem, _) = self_signed_ca("KTEST Local CA");
         let garbage = CertificateDer::from(vec![0x30, 0x03, 0x01, 0x02, 0x03]);
 
-        let roots = build_root_store(&[garbage], &saiai_pem);
+        let roots = build_root_store(&[garbage], &ktest_pem);
 
         assert_eq!(roots.roots, bundled_roots());
     }

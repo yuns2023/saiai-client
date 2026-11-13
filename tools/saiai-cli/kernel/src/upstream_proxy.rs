@@ -1,17 +1,17 @@
-//! Egress route for connections SAIAI makes to the Gateway and to passthrough
+//! Egress route for connections the program makes to the Gateway and to passthrough
 //! destinations (CONNECT tunnels and plain HTTP forwarding).
 //!
-//! By default SAIAI follows the user's own network: a proxy configured in the
-//! SAIAI service environment (`HTTPS_PROXY` and friends) or in the operating
-//! system is used, and without one SAIAI connects directly. A configured but
+//! By default the program follows the user's own network: a proxy configured in the
+//! program's service environment (`HTTPS_PROXY` and friends) or in the operating
+//! system is used, and without one the program connects directly. A configured but
 //! unusable proxy fails the connection instead of silently going direct, as a
-//! browser would. `upstream_proxy` in the SAIAI config, or the
-//! `SAIAI_UPSTREAM_PROXY` environment variable, selects `system` (default),
+//! browser would. `upstream_proxy` in the program config, or the
+//! brand's `UPSTREAM_PROXY` environment variable, selects `system` (default),
 //! `direct`, or a fixed `http://[user:password@]host:port` proxy.
 //!
 //! Only HTTP proxies (with optional Basic authentication) are supported.
 //! Windows proxy auto-configuration (PAC/WPAD) is evaluated by WinHTTP; macOS
-//! automatic configuration is not evaluated and SAIAI connects directly.
+//! automatic configuration is not evaluated and the program connects directly.
 //!
 //! The policy is re-read every 30 seconds. Each change publishes a new
 //! snapshot with a new generation; HTTP clients are rebuilt per generation so
@@ -112,8 +112,8 @@ impl Endpoint {
         })
     }
 
-    /// True when the proxy is this SAIAI listener itself, e.g. an inherited
-    /// `HTTPS_PROXY` that SAIAI set for a Claude or Codex child.
+    /// True when the proxy is this program's listener itself, e.g. an inherited
+    /// `HTTPS_PROXY` that the program set for a Claude or Codex child.
     fn is_listener(&self, listen: Option<SocketAddr>) -> bool {
         let Some(listen) = listen else {
             return false;
@@ -1038,8 +1038,9 @@ pub(crate) struct UpstreamProxy {
 }
 
 impl UpstreamProxy {
-    /// `setting` is the `upstream_proxy` config value; `SAIAI_UPSTREAM_PROXY`
-    /// overrides it. `listen` is this SAIAI listener, never used as upstream.
+    /// `setting` is the `upstream_proxy` config value; the brand's
+    /// `UPSTREAM_PROXY` variable overrides it. `listen` is this listener,
+    /// never used as upstream.
     /// `prewarm` lists Gateway origins resolved whenever a policy changes.
     pub(crate) fn new(
         setting: Option<&str>,
@@ -1649,7 +1650,7 @@ mod tests {
             listen(),
         )
         .0;
-        assert_eq!(route(&fixed, true, "api.saiai.top"), proxy("corp:8080"));
+        assert_eq!(route(&fixed, true, "api.ktest.test"), proxy("corp:8080"));
         assert_eq!(route(&fixed, true, "localhost"), Route::Direct);
 
         let looped = policy_from_inputs(
@@ -1687,12 +1688,12 @@ mod tests {
             ]),
             windows_os.clone(),
         );
-        assert_eq!(route(&policy, true, "api.saiai.top"), proxy("corp:8080"));
+        assert_eq!(route(&policy, true, "api.ktest.test"), proxy("corp:8080"));
         assert_eq!(route(&policy, true, "git.internal"), Route::Direct);
         assert_eq!(route(&policy, true, "10.1.2.3"), Route::Direct);
         assert_eq!(route(&policy, false, "example.com"), Route::Direct);
 
-        // SAIAI's own child environment must not loop back into SAIAI.
+        // KTEST's own child environment must not loop back into KTEST.
         for value in [
             "http://127.0.0.1:19908",
             "http://localhost:19908",
@@ -1709,13 +1710,13 @@ mod tests {
                 windows_os.clone(),
             );
             assert_eq!(
-                route(&policy, true, "api.saiai.top"),
+                route(&policy, true, "api.ktest.test"),
                 proxy("127.0.0.1:7890"),
                 "{value}"
             );
             assert!(description.contains("ignored"), "{description}");
         }
-        // A scheme variable pointing at SAIAI falls back to ALL_PROXY.
+        // A scheme variable pointing at KTEST falls back to ALL_PROXY.
         let (policy, _) = system(
             env(&[
                 ("HTTPS_PROXY", "http://localhost:19908"),
@@ -1724,7 +1725,7 @@ mod tests {
             OsProxy::None,
         );
         assert_eq!(
-            route(&policy, true, "api.saiai.top"),
+            route(&policy, true, "api.ktest.test"),
             proxy("localhost:7890")
         );
         // Same host, different port: a real local proxy such as Clash.
@@ -1733,7 +1734,7 @@ mod tests {
             OsProxy::None,
         );
         assert_eq!(
-            route(&policy, true, "api.saiai.top"),
+            route(&policy, true, "api.ktest.test"),
             proxy("127.0.0.1:7890")
         );
 
@@ -1747,7 +1748,7 @@ mod tests {
             OsProxy::None,
         );
         assert_eq!(
-            route(&policy, true, "api.saiai.top"),
+            route(&policy, true, "api.ktest.test"),
             proxy("127.0.0.1:7890")
         );
         // Only the scheme that would need the SOCKS ALL_PROXY fails.
@@ -1759,7 +1760,7 @@ mod tests {
             OsProxy::None,
         );
         assert_eq!(
-            route(&policy, true, "api.saiai.top"),
+            route(&policy, true, "api.ktest.test"),
             proxy("127.0.0.1:7890")
         );
         let snapshot = Snapshot::new(1, policy, String::new(), listen());
@@ -1783,7 +1784,11 @@ mod tests {
             OsProxy::None,
         );
         let snapshot = Snapshot::new(1, policy, String::new(), listen());
-        assert!(snapshot.route_blocking(true, "api.saiai.top", 443).is_err());
+        assert!(
+            snapshot
+                .route_blocking(true, "api.ktest.test", 443)
+                .is_err()
+        );
         assert!(!description.contains("secret"), "{description}");
     }
 
@@ -1794,11 +1799,11 @@ mod tests {
         };
         let all = routes("127.0.0.1:7890", Some("localhost;127.*;10.*;<local>"));
         assert_eq!(
-            all.route(true, "api.saiai.top", 443),
+            all.route(true, "api.ktest.test", 443),
             Ok(proxy("127.0.0.1:7890"))
         );
         assert_eq!(
-            all.route(false, "api.saiai.top", 443),
+            all.route(false, "api.ktest.test", 443),
             Ok(proxy("127.0.0.1:7890"))
         );
         assert_eq!(all.route(true, "10.2.3.4", 443), Ok(Route::Direct));
@@ -1855,7 +1860,7 @@ mod tests {
         let clash = "<dictionary> {\n  ExceptionsList : <array> {\n    0 : 192.168.0.0/16\n    1 : *.local\n    2 : 169.254/16\n    3 : example.com\n  }\n  ExcludeSimpleHostnames : 1\n  HTTPEnable : 1\n  HTTPPort : 7890\n  HTTPProxy : 127.0.0.1\n  HTTPSEnable : 1\n  HTTPSPort : 7890\n  HTTPSProxy : 127.0.0.1\n  SOCKSEnable : 1\n  SOCKSPort : 7891\n  SOCKSProxy : 127.0.0.1\n}\n";
         let (policy, _) = macos_policy(clash, listen());
         assert_eq!(
-            route(&policy, true, "api.saiai.top"),
+            route(&policy, true, "api.ktest.test"),
             proxy("127.0.0.1:7890")
         );
         assert_eq!(route(&policy, true, "192.168.1.5"), Route::Direct);
@@ -1895,7 +1900,7 @@ mod tests {
                 &fallback,
                 listen(),
                 true,
-                "api.saiai.top",
+                "api.ktest.test",
                 443,
             )
         };
@@ -1941,7 +1946,7 @@ mod tests {
         assert_eq!(
             upstream
                 .snapshot()
-                .route_blocking(true, "api.saiai.top", 443)
+                .route_blocking(true, "api.ktest.test", 443)
                 .unwrap(),
             Route::Direct
         );
@@ -1949,14 +1954,14 @@ mod tests {
         assert!(
             upstream
                 .snapshot()
-                .route_blocking(true, "api.saiai.top", 443)
+                .route_blocking(true, "api.ktest.test", 443)
                 .is_err()
         );
         assert!(upstream.publish(inputs(OsProxy::None)));
         assert!(
             upstream
                 .snapshot()
-                .route_blocking(true, "api.saiai.top", 443)
+                .route_blocking(true, "api.ktest.test", 443)
                 .is_ok()
         );
     }
@@ -2032,14 +2037,14 @@ mod tests {
             fake_proxy(b"HTTP/1.1 200 Connection established\r\nProxy-Agent: x\r\n\r\n").await;
         let endpoint =
             Endpoint::parse(&format!("http://user:pa%20ss@127.0.0.1:{}", address.port())).unwrap();
-        let mut stream = open_tunnel(&endpoint, "api.saiai.top", 443).await.unwrap();
+        let mut stream = open_tunnel(&endpoint, "api.ktest.test", 443).await.unwrap();
         let mut tunneled = [0_u8; 8];
         stream.read_exact(&mut tunneled).await.unwrap();
         assert_eq!(&tunneled, b"tunneled");
         let request = String::from_utf8(task.await.unwrap()).unwrap();
         assert!(
             request
-                .starts_with("CONNECT api.saiai.top:443 HTTP/1.1\r\nHost: api.saiai.top:443\r\n")
+                .starts_with("CONNECT api.ktest.test:443 HTTP/1.1\r\nHost: api.ktest.test:443\r\n")
         );
         let expected = base64::engine::general_purpose::STANDARD.encode("user:pa ss");
         assert!(
@@ -2066,7 +2071,7 @@ mod tests {
             Endpoint::parse(&format!("http://u:secret@127.0.0.1:{}", address.port())).unwrap();
         let error = format!(
             "{:#}",
-            open_tunnel(&endpoint, "api.saiai.top", 443)
+            open_tunnel(&endpoint, "api.ktest.test", 443)
                 .await
                 .unwrap_err()
         );
@@ -2077,7 +2082,7 @@ mod tests {
         let endpoint = Endpoint::parse(&format!("127.0.0.1:{}", address.port())).unwrap();
         let error = format!(
             "{:#}",
-            open_tunnel(&endpoint, "api.saiai.top", 443)
+            open_tunnel(&endpoint, "api.ktest.test", 443)
                 .await
                 .unwrap_err()
         );
@@ -2109,7 +2114,7 @@ mod tests {
         let error = format!(
             "{:#}",
             through(port)
-                .connect(true, "api.saiai.top", 443)
+                .connect(true, "api.ktest.test", 443)
                 .await
                 .unwrap_err()
         );
@@ -2128,11 +2133,11 @@ mod tests {
         ));
         assert!(
             unavailable
-                .connect(true, "api.saiai.top", 443)
+                .connect(true, "api.ktest.test", 443)
                 .await
                 .is_err()
         );
-        assert!(route_for_url_blocking(&unavailable, "https://api.saiai.top").is_err());
+        assert!(route_for_url_blocking(&unavailable, "https://api.ktest.test").is_err());
     }
 
     #[tokio::test]
@@ -2195,11 +2200,11 @@ mod tests {
             Vec::new(),
         ));
         let clients = HttpClients::new(upstream, reqwest::Client::builder);
-        let client = clients.for_url("https://api.saiai.top/x").await.unwrap();
-        assert!(client.get("https://api.saiai.top/x").send().await.is_err());
+        let client = clients.for_url("https://api.ktest.test/x").await.unwrap();
+        assert!(client.get("https://api.ktest.test/x").send().await.is_err());
         let head = server.await.unwrap();
         assert!(
-            head.starts_with("CONNECT api.saiai.top:443 HTTP/1.1"),
+            head.starts_with("CONNECT api.ktest.test:443 HTTP/1.1"),
             "{head}"
         );
         assert!(

@@ -52,18 +52,18 @@ const CHATGPT_HOST: &str = "chatgpt.com";
 // Packaged Windows Desktop 26.908.4834.0 also uses this authenticated
 // control-plane alias. Treat it exactly like chatgpt.com: falling through to
 // a direct CONNECT bypasses the local sidecars and fails on networks which
-// require SAIAI routing.
+// require this proxy's routing.
 const CHAT_OPENAI_HOST: &str = "chat.openai.com";
 // The packaged Desktop currently uses this host for authenticated Web/Wham
 // control-plane calls. It must receive the same local MITM/sidecar treatment
 // as chatgpt.com; otherwise CONNECT falls through to the real provider with
-// the SAIAI placeholder and the app appears logged out.
+// the local placeholder and the app appears logged out.
 const CHATGPT_AUX_HOST: &str = "ab.chatgpt.com";
 pub(crate) const CERTIFICATE_CONTROL_HOST: crate::brand::BrandValue<&'static str> =
     crate::brand::BrandValue(|brand| brand.certificates.control_host);
 // Third-party telemetry and error-reporting intake hosts that the local proxy
 // refuses with 403 before any upstream connect.  Exact hosts must be measured
-// from the clients SAIAI launches; the Sentry suffixes generalise measured
+// from the clients this program launches; the Sentry suffixes generalise measured
 // (and bundle-extracted) per-organisation ingest hosts.  Only hosts serving
 // nothing but event/log/crash ingestion belong here; feature-gate hosts (Statsig,
 // GrowthBook), auth, update, GitHub and shared CDN hosts must never be added.
@@ -88,7 +88,7 @@ const DESKTOP_STATSIG_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 // Codex Desktop 26.908.4834.0 / Statsig JS 3.33.4 gates bundled locale
 // messages behind layer 72216192. Keep this local bootstrap deliberately
 // narrow: it enables i18n and, unless disabled, Desktop browser and Computer
-// Use control. It does not opt the synthetic SAIAI identity into unrelated
+// Use control. It does not opt the synthetic local identity into unrelated
 // hosted experiments or send it to the Statsig control plane.
 const DESKTOP_STATSIG_LOCAL_TEMPLATE: &str = r#"{"feature_gates":{},"dynamic_configs":{},"layer_configs":{"72216192":{"name":"72216192","value":{"enable_i18n":true},"rule_id":"@@ID@@-i18n","secondary_exposures":[],"is_user_in_experiment":false,"is_experiment_active":false,"allocated_experiment_name":"","explicit_parameters":["enable_i18n"],"undelegated_secondary_exposures":[]}},"has_updates":true,"time":0,"user":{"userID":"@@ID@@-proxy-user","customIDs":{"stableID":"@@ID@@-proxy"}}}"#;
 /// The local Statsig bootstrap with the brand's synthetic identifiers.
@@ -171,7 +171,7 @@ pub struct Config {
     /// State directory of the Gateway extension (device keys and the like);
     /// `None` disables its persistent features.
     pub gateway_state_dir: Option<std::path::PathBuf>,
-    /// Selected SAIAI environment root; independent of client-proof storage.
+    /// Selected program environment root; independent of client-proof storage.
     pub desktop_config_root: Option<std::path::PathBuf>,
     /// `upstream_proxy` setting: `system` (default), `direct`, or a URL.
     pub upstream_proxy: Option<String>,
@@ -2942,7 +2942,7 @@ fn normalize_ordinary_chat_target(target: &str, updates_path: Option<&str>) -> R
     Ok(target.replacen("/backend-api/", "/chatgpt/backend-api/", 1))
 }
 
-/// `SAIAI_DESKTOP_BROWSER_USE=0/1` overrides the configured value; any other
+/// The brand's `DESKTOP_BROWSER_USE` variable (`0`/`1`) overrides the configured value; any other
 /// value keeps the configuration so a typo cannot silently flip the default.
 fn desktop_browser_use_setting(env_value: Option<&str>, configured: bool) -> bool {
     match env_value {
@@ -3738,7 +3738,7 @@ fn is_hop_by_hop_header(name: &str) -> bool {
 }
 
 /// Passthrough connection for a non-managed CONNECT target, routed like all
-/// other SAIAI egress (directly or through the user's proxy).
+/// other egress of the program (directly or through the user's proxy).
 async fn connect_passthrough_target(
     upstream: &Arc<Snapshot>,
     host: &str,
@@ -3802,7 +3802,7 @@ pub(crate) fn sign_leaf_certificate(
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, host);
     params.distinguished_name = dn;
-    // Older SAIAI CAs share this CA's subject name and may remain trusted in
+    // Older installation CAs share this CA's subject name and may remain trusted in
     // an OS store. Without an authority key identifier, OpenSSL/BoringSSL
     // clients can pick such a stale CA by name and fail the signature check.
     params.use_authority_key_identifier_extension = true;
@@ -3990,8 +3990,9 @@ fn request_path(target: &str) -> Result<String> {
 mod tests {
     use super::*;
 
-    /// The SAIAI Gateway's Chat relay (the unit-test fallback extension).
-    pub(super) fn saiai_chat() -> Option<NativeChatProtocol> {
+    /// The Chat relay of the test Gateway extension (the unit-test runtime
+    /// fallback).
+    pub(super) fn test_gateway_chat() -> Option<NativeChatProtocol> {
         crate::runtime::gateway().native_chat()
     }
 
@@ -4219,14 +4220,14 @@ mod tests {
             let path = format!("/backend-api/codex/images/{operation}");
             let target = format!("{path}?opaque=a%2Fb&opaque=%2B");
             let normalized =
-                normalize_chatgpt_gateway_target(&target, saiai_chat().as_ref()).unwrap();
+                normalize_chatgpt_gateway_target(&target, test_gateway_chat().as_ref()).unwrap();
             assert_eq!(
                 normalized,
                 format!("/v1/codex/images/{operation}?opaque=a%2Fb&opaque=%2B")
             );
             assert!(is_forwarded_openai_path(
                 &request_path(&normalized).unwrap(),
-                saiai_chat().as_ref()
+                test_gateway_chat().as_ref()
             ));
             assert!(!is_forwarded_chatgpt_path(
                 &request_path(&normalized).unwrap()
@@ -4234,18 +4235,18 @@ mod tests {
             assert!(
                 normalize_chatgpt_gateway_target(
                     &format!("{path}/unexpected"),
-                    saiai_chat().as_ref()
+                    test_gateway_chat().as_ref()
                 )
                 .is_err()
             );
         }
         assert!(!is_forwarded_openai_path(
             "/v1/codex/images/unknown",
-            saiai_chat().as_ref()
+            test_gateway_chat().as_ref()
         ));
         assert!(!is_forwarded_openai_path(
             "/v1/images/generations",
-            saiai_chat().as_ref()
+            test_gateway_chat().as_ref()
         ));
     }
 
@@ -4326,23 +4327,23 @@ mod tests {
     fn detects_forwarded_openai_paths() {
         assert!(is_forwarded_openai_path(
             "/v1/responses",
-            saiai_chat().as_ref()
+            test_gateway_chat().as_ref()
         ));
         assert!(is_forwarded_openai_path(
             "/v1/responses/compact",
-            saiai_chat().as_ref()
+            test_gateway_chat().as_ref()
         ));
         assert!(is_forwarded_openai_path(
             "/v1/models",
-            saiai_chat().as_ref()
+            test_gateway_chat().as_ref()
         ));
         assert!(is_forwarded_openai_path(
             "/v1/models/gpt-5.3-codex",
-            saiai_chat().as_ref()
+            test_gateway_chat().as_ref()
         ));
         assert!(!is_forwarded_openai_path(
             "/backend-api/codex/models",
-            saiai_chat().as_ref()
+            test_gateway_chat().as_ref()
         ));
     }
 
@@ -4350,7 +4351,7 @@ mod tests {
     /// first one an ingress request meets.
     #[test]
     fn each_native_chat_gate_closes_without_the_capability_and_keeps_codex() {
-        let on = saiai_chat();
+        let on = test_gateway_chat();
         let on = on.as_ref();
         for path in ["/v1/codex/images/generations", "/v1/codex/images/edits"] {
             assert!(is_forwarded_openai_path(path, on), "{path}");
@@ -4495,7 +4496,7 @@ mod tests {
         assert_eq!(
             normalize_chatgpt_gateway_target(
                 "/backend-api/codex/responses?stream=true",
-                saiai_chat().as_ref()
+                test_gateway_chat().as_ref()
             )
             .unwrap(),
             "/v1/responses?stream=true"
@@ -4503,14 +4504,17 @@ mod tests {
         assert_eq!(
             normalize_chatgpt_gateway_target(
                 "/backend-api/codex/models/gpt-5",
-                saiai_chat().as_ref()
+                test_gateway_chat().as_ref()
             )
             .unwrap(),
             "/v1/models/gpt-5"
         );
         assert!(
-            normalize_chatgpt_gateway_target("/backend-api/conversations", saiai_chat().as_ref())
-                .is_err()
+            normalize_chatgpt_gateway_target(
+                "/backend-api/conversations",
+                test_gateway_chat().as_ref()
+            )
+            .is_err()
         );
         assert!(is_managed_host(CHATGPT_HOST));
         assert!(is_managed_host(CHAT_OPENAI_HOST));
@@ -4526,7 +4530,7 @@ mod tests {
         );
         assert!(is_forwarded_openai_path(
             "/chatgpt/backend-api/ios/attestation_challenge",
-            saiai_chat().as_ref()
+            test_gateway_chat().as_ref()
         ));
         assert!(
             normalize_chatgpt_chat_target("/backend-api/ios/attestation_challenge/future").is_err()
@@ -4538,10 +4542,11 @@ mod tests {
         );
         assert!(is_forwarded_openai_path(
             "/chatgpt/backend-api/models",
-            saiai_chat().as_ref()
+            test_gateway_chat().as_ref()
         ));
         assert!(
-            normalize_chatgpt_gateway_target("/backend-api/models", saiai_chat().as_ref()).is_err()
+            normalize_chatgpt_gateway_target("/backend-api/models", test_gateway_chat().as_ref())
+                .is_err()
         );
         assert!(normalize_chatgpt_chat_target("/backend-api/models/future").is_err());
         assert!(normalize_chatgpt_chat_target("/backend-api/models-admin").is_err());
@@ -4598,7 +4603,8 @@ mod tests {
             headers: Vec::new(),
             body: Vec::new(),
         };
-        let response = chatgpt_chat_disabled_response(&request, saiai_chat().as_ref()).unwrap();
+        let response =
+            chatgpt_chat_disabled_response(&request, test_gateway_chat().as_ref()).unwrap();
         assert_eq!(response.status, StatusCode::NOT_IMPLEMENTED);
         assert_eq!(response.reason, "chat_mode_temporarily_disabled");
         assert!(
@@ -4607,7 +4613,7 @@ mod tests {
                     target: "/backend-api/codex/models".to_string(),
                     ..request
                 },
-                saiai_chat().as_ref()
+                test_gateway_chat().as_ref()
             )
             .is_some()
         );
@@ -4709,9 +4715,12 @@ mod tests {
             "session=MOCK_ONLY_AUTH; _devicecheck=MOCK_ONLY_PROOF; other=MOCK_ONLY_OTHER".into(),
         )];
         assert_eq!(
-            chatgpt_device_cookie(&headers, saiai_chat().unwrap().rejected_device_proofs)
-                .unwrap()
-                .as_deref(),
+            chatgpt_device_cookie(
+                &headers,
+                test_gateway_chat().unwrap().rejected_device_proofs
+            )
+            .unwrap()
+            .as_deref(),
             Some("_devicecheck=MOCK_ONLY_PROOF")
         );
         for invalid in [
@@ -4722,7 +4731,7 @@ mod tests {
             assert!(
                 chatgpt_device_cookie(
                     &[("Cookie".into(), invalid.into())],
-                    saiai_chat().unwrap().rejected_device_proofs
+                    test_gateway_chat().unwrap().rejected_device_proofs
                 )
                 .is_err()
             );
@@ -4733,7 +4742,7 @@ mod tests {
                     "Cookie".into(),
                     "_devicecheck=test-gateway-placeholder".into()
                 )],
-                saiai_chat().unwrap().rejected_device_proofs
+                test_gateway_chat().unwrap().rejected_device_proofs
             )
             .unwrap()
             .is_none()
@@ -5207,7 +5216,7 @@ mod tests {
         let payload: Value =
             serde_json::from_str(body["statsigPayload"].as_str().unwrap()).unwrap();
         assert_eq!(payload["has_updates"], true);
-        assert_eq!(payload["user"]["userID"], "saiai-local-proxy-user");
+        assert_eq!(payload["user"]["userID"], "ktest-local-proxy-user");
         assert_eq!(
             payload["layer_configs"]["72216192"]["value"]["enable_i18n"],
             true
@@ -5259,7 +5268,7 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["jsonrpc"], "2.0");
         assert_eq!(body["id"], 7);
-        assert_eq!(body["result"]["serverInfo"]["name"], "saiai-local");
+        assert_eq!(body["result"]["serverInfo"]["name"], "ktest-local");
 
         let tools_list = IncomingRequest {
             method: "POST".to_string(),
@@ -5703,7 +5712,7 @@ mod tests {
 
     fn desktop_statsig_expected_gates() -> Value {
         let gate = |name: &str| {
-            json!({"name": name, "value": true, "rule_id": "saiai-local-browser-use",
+            json!({"name": name, "value": true, "rule_id": "ktest-local-browser-use",
                 "id_type": "userID", "secondary_exposures": []})
         };
         json!({
@@ -6014,7 +6023,7 @@ mod tests {
                 "Sec-WebSocket-Extensions".into(),
                 "permessage-deflate".into(),
             ),
-            ("X-Saiai-Client-Proof".into(), "v1.MOCK_SPOOFED".into()),
+            ("X-Ktest-Client-Proof".into(), "v1.MOCK_SPOOFED".into()),
         ];
         let mut signed = None;
         let request = build_openai_websocket_request(
@@ -6024,7 +6033,7 @@ mod tests {
             crate::runtime::gateway(),
             |method, target| {
                 signed = Some((method.to_string(), target.to_string()));
-                vec![("x-saiai-client-proof", "v1.MOCK_SIGNED".to_string())]
+                vec![("x-ktest-client-proof", "v1.MOCK_SIGNED".to_string())]
             },
         )
         .unwrap();
@@ -6068,7 +6077,7 @@ mod tests {
         assert!(headers.get("x-mock-hop").is_none());
         assert_eq!(
             headers
-                .get_all("x-saiai-client-proof")
+                .get_all("x-ktest-client-proof")
                 .iter()
                 .collect::<Vec<_>>(),
             vec!["v1.MOCK_SIGNED"]
@@ -6312,7 +6321,7 @@ mod tests {
             &mut writer,
             response,
             true,
-            saiai_chat().unwrap().preference_restored_header,
+            test_gateway_chat().unwrap().preference_restored_header,
         )
         .await
         .unwrap();
@@ -6868,7 +6877,7 @@ mod tests {
         let (ca_cert_pem, ca_key_pem) = test_ca();
         let cfg = Config {
             listen: "127.0.0.1:0".to_string(),
-            base_url: "https://api.saiai.top".to_string(),
+            base_url: "https://api.ktest.test".to_string(),
             api_key: "sk-test".to_string(),
             claude: Some(RouteConfig {
                 base_url: "https://claude.example.test".to_string(),
@@ -7324,7 +7333,7 @@ mod tests {
                 "Bearer caller-own-token".to_string(),
             ),
             ("Cookie".to_string(), "session=caller-own".to_string()),
-            ("X-Saiai-Client-Proof".to_string(), "forged".to_string()),
+            ("X-Ktest-Client-Proof".to_string(), "forged".to_string()),
             ("X-Custom".to_string(), "kept".to_string()),
         ])
         .await;
@@ -7333,7 +7342,7 @@ mod tests {
         assert!(lower.contains("\r\nauthorization: bearer caller-own-token\r\n"));
         assert!(lower.contains("\r\ncookie: session=caller-own\r\n"));
         assert!(lower.contains("\r\nx-custom: kept\r\n"));
-        assert!(!lower.contains("x-saiai-client-proof"));
+        assert!(!lower.contains("x-ktest-client-proof"));
         assert!(!lower.contains("proxy-connection"));
         assert!(!lower.contains("proxy-authorization"));
         assert!(!lower.contains("x-hop"));
@@ -7352,7 +7361,7 @@ mod tests {
         ] {
             assert!(is_managed_host(&canonical_host(host)));
         }
-        for name in ["Authorization", "cookie", "x-saiai-client-proof"] {
+        for name in ["Authorization", "cookie", "x-ktest-client-proof"] {
             assert!(
                 !should_forward_http_proxy_header(name, true, crate::runtime::gateway()),
                 "{name}"
@@ -7365,7 +7374,7 @@ mod tests {
             );
         }
         assert!(!should_forward_http_proxy_header(
-            "x-saiai-client-proof",
+            "x-ktest-client-proof",
             false,
             crate::runtime::gateway()
         ));
@@ -7803,7 +7812,7 @@ mod tests {
         let (ca_cert_pem, ca_key_pem) = test_ca();
         let error = State::new(Config {
             listen: "0.0.0.0:19908".to_string(),
-            base_url: "https://api.saiai.top".to_string(),
+            base_url: "https://api.ktest.test".to_string(),
             api_key: "sk-test".to_string(),
             claude: None,
             codex: None,
@@ -8002,9 +8011,9 @@ mod tests {
             body: b"{}".to_vec(),
             headers: vec![
                 ("Authorization".into(), authorization.into()),
-                ("X-Saiai-Client-Proof".into(), "v1.MOCK_SPOOFED".into()),
+                ("X-Ktest-Client-Proof".into(), "v1.MOCK_SPOOFED".into()),
                 (
-                    "x-saiai-client-proof".into(),
+                    "x-ktest-client-proof".into(),
                     "v1.MOCK_SPOOFED_AGAIN".into(),
                 ),
                 ("X-Test-Gateway-Signature".into(), "MOCK_SPOOFED".into()),
@@ -8057,7 +8066,7 @@ mod tests {
                     "MOCK_ONLY_GATEWAY"
                 )]
             );
-            assert!(header_value(&request.headers, "x-saiai-client-proof").is_none());
+            assert!(header_value(&request.headers, "x-ktest-client-proof").is_none());
         }
     }
 
@@ -8193,7 +8202,7 @@ mod tests {
 
     #[test]
     fn client_proof_is_never_relayed_on_any_outbound_path() {
-        for name in ["X-Saiai-Client-Proof", "x-saiai-client-proof"] {
+        for name in ["X-Ktest-Client-Proof", "x-ktest-client-proof"] {
             assert!(!should_forward_request_header(
                 name,
                 crate::runtime::gateway()
