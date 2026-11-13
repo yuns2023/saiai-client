@@ -65,7 +65,10 @@ fn validate(brand: &Brand) -> Result<()> {
             bail!("brand sensitive_inbound_headers entry is not a usable header name: {name:?}");
         }
     }
-    // Embedded verbatim in JSON answers and messages.
+    // Embedded verbatim in JSON answers and messages. A conservative limit
+    // because those answers are assembled by hand (`format!`) rather than
+    // serialized; a display name could be JSON-escaped instead if a brand
+    // ever needs other characters.
     for (field, value, valid) in [
         (
             "binary_name",
