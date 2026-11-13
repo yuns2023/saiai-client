@@ -1318,8 +1318,9 @@ fn kernel_module_path_scanner_sees_aliases_groups_and_spacing() {
 #[test]
 fn saiai_side_uses_only_the_public_kernel_root() {
     // The SAIAI modules and SAIAI-side tests that move with them.
-    const SAIAI_SIDE: [&str; 4] = [
+    const SAIAI_SIDE: [&str; 5] = [
         "client_proof",
+        "client_proof_saiai_tests",
         "gateway_saiai",
         "brand_saiai",
         "contract_desktop_tests",

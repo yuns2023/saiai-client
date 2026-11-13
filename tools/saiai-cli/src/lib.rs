@@ -39,6 +39,9 @@ mod claude_desktop;
 mod claude_desktop_fixtures;
 mod claude_launcher;
 mod client_proof;
+// SAIAI client proof goldens; they move with the client proof.
+#[cfg(test)]
+mod client_proof_saiai_tests;
 mod codex_daemon;
 mod codex_diagnostics;
 #[cfg(any(test, feature = "contract"))]
