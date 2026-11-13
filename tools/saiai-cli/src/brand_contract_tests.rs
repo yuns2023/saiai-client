@@ -2112,3 +2112,67 @@ fn windows_desktop_runtime_directory_is_frozen() {
         format!(r"{base}\SAIAI\desktop-runtime")
     );
 }
+
+/// Files that may name SAIAI: its brand values, its Gateway extension, the
+/// client proof (moves out in C4), and the SAIAI program entry point.
+const SAIAI_NAMING_FILES: [&str; 4] = [
+    "brand_saiai.rs",
+    "gateway_saiai.rs",
+    "client_proof.rs",
+    "main.rs",
+];
+
+/// Production lines elsewhere that still contain `saiai` (any case), one
+/// `file<TAB>line` per occurrence, whitespace collapsed. The list may only
+/// shrink: names move to `Brand`, they never come back.
+const SAIAI_RESIDUE: &str = include_str!("brand_residue.txt");
+
+fn saiai_residue_lines() -> Vec<String> {
+    let mut lines = Vec::new();
+    for (file, text) in cli_sources() {
+        if SAIAI_NAMING_FILES.contains(&file.as_str()) {
+            continue;
+        }
+        for line in text.lines() {
+            if line.to_ascii_lowercase().contains("saiai") {
+                let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+                lines.push(format!("{file}\t{line}"));
+            }
+        }
+    }
+    lines.sort();
+    lines
+}
+
+#[test]
+fn saiai_names_outside_the_brand_only_shrink() {
+    let mut expected: Vec<String> = SAIAI_RESIDUE
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    expected.sort();
+    let actual = saiai_residue_lines();
+    let added: Vec<_> = actual
+        .iter()
+        .filter(|line| !expected.contains(line))
+        .collect();
+    let removed: Vec<_> = expected
+        .iter()
+        .filter(|line| !actual.contains(line))
+        .collect();
+    assert!(
+        added.is_empty() && removed.is_empty() && actual == expected,
+        "SAIAI name residue changed.\nNew (read the value from Brand instead):\n{}\nGone (delete from brand_residue.txt):\n{}",
+        added
+            .iter()
+            .map(|line| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        removed
+            .iter()
+            .map(|line| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+}
