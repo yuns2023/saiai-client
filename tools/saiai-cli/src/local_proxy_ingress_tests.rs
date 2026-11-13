@@ -47,6 +47,22 @@ async fn head(stream: &mut TcpStream) -> Vec<u8> {
 }
 
 async fn tls_request(state: Arc<State>, entry: EntryPoint, host: &str, request: &[u8]) -> Vec<u8> {
+    tls_round_trip(state, entry, host, request, false).await
+}
+
+/// Like `tls_request`, but an upgraded (101) or kept-alive answer ends the
+/// exchange instead of waiting for the proxy to close the connection.
+async fn tls_exchange(state: Arc<State>, entry: EntryPoint, host: &str, request: &[u8]) -> Vec<u8> {
+    tls_round_trip(state, entry, host, request, true).await
+}
+
+async fn tls_round_trip(
+    state: Arc<State>,
+    entry: EntryPoint,
+    host: &str,
+    request: &[u8],
+    open_ended: bool,
+) -> Vec<u8> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut std::io::Cursor::new(&state.ca_cert_pem)) {
         roots.add(cert.unwrap()).unwrap();
@@ -69,7 +85,7 @@ async fn tls_request(state: Arc<State>, entry: EntryPoint, host: &str, request: 
     let mut tls = connector.connect(name, stream).await.unwrap();
     tls.write_all(request).await.unwrap();
     let mut response = Vec::new();
-    while !response.ends_with(b"\r\n\r\n") {
+    while open_ended && !response.ends_with(b"\r\n\r\n") {
         match timeout(Duration::from_secs(5), tls.read_u8())
             .await
             .unwrap()
@@ -1115,7 +1131,7 @@ async fn native_chat_relay_follows_the_gateway_capability_and_the_user_switch() 
                     "capability={capability} passthrough={passthrough} {host} {}",
                     request.lines().next().unwrap()
                 );
-                let response = tls_request(
+                let response = tls_exchange(
                     Arc::clone(&state),
                     EntryPoint::Main,
                     host,
@@ -1129,6 +1145,16 @@ async fn native_chat_relay_follows_the_gateway_capability_and_the_user_switch() 
                             .unwrap_or_else(|_| panic!("not forwarded: {label}"))
                             .unwrap();
                         assert_eq!(seen.target, *target, "{label}");
+                        let status = if request.contains("Upgrade: websocket") {
+                            "HTTP/1.1 101"
+                        } else {
+                            "HTTP/1.1 200"
+                        };
+                        assert!(
+                            response.starts_with(status.as_bytes()),
+                            "{label}: {}",
+                            String::from_utf8_lossy(&response)
+                        );
                     }
                     None => {
                         let text = String::from_utf8_lossy(&response);
@@ -1142,7 +1168,7 @@ async fn native_chat_relay_follows_the_gateway_capability_and_the_user_switch() 
                 }
             }
             // The local Desktop compatibility layer answers either way.
-            let response = tls_request(
+            let response = tls_exchange(
                 Arc::clone(&state),
                 EntryPoint::Main,
                 CHATGPT_HOST,
@@ -1227,4 +1253,66 @@ async fn no_chat_relay_means_no_device_cookie_and_no_preference_rewrite() {
         String::from_utf8_lossy(&response).contains(std::str::from_utf8(upstream).unwrap()),
         "{text}"
     );
+}
+
+/// Without a Chat relay, no spelling of a relay path gets through: dot
+/// segments the outgoing URL would resolve, a bare `/chatgpt`, and a
+/// `/chatgpt/` path sent to chatgpt.com — over HTTP and WebSocket alike.
+#[tokio::test]
+async fn no_chat_relay_refuses_every_spelling_of_a_relay_path() {
+    static NONE: crate::gateway::NoGatewayExtension = crate::gateway::NoGatewayExtension;
+    let (url, mut forwarded, task) = recording_gateway().await;
+    let (mut state, _root) = proof_test_state(&url, &url, None);
+    state.gateway = &NONE;
+    state.gateway_session = std::sync::OnceLock::new();
+    state.chatgpt_chat_passthrough = true;
+    let state = Arc::new(state);
+    let targets = [
+        (
+            OPENAI_HOST,
+            "/v1/responses/../../chatgpt/backend-api/models",
+        ),
+        (
+            OPENAI_HOST,
+            "/v1/responses/%2e%2e/%2E%2E/chatgpt/backend-api/models",
+        ),
+        (OPENAI_HOST, "/v1/models/../codex/images/generations"),
+        (OPENAI_HOST, "/chatgpt"),
+        (OPENAI_HOST, "/chatgpt?x=1"),
+        (CHATGPT_HOST, "/chatgpt/backend-api/f/conversation"),
+        (
+            CHATGPT_HOST,
+            "/backend-api/codex/responses/../../../chatgpt/backend-api/f/conversation",
+        ),
+        (
+            CHATGPT_HOST,
+            "/backend-api/codex/models/../codex/images/edits",
+        ),
+    ];
+    for (host, target) in targets {
+        for websocket in [false, true] {
+            let headers = if websocket {
+                WS_HEADERS
+            } else {
+                "Connection: close\r\n"
+            };
+            let request = format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n{headers}\r\n");
+            let response = tls_exchange(
+                Arc::clone(&state),
+                EntryPoint::Main,
+                host,
+                request.as_bytes(),
+            )
+            .await;
+            let text = String::from_utf8_lossy(&response);
+            let label = format!("{host} {target} websocket={websocket}");
+            assert!(text.starts_with("HTTP/1.1 501"), "{label}: {text}");
+            assert!(
+                text.contains("chat_mode_temporarily_disabled"),
+                "{label}: {text}"
+            );
+            assert!(forwarded.try_recv().is_err(), "forwarded anyway: {label}");
+        }
+    }
+    task.abort();
 }
