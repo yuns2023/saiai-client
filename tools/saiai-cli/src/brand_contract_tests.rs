@@ -2344,7 +2344,9 @@ const BRAND_TEXT_CONTRACTS: [(&str, &str, &str); 11] = [
 ];
 
 /// Top-level arguments of a call between `from` and `end` (the text after
-/// its format literal), each with whitespace collapsed.
+/// its format literal), each with whitespace collapsed. Not a Rust parser:
+/// commas inside generics or closure parameters also split; that is enough
+/// to find a standalone `name = BRAND.field` argument, the only use.
 fn call_arguments(
     text: &str,
     literals: &[std::ops::Range<usize>],
@@ -2481,4 +2483,25 @@ fn brand_text_renders_the_frozen_saiai_bytes() {
             "{file}: {literal} (parsed by {consumer}) is not frozen"
         );
     }
+}
+
+#[test]
+fn call_arguments_finds_standalone_named_arguments() {
+    let text = r#"format!(
+        "{brand_product} at {}, {x}",
+        f(a, "b, c"),
+        brand_product = BRAND.product_name.to_ascii_lowercase(),
+        x = [1, 2].len()
+    ) + g(brand_binary = BRAND.binary_name)"#;
+    let literals = rust_literal_ranges(text);
+    let format_literal = literals[0].clone();
+    let end = enclosing_call_end(text, &literals, format_literal.end);
+    assert_eq!(
+        call_arguments(text, &literals, format_literal.end, end),
+        [
+            r#"f(a, "b, c")"#,
+            "brand_product = BRAND.product_name.to_ascii_lowercase()",
+            "x = [1, 2].len()",
+        ]
+    );
 }
