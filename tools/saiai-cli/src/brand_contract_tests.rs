@@ -1897,6 +1897,54 @@ fn saiai_brand_values_are_frozen() {
     assert_eq!(brand.sensitive_inbound_headers, ["x-saiai-client-proof"]);
 }
 
+/// Identifier (not a field access or field declaration) of the client proof
+/// protocol or the SAIAI extension used on `line`, if any.
+fn protocol_reference(line: &str) -> Option<&'static str> {
+    let ident = |ch: char| ch.is_ascii_alphanumeric() || ch == '_';
+    for name in [
+        "client_proof",
+        "ClientProof",
+        "gateway_saiai",
+        "SAIAI_GATEWAY",
+    ] {
+        for (index, _) in line.match_indices(name) {
+            let before = &line[..index];
+            let after = &line[index + name.len()..];
+            if before.ends_with(ident) || after.starts_with(ident) {
+                continue;
+            }
+            // `brand.client_proof.header` and `client_proof: ClientProofNames`
+            // are brand data, not the protocol module.
+            if before.ends_with('.') || (after.starts_with(':') && !after.starts_with("::")) {
+                continue;
+            }
+            return Some(name);
+        }
+    }
+    None
+}
+
+#[test]
+fn protocol_reference_scanner_sees_paths_imports_and_types() {
+    for line in [
+        "crate::client_proof::wire_target(&url)",
+        "use crate::client_proof::{self, ClientProof};",
+        "let proof: Arc<ClientProof> = todo!();",
+        "&proxy_cli::gateway_saiai::SAIAI_GATEWAY",
+        "client_proof::HEADER_NAME.get()",
+    ] {
+        assert!(protocol_reference(line).is_some(), "{line}");
+    }
+    for line in [
+        "BRAND.client_proof.key_filename,",
+        "pub client_proof: ClientProofNames,",
+        "client_proof: ClientProofNames {",
+        "BrandValue(|brand| brand.client_proof.header)",
+    ] {
+        assert_eq!(protocol_reference(line), None, "{line}");
+    }
+}
+
 /// The SAIAI program injects the SAIAI Gateway extension; library sources
 /// other than the extension itself never use the client proof protocol.
 /// A textual check of direct references, not a dependency-graph proof.
@@ -1921,18 +1969,8 @@ fn only_the_extension_side_uses_the_client_proof_protocol() {
             {
                 continue;
             }
-            for name in [
-                "client_proof::",
-                "ClientProof",
-                "gateway_saiai",
-                "SAIAI_GATEWAY",
-            ] {
-                // Whole identifiers only (`ClientProofNames` is brand data).
-                let used = trimmed.match_indices(name).any(|(index, _)| {
-                    !trimmed[index + name.len()..]
-                        .starts_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_')
-                });
-                assert!(!used, "{file} uses {name}: {trimmed}");
+            if let Some(name) = protocol_reference(trimmed) {
+                panic!("{file} uses {name}: {trimmed}");
             }
         }
     }

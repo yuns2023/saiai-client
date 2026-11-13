@@ -640,3 +640,84 @@ async fn reserved_headers_are_stripped_even_when_the_extension_fails_to_load() {
         None
     );
 }
+
+/// Signing starts as soon as the key is loaded, while the configured route's
+/// enrollment is still in flight, and that configured claim uses none of the
+/// on-demand enrollment budget.
+#[tokio::test]
+async fn signing_does_not_wait_for_enrollment_and_configured_routes_use_no_budget() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (enrolled, mut enrollments) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (forward, mut forwarded) = tokio::sync::mpsc::unbounded_channel::<IncomingRequest>();
+    let server = tokio::spawn(async move {
+        // Enrollment connections are held open and never answered.
+        let mut held = Vec::new();
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let request = read_http_request(&mut reader).await.unwrap();
+            if request.target.ends_with("/client/devices/enroll") {
+                let _ = enrolled.send(());
+                held.push(reader);
+                continue;
+            }
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+            let _ = forward.send(request);
+        }
+    });
+    let (mut state, _root) = proof_test_state(&url, &url, None);
+    state.gateway_session = std::sync::OnceLock::new();
+    let state_dir = tempfile::tempdir().unwrap();
+    crate::client_proof::ClientProof::load(state_dir.path())
+        .unwrap()
+        .record_device(&url, "MOCK_ONLY_GATEWAY", "cd_MOCKMOCKMOCKMOCKMOCK00")
+        .unwrap();
+    state.gateway_state_dir = Some(state_dir.path().to_path_buf());
+    let state = Arc::new(state);
+    state.start_gateway_session();
+
+    timeout(Duration::from_secs(5), enrollments.recv())
+        .await
+        .expect("configured route enrollment started")
+        .unwrap();
+    let session = state.gateway_session.get().unwrap();
+    let saiai = session
+        .as_any()
+        .downcast_ref::<crate::gateway_saiai::SaiaiSession>()
+        .unwrap();
+    // Publication follows the configured claims without awaiting enrollment.
+    timeout(Duration::from_secs(5), async {
+        while saiai.proof().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("proof published while enrollment is pending");
+
+    let response = tls_request(
+        Arc::clone(&state),
+        EntryPoint::Main,
+        ANTHROPIC_HOST,
+        b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
+    )
+    .await;
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+    let request = timeout(Duration::from_secs(5), forwarded.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let proof = super::tests::saiai_proof(&state);
+    let header = header_value(&request.headers, "x-saiai-client-proof").expect("signed");
+    super::tests::verify_proof(&proof, header, "POST", "/v1/messages", "MOCK_ONLY_GATEWAY");
+    // The whole on-demand budget (16 extra credentials) is still available.
+    for index in 0..16 {
+        assert!(proof.claim_enrollment(&url, &format!("TEST_ONLY_EXTRA_{index}"), true));
+    }
+    assert!(!proof.claim_enrollment(&url, "TEST_ONLY_EXTRA_16", true));
+    server.abort();
+}

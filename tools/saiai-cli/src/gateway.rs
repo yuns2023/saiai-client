@@ -184,10 +184,15 @@ pub(crate) fn signature(
             eprintln!("gateway extension: skipped forbidden signature header {name}");
             continue;
         }
-        if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err()
-            || reqwest::header::HeaderValue::from_str(&value).is_err()
-        {
-            // Like before, a signature that cannot be encoded is skipped.
+        // Exits insert with `HeaderName::from_static`, which needs a valid
+        // lowercase name; anything else would panic there.
+        if name != lower || reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+            eprintln!("gateway extension: skipped invalid signature header name {name}");
+            continue;
+        }
+        if reqwest::header::HeaderValue::from_str(&value).is_err() {
+            // The value is a credential-like proof: never print it.
+            eprintln!("gateway extension: skipped invalid value for signature header {name}");
             continue;
         }
         // Insertion replaces an earlier value of the same header.
@@ -255,6 +260,13 @@ mod tests {
             signature(&extension, &session, &INPUT),
             vec![("x-test-proof", "second".to_string())]
         );
+    }
+
+    #[test]
+    fn a_declared_name_that_is_not_lowercase_is_skipped_not_inserted() {
+        let extension = Declares(&["X-Test-Proof", "x test"]);
+        let session = Scripted(pairs(&[("x-test-proof", "value"), ("x test", "value")]));
+        assert!(signature(&extension, &session, &INPUT).is_empty());
     }
 
     #[test]

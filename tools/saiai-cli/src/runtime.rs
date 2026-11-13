@@ -16,7 +16,10 @@ pub struct RuntimeContext {
     /// enrollment, Codex daemon client info).
     pub version: &'static str,
     /// Gateway behavior of this distribution; `&NoGatewayExtension` for a
-    /// Gateway without extra protocol. Pass a named `static`.
+    /// Gateway without extra protocol. Pass a named `static`. Identity is the
+    /// concrete type at its address: zero-sized extensions carry no state, so
+    /// two statics of the same zero-sized type are the same logical extension
+    /// (they may share an address); different types are always told apart.
     pub gateway: &'static dyn GatewayExtension,
 }
 
