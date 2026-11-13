@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::{
-    CLAUDE_STREAM_IDLE_TIMEOUT_MS, SaiaiConfig, ensure_local_proxy_running_with_start, home_dir,
-    read_runtime_ca, read_saiai_config, warn_claude_settings_overrides,
+    AppConfig, CLAUDE_STREAM_IDLE_TIMEOUT_MS, ensure_local_proxy_running_with_start, home_dir,
+    read_app_config, read_runtime_ca, warn_claude_settings_overrides,
 };
 
 const LOCAL_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local";
@@ -56,7 +56,7 @@ pub(crate) const CONFLICTING_ENV: &[&str] = &[
 
 pub(crate) fn run(args: &[String]) -> Result<()> {
     let mut command = process_command()?;
-    let config = read_saiai_config()
+    let config = read_app_config()
         .with_context(|| format!("{brand_product} local proxy is not configured; run the {brand_product} Claude setup first", brand_product = BRAND.product_name))?;
     let token = claude_token(&config)?;
     validate_listen(&config.listen)?;
@@ -119,7 +119,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
 }
 
-fn claude_token(config: &SaiaiConfig) -> Result<&str> {
+fn claude_token(config: &AppConfig) -> Result<&str> {
     let token = if let Some(credential) = config.providers.claude.as_ref() {
         &credential.api_key
     } else if config.providers.is_empty() {
@@ -173,7 +173,7 @@ fn restore_user_proxy_environment(command: &mut Command) {
     }
 }
 
-fn apply_environment(command: &mut Command, config: &SaiaiConfig, token: &str) {
+fn apply_environment(command: &mut Command, config: &AppConfig, token: &str) {
     for name in CONFLICTING_ENV {
         command.env_remove(name);
     }
@@ -286,15 +286,15 @@ fn resolve_windows_launch(directories: &[PathBuf], home: Option<&Path>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ProviderCredential, ProviderCredentials, SAIAI_CONFIG_VERSION};
+    use crate::{CONFIG_VERSION, ProviderCredential, ProviderCredentials};
     #[cfg(unix)]
     use std::collections::HashMap;
     use std::ffi::OsStr;
     use tempfile::TempDir;
 
-    fn config() -> SaiaiConfig {
-        SaiaiConfig {
-            version: SAIAI_CONFIG_VERSION.get(),
+    fn config() -> AppConfig {
+        AppConfig {
+            version: CONFIG_VERSION.get(),
             base_url: "https://gateway.invalid".to_string(),
             api_key: "synthetic-legacy-key".to_string(),
             listen: "127.0.0.1:19908".to_string(),

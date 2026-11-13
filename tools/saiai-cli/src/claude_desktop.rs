@@ -84,7 +84,7 @@ fn read_endpoint(root: &Path, main_listen: &str) -> Result<std::net::SocketAddr>
 }
 
 #[cfg(target_os = "linux")]
-fn verified_endpoint(root: &Path, cfg: &crate::SaiaiConfig) -> Result<(String, String)> {
+fn verified_endpoint(root: &Path, cfg: &crate::AppConfig) -> Result<(String, String)> {
     let listen = read_endpoint(root, &cfg.listen)?.to_string();
     let mut desktop_cfg = cfg.clone();
     desktop_cfg.listen = listen.clone();
@@ -329,7 +329,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         if !executable.is_file() {
             bail!("/usr/bin/claude-desktop was not found");
         }
-        let config_root = crate::saiai_config_dir()?;
+        let config_root = crate::app_config_dir()?;
         let root = config_root.join("desktop/claude");
         for relative in [
             "desktop",
@@ -371,7 +371,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 "isolated Claude Desktop is already running or has a SingletonLock; close it before relaunching (no process was killed)"
             );
         }
-        let cfg = crate::read_saiai_config()?;
+        let cfg = crate::read_app_config()?;
         if !cfg.providers.is_empty() && cfg.providers.claude.is_none() {
             bail!(
                 "{brand_product} Claude route is not configured; run the {brand_product} Claude setup first",
@@ -463,7 +463,7 @@ pub(crate) fn doctor() -> Result<()> {
         "version={} supported={VERSION}",
         version.as_deref().unwrap_or("unavailable")
     );
-    let root = crate::saiai_config_dir()?;
+    let root = crate::app_config_dir()?;
     println!(
         "executable=/usr/bin/claude-desktop profile={}",
         root.join("desktop/claude/user-data").display()
@@ -472,7 +472,7 @@ pub(crate) fn doctor() -> Result<()> {
         "local placeholder present={}",
         Identity::load(&root)?.is_some()
     );
-    let cfg = crate::read_saiai_config()?;
+    let cfg = crate::read_app_config()?;
     println!("main proxy={} CA={}", cfg.listen, cfg.ca_cert_path);
     crate::read_runtime_ca(&cfg)?;
     crate::verify_selected_proxy_identity(&cfg.listen)?;

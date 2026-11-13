@@ -289,7 +289,7 @@ fn legacy_route_matches(root: &Path, product: &str) -> Result<bool> {
     let Ok(raw) = fs::read(root.join("config.json")) else {
         return Ok(false);
     };
-    let Ok(config) = serde_json::from_slice::<crate::SaiaiConfig>(&raw) else {
+    let Ok(config) = serde_json::from_slice::<crate::AppConfig>(&raw) else {
         return Ok(false);
     };
     let proxy = format!("http://{}", config.listen);
@@ -367,9 +367,7 @@ pub(crate) fn launchd_label() -> String {
 
 // Pin the already resolved directory: never re-infer from two inherited vars.
 pub(crate) fn pin_start(command: &mut std::process::Command) -> Result<()> {
-    command
-        .arg("--instance-dir")
-        .arg(crate::saiai_config_dir()?);
+    command.arg("--instance-dir").arg(crate::app_config_dir()?);
     Ok(())
 }
 

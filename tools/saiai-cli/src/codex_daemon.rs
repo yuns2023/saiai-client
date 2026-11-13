@@ -456,7 +456,7 @@ impl OfficialDaemon<'_> {
         if args[0] != "version" {
             // Match the working launcher environment. A daemon started before
             // initialization also retains its old proxy/CA environment.
-            let cfg = crate::read_saiai_config().map_err(|_| {
+            let cfg = crate::read_app_config().map_err(|_| {
                 anyhow!(
                     "{brand_product} proxy configuration is unavailable",
                     brand_product = BRAND.product_name

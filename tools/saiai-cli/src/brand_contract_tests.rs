@@ -68,19 +68,19 @@ fn release_version() -> String {
 
 #[test]
 fn saiai_home_file_names_and_versions() {
-    assert_eq!(SAIAI_CONFIG_FILENAME, "config.json");
-    assert_eq!(SAIAI_CA_FILENAME, "saiai-ca.crt");
-    assert_eq!(SAIAI_CA_KEY_FILENAME, "saiai-ca.key");
-    assert_eq!(SAIAI_CONFIG_VERSION, 2);
+    assert_eq!(CONFIG_FILENAME, "config.json");
+    assert_eq!(CA_FILENAME, "saiai-ca.crt");
+    assert_eq!(CA_KEY_FILENAME, "saiai-ca.key");
+    assert_eq!(CONFIG_VERSION, 2);
     assert_eq!(DEFAULT_LOCAL_PROXY_LISTEN, "127.0.0.1:19908");
     assert_eq!(environment_scope::PRODUCT_DIR_FILENAME, "product-dir");
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    assert_eq!(SAIAI_SERVICE_LOG_FILENAME, "saiai.log");
+    assert_eq!(SERVICE_LOG_FILENAME, "saiai.log");
 }
 
 #[test]
 fn saiai_config_json_shape_is_frozen() {
-    let config = SaiaiConfig {
+    let config = AppConfig {
         version: 2,
         base_url: "https://gateway.example".into(),
         api_key: "TEST_ONLY_CONTRACT".into(),
@@ -133,7 +133,7 @@ fn saiai_config_json_shape_is_frozen() {
             "codex": {"base_url": "https://codex.gateway.example", "api_key": "TEST_ONLY_CODEX"}
         }
     });
-    let parsed: SaiaiConfig = serde_json::from_value(full.clone()).unwrap();
+    let parsed: AppConfig = serde_json::from_value(full.clone()).unwrap();
     assert_eq!(
         parsed.upstream_proxy.as_deref(),
         Some("http://127.0.0.1:7890")
@@ -149,7 +149,7 @@ fn saiai_config_json_shape_is_frozen() {
     assert_eq!(serde_json::to_value(&parsed).unwrap(), full);
 
     // Configurations written by older clients keep loading with defaults.
-    let legacy: SaiaiConfig = serde_json::from_value(serde_json::json!({
+    let legacy: AppConfig = serde_json::from_value(serde_json::json!({
         "version": 2,
         "base_url": "https://gateway.example",
         "api_key": "TEST_ONLY_CONTRACT",
@@ -248,10 +248,10 @@ WantedBy=default.target
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_headless_background_state_is_frozen() {
-    assert_eq!(SAIAI_LINUX_PID_FILENAME, "saiai.pid");
-    assert_eq!(SAIAI_LINUX_LOCK_FILENAME, "saiai.lock");
-    assert_eq!(SAIAI_LINUX_BACKGROUND_COMMAND, "__run-background-proxy");
-    assert_eq!(SAIAI_LINUX_BACKGROUND_STATE_VERSION, 1);
+    assert_eq!(LINUX_PID_FILENAME, "saiai.pid");
+    assert_eq!(LINUX_LOCK_FILENAME, "saiai.lock");
+    assert_eq!(LINUX_BACKGROUND_COMMAND, "__run-background-proxy");
+    assert_eq!(LINUX_BACKGROUND_STATE_VERSION, 1);
     assert!(matches!(
         parse_command(&["__run-background-proxy".to_string()]).unwrap(),
         Command::RunLinuxBackgroundProxy
@@ -280,7 +280,7 @@ fn linux_headless_background_state_is_frozen() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_nss_certificate_nickname_is_frozen() {
-    assert_eq!(SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME, "saiai-local-proxy");
+    assert_eq!(LOCAL_PROXY_NSS_CERT_NICKNAME, "saiai-local-proxy");
 }
 
 // ------------------------------------------------------ macOS background
@@ -337,8 +337,8 @@ fn macos_launchd_plist_renders_exactly() {
 #[cfg(target_os = "windows")]
 #[test]
 fn windows_background_identity_is_frozen() {
-    assert_eq!(SAIAI_WINDOWS_PID_FILENAME, "saiai.pid");
-    assert_eq!(SAIAI_WINDOWS_BACKGROUND_COMMAND, "__run-background-proxy");
+    assert_eq!(WINDOWS_PID_FILENAME, "saiai.pid");
+    assert_eq!(WINDOWS_BACKGROUND_COMMAND, "__run-background-proxy");
     assert_eq!(
         WINDOWS_PACKAGED_PROXY_LEASE_FILENAME,
         "windows-packaged-proxy-lease.json"
@@ -590,7 +590,7 @@ fn vscode_ownership_marker_is_frozen() {
 #[test]
 fn uninstall_recognition_rules_are_frozen() {
     assert_eq!(
-        uninstall::SAIAI_HOME_FILES,
+        uninstall::APP_HOME_FILES,
         &[
             "config.json",
             "saiai-ca.crt",
@@ -606,17 +606,15 @@ fn uninstall_recognition_rules_are_frozen() {
             "windows-packaged-proxy-lease.json",
         ]
     );
-    assert_eq!(uninstall::SAIAI_HOME_DIRS, &["log-followers", "desktop"]);
+    assert_eq!(uninstall::APP_HOME_DIRS, &["log-followers", "desktop"]);
     for name in [
         "config.json.bak-20261030-010203",
         ".config.json.saiai-tmp-1-abc",
         "saiai-ca.key.bak-1",
     ] {
-        assert!(uninstall::is_saiai_home_file(name), "{name}");
+        assert!(uninstall::is_app_home_file(name), "{name}");
     }
-    assert!(!uninstall::is_saiai_home_file(
-        ".config.json.aitp-tmp-1-abc"
-    ));
+    assert!(!uninstall::is_app_home_file(".config.json.aitp-tmp-1-abc"));
     for name in [
         "saiai",
         "saiai.exe",
@@ -654,7 +652,7 @@ fn listen_port_owner_recognition_is_frozen() {
             pid: 1,
             name: name.to_string(),
         };
-        assert_eq!(owner.is_saiai(), ours, "{name}");
+        assert_eq!(owner.is_app(), ours, "{name}");
     }
 }
 
@@ -1523,21 +1521,21 @@ fn brand_environment_call_sites_are_pinned() {
         (
             "lib.rs",
             "finalize_update",
-            ".env(BRAND.env.home, saiai_config_dir()?)",
+            ".env(BRAND.env.home, app_config_dir()?)",
         ),
         (
             "lib.rs",
             "start_linux_background_proxy",
-            ".env(BRAND.env.home, &saiai_home)",
+            ".env(BRAND.env.home, &app_home)",
         ),
         (
             "lib.rs",
             "start_windows_background_proxy",
-            ".env(BRAND.env.home, &saiai_home)",
+            ".env(BRAND.env.home, &app_home)",
         ),
         (
             "lib.rs",
-            "saiai_config_dir",
+            "app_config_dir",
             "env_dir_override(BRAND.env.home)",
         ),
         (
@@ -1564,27 +1562,27 @@ fn brand_environment_call_sites_are_pinned() {
         (
             "lib.rs",
             "resolve_chatgpt_timezone",
-            "env::var_os(SAIAI_CHATGPT_TIMEZONE_ENV.get())",
+            "env::var_os(CHATGPT_TIMEZONE_ENV.get())",
         ),
         (
             "lib.rs",
             "run_windows_packaged_desktop",
-            "env::var_os(SAIAI_CHATGPT_TIMEZONE_ENV.get()).is_some()",
+            "env::var_os(CHATGPT_TIMEZONE_ENV.get()).is_some()",
         ),
         (
             "lib.rs",
             "run_linux_desktop",
-            "command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV.get());",
+            "command.env_remove(CHATGPT_TIMEZONE_ENV.get());",
         ),
         (
             "lib.rs",
             "run_macos_desktop",
-            "command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV.get());",
+            "command.env_remove(CHATGPT_TIMEZONE_ENV.get());",
         ),
         (
             "lib.rs",
             "run_windows_desktop",
-            "command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV.get());",
+            "command.env_remove(CHATGPT_TIMEZONE_ENV.get());",
         ),
         // Installer hand-off and configure-only switch.
         (
@@ -1652,7 +1650,7 @@ fn brand_environment_call_sites_are_pinned() {
     for (file, needle) in [
         (
             "lib.rs",
-            "const SAIAI_CHATGPT_TIMEZONE_ENV: BrandValue<&'static str> =\n    BrandValue(|brand| brand.env.chatgpt_timezone);",
+            "const CHATGPT_TIMEZONE_ENV: BrandValue<&'static str> =\n    BrandValue(|brand| brand.env.chatgpt_timezone);",
         ),
         (
             "local_proxy.rs",
@@ -2149,6 +2147,11 @@ const SAIAI_NAMING_FILES: [&str; 4] = [
 /// `file<TAB>line` per occurrence, whitespace collapsed. The test requires
 /// the list to equal the code exactly; that it only ever shrinks is enforced
 /// by review of this file's diff, not by the test.
+///
+/// Remaining entry: `lib.rs` `pub mod gateway_saiai;` — the SAIAI Gateway
+/// extension is compiled into the library (the program reaches it as
+/// `proxy_cli::gateway_saiai::SAIAI_GATEWAY`) until the client proof moves
+/// out of the library (C4) and the extension can move with it.
 const SAIAI_RESIDUE: &str = include_str!("brand_residue.txt");
 
 fn saiai_residue_lines() -> Vec<String> {
@@ -2278,9 +2281,12 @@ const BRAND_TEXT_TOKENS: [(&str, &str, &str); 6] = [
 
 /// Every production string literal that renders SAIAI text, as
 /// `["file", "literal source"]` JSON lines, frozen before the text moved to
-/// `Brand`. A literal whose brand placeholders are put back to the SAIAI
-/// values must reproduce one of these exactly; with the SAIAI brand the
-/// program therefore prints the same bytes.
+/// `Brand`. This is a source contract: a literal whose brand placeholders are
+/// put back to the SAIAI values must reproduce one of these exactly, and each
+/// placeholder must be bound to its field in its own call. It does not by
+/// itself prove the bytes the program prints at run time (format context,
+/// argument values); that equivalence rests on the behavior tests and golden
+/// outputs elsewhere.
 const BRAND_TEXT_GOLDEN: &str = include_str!("brand_text_golden.txt");
 
 /// Text that scripts, tests or tools outside this crate parse; each must stay
@@ -2406,8 +2412,8 @@ fn enclosing_call_end(text: &str, literals: &[std::ops::Range<usize>], from: usi
 }
 
 /// Production literals that render SAIAI text, with brand placeholders put
-/// back to the SAIAI values; panics if a placeholder is not bound to its
-/// `Brand` field in the same call.
+/// back to the SAIAI values (source literals, not run-time output); panics
+/// if a placeholder is not bound to its `Brand` field in the same call.
 fn rendered_brand_text() -> Vec<(String, String)> {
     let mut rendered = Vec::new();
     for (file, text) in cli_sources() {

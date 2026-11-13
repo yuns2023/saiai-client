@@ -75,7 +75,7 @@ pub use runtime::RuntimeContext;
 
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
 #[cfg(target_os = "linux")]
-const SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME: BrandValue<&'static str> =
+const LOCAL_PROXY_NSS_CERT_NICKNAME: BrandValue<&'static str> =
     BrandValue(|brand| brand.certificates.nss_nickname);
 const USAGE: BrandText = BrandText(|| {
     format!(
@@ -112,13 +112,13 @@ use it only after consenting to this user-wide trust.",
     )
 });
 
-const SAIAI_CA_FILENAME: BrandValue<&'static str> =
+const CA_FILENAME: BrandValue<&'static str> =
     BrandValue(|brand| brand.certificates.ca_cert_filename);
-const SAIAI_CA_KEY_FILENAME: BrandValue<&'static str> =
+const CA_KEY_FILENAME: BrandValue<&'static str> =
     BrandValue(|brand| brand.certificates.ca_key_filename);
 #[cfg(target_os = "windows")]
 const WINDOWS_PACKAGED_PROXY_LEASE_FILENAME: &str = "windows-packaged-proxy-lease.json";
-const SAIAI_CONFIG_VERSION: BrandValue<u32> = BrandValue(|brand| brand.config.version);
+const CONFIG_VERSION: BrandValue<u32> = BrandValue(|brand| brand.config.version);
 const CLAUDE_STREAM_IDLE_TIMEOUT_MS: &str = "600000";
 const DEFAULT_LOCAL_PROXY_LISTEN: &str = "127.0.0.1:19908";
 // Claude's updater goes through the local proxy like everything else; the
@@ -128,7 +128,7 @@ const DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12
 // Written by Client 1.1.0–1.1.57; recognized by uninstall and migrated at
 // local proxy startup.
 const LEGACY_DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local,downloads.claude.ai";
-const SAIAI_CONFIG_FILENAME: BrandValue<&'static str> = BrandValue(|brand| brand.config.filename);
+const CONFIG_FILENAME: BrandValue<&'static str> = BrandValue(|brand| brand.config.filename);
 
 // `saiai codex` owns these variables only in the Codex child process. The
 // invoking shell and the user's system environment are never modified.
@@ -177,7 +177,7 @@ const CODEX_PLACEHOLDER_ACCESS_TOKEN: BrandValue<&'static str> = CODEX_PLACEHOLD
 // Codex resolves its timezone through iana-time-zone, which ignores `TZ` on
 // Linux and Windows. Codex time reporting is disabled through the managed
 // `include_environment_context_time = false` configuration key instead.
-const SAIAI_CHATGPT_TIMEZONE_ENV: BrandValue<&'static str> =
+const CHATGPT_TIMEZONE_ENV: BrandValue<&'static str> =
     BrandValue(|brand| brand.env.chatgpt_timezone);
 
 // Codex >= 0.163.0 omits the machine timezone and current date from the
@@ -271,22 +271,21 @@ const MACOS_LAUNCHCTL_COMMAND: &str = "/bin/launchctl";
 #[cfg(target_os = "macos")]
 const MACOS_TAIL_COMMAND: &str = "/usr/bin/tail";
 #[cfg(target_os = "linux")]
-const SAIAI_LINUX_PID_FILENAME: BrandValue<&'static str> =
-    BrandValue(|brand| brand.service.pid_filename);
+const LINUX_PID_FILENAME: BrandValue<&'static str> = BrandValue(|brand| brand.service.pid_filename);
 #[cfg(target_os = "linux")]
-const SAIAI_LINUX_LOCK_FILENAME: BrandValue<&'static str> =
+const LINUX_LOCK_FILENAME: BrandValue<&'static str> =
     BrandValue(|brand| brand.service.lock_filename);
 #[cfg(target_os = "linux")]
-const SAIAI_LINUX_BACKGROUND_COMMAND: &str = "__run-background-proxy";
+const LINUX_BACKGROUND_COMMAND: &str = "__run-background-proxy";
 #[cfg(target_os = "linux")]
-const SAIAI_LINUX_BACKGROUND_STATE_VERSION: u32 = 1;
+const LINUX_BACKGROUND_STATE_VERSION: u32 = 1;
 #[cfg(target_os = "windows")]
-const SAIAI_WINDOWS_PID_FILENAME: BrandValue<&'static str> =
+const WINDOWS_PID_FILENAME: BrandValue<&'static str> =
     BrandValue(|brand| brand.service.pid_filename);
 #[cfg(target_os = "windows")]
-const SAIAI_WINDOWS_BACKGROUND_COMMAND: &str = "__run-background-proxy";
+const WINDOWS_BACKGROUND_COMMAND: &str = "__run-background-proxy";
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-const SAIAI_SERVICE_LOG_FILENAME: BrandValue<&'static str> =
+const SERVICE_LOG_FILENAME: BrandValue<&'static str> =
     BrandValue(|brand| brand.service.log_filename);
 
 fn is_managed_claude_env(key: &str) -> bool {
@@ -495,20 +494,20 @@ fn parse_command(args: &[String]) -> Result<Command> {
             });
         }
         #[cfg(target_os = "linux")]
-        SAIAI_LINUX_BACKGROUND_COMMAND => {
+        LINUX_BACKGROUND_COMMAND => {
             return parse_no_arg_command(
-                SAIAI_LINUX_BACKGROUND_COMMAND,
+                LINUX_BACKGROUND_COMMAND,
                 &args[1..],
                 Command::RunLinuxBackgroundProxy,
             );
         }
         #[cfg(target_os = "windows")]
-        SAIAI_WINDOWS_BACKGROUND_COMMAND => {
+        WINDOWS_BACKGROUND_COMMAND => {
             if args.len() == 2 && args[1] == "--instance-v2" {
                 return Ok(Command::RunWindowsBackgroundProxy);
             }
             return parse_no_arg_command(
-                SAIAI_WINDOWS_BACKGROUND_COMMAND,
+                WINDOWS_BACKGROUND_COMMAND,
                 &args[1..],
                 Command::RunWindowsBackgroundProxy,
             );
@@ -741,7 +740,7 @@ fn try_lock_initialization() -> Result<Option<fs::File>> {
 fn open_initialization_lock() -> Result<fs::File> {
     let directory = environment_scope::active()
         .map(|s| s.root.clone())
-        .unwrap_or(saiai_config_dir()?);
+        .unwrap_or(app_config_dir()?);
     fs::create_dir_all(&directory)?;
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true).truncate(false);
@@ -762,18 +761,18 @@ fn init_claude(args: InitArgs) -> Result<()> {
     let state_path = &paths.state_path;
     let credentials_path = &paths.credentials_path;
     let ca_dir = if environment_scope::isolated() {
-        saiai_config_dir()?
+        app_config_dir()?
     } else {
         claude_dir.clone()
     };
-    let default_ca_path = ca_dir.join(SAIAI_CA_FILENAME.get());
-    let default_ca_key_path = ca_dir.join(SAIAI_CA_KEY_FILENAME.get());
+    let default_ca_path = ca_dir.join(CA_FILENAME.get());
+    let default_ca_key_path = ca_dir.join(CA_KEY_FILENAME.get());
     let (ca_path, ca_key_path) =
         existing_runtime_ca_paths().unwrap_or((default_ca_path, default_ca_key_path));
 
     fs::create_dir_all(claude_dir)
         .with_context(|| format!("failed to create {}", claude_dir.display()))?;
-    fs::create_dir_all(saiai_config_dir()?).with_context(|| {
+    fs::create_dir_all(app_config_dir()?).with_context(|| {
         format!(
             "failed to create {brand_product} config directory",
             brand_product = BRAND.product_name
@@ -787,7 +786,7 @@ fn init_claude(args: InitArgs) -> Result<()> {
 
     let ca_changed = ensure_installation_ca(&ca_path, &ca_key_path, &timestamp)?;
 
-    let saiai_config = update_saiai_provider_config(
+    let app_config = update_app_provider_config(
         ProviderKind::Claude,
         ProviderCredential {
             base_url: args.base_url.clone(),
@@ -804,7 +803,7 @@ fn init_claude(args: InitArgs) -> Result<()> {
         .unwrap_or_default();
     let mut env_obj = env_value;
     apply_common_claude_env(&mut env_obj, &args.api_key);
-    apply_claude_local_proxy_env(&mut env_obj, &saiai_config.config.listen, &ca_path);
+    apply_claude_local_proxy_env(&mut env_obj, &app_config.config.listen, &ca_path);
     settings.insert("env".to_string(), Value::Object(env_obj));
     write_json_object(settings_path, Value::Object(settings))?;
 
@@ -822,18 +821,18 @@ fn init_claude(args: InitArgs) -> Result<()> {
     println!("  {}", state_path.display());
     println!("  {}", ca_path.display());
     println!("  {}", ca_key_path.display());
-    println!("  {}", saiai_config_path()?.display());
+    println!("  {}", app_config_path()?.display());
     println!("Removed stale Claude OAuth credentials if present:");
     println!("  {}", credentials_path.display());
     warn_claude_settings_overrides_for_paths(&paths);
     configure_vscode_editor_after_initialization(
-        &saiai_config.config.listen,
+        &app_config.config.listen,
         &ca_path,
         "Claude Code",
         args.configure_vscode_editor,
         args.trust_vscode_ca,
     );
-    start_managed_service_after_initialization(saiai_config.changed || ca_changed)?;
+    start_managed_service_after_initialization(app_config.changed || ca_changed)?;
 
     Ok(())
 }
@@ -908,8 +907,8 @@ struct CodexLocalProxyInit {
     ca_key_path: PathBuf,
 }
 
-struct SaiaiConfigUpdate {
-    config: SaiaiConfig,
+struct AppConfigUpdate {
+    config: AppConfig,
     changed: bool,
 }
 
@@ -938,7 +937,7 @@ fn configure_codex_oauth_local_proxy(
 }
 
 fn initialize_codex_local_proxy(args: &InitArgs, timestamp: &str) -> Result<CodexLocalProxyInit> {
-    let config_dir = saiai_config_dir()?;
+    let config_dir = app_config_dir()?;
     initialize_codex_local_proxy_at(&config_dir, args, timestamp)
 }
 
@@ -949,11 +948,11 @@ fn initialize_codex_local_proxy_at(
 ) -> Result<CodexLocalProxyInit> {
     fs::create_dir_all(config_dir)
         .with_context(|| format!("failed to create {}", config_dir.display()))?;
-    let config_path = config_dir.join(SAIAI_CONFIG_FILENAME.get());
+    let config_path = config_dir.join(CONFIG_FILENAME.get());
     let proxy_base_url = codex_proxy_gateway_root(&args.base_url)?;
 
     if let Ok(raw) = fs::read_to_string(&config_path)
-        && let Ok(existing) = serde_json::from_str::<SaiaiConfig>(&raw)
+        && let Ok(existing) = serde_json::from_str::<AppConfig>(&raw)
         && read_runtime_ca(&existing).is_ok()
     {
         let mut migrated_legacy = false;
@@ -967,10 +966,10 @@ fn initialize_codex_local_proxy_at(
                 base_url: migrated.base_url.clone(),
                 api_key: migrated.api_key.clone(),
             });
-            write_saiai_config_at(&config_path, &migrated)?;
+            write_app_config_at(&config_path, &migrated)?;
             migrated_legacy = true;
         }
-        let updated = update_saiai_provider_config_at(
+        let updated = update_app_provider_config_at(
             &config_path,
             ProviderKind::Codex,
             ProviderCredential {
@@ -1003,11 +1002,11 @@ fn initialize_codex_local_proxy_at(
         .and_then(|existing| existing.get("upstream_proxy")?.as_str())
         .map(str::to_string);
     backup_if_exists(&config_path, timestamp)?;
-    let ca_cert_path = config_dir.join(SAIAI_CA_FILENAME.get());
-    let ca_key_path = config_dir.join(SAIAI_CA_KEY_FILENAME.get());
+    let ca_cert_path = config_dir.join(CA_FILENAME.get());
+    let ca_key_path = config_dir.join(CA_KEY_FILENAME.get());
     let _ca_changed = ensure_installation_ca(&ca_cert_path, &ca_key_path, timestamp)?;
-    let mut config = SaiaiConfig {
-        version: SAIAI_CONFIG_VERSION.get(),
+    let mut config = AppConfig {
+        version: CONFIG_VERSION.get(),
         base_url: proxy_base_url.clone(),
         api_key: args.api_key.clone(),
         listen: select_local_proxy_listen(None)?,
@@ -1022,7 +1021,7 @@ fn initialize_codex_local_proxy_at(
         base_url: proxy_base_url,
         api_key: args.api_key.clone(),
     });
-    write_saiai_config_at(&config_path, &config)?;
+    write_app_config_at(&config_path, &config)?;
     Ok(CodexLocalProxyInit {
         config_path,
         config_changed: true,
@@ -1058,7 +1057,7 @@ fn run_codex(args: &[String]) -> Result<()> {
     // terminals, and Windows npm installs expose a .cmd shim that Rust's
     // Command cannot execute directly.
     let mut command = codex_process_command().context("failed to resolve Codex executable")?;
-    let cfg = read_saiai_config().with_context(|| {
+    let cfg = read_app_config().with_context(|| {
         format!(
             "{brand_product} local proxy is not configured; run `{brand_binary} init-codex` first",
             brand_binary = BRAND.binary_name,
@@ -1245,7 +1244,7 @@ fn configure_vscode() -> Result<()> {
     fs::create_dir_all(&codex_dir)
         .with_context(|| format!("failed to create {}", codex_dir.display()))?;
     let auth_path = codex_dir.join("auth.json");
-    let cfg = read_saiai_config().with_context(|| {
+    let cfg = read_app_config().with_context(|| {
         format!(
             "{brand_product} local proxy is not configured; run the {brand_product} setup first",
             brand_product = BRAND.product_name
@@ -1864,7 +1863,7 @@ fn run_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn run_linux_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
-    let cfg = read_saiai_config().with_context(|| {
+    let cfg = read_app_config().with_context(|| {
         format!(
             "{brand_product} local proxy is not configured",
             brand_product = BRAND.product_name
@@ -1878,7 +1877,7 @@ fn run_linux_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
     })?;
     ensure_local_proxy_running(&cfg.listen)?;
 
-    let desktop_root = saiai_config_dir()?.join("desktop");
+    let desktop_root = app_config_dir()?.join("desktop");
     let desktop_home = desktop_root.join("home");
     let desktop_codex = desktop_root.join("codex");
     let desktop_user_data = desktop_root.join("user-data");
@@ -1923,7 +1922,7 @@ fn run_linux_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
     }
     // Do not pass the SAIAI control variable into Electron. If configured,
     // apply the validated IANA timezone only to this Desktop child process.
-    command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV.get());
+    command.env_remove(CHATGPT_TIMEZONE_ENV.get());
     command
         .env("HOME", &desktop_home)
         .env("USERPROFILE", &desktop_home)
@@ -1977,7 +1976,7 @@ fn run_linux_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn run_macos_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
-    let cfg = read_saiai_config().with_context(|| {
+    let cfg = read_app_config().with_context(|| {
         format!(
             "{brand_product} local proxy is not configured",
             brand_product = BRAND.product_name
@@ -1997,7 +1996,7 @@ fn run_macos_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
         None
     };
 
-    let desktop_root = saiai_config_dir()?.join("desktop");
+    let desktop_root = app_config_dir()?.join("desktop");
     let desktop_home = desktop_root.join("home");
     let desktop_codex = desktop_root.join("codex");
     let desktop_user_data = desktop_root.join("user-data");
@@ -2037,7 +2036,7 @@ fn run_macos_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
     for name in CODEX_MANAGED_ENV {
         command.env_remove(*name);
     }
-    command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV.get());
+    command.env_remove(CHATGPT_TIMEZONE_ENV.get());
     command
         .env("HOME", &desktop_home)
         .env("USERPROFILE", &desktop_home)
@@ -2325,7 +2324,7 @@ fn macos_packaged_desktop_bundle_process_running(bundle: &Path) -> Result<bool> 
 
 #[cfg(target_os = "windows")]
 fn run_windows_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
-    let cfg = read_saiai_config().with_context(|| {
+    let cfg = read_app_config().with_context(|| {
         format!(
             "{brand_product} local proxy is not configured",
             brand_product = BRAND.product_name
@@ -2344,7 +2343,7 @@ fn run_windows_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
     }
     ensure_local_proxy_running(&cfg.listen)?;
 
-    let desktop_root = saiai_config_dir()?.join("desktop");
+    let desktop_root = app_config_dir()?.join("desktop");
     let desktop_home = desktop_root.join("home");
     let desktop_codex = desktop_root.join("codex");
     let desktop_user_data = desktop_root.join("user-data");
@@ -2382,7 +2381,7 @@ fn run_windows_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
     for name in CODEX_MANAGED_ENV {
         command.env_remove(*name);
     }
-    command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV.get());
+    command.env_remove(CHATGPT_TIMEZONE_ENV.get());
     command
         .env("HOME", &desktop_home)
         .env("USERPROFILE", &desktop_home)
@@ -2431,7 +2430,7 @@ fn run_windows_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
 fn run_windows_packaged_desktop(
     product: DesktopProduct,
     args: &[String],
-    cfg: &SaiaiConfig,
+    cfg: &AppConfig,
     package: &WindowsPackagedDesktop,
 ) -> Result<()> {
     if !args.is_empty() {
@@ -2446,7 +2445,7 @@ fn run_windows_packaged_desktop(
             "packaged Windows Desktop cannot inherit CODEX_HOME; use the standard Windows Codex profile or a non-packaged Desktop override"
         );
     }
-    if env::var_os(SAIAI_CHATGPT_TIMEZONE_ENV.get()).is_some() {
+    if env::var_os(CHATGPT_TIMEZONE_ENV.get()).is_some() {
         bail!("packaged Windows Desktop cannot inherit a child-only timezone override");
     }
     let codex_home = codex_config_dir()?;
@@ -2632,7 +2631,7 @@ fn run_windows_packaged_desktop(
 
 #[cfg(target_os = "windows")]
 fn windows_packaged_profile(
-    cfg: &SaiaiConfig,
+    cfg: &AppConfig,
     codex_home: &Path,
 ) -> Result<windows_desktop_runtime::Profile> {
     use std::io::Read;
@@ -2810,7 +2809,7 @@ fn restore_legacy_windows_packaged_proxy_lease_at(marker_path: &Path) -> Result<
 
 #[cfg(target_os = "windows")]
 fn windows_packaged_proxy_lease_marker_path() -> Result<PathBuf> {
-    Ok(saiai_config_dir()?
+    Ok(app_config_dir()?
         .join("desktop")
         .join(WINDOWS_PACKAGED_PROXY_LEASE_FILENAME))
 }
@@ -2976,13 +2975,13 @@ fn resolve_windows_packaged_desktop() -> Result<Option<WindowsPackagedDesktop>> 
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn resolve_chatgpt_timezone() -> Result<Option<String>> {
-    let raw = env::var_os(SAIAI_CHATGPT_TIMEZONE_ENV.get());
+    let raw = env::var_os(CHATGPT_TIMEZONE_ENV.get());
     let Some(raw) = raw else {
         return resolve_chatgpt_timezone_value(None);
     };
     let value = raw
         .to_str()
-        .with_context(|| format!("{SAIAI_CHATGPT_TIMEZONE_ENV} must be valid UTF-8"))?
+        .with_context(|| format!("{CHATGPT_TIMEZONE_ENV} must be valid UTF-8"))?
         .trim();
     resolve_chatgpt_timezone_value(Some(value))
 }
@@ -3013,7 +3012,7 @@ fn validate_chatgpt_timezone_name(value: &str) -> Result<()> {
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '+' | '-' | '.'))
     {
-        bail!("{SAIAI_CHATGPT_TIMEZONE_ENV} must be an IANA timezone such as America/Los_Angeles");
+        bail!("{CHATGPT_TIMEZONE_ENV} must be an IANA timezone such as America/Los_Angeles");
     }
     Ok(())
 }
@@ -3024,13 +3023,13 @@ fn validate_chatgpt_timezone(value: &str) -> Result<Option<String>> {
     let zoneinfo_path = Path::new("/usr/share/zoneinfo").join(value);
     let metadata = fs::metadata(&zoneinfo_path).with_context(|| {
         format!(
-            "{SAIAI_CHATGPT_TIMEZONE_ENV} does not exist in {}",
+            "{CHATGPT_TIMEZONE_ENV} does not exist in {}",
             zoneinfo_path.display()
         )
     })?;
     if !metadata.is_file() {
         bail!(
-            "{SAIAI_CHATGPT_TIMEZONE_ENV} is not a zoneinfo file: {}",
+            "{CHATGPT_TIMEZONE_ENV} is not a zoneinfo file: {}",
             zoneinfo_path.display()
         );
     }
@@ -3110,13 +3109,7 @@ fn ensure_nss_ca(home: &Path, ca_cert: &Path) -> Result<bool> {
         }
     }
     let _ = ProcessCommand::new("certutil")
-        .args([
-            "-D",
-            "-d",
-            &db,
-            "-n",
-            SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME.get(),
-        ])
+        .args(["-D", "-d", &db, "-n", LOCAL_PROXY_NSS_CERT_NICKNAME.get()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -3126,7 +3119,7 @@ fn ensure_nss_ca(home: &Path, ca_cert: &Path) -> Result<bool> {
             "-d",
             &db,
             "-n",
-            SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME.get(),
+            LOCAL_PROXY_NSS_CERT_NICKNAME.get(),
             "-t",
             "C,,",
             "-a",
@@ -3188,13 +3181,7 @@ fn check_direct_linux_desktop_trust(report: &mut DoctorReport) {
     let db_dir = nss_database_dir(&home);
     let db = format!("sql:{}", db_dir.display());
     let present = ProcessCommand::new("certutil")
-        .args([
-            "-L",
-            "-d",
-            &db,
-            "-n",
-            SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME.get(),
-        ])
+        .args(["-L", "-d", &db, "-n", LOCAL_PROXY_NSS_CERT_NICKNAME.get()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -3651,7 +3638,7 @@ fn ensure_local_proxy_running(listen: &str) -> Result<()> {
 }
 
 fn verify_selected_proxy_identity(listen: &str) -> Result<()> {
-    let config = read_saiai_config()?;
+    let config = read_app_config()?;
     if config.listen != listen {
         bail!("the environment configuration changed during launch; retry the command");
     }
@@ -3777,7 +3764,7 @@ fn local_proxy_chatgpt_spki(listen: &str) -> Result<String> {
 }
 
 #[derive(Clone, Serialize, Deserialize, Eq, PartialEq)]
-struct SaiaiConfig {
+struct AppConfig {
     version: u32,
     base_url: String,
     api_key: String,
@@ -3823,13 +3810,13 @@ fn other_environment_listeners() -> Result<Vec<String>> {
     let Some(scope) = environment_scope::active() else {
         return Ok(Vec::new());
     };
-    let mut paths = vec![scope.root.join(SAIAI_CONFIG_FILENAME.get())];
+    let mut paths = vec![scope.root.join(CONFIG_FILENAME.get())];
     match fs::read_dir(scope.root.join("environments")) {
         Ok(entries) => {
             for entry in entries {
                 let entry = entry?;
                 if entry.file_type()?.is_dir() {
-                    paths.push(entry.path().join(SAIAI_CONFIG_FILENAME.get()));
+                    paths.push(entry.path().join(CONFIG_FILENAME.get()));
                 }
             }
         }
@@ -3843,7 +3830,7 @@ fn other_environment_listeners() -> Result<Vec<String>> {
             });
         }
     }
-    let own = scope.directory.join(SAIAI_CONFIG_FILENAME.get());
+    let own = scope.directory.join(CONFIG_FILENAME.get());
     let mut reserved = Vec::new();
     for path in paths.into_iter().filter(|path| path != &own) {
         let raw = match fs::read(&path) {
@@ -3947,27 +3934,27 @@ impl ProviderKind {
     }
 }
 
-fn update_saiai_provider_config(
+fn update_app_provider_config(
     provider: ProviderKind,
     credential: ProviderCredential,
     ca_paths: Option<(PathBuf, PathBuf)>,
-) -> Result<SaiaiConfigUpdate> {
-    let path = saiai_config_path()?;
-    update_saiai_provider_config_at(&path, provider, credential, ca_paths)
+) -> Result<AppConfigUpdate> {
+    let path = app_config_path()?;
+    update_app_provider_config_at(&path, provider, credential, ca_paths)
 }
 
-fn update_saiai_provider_config_at(
+fn update_app_provider_config_at(
     path: &Path,
     provider: ProviderKind,
     credential: ProviderCredential,
     ca_paths: Option<(PathBuf, PathBuf)>,
-) -> Result<SaiaiConfigUpdate> {
+) -> Result<AppConfigUpdate> {
     let existing = fs::read_to_string(path)
         .ok()
-        .and_then(|raw| serde_json::from_str::<SaiaiConfig>(&raw).ok());
+        .and_then(|raw| serde_json::from_str::<AppConfig>(&raw).ok());
     let previous = existing.clone();
-    let mut config = existing.unwrap_or_else(|| SaiaiConfig {
-        version: SAIAI_CONFIG_VERSION.get(),
+    let mut config = existing.unwrap_or_else(|| AppConfig {
+        version: CONFIG_VERSION.get(),
         base_url: credential.base_url.clone(),
         api_key: credential.api_key.clone(),
         listen: String::new(),
@@ -3987,12 +3974,12 @@ fn update_saiai_provider_config_at(
     let existing_listen = (!config.listen.trim().is_empty()).then_some(config.listen.as_str());
     config.listen = select_local_proxy_listen(existing_listen)?;
 
-    if config.version != SAIAI_CONFIG_VERSION.get()
+    if config.version != CONFIG_VERSION.get()
         || config.ca_cert_path.trim().is_empty()
         || config.ca_key_path.trim().is_empty()
     {
         if let Some((cert, key)) = ca_paths.as_ref() {
-            config.version = SAIAI_CONFIG_VERSION.get();
+            config.version = CONFIG_VERSION.get();
             config.ca_cert_path = cert.display().to_string();
             config.ca_key_path = key.display().to_string();
         } else {
@@ -4006,7 +3993,7 @@ fn update_saiai_provider_config_at(
     if let Some((cert, key)) = ca_paths.as_ref()
         && read_runtime_ca(&config).is_err()
     {
-        config.version = SAIAI_CONFIG_VERSION.get();
+        config.version = CONFIG_VERSION.get();
         config.ca_cert_path = cert.display().to_string();
         config.ca_key_path = key.display().to_string();
     }
@@ -4030,14 +4017,14 @@ fn update_saiai_provider_config_at(
     .expect("selected provider credential was just inserted");
     config.base_url = selected.base_url.clone();
     config.api_key = selected.api_key.clone();
-    write_saiai_config_at(path, &config)?;
-    Ok(SaiaiConfigUpdate {
+    write_app_config_at(path, &config)?;
+    Ok(AppConfigUpdate {
         changed: proxy_runtime_config_changed(previous.as_ref(), &config),
         config,
     })
 }
 
-fn proxy_runtime_config_changed(previous: Option<&SaiaiConfig>, current: &SaiaiConfig) -> bool {
+fn proxy_runtime_config_changed(previous: Option<&AppConfig>, current: &AppConfig) -> bool {
     let Some(previous) = previous else {
         return true;
     };
@@ -4100,7 +4087,7 @@ fn print_version() -> Result<()> {
 }
 
 fn run_local_proxy(verbose: bool) -> Result<()> {
-    let cfg = read_saiai_config()?;
+    let cfg = read_app_config()?;
     let (ca_cert_pem, ca_key_pem) = read_runtime_ca(&cfg)?;
     ensure_listen_available(&cfg.listen)?;
     if let Err(error) = migrate_legacy_claude_no_proxy_for_instance(&cfg.listen) {
@@ -4142,9 +4129,9 @@ fn run_local_proxy(verbose: bool) -> Result<()> {
         verbose,
         chatgpt_chat_passthrough: cfg.chatgpt_chat_passthrough,
         desktop_browser_use: cfg.desktop_browser_use,
-        gateway_state_dir: saiai_config_dir().ok(),
+        gateway_state_dir: app_config_dir().ok(),
         desktop_config_root: if cfg!(target_os = "linux") {
-            Some(saiai_config_dir()?)
+            Some(app_config_dir()?)
         } else {
             None
         },
@@ -4154,7 +4141,7 @@ fn run_local_proxy(verbose: bool) -> Result<()> {
 
 fn run_upstream_proxy_command(value: Option<String>) -> Result<()> {
     let Some(value) = value else {
-        let cfg = read_saiai_config()?;
+        let cfg = read_app_config()?;
         println!(
             "setting: {}",
             upstream_proxy::describe_setting(cfg.upstream_proxy.as_deref())
@@ -4168,10 +4155,10 @@ fn run_upstream_proxy_command(value: Option<String>) -> Result<()> {
     };
     upstream_proxy::validate_setting(&value)?;
     let _initialization_lock = lock_initialization()?;
-    let mut cfg = read_saiai_config()?;
+    let mut cfg = read_app_config()?;
     let value = value.trim();
     cfg.upstream_proxy = (!value.eq_ignore_ascii_case("system")).then(|| value.to_string());
-    write_saiai_config_at(&saiai_config_path()?, &cfg)?;
+    write_app_config_at(&app_config_path()?, &cfg)?;
     println!(
         "upstream proxy set to {}; run `{brand_binary} restart` to apply it to the running service",
         upstream_proxy::describe_setting(cfg.upstream_proxy.as_deref()),
@@ -4188,7 +4175,7 @@ struct Egress {
 }
 
 impl Egress {
-    fn for_config(cfg: &SaiaiConfig) -> Self {
+    fn for_config(cfg: &AppConfig) -> Self {
         let upstream = upstream_proxy::UpstreamProxy::new(
             cfg.upstream_proxy.as_deref(),
             cfg.listen.parse().ok(),
@@ -4214,12 +4201,12 @@ impl Egress {
 
 /// The installation CA certificate, excluded from upstream trust. Empty when
 /// unreadable, which limits upstream trust to the bundled roots.
-fn installation_ca_pem(cfg: &SaiaiConfig) -> String {
+fn installation_ca_pem(cfg: &AppConfig) -> String {
     fs::read_to_string(&cfg.ca_cert_path).unwrap_or_default()
 }
 
-fn read_runtime_ca(cfg: &SaiaiConfig) -> Result<(String, String)> {
-    if cfg.version != SAIAI_CONFIG_VERSION.get() || cfg.ca_key_path.trim().is_empty() {
+fn read_runtime_ca(cfg: &AppConfig) -> Result<(String, String)> {
+    if cfg.version != CONFIG_VERSION.get() || cfg.ca_key_path.trim().is_empty() {
         bail!(
             "{brand_product} local proxy configuration is obsolete; rerun the one-command {brand_product} setup",
             brand_product = BRAND.product_name
@@ -4247,7 +4234,7 @@ fn read_runtime_ca(cfg: &SaiaiConfig) -> Result<(String, String)> {
 #[cfg(target_os = "linux")]
 fn run_service_start() -> Result<()> {
     let _service_lock = acquire_linux_service_lock()?;
-    let cfg = read_saiai_config()?;
+    let cfg = read_app_config()?;
     match ensure_systemd_user_available() {
         Ok(()) => {
             stop_linux_background_proxy()?;
@@ -4296,7 +4283,7 @@ fn run_service_start() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn run_service_start() -> Result<()> {
-    let cfg = read_saiai_config()?;
+    let cfg = read_app_config()?;
     let domain = launchctl_gui_domain()?;
     let target = launchctl_service_target(&domain);
     let loaded = macos_launchd_loaded(&target);
@@ -4370,7 +4357,7 @@ fn wait_for_local_listener(listen: &str, wait: Duration) -> bool {
 #[cfg(target_os = "windows")]
 fn run_service_start() -> Result<()> {
     let _service_lock = lock_windows_service()?;
-    let cfg = read_saiai_config()?;
+    let cfg = read_app_config()?;
     if let Some(pid) = windows_background_pid()? {
         if windows_pid_is_running(pid).unwrap_or(false) {
             stop_windows_background_proxy()?;
@@ -4432,7 +4419,7 @@ fn run_service_stop() -> Result<()> {
                     "{brand_product} background proxy stopped.",
                     brand_product = BRAND.product_name
                 );
-            } else if linux_configured_listen_has_saiai_owner()? {
+            } else if linux_configured_listen_has_app_owner()? {
                 bail!(
                     "a {brand_product} process is listening, but it is not the managed background process and systemd --user is unavailable: {systemd_error}",
                     brand_product = BRAND.product_name
@@ -4485,9 +4472,9 @@ fn run_service_status() -> Result<()> {
     println!("{} {}", BRAND.binary_name, runtime::version());
     print_process_env_conflicts_for_status();
     print_claude_settings_overrides_for_status();
-    match read_saiai_config() {
+    match read_app_config() {
         Ok(cfg) => {
-            println!("config: {}", saiai_config_path()?.display());
+            println!("config: {}", app_config_path()?.display());
             println!("base_url: {}", cfg.base_url.trim().trim_end_matches('/'));
             println!("listen: http://{}", cfg.listen);
         }
@@ -4560,9 +4547,9 @@ fn run_service_status() -> Result<()> {
     println!("{} {}", BRAND.binary_name, runtime::version());
     print_process_env_conflicts_for_status();
     print_claude_settings_overrides_for_status();
-    match read_saiai_config() {
+    match read_app_config() {
         Ok(cfg) => {
-            println!("config: {}", saiai_config_path()?.display());
+            println!("config: {}", app_config_path()?.display());
             println!("base_url: {}", cfg.base_url.trim().trim_end_matches('/'));
             println!("listen: http://{}", cfg.listen);
         }
@@ -4588,9 +4575,9 @@ fn run_service_status() -> Result<()> {
     println!("{} {}", BRAND.binary_name, runtime::version());
     print_process_env_conflicts_for_status();
     print_claude_settings_overrides_for_status();
-    match read_saiai_config() {
+    match read_app_config() {
         Ok(cfg) => {
-            println!("config: {}", saiai_config_path()?.display());
+            println!("config: {}", app_config_path()?.display());
             println!("base_url: {}", cfg.base_url.trim().trim_end_matches('/'));
             println!("listen: http://{}", cfg.listen);
         }
@@ -4777,7 +4764,7 @@ fn initialization_requires_proxy_refresh(
 }
 
 fn configured_local_proxy_reachable() -> bool {
-    let Ok(config) = read_saiai_config() else {
+    let Ok(config) = read_app_config() else {
         return false;
     };
     let Ok(address) = config.listen.parse::<SocketAddr>() else {
@@ -4842,7 +4829,7 @@ fn update_urls(base_url: &str, asset: &str) -> (String, String) {
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn run_update() -> Result<()> {
     let service_was_active = managed_service_is_active();
-    let cfg = read_saiai_config()?;
+    let cfg = read_app_config()?;
     let asset = current_platform_asset_name()?;
     let (manifest_url, url) = update_urls(&cfg.base_url, &asset);
     let current_exe = env::current_exe().with_context(|| {
@@ -5045,13 +5032,13 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
         check_persistent_env_conflicts(&mut report);
     }
 
-    let config_path = saiai_config_path().with_context(|| {
+    let config_path = app_config_path().with_context(|| {
         format!(
             "failed to resolve {brand_product} config path",
             brand_product = BRAND.product_name
         )
     })?;
-    let cfg = match read_saiai_config() {
+    let cfg = match read_app_config() {
         Ok(cfg) => {
             report.ok("config", config_path.display().to_string());
             Some(cfg)
@@ -5063,7 +5050,7 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
     };
 
     if let Some(cfg) = &cfg {
-        check_saiai_config(&mut report, cfg);
+        check_app_config(&mut report, cfg);
         if check_claude {
             check_provider_route(&mut report, cfg, ProviderKind::Claude);
         }
@@ -5179,7 +5166,7 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
     report.finish()
 }
 
-fn check_vscode_editor_config(report: &mut DoctorReport, cfg: &SaiaiConfig) {
+fn check_vscode_editor_config(report: &mut DoctorReport, cfg: &AppConfig) {
     let Some(home) = home_dir() else {
         report.warn(
             "VSCode settings",
@@ -5794,7 +5781,7 @@ fn systemd_env_contains_key(output: &str, key: &str) -> bool {
     output.lines().any(|line| line.starts_with(&prefix))
 }
 
-fn provider_route(cfg: &SaiaiConfig, provider: ProviderKind) -> (&str, &str) {
+fn provider_route(cfg: &AppConfig, provider: ProviderKind) -> (&str, &str) {
     let explicit = match provider {
         ProviderKind::Claude => cfg.providers.claude.as_ref(),
         ProviderKind::Codex => cfg.providers.codex.as_ref(),
@@ -5805,7 +5792,7 @@ fn provider_route(cfg: &SaiaiConfig, provider: ProviderKind) -> (&str, &str) {
     }
 }
 
-fn check_provider_route(report: &mut DoctorReport, cfg: &SaiaiConfig, provider: ProviderKind) {
+fn check_provider_route(report: &mut DoctorReport, cfg: &AppConfig, provider: ProviderKind) {
     let explicit = match provider {
         ProviderKind::Claude => cfg.providers.claude.is_some(),
         ProviderKind::Codex => cfg.providers.codex.is_some(),
@@ -5836,9 +5823,9 @@ fn check_provider_route(report: &mut DoctorReport, cfg: &SaiaiConfig, provider: 
     }
 }
 
-fn check_saiai_config(report: &mut DoctorReport, cfg: &SaiaiConfig) {
-    if cfg.version == SAIAI_CONFIG_VERSION.get() {
-        report.ok("config version", SAIAI_CONFIG_VERSION.get().to_string());
+fn check_app_config(report: &mut DoctorReport, cfg: &AppConfig) {
+    if cfg.version == CONFIG_VERSION.get() {
+        report.ok("config version", CONFIG_VERSION.get().to_string());
     } else {
         report.warn(
             "config version",
@@ -5890,7 +5877,7 @@ fn check_saiai_config(report: &mut DoctorReport, cfg: &SaiaiConfig) {
     let ca_path = PathBuf::from(&cfg.ca_cert_path);
     check_ca_cert(report, "configured CA", &ca_path);
     #[cfg(target_os = "windows")]
-    check_stale_windows_saiai_cas(report, &ca_path);
+    check_stale_windows_app_cas(report, &ca_path);
     if cfg.ca_key_path.trim().is_empty() {
         report.error(
             "configured CA key",
@@ -5909,7 +5896,7 @@ fn check_saiai_config(report: &mut DoctorReport, cfg: &SaiaiConfig) {
 
 fn check_claude_config(
     report: &mut DoctorReport,
-    cfg: Option<&SaiaiConfig>,
+    cfg: Option<&AppConfig>,
     paths: &ClaudeConfigPaths,
 ) {
     if paths.settings_path.exists() {
@@ -6055,7 +6042,7 @@ fn check_claude_state(report: &mut DoctorReport, path: &Path) {
     }
 }
 
-fn check_codex_config(report: &mut DoctorReport, cfg: Option<&SaiaiConfig>, required: bool) {
+fn check_codex_config(report: &mut DoctorReport, cfg: Option<&AppConfig>, required: bool) {
     let codex_dir = match codex_config_dir() {
         Ok(path) => path,
         Err(err) => {
@@ -6202,9 +6189,9 @@ fn managed_codex_config_paths(codex_dir: &Path) -> Result<Vec<PathBuf>> {
 fn check_codex_environment_context_time(report: &mut DoctorReport, codex_dir: &Path) {
     const LABEL: &str = "Codex time reporting";
     let mut profiles = vec![(codex_dir.to_path_buf(), false)];
-    match saiai_config_dir() {
-        Ok(saiai_dir) => {
-            let desktop_codex = saiai_dir.join("desktop").join("codex");
+    match app_config_dir() {
+        Ok(app_root) => {
+            let desktop_codex = app_root.join("desktop").join("codex");
             if desktop_codex.is_dir() {
                 profiles.push((desktop_codex, true));
             }
@@ -6281,7 +6268,7 @@ fn check_codex_environment_context_time(report: &mut DoctorReport, codex_dir: &P
 const STALE_CA_LISTING_SCRIPT: &str = "$ErrorActionPreference='Stop'; foreach ($store in 'CurrentUser','LocalMachine') { Get-ChildItem \"Cert:\\$store\\Root\" | Where-Object { $_.Subject -match '(^|, )O=@@CA_ORG@@(,|$)' } | ForEach-Object { $_.Thumbprint + ' ' + $store + ' ' + [Convert]::ToBase64String($_.RawData) } }";
 
 #[cfg(target_os = "windows")]
-fn check_stale_windows_saiai_cas(report: &mut DoctorReport, ca_path: &Path) {
+fn check_stale_windows_app_cas(report: &mut DoctorReport, ca_path: &Path) {
     let current = fs::read(ca_path).ok().and_then(|pem| {
         rustls_pemfile::certs(&mut pem.as_slice())
             .next()
@@ -6298,7 +6285,7 @@ fn check_stale_windows_saiai_cas(report: &mut DoctorReport, ca_path: &Path) {
     );
     match listing {
         Ok(listing) => {
-            let stale = stale_saiai_ca_thumbprints(&listing, &current);
+            let stale = stale_app_ca_thumbprints(&listing, &current);
             if !stale.is_empty() {
                 report.warn(
                     &format!("other {brand_product} CAs", brand_product = BRAND.product_name),
@@ -6321,7 +6308,7 @@ fn check_stale_windows_saiai_cas(report: &mut DoctorReport, ca_path: &Path) {
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn stale_saiai_ca_thumbprints(listing: &str, current_der_base64: &str) -> Vec<String> {
+fn stale_app_ca_thumbprints(listing: &str, current_der_base64: &str) -> Vec<String> {
     let mut stale = Vec::new();
     for line in listing.lines() {
         let mut fields = line.split_whitespace();
@@ -6450,7 +6437,7 @@ fn check_listen_owner(report: &mut DoctorReport, addr: SocketAddr) {
         return;
     }
     let summary = format_listen_owners(&owners);
-    if owners.iter().any(|owner| owner.is_saiai()) {
+    if owners.iter().any(|owner| owner.is_app()) {
         report.ok("listen owner", summary);
     } else {
         report.warn(
@@ -6470,7 +6457,7 @@ struct ListenPortOwner {
 }
 
 impl ListenPortOwner {
-    fn is_saiai(&self) -> bool {
+    fn is_app(&self) -> bool {
         let binary = BRAND.binary_name.to_ascii_lowercase();
         self.name.eq_ignore_ascii_case(&binary) || self.name.to_ascii_lowercase().contains(&binary)
     }
@@ -6618,7 +6605,7 @@ async fn check_gateway_health(base_url: &str, egress: &Egress) -> Result<String>
 }
 
 async fn connect_local_proxy_tls(
-    cfg: &SaiaiConfig,
+    cfg: &AppConfig,
 ) -> Result<tokio_rustls::client::TlsStream<TokioTcpStream>> {
     let addr = cfg
         .listen
@@ -6663,7 +6650,7 @@ async fn connect_local_proxy_tls(
     Ok(tls)
 }
 
-async fn check_local_proxy_mitm(cfg: &SaiaiConfig) -> Result<String> {
+async fn check_local_proxy_mitm(cfg: &AppConfig) -> Result<String> {
     let addr = &cfg.listen;
     let mut tls = connect_local_proxy_tls(cfg).await?;
     tls.write_all(
@@ -7182,7 +7169,7 @@ fn finalize_update(
     fs::write(&script_path, script)
         .with_context(|| format!("failed to write {}", script_path.display()))?;
     if let Err(err) = ProcessCommand::new("powershell")
-        .env(BRAND.env.home, saiai_config_dir()?)
+        .env(BRAND.env.home, app_config_dir()?)
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CODEX_HOME")
         .arg("-NoProfile")
@@ -7370,19 +7357,19 @@ fn write_user_service() -> Result<PathBuf> {
             brand_binary = BRAND.binary_name
         )
     })?;
-    let saiai_home = absolute_existing_or_raw(saiai_config_dir()?);
+    let app_home = absolute_existing_or_raw(app_config_dir()?);
     let working_dir = home_dir().context("failed to resolve home directory")?;
     let service_path = service_dir.join(environment_scope::service_name());
-    let content = render_user_service(&exe, &saiai_home, &working_dir)?;
+    let content = render_user_service(&exe, &app_home, &working_dir)?;
     write_bytes_atomic(&service_path, content.as_bytes(), 0o644)
         .with_context(|| format!("failed to write {}", service_path.display()))?;
     Ok(service_path)
 }
 
 #[cfg(target_os = "linux")]
-fn render_user_service(exe: &Path, saiai_home: &Path, working_dir: &Path) -> Result<String> {
+fn render_user_service(exe: &Path, app_home: &Path, working_dir: &Path) -> Result<String> {
     let exe = path_to_string(exe)?;
-    let saiai_home = path_to_string(saiai_home)?;
+    let app_home = path_to_string(app_home)?;
     let working_dir = path_to_string(working_dir)?;
     Ok(format!(
         "[Unit]\n\
@@ -7402,10 +7389,10 @@ StandardError=journal\n\
 \n\
 [Install]\n\
 WantedBy=default.target\n",
-        systemd_quote(&format!("{}={saiai_home}", BRAND.env.home))?,
+        systemd_quote(&format!("{}={app_home}", BRAND.env.home))?,
         systemd_path_setting(&working_dir)?,
         systemd_quote(&exe)?,
-        systemd_quote(&saiai_home)?,
+        systemd_quote(&app_home)?,
         brand_product = BRAND.product_name
     ))
 }
@@ -7502,10 +7489,10 @@ fn write_launchd_plist() -> Result<LaunchdPlist> {
         )
     })?;
     let exe = absolute_existing_or_raw(exe);
-    let saiai_home = absolute_existing_or_raw(saiai_config_dir()?);
+    let app_home = absolute_existing_or_raw(app_config_dir()?);
     let working_dir = home_dir().context("failed to resolve home directory")?;
     let plist_path = launchd_plist_path()?;
-    let content = render_launchd_plist(&exe, &saiai_home, &working_dir, &log_path)?;
+    let content = render_launchd_plist(&exe, &app_home, &working_dir, &log_path)?;
     let changed = match fs::read_to_string(&plist_path) {
         Ok(existing) => existing != content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
@@ -7526,12 +7513,12 @@ fn write_launchd_plist() -> Result<LaunchdPlist> {
 #[cfg(target_os = "macos")]
 fn render_launchd_plist(
     exe: &Path,
-    saiai_home: &Path,
+    app_home: &Path,
     working_dir: &Path,
     log_path: &Path,
 ) -> Result<String> {
     let exe = xml_escape(&path_to_string(exe)?);
-    let saiai_home = xml_escape(&path_to_string(saiai_home)?);
+    let app_home = xml_escape(&path_to_string(app_home)?);
     let working_dir = xml_escape(&path_to_string(working_dir)?);
     let log_path = xml_escape(&path_to_string(log_path)?);
     Ok(format!(
@@ -7545,12 +7532,12 @@ fn render_launchd_plist(
   <array>\n\
     <string>{exe}</string>\n\
     <string>--instance-dir</string>\n\
-    <string>{saiai_home}</string>\n\
+    <string>{app_home}</string>\n\
   </array>\n\
   <key>EnvironmentVariables</key>\n\
   <dict>\n\
     <key>{home_variable}</key>\n\
-    <string>{saiai_home}</string>\n\
+    <string>{app_home}</string>\n\
   </dict>\n\
   <key>WorkingDirectory</key>\n\
   <string>{working_dir}</string>\n\
@@ -7584,7 +7571,7 @@ fn launchd_plist_path() -> Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn launchd_log_path() -> Result<PathBuf> {
-    Ok(saiai_config_dir()?.join(SAIAI_SERVICE_LOG_FILENAME.get()))
+    Ok(app_config_dir()?.join(SERVICE_LOG_FILENAME.get()))
 }
 
 #[cfg(target_os = "macos")]
@@ -7655,15 +7642,15 @@ fn run_linux_background_proxy_worker() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn start_linux_background_proxy(cfg: &SaiaiConfig) -> Result<u32> {
+fn start_linux_background_proxy(cfg: &AppConfig) -> Result<u32> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     stop_linux_background_proxy()?;
     ensure_listen_available(&cfg.listen)?;
 
-    let saiai_home = saiai_config_dir()?;
-    fs::create_dir_all(&saiai_home)
-        .with_context(|| format!("failed to create {}", saiai_home.display()))?;
+    let app_home = app_config_dir()?;
+    fs::create_dir_all(&app_home)
+        .with_context(|| format!("failed to create {}", app_home.display()))?;
     let log_path = linux_service_log_path()?;
     match fs::symlink_metadata(&log_path) {
         Ok(metadata) if !metadata.file_type().is_file() => {
@@ -7702,8 +7689,8 @@ fn start_linux_background_proxy(cfg: &SaiaiConfig) -> Result<u32> {
         )
     })?;
     let mut child = ProcessCommand::new(exe)
-        .arg(SAIAI_LINUX_BACKGROUND_COMMAND)
-        .env(BRAND.env.home, &saiai_home)
+        .arg(LINUX_BACKGROUND_COMMAND)
+        .env(BRAND.env.home, &app_home)
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CODEX_HOME")
         .stdin(Stdio::null())
@@ -7747,10 +7734,10 @@ fn start_linux_background_proxy(cfg: &SaiaiConfig) -> Result<u32> {
             std::thread::sleep(Duration::from_millis(20));
         };
         let state = LinuxBackgroundState {
-            schema_version: SAIAI_LINUX_BACKGROUND_STATE_VERSION,
+            schema_version: LINUX_BACKGROUND_STATE_VERSION,
             pid,
             start_time_ticks: identity.start_time_ticks,
-            instance: Some(saiai_config_dir()?.display().to_string()),
+            instance: Some(app_config_dir()?.display().to_string()),
         };
         write_linux_background_state(&state)?;
 
@@ -7803,12 +7790,12 @@ fn start_linux_background_proxy(cfg: &SaiaiConfig) -> Result<u32> {
 
 #[cfg(target_os = "linux")]
 fn stop_linux_background_proxy() -> Result<bool> {
-    stop_linux_background_proxy_at(&saiai_config_dir()?, environment_scope::isolated())
+    stop_linux_background_proxy_at(&app_config_dir()?, environment_scope::isolated())
 }
 
 #[cfg(target_os = "linux")]
 fn stop_linux_background_proxy_at(dir: &Path, isolated: bool) -> Result<bool> {
-    let state_path = dir.join(SAIAI_LINUX_PID_FILENAME.get());
+    let state_path = dir.join(LINUX_PID_FILENAME.get());
     let Some(state) = linux_background_state_at(dir)? else {
         return Ok(false);
     };
@@ -7885,12 +7872,12 @@ fn signal_linux_background_process(
 
 #[cfg(target_os = "linux")]
 fn linux_background_state() -> Result<Option<LinuxBackgroundState>> {
-    linux_background_state_at(&saiai_config_dir()?)
+    linux_background_state_at(&app_config_dir()?)
 }
 
 #[cfg(target_os = "linux")]
 fn linux_background_state_at(dir: &Path) -> Result<Option<LinuxBackgroundState>> {
-    let path = dir.join(SAIAI_LINUX_PID_FILENAME.get());
+    let path = dir.join(LINUX_PID_FILENAME.get());
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
@@ -7909,7 +7896,7 @@ fn linux_background_state_at(dir: &Path) -> Result<Option<LinuxBackgroundState>>
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let state: LinuxBackgroundState = serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse {}", path.display()))?;
-    if state.schema_version != SAIAI_LINUX_BACKGROUND_STATE_VERSION
+    if state.schema_version != LINUX_BACKGROUND_STATE_VERSION
         || state.pid <= 1
         || state.start_time_ticks == 0
     {
@@ -7936,7 +7923,7 @@ fn write_linux_background_state(state: &LinuxBackgroundState) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn linux_background_state_matches(state: &LinuxBackgroundState) -> Result<bool> {
-    linux_background_state_matches_at(state, &saiai_config_dir()?, environment_scope::isolated())
+    linux_background_state_matches_at(state, &app_config_dir()?, environment_scope::isolated())
 }
 
 #[cfg(target_os = "linux")]
@@ -8016,12 +8003,12 @@ fn linux_process_has_background_marker(pid: u32) -> Result<bool> {
     };
     Ok(bytes
         .split(|byte| *byte == 0)
-        .any(|arg| arg == SAIAI_LINUX_BACKGROUND_COMMAND.as_bytes()))
+        .any(|arg| arg == LINUX_BACKGROUND_COMMAND.as_bytes()))
 }
 
 #[cfg(target_os = "linux")]
 fn acquire_linux_service_lock() -> Result<LinuxServiceLock> {
-    acquire_linux_service_lock_at(&saiai_config_dir()?)
+    acquire_linux_service_lock_at(&app_config_dir()?)
 }
 
 #[cfg(target_os = "linux")]
@@ -8030,7 +8017,7 @@ fn acquire_linux_service_lock_at(dir: &Path) -> Result<LinuxServiceLock> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    let path = dir.join(SAIAI_LINUX_LOCK_FILENAME.get());
+    let path = dir.join(LINUX_LOCK_FILENAME.get());
     match fs::symlink_metadata(&path) {
         Ok(metadata) if !metadata.file_type().is_file() => {
             bail!(
@@ -8066,12 +8053,12 @@ fn acquire_linux_service_lock_at(dir: &Path) -> Result<LinuxServiceLock> {
 
 #[cfg(target_os = "linux")]
 fn linux_background_state_path() -> Result<PathBuf> {
-    Ok(saiai_config_dir()?.join(SAIAI_LINUX_PID_FILENAME.get()))
+    Ok(app_config_dir()?.join(LINUX_PID_FILENAME.get()))
 }
 
 #[cfg(target_os = "linux")]
 fn linux_service_log_path() -> Result<PathBuf> {
-    Ok(saiai_config_dir()?.join(SAIAI_SERVICE_LOG_FILENAME.get()))
+    Ok(app_config_dir()?.join(SERVICE_LOG_FILENAME.get()))
 }
 
 #[cfg(target_os = "linux")]
@@ -8106,8 +8093,8 @@ fn run_linux_background_logs() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_configured_listen_has_saiai_owner() -> Result<bool> {
-    let cfg = match read_saiai_config() {
+fn linux_configured_listen_has_app_owner() -> Result<bool> {
+    let cfg = match read_app_config() {
         Ok(cfg) => cfg,
         Err(_) => return Ok(false),
     };
@@ -8115,9 +8102,7 @@ fn linux_configured_listen_has_saiai_owner() -> Result<bool> {
         .listen
         .parse::<SocketAddr>()
         .with_context(|| format!("invalid local proxy listen address {:?}", cfg.listen))?;
-    Ok(listen_port_owners(addr)
-        .iter()
-        .any(ListenPortOwner::is_saiai))
+    Ok(listen_port_owners(addr).iter().any(ListenPortOwner::is_app))
 }
 
 #[cfg(target_os = "windows")]
@@ -8140,9 +8125,9 @@ fn start_windows_background_proxy() -> Result<u32> {
             brand_binary = BRAND.binary_name
         )
     })?;
-    let saiai_home = saiai_config_dir()?;
-    fs::create_dir_all(&saiai_home)
-        .with_context(|| format!("failed to create {}", saiai_home.display()))?;
+    let app_home = app_config_dir()?;
+    fs::create_dir_all(&app_home)
+        .with_context(|| format!("failed to create {}", app_home.display()))?;
     let log_path = windows_log_path()?;
     let stdout = OpenOptions::new()
         .create(true)
@@ -8154,9 +8139,9 @@ fn start_windows_background_proxy() -> Result<u32> {
         .with_context(|| format!("failed to clone {}", log_path.display()))?;
 
     let mut child = ProcessCommand::new(exe)
-        .arg(SAIAI_WINDOWS_BACKGROUND_COMMAND)
+        .arg(WINDOWS_BACKGROUND_COMMAND)
         .arg("--instance-v2")
-        .env(BRAND.env.home, &saiai_home)
+        .env(BRAND.env.home, &app_home)
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CODEX_HOME")
         .stdin(Stdio::null())
@@ -8178,7 +8163,7 @@ fn start_windows_background_proxy() -> Result<u32> {
             version: 2,
             pid,
             created: process.created,
-            instance: saiai_config_dir()?.display().to_string(),
+            instance: app_config_dir()?.display().to_string(),
         };
         write_bytes_atomic(&windows_pid_path()?, &serde_json::to_vec(&state)?, 0o600)?;
         Ok(pid)
@@ -8193,7 +8178,7 @@ fn start_windows_background_proxy() -> Result<u32> {
 #[cfg(target_os = "windows")]
 fn stop_windows_background_proxy() -> Result<()> {
     stop_windows_background_proxy_at(
-        &saiai_config_dir()?,
+        &app_config_dir()?,
         environment_scope::isolated(),
         &[env::current_exe()?],
     )
@@ -8209,7 +8194,7 @@ fn stop_windows_background_proxy_at(
         process.stop()?;
     }
     stop_windows_log_followers_at(dir)?;
-    let _ = fs::remove_file(dir.join(SAIAI_WINDOWS_PID_FILENAME.get()));
+    let _ = fs::remove_file(dir.join(WINDOWS_PID_FILENAME.get()));
     Ok(())
 }
 
@@ -8225,7 +8210,7 @@ struct WindowsBackgroundState {
 #[cfg(target_os = "windows")]
 fn windows_background_process(terminate: bool) -> Result<Option<windows_background::Process>> {
     windows_background_process_at(
-        &saiai_config_dir()?,
+        &app_config_dir()?,
         environment_scope::isolated(),
         terminate,
         &[env::current_exe()?],
@@ -8239,7 +8224,7 @@ fn windows_background_process_at(
     terminate: bool,
     legacy_executables: &[PathBuf],
 ) -> Result<Option<windows_background::Process>> {
-    let path = dir.join(SAIAI_WINDOWS_PID_FILENAME.get());
+    let path = dir.join(WINDOWS_PID_FILENAME.get());
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -8301,7 +8286,7 @@ struct WindowsLogFollower {
 
 #[cfg(target_os = "windows")]
 fn register_windows_log_follower(child: u32) -> Result<PathBuf> {
-    let directory = saiai_config_dir()?;
+    let directory = app_config_dir()?;
     let state = |pid| -> Result<WindowsBackgroundState> {
         let process =
             windows_background::Process::open(pid, false)?.context("log follower exited")?;
@@ -8355,7 +8340,7 @@ fn stop_windows_log_followers_at(directory: &Path) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn lock_windows_service() -> Result<fs::File> {
-    lock_windows_service_at(&saiai_config_dir()?)
+    lock_windows_service_at(&app_config_dir()?)
 }
 
 #[cfg(target_os = "windows")]
@@ -8388,12 +8373,12 @@ fn windows_pid_is_running(pid: u32) -> Result<bool> {
 
 #[cfg(target_os = "windows")]
 fn windows_pid_path() -> Result<PathBuf> {
-    Ok(saiai_config_dir()?.join(SAIAI_WINDOWS_PID_FILENAME.get()))
+    Ok(app_config_dir()?.join(WINDOWS_PID_FILENAME.get()))
 }
 
 #[cfg(target_os = "windows")]
 fn windows_log_path() -> Result<PathBuf> {
-    Ok(saiai_config_dir()?.join(SAIAI_SERVICE_LOG_FILENAME.get()))
+    Ok(app_config_dir()?.join(SERVICE_LOG_FILENAME.get()))
 }
 
 #[cfg(target_os = "linux")]
@@ -8623,7 +8608,7 @@ fn migrate_legacy_claude_no_proxy(settings_path: &Path, listen: &str) -> Result<
     Ok(())
 }
 
-fn migrate_legacy_codex_system_proxy_for_instance(cfg: &SaiaiConfig) -> Result<()> {
+fn migrate_legacy_codex_system_proxy_for_instance(cfg: &AppConfig) -> Result<()> {
     let Some(_initialization_lock) = try_lock_initialization()? else {
         return Ok(());
     };
@@ -8734,7 +8719,7 @@ fn codex_config_dir() -> Result<PathBuf> {
     Ok(home.join(".codex"))
 }
 
-fn saiai_config_dir() -> Result<PathBuf> {
+fn app_config_dir() -> Result<PathBuf> {
     if let Some(scope) = environment_scope::active() {
         return Ok(scope.directory.clone());
     }
@@ -8745,11 +8730,11 @@ fn saiai_config_dir() -> Result<PathBuf> {
     Ok(home.join(BRAND.home_dir_name))
 }
 
-fn saiai_config_path() -> Result<PathBuf> {
-    Ok(saiai_config_dir()?.join(SAIAI_CONFIG_FILENAME.get()))
+fn app_config_path() -> Result<PathBuf> {
+    Ok(app_config_dir()?.join(CONFIG_FILENAME.get()))
 }
 
-fn write_saiai_config_at(path: &Path, config: &SaiaiConfig) -> Result<()> {
+fn write_app_config_at(path: &Path, config: &AppConfig) -> Result<()> {
     let parent = path.parent().with_context(|| {
         format!(
             "failed to resolve {brand_product} config parent directory",
@@ -8766,8 +8751,8 @@ fn write_saiai_config_at(path: &Path, config: &SaiaiConfig) -> Result<()> {
     write_json_object(path, value)
 }
 
-fn read_saiai_config() -> Result<SaiaiConfig> {
-    let path = saiai_config_path()?;
+fn read_app_config() -> Result<AppConfig> {
+    let path = app_config_path()?;
     let raw = fs::read_to_string(&path).with_context(|| {
         format!(
             "failed to read {}; run the {brand_product} setup command first",
@@ -8779,10 +8764,10 @@ fn read_saiai_config() -> Result<SaiaiConfig> {
 }
 
 fn existing_runtime_ca_paths() -> Option<(PathBuf, PathBuf)> {
-    let path = saiai_config_path().ok()?;
+    let path = app_config_path().ok()?;
     let raw = fs::read_to_string(path).ok()?;
-    let config = serde_json::from_str::<SaiaiConfig>(&raw).ok()?;
-    if config.version != SAIAI_CONFIG_VERSION.get()
+    let config = serde_json::from_str::<AppConfig>(&raw).ok()?;
+    if config.version != CONFIG_VERSION.get()
         || config.ca_cert_path.trim().is_empty()
         || config.ca_key_path.trim().is_empty()
     {
@@ -9960,8 +9945,8 @@ HTTPS_PROXY="http://127.0.0.1:1111"
 
     #[test]
     fn existing_saiai_config_defaults_chatgpt_passthrough_on() {
-        let config: SaiaiConfig = serde_json::from_value(serde_json::json!({
-            "version": SAIAI_CONFIG_VERSION.get(),
+        let config: AppConfig = serde_json::from_value(serde_json::json!({
+            "version": CONFIG_VERSION.get(),
             "base_url": "https://gateway.example.test",
             "api_key": "TEST_ONLY_KEY",
             "listen": "127.0.0.1:19908",
@@ -10017,8 +10002,8 @@ HTTPS_PROXY="http://127.0.0.1:1111"
                 api_key: "TEST_ONLY_CODEX_KEY".to_string(),
             }),
         };
-        let previous = SaiaiConfig {
-            version: SAIAI_CONFIG_VERSION.get(),
+        let previous = AppConfig {
+            version: CONFIG_VERSION.get(),
             base_url: "https://claude.example.test".to_string(),
             api_key: "TEST_ONLY_CLAUDE_KEY".to_string(),
             listen: "127.0.0.1:19908".to_string(),
@@ -10029,7 +10014,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             upstream_proxy: None,
             providers: providers.clone(),
         };
-        let current = SaiaiConfig {
+        let current = AppConfig {
             base_url: "https://codex.example.test".to_string(),
             api_key: "TEST_ONLY_CODEX_KEY".to_string(),
             providers,
@@ -10051,10 +10036,10 @@ HTTPS_PROXY="http://127.0.0.1:1111"
 
         let initialized =
             initialize_codex_local_proxy_at(temporary.path(), &args, "test-create").unwrap();
-        let config: SaiaiConfig =
+        let config: AppConfig =
             serde_json::from_slice(&fs::read(&initialized.config_path).unwrap()).unwrap();
 
-        assert_eq!(config.version, SAIAI_CONFIG_VERSION.get());
+        assert_eq!(config.version, CONFIG_VERSION.get());
         assert_eq!(config.base_url, "https://gateway.example.test");
         assert_eq!(config.api_key, args.api_key);
         assert_eq!(
@@ -10103,16 +10088,16 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             trust_vscode_ca: false,
         };
         let first = initialize_codex_local_proxy_at(temporary.path(), &args, "test-first").unwrap();
-        let mut config: SaiaiConfig =
+        let mut config: AppConfig =
             serde_json::from_slice(&fs::read(&first.config_path).unwrap()).unwrap();
         config.desktop_browser_use = false;
-        write_saiai_config_at(&first.config_path, &config).unwrap();
+        write_app_config_at(&first.config_path, &config).unwrap();
         // An unreadable CA sends init down the rebuild branch.
         fs::remove_file(&first.ca_cert_path).unwrap();
 
         let second =
             initialize_codex_local_proxy_at(temporary.path(), &args, "test-second").unwrap();
-        let rebuilt: SaiaiConfig =
+        let rebuilt: AppConfig =
             serde_json::from_slice(&fs::read(&second.config_path).unwrap()).unwrap();
         assert!(read_runtime_ca(&rebuilt).is_ok());
         assert!(!rebuilt.desktop_browser_use);
@@ -10132,7 +10117,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             initialize_codex_local_proxy_at(temporary.path(), &first_args, "test-first").unwrap();
         let cert_before = fs::read(&first.ca_cert_path).unwrap();
         let key_before = fs::read(&first.ca_key_path).unwrap();
-        let mut config: SaiaiConfig =
+        let mut config: AppConfig =
             serde_json::from_slice(&fs::read(&first.config_path).unwrap()).unwrap();
         config.providers.claude = Some(ProviderCredential {
             base_url: "https://claude.example.test".to_string(),
@@ -10141,7 +10126,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         config.listen = "127.0.0.1:29908".to_string();
         config.chatgpt_chat_passthrough = false;
         config.desktop_browser_use = false;
-        write_saiai_config_at(&first.config_path, &config).unwrap();
+        write_app_config_at(&first.config_path, &config).unwrap();
 
         let second_args = InitArgs {
             base_url: "https://second.example.test".to_string(),
@@ -10152,7 +10137,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         };
         let second =
             initialize_codex_local_proxy_at(temporary.path(), &second_args, "test-second").unwrap();
-        let updated: SaiaiConfig =
+        let updated: AppConfig =
             serde_json::from_slice(&fs::read(&second.config_path).unwrap()).unwrap();
 
         assert_eq!(second.ca_cert_path, first.ca_cert_path);
@@ -10182,10 +10167,10 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     #[test]
     fn updates_only_selected_saiai_provider_config() {
         let temporary = tempfile::tempdir().unwrap();
-        let config_path = temporary.path().join(SAIAI_CONFIG_FILENAME.get());
+        let config_path = temporary.path().join(CONFIG_FILENAME.get());
         let cert_path = temporary.path().join("saiai-ca.crt");
         let key_path = temporary.path().join("saiai-ca.key");
-        let _initial = update_saiai_provider_config_at(
+        let _initial = update_app_provider_config_at(
             &config_path,
             ProviderKind::Claude,
             ProviderCredential {
@@ -10195,7 +10180,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             Some((cert_path.clone(), key_path.clone())),
         )
         .unwrap();
-        let updated = update_saiai_provider_config_at(
+        let updated = update_app_provider_config_at(
             &config_path,
             ProviderKind::Codex,
             ProviderCredential {
@@ -10228,7 +10213,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             Some(&"TEST_ONLY_CODEX_KEY".to_string())
         );
 
-        let unchanged = update_saiai_provider_config_at(
+        let unchanged = update_app_provider_config_at(
             &config_path,
             ProviderKind::Codex,
             ProviderCredential {
@@ -10423,13 +10408,13 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     fn reports_each_other_saiai_ca_once() {
         let listing = "AAA CurrentUser current\r\nBBB CurrentUser old\nBBB CurrentUser old\n\nBBB LocalMachine old\nCCC\n";
         assert_eq!(
-            stale_saiai_ca_thumbprints(listing, "current"),
+            stale_app_ca_thumbprints(listing, "current"),
             vec![
                 "BBB in CurrentUser\\Root".to_string(),
                 "BBB in LocalMachine\\Root".to_string()
             ]
         );
-        assert!(stale_saiai_ca_thumbprints("AAA CurrentUser current\n", "current").is_empty());
+        assert!(stale_app_ca_thumbprints("AAA CurrentUser current\n", "current").is_empty());
     }
 
     #[test]
@@ -10641,32 +10626,24 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     #[cfg(target_os = "linux")]
     #[test]
     fn parses_private_linux_background_worker_command() {
-        match parse_command(&[SAIAI_LINUX_BACKGROUND_COMMAND.to_string()]).unwrap() {
+        match parse_command(&[LINUX_BACKGROUND_COMMAND.to_string()]).unwrap() {
             Command::RunLinuxBackgroundProxy => {}
             _ => panic!("expected Linux background proxy worker command"),
         }
         assert!(
-            parse_command(&[
-                SAIAI_LINUX_BACKGROUND_COMMAND.to_string(),
-                "extra".to_string(),
-            ])
-            .is_err()
+            parse_command(&[LINUX_BACKGROUND_COMMAND.to_string(), "extra".to_string(),]).is_err()
         );
     }
 
     #[cfg(target_os = "windows")]
     #[test]
     fn parses_private_windows_background_worker_command() {
-        match parse_command(&[SAIAI_WINDOWS_BACKGROUND_COMMAND.to_string()]).unwrap() {
+        match parse_command(&[WINDOWS_BACKGROUND_COMMAND.to_string()]).unwrap() {
             Command::RunWindowsBackgroundProxy => {}
             _ => panic!("expected Windows background proxy worker command"),
         }
         assert!(
-            parse_command(&[
-                SAIAI_WINDOWS_BACKGROUND_COMMAND.to_string(),
-                "extra".to_string(),
-            ])
-            .is_err()
+            parse_command(&[WINDOWS_BACKGROUND_COMMAND.to_string(), "extra".to_string(),]).is_err()
         );
     }
 
@@ -10750,7 +10727,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             name: "saiai".to_string(),
         }];
         assert_eq!(format_listen_owners(&owners), "pid 42 (saiai)");
-        assert!(owners[0].is_saiai());
+        assert!(owners[0].is_app());
     }
 
     #[test]

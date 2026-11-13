@@ -24,10 +24,10 @@ const PLAN_MARKER: BrandText = BrandText(|| {
 #[cfg(windows)]
 const RELAUNCH_FLAG: &str = "--relaunched-from";
 const ENVIRONMENTS_DIR: &str = "environments";
-pub(crate) const SAIAI_HOME_FILES: &[BrandValue<&'static str>] = &[
-    crate::SAIAI_CONFIG_FILENAME,
-    crate::SAIAI_CA_FILENAME,
-    crate::SAIAI_CA_KEY_FILENAME,
+pub(crate) const APP_HOME_FILES: &[BrandValue<&'static str>] = &[
+    crate::CONFIG_FILENAME,
+    crate::CA_FILENAME,
+    crate::CA_KEY_FILENAME,
     BrandValue(|_| "initialization.lock"),
     BrandValue(|brand| brand.service.lock_filename),
     BrandValue(|brand| brand.service.pid_filename),
@@ -38,7 +38,7 @@ pub(crate) const SAIAI_HOME_FILES: &[BrandValue<&'static str>] = &[
     BrandValue(|brand| brand.client_proof.corrupt_key_filename),
     BrandValue(|_| "windows-packaged-proxy-lease.json"),
 ];
-pub(crate) const SAIAI_HOME_DIRS: &[&str] = &["log-followers", "desktop"];
+pub(crate) const APP_HOME_DIRS: &[&str] = &["log-followers", "desktop"];
 const CLAUDE_GENERIC_ENV: &[&str] = &[
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     "ENABLE_PROMPT_CACHING_1H",
@@ -545,7 +545,7 @@ fn read_instance(
             instance.product_dir = Some(dir);
         }
     }
-    let raw = match fs::read(instance.dir.join(crate::SAIAI_CONFIG_FILENAME.get())) {
+    let raw = match fs::read(instance.dir.join(crate::CONFIG_FILENAME.get())) {
         Ok(raw) => raw,
         Err(error) => {
             instance.config_present = error.kind() != ErrorKind::NotFound;
@@ -556,7 +556,7 @@ fn read_instance(
     let Ok(config) = serde_json::from_slice::<Value>(&raw) else {
         return instance;
     };
-    instance.has_config = is_saiai_config(&config);
+    instance.has_config = is_app_config(&config);
     if !instance.has_config {
         return instance;
     }
@@ -576,14 +576,14 @@ fn read_instance(
 }
 
 /// Fields every SAIAI config.json carries (version 2, or the version-less v1 shape).
-fn is_saiai_config(config: &Value) -> bool {
+fn is_app_config(config: &Value) -> bool {
     let text = |key: &str| config.get(key).is_some_and(Value::is_string);
     config.is_object()
         && text("listen")
         && text("ca_cert_path")
         && match config.get("version") {
             Some(version) => {
-                version.as_u64() == Some(u64::from(crate::SAIAI_CONFIG_VERSION.get()))
+                version.as_u64() == Some(u64::from(crate::CONFIG_VERSION.get()))
                     || version.as_u64() == Some(1)
             }
             None => text("base_url") && text("api_key"),
@@ -617,8 +617,8 @@ fn owned_environment(instance: &Instance) -> bool {
                 return false;
             }
             record = true;
-        } else if name == crate::SAIAI_CONFIG_FILENAME.get()
-            || !is_saiai_home_file(name)
+        } else if name == crate::CONFIG_FILENAME.get()
+            || !is_app_home_file(name)
             || !entry.file_type().is_ok_and(|kind| kind.is_file())
         {
             return false;
@@ -768,7 +768,7 @@ fn parse_json_object(bytes: &[u8]) -> Option<Map<String, Value>> {
         .and_then(crate::as_object)
 }
 
-fn collect_backups(dir: &Path, exclude_saiai_ca: bool, plan: &mut Plan) {
+fn collect_backups(dir: &Path, exclude_app_ca: bool, plan: &mut Plan) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -777,7 +777,7 @@ fn collect_backups(dir: &Path, exclude_saiai_ca: bool, plan: &mut Plan) {
         .filter_map(|entry| {
             let name = entry.file_name().to_str()?.to_string();
             (name.contains(".bak-")
-                && !(exclude_saiai_ca && name.starts_with(BRAND.certificates.ca_backup_prefix))
+                && !(exclude_app_ca && name.starts_with(BRAND.certificates.ca_backup_prefix))
                 && entry.file_type().is_ok_and(|kind| kind.is_file()))
             .then(|| entry.path())
         })
@@ -1305,8 +1305,8 @@ fn ca_backup_paths(dir: &Path) -> Vec<PathBuf> {
         return Vec::new();
     };
     let prefixes = [
-        format!("{}.bak-", crate::SAIAI_CA_FILENAME.get()),
-        format!("{}.bak-", crate::SAIAI_CA_KEY_FILENAME.get()),
+        format!("{}.bak-", crate::CA_FILENAME.get()),
+        format!("{}.bak-", crate::CA_KEY_FILENAME.get()),
     ];
     let mut paths = entries
         .flatten()
@@ -1345,12 +1345,12 @@ fn known_ca_files(discovery: &Discovery) -> Vec<PathBuf> {
         }
     }
     for directory in directories {
-        files.insert(directory.join(crate::SAIAI_CA_FILENAME.get()));
+        files.insert(directory.join(crate::CA_FILENAME.get()));
         for path in ca_backup_paths(directory) {
             if path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(crate::SAIAI_CA_FILENAME.get()))
+                .is_some_and(|name| name.starts_with(crate::CA_FILENAME.get()))
             {
                 files.insert(path);
             }
@@ -1404,7 +1404,7 @@ fn certutil_export(db: &str) -> Result<Option<Vec<u8>>> {
             "-d",
             db,
             "-n",
-            crate::SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME.get(),
+            crate::LOCAL_PROXY_NSS_CERT_NICKNAME.get(),
             "-a",
         ])
         .stdin(std::process::Stdio::null())
@@ -1443,7 +1443,7 @@ fn plan_nss(files: &[PathBuf], plan: &mut Plan) {
         .collect::<BTreeSet<_>>();
     let label = format!(
         "NSS certificate {} in {}",
-        crate::SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME.get(),
+        crate::LOCAL_PROXY_NSS_CERT_NICKNAME.get(),
         db_dir.display()
     );
     match nss_decision(&exported, &known) {
@@ -1465,8 +1465,8 @@ fn plan_nss(files: &[PathBuf], plan: &mut Plan) {
 
 // ------------------------------------------------------------------ Data
 
-pub(crate) fn is_saiai_home_file(name: &str) -> bool {
-    SAIAI_HOME_FILES.iter().map(BrandValue::get).any(|file| {
+pub(crate) fn is_app_home_file(name: &str) -> bool {
+    APP_HOME_FILES.iter().map(BrandValue::get).any(|file| {
         name == file
             || name.starts_with(&format!("{file}.bak-"))
             || name.starts_with(&format!(".{file}.{}-", BRAND.config.temp_file_infix))
@@ -1474,12 +1474,9 @@ pub(crate) fn is_saiai_home_file(name: &str) -> bool {
 }
 
 pub(crate) fn is_claude_ca_file(name: &str) -> bool {
-    [
-        crate::SAIAI_CA_FILENAME.get(),
-        crate::SAIAI_CA_KEY_FILENAME.get(),
-    ]
-    .iter()
-    .any(|file| name == *file || name.starts_with(&format!("{file}.bak-")))
+    [crate::CA_FILENAME.get(), crate::CA_KEY_FILENAME.get()]
+        .iter()
+        .any(|file| name == *file || name.starts_with(&format!("{file}.bak-")))
 }
 
 fn matching_files(dir: &Path, filter: fn(&str) -> bool) -> Result<Vec<PathBuf>> {
@@ -1517,12 +1514,12 @@ fn plan_data(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
             ),
         );
     } else if root.is_dir() {
-        let saiai_config = discovery.instances.first().is_some_and(|i| i.has_config);
-        for path in matching_files(root, is_saiai_home_file)? {
+        let app_config = discovery.instances.first().is_some_and(|i| i.has_config);
+        for path in matching_files(root, is_app_home_file)? {
             if path
                 .file_name()
-                .is_some_and(|name| name == crate::SAIAI_CONFIG_FILENAME.get())
-                && !saiai_config
+                .is_some_and(|name| name == crate::CONFIG_FILENAME.get())
+                && !app_config
             {
                 plan.note(
                     Area::Data,
@@ -1536,7 +1533,7 @@ fn plan_data(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
             }
             plan.remove_file(Area::Data, path);
         }
-        for name in SAIAI_HOME_DIRS {
+        for name in APP_HOME_DIRS {
             let path = root.join(name);
             match fs::symlink_metadata(&path) {
                 Ok(meta) if meta.is_dir() => plan.remove_tree(Area::Data, path),
@@ -2459,7 +2456,7 @@ fn execute_nss(db: &str, known: &BTreeSet<String>) -> Result<Outcome> {
                 "-d",
                 db,
                 "-n",
-                crate::SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME.get(),
+                crate::LOCAL_PROXY_NSS_CERT_NICKNAME.get(),
             ])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -3077,10 +3074,10 @@ mod tests {
             ".config.json.saiai-tmp-1-abc",
             "saiai.log",
         ] {
-            assert!(is_saiai_home_file(name), "{name}");
+            assert!(is_app_home_file(name), "{name}");
         }
         for name in ["notes.txt", "config.json.orig", "environments", "desktop"] {
-            assert!(!is_saiai_home_file(name), "{name}");
+            assert!(!is_app_home_file(name), "{name}");
         }
         assert!(is_claude_ca_file("saiai-ca.crt.bak-1"));
         assert!(!is_claude_ca_file("settings.json"));
@@ -3115,7 +3112,7 @@ mod tests {
             json!({"version": 1, "listen": "127.0.0.1:1", "ca_cert_path": "/ca"}),
             json!({"listen": "127.0.0.1:1", "ca_cert_path": "/ca", "base_url": "u", "api_key": "k"}),
         ] {
-            assert!(is_saiai_config(&config), "{config}");
+            assert!(is_app_config(&config), "{config}");
         }
         for config in [
             json!({"theme": "dark"}),
@@ -3124,7 +3121,7 @@ mod tests {
             json!({"listen": "127.0.0.1:1", "ca_cert_path": "/ca"}),
             json!([1]),
         ] {
-            assert!(!is_saiai_config(&config), "{config}");
+            assert!(!is_app_config(&config), "{config}");
         }
     }
 
