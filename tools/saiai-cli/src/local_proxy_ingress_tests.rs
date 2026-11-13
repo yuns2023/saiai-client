@@ -1272,6 +1272,8 @@ async fn no_chat_relay_refuses_every_spelling_of_a_relay_path() {
         (OPENAI_HOST, "/ChatGPT/backend-api/celsius/ws/user"),
         (OPENAI_HOST, "/v1/codex/images/generations/"),
         (OPENAI_HOST, "//chatgpt/backend-api/models"),
+        (OPENAI_HOST, "/chatgpt#x"),
+        (CHATGPT_HOST, "/backend-api/devicecheck#x"),
         (CHAT_OPENAI_HOST, "/Backend-API/f/conversation"),
         (CHATGPT_AUX_HOST, "/backend-api/codex/images/generations/"),
         (CHATGPT_HOST, "/backend-api/devicecheck/"),
@@ -1365,6 +1367,8 @@ async fn plain_http_proxy_holds_the_chat_relay_gate() {
         ),
         ("POST", "http://chatgpt.com/backend-api/codex/images/edits"),
         ("HEAD", "http://api.openai.com/chatgpt/backend-api/models"),
+        ("GET", "http://chatgpt.com/backend-api/devicecheck#x"),
+        ("GET", "http://api.openai.com/chatgpt#x"),
         ("OPTIONS", "http://chatgpt.com/backend-api/f/conversation"),
     ];
     let open = [

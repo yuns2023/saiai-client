@@ -1035,9 +1035,7 @@ async fn serve_http_proxy_request(
     let port = target.port_or_known_default().unwrap_or(80);
     // The Chat relay gate holds on the plain HTTP proxy too, on the path
     // the absolute-form URL resolved to (the one that would be sent).
-    if state.gateway.native_chat().is_none()
-        && refused_without_chat_relay(&host, &target[url::Position::BeforePath..])
-    {
+    if state.gateway.native_chat().is_none() && refused_without_chat_relay(&host, target.path()) {
         let resp = chat_relay_disabled_response();
         return write_static_response(&mut stream, resp.status, resp.content_type, resp.body, true)
             .await;
@@ -2727,11 +2725,12 @@ fn refused_without_chat_relay(host: &str, target: &str) -> bool {
                 .is_some_and(|path| normalize_ordinary_chat_target(&path, None).is_ok())
 }
 
-/// `path` as the Chat relay gate compares it: lowercase, `%2f` and `%2e`
-/// decoded, `;` parameters and empty segments dropped. `None` when it holds
-/// dot segments or backslashes, whose resolution depends on the Gateway
-/// base path.
+/// `path` as the Chat relay gate compares it: any fragment cut (never sent),
+/// lowercase, `%2f` and `%2e` decoded, `;` parameters and empty segments
+/// dropped. `None` when it holds dot segments or backslashes, whose
+/// resolution depends on the Gateway base path.
 fn relay_gate_path(path: &str) -> Option<String> {
+    let path = path.split('#').next().unwrap_or_default();
     if path.contains('\\') {
         return None;
     }
@@ -4278,6 +4277,8 @@ mod tests {
             ("/v1/.well", "/v1/.well"),
             ("/ChatGPT//Backend-API/", "/chatgpt/backend-api"),
             ("/chatgpt%2Fbackend-api;x=1/f", "/chatgpt/backend-api/f"),
+            ("/chatgpt#x", "/chatgpt"),
+            ("/backend-api/devicecheck#/../x", "/backend-api/devicecheck"),
         ] {
             assert_eq!(relay_gate_path(path).as_deref(), Some(gate), "{path}");
         }
@@ -4294,6 +4295,8 @@ mod tests {
             (CHAT_OPENAI_HOST, "/backend-api/devicecheck/"),
             (CHATGPT_AUX_HOST, "/backend-api/codex/images/generations/"),
             (CHATGPT_HOST, "/celsius/ws/user"),
+            (OPENAI_HOST, "/chatgpt#x"),
+            (CHATGPT_HOST, "/backend-api/devicecheck#x"),
         ] {
             assert!(refused_without_chat_relay(host, target), "{host}{target}");
         }
