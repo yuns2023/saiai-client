@@ -1825,6 +1825,7 @@ fn saiai_brand_values_are_frozen() {
     assert_eq!(brand.config.filename, "config.json");
     assert_eq!(brand.config.version, 2);
     assert_eq!(brand.config.temp_file_infix, "saiai-tmp");
+    assert_eq!(brand.config.type_name, "SaiaiConfig");
     let env = &brand.env;
     assert_eq!(
         [
@@ -2153,15 +2154,10 @@ const SAIAI_NAMING_FILES: [&str; 4] = [
 /// the list to equal the code exactly; that it only ever shrinks is enforced
 /// by review of this file's diff, not by the test.
 ///
-/// Remaining entries, both in `lib.rs`:
-/// - `pub mod gateway_saiai;` — the SAIAI Gateway extension is compiled into
-///   the library (the program reaches it as
-///   `proxy_cli::gateway_saiai::SAIAI_GATEWAY`) until the client proof moves
-///   out of the library (C4) and the extension can move with it.
-/// - `#[serde(expecting = "struct SaiaiConfig")]` — the diagnostic printed
-///   when config.json is not an object keeps its earlier wording (serde
-///   derived it from the old type name); a behavior-changing release may
-///   make it neutral.
+/// Remaining entry: `lib.rs` `pub mod gateway_saiai;` — the SAIAI Gateway
+/// extension is compiled into the library (the program reaches it as
+/// `proxy_cli::gateway_saiai::SAIAI_GATEWAY`) until the client proof moves
+/// out of the library (C4c) and the extension can move with it.
 const SAIAI_RESIDUE: &str = include_str!("brand_residue.txt");
 
 fn saiai_residue_lines() -> Vec<String> {

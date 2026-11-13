@@ -22,6 +22,7 @@ pub(crate) const SAIAI_VALUES: Brand = Brand {
         filename: "config.json",
         version: 2,
         temp_file_infix: "saiai-tmp",
+        type_name: "SaiaiConfig",
     },
     env: EnvironmentNames {
         home: "SAIAI_HOME",

@@ -3763,10 +3763,12 @@ fn local_proxy_chatgpt_spki(listen: &str) -> Result<String> {
     Ok(spki)
 }
 
+// The derived code below is used through `AppConfig::serialize` /
+// `AppConfig::deserialize` (`remote = "Self"`); the trait impls after the
+// struct name the brand's config type in shape errors, which derived code
+// would take from the Rust type name.
 #[derive(Clone, Serialize, Deserialize, Eq, PartialEq)]
-// Keeps the type name earlier releases printed when config.json is not an
-// object (serde derives `expected struct <type>` from the Rust name).
-#[serde(expecting = "struct SaiaiConfig")]
+#[serde(remote = "Self")]
 struct AppConfig {
     version: u32,
     base_url: String,
@@ -4041,6 +4043,103 @@ fn proxy_runtime_config_changed(previous: Option<&AppConfig>, current: &AppConfi
         || previous.providers != current.providers
         || (previous.providers.is_empty()
             && (previous.base_url != current.base_url || previous.api_key != current.api_key))
+}
+
+/// Field order of an array-form config.json (the struct's field order).
+const APP_CONFIG_FIELDS: &[&str] = &[
+    "version",
+    "base_url",
+    "api_key",
+    "listen",
+    "ca_cert_path",
+    "ca_key_path",
+    "chatgpt_chat_passthrough",
+    "desktop_browser_use",
+    "upstream_proxy",
+    "providers",
+];
+
+impl Serialize for AppConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        AppConfig::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AppConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct(
+            "AppConfig",
+            APP_CONFIG_FIELDS,
+            AppConfigVisitor(crate::brand::brand()),
+        )
+    }
+}
+
+/// `struct <brand type name> with <n> elements`: the expectation of an
+/// array-form config that is too short.
+struct AppConfigElements(&'static brand::Brand);
+
+impl serde::de::Expected for AppConfigElements {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "struct {} with {} elements",
+            self.0.config.type_name,
+            APP_CONFIG_FIELDS.len()
+        )
+    }
+}
+
+/// Reads a config for `brand`, whose config type name the shape errors use.
+struct AppConfigVisitor(&'static brand::Brand);
+
+impl<'de> serde::de::Visitor<'de> for AppConfigVisitor {
+    type Value = AppConfig;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "struct {}", self.0.config.type_name)
+    }
+
+    // Field errors (missing, duplicate, mistyped) name fields, not the type,
+    // so the derived code handles objects as before.
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<AppConfig, A::Error> {
+        AppConfig::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+    }
+
+    // As derived code reads an array: fields in order, a defaulted field may
+    // be missing at the end, a missing required one is a length error.
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<AppConfig, A::Error> {
+        let brand = self.0;
+        let required_error =
+            |index| serde::de::Error::invalid_length(index, &AppConfigElements(brand));
+        fn required<'de, A: serde::de::SeqAccess<'de>, T: Deserialize<'de>>(
+            seq: &mut A,
+            index: &mut usize,
+            error: impl Fn(usize) -> A::Error,
+        ) -> Result<T, A::Error> {
+            let element = seq.next_element()?.ok_or_else(|| error(*index));
+            *index += 1;
+            element
+        }
+        let mut index = 0;
+        let version = required(&mut seq, &mut index, required_error)?;
+        let base_url = required(&mut seq, &mut index, required_error)?;
+        let api_key = required(&mut seq, &mut index, required_error)?;
+        let listen = required(&mut seq, &mut index, required_error)?;
+        let ca_cert_path = required(&mut seq, &mut index, required_error)?;
+        Ok(AppConfig {
+            version,
+            base_url,
+            api_key,
+            listen,
+            ca_cert_path,
+            ca_key_path: seq.next_element()?.unwrap_or_default(),
+            chatgpt_chat_passthrough: seq.next_element()?.unwrap_or_else(default_true),
+            desktop_browser_use: seq.next_element()?.unwrap_or_else(default_true),
+            upstream_proxy: seq.next_element()?.unwrap_or_default(),
+            providers: seq.next_element()?.unwrap_or_default(),
+        })
+    }
 }
 
 fn default_true() -> bool {
@@ -10101,6 +10200,36 @@ HTTPS_PROXY="http://127.0.0.1:1111"
                 *expected,
                 "{input:?}"
             );
+        }
+    }
+
+    /// The config type name in shape errors is the brand's.
+    #[test]
+    fn config_shape_errors_name_the_brand_config_type() {
+        use serde::Deserializer as _;
+        static ACME: brand::Brand = brand::Brand {
+            config: brand::ConfigNames {
+                type_name: "AcmeConfig",
+                ..crate::brand_saiai::SAIAI_VALUES.config
+            },
+            ..crate::brand_saiai::SAIAI_VALUES
+        };
+        for (input, message) in [
+            (
+                "null",
+                "invalid type: null, expected struct AcmeConfig at line 1 column 4",
+            ),
+            (
+                "[2]",
+                "invalid length 1, expected struct AcmeConfig with 10 elements at line 1 column 3",
+            ),
+        ] {
+            let mut deserializer = serde_json::Deserializer::from_str(input);
+            let error = (&mut deserializer)
+                .deserialize_struct("AppConfig", APP_CONFIG_FIELDS, AppConfigVisitor(&ACME))
+                .err()
+                .unwrap();
+            assert_eq!(error.to_string(), message, "{input}");
         }
     }
 

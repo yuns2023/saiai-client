@@ -79,6 +79,9 @@ fn validate(brand: &Brand) -> Result<()> {
         ("product_name", brand.product_name, |byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'.')
         }),
+        ("config.type_name", brand.config.type_name, |byte| {
+            byte.is_ascii_alphanumeric() || byte == b'_'
+        }),
         (
             "placeholders.synthetic_id_prefix",
             brand.placeholders.synthetic_id_prefix,
@@ -281,6 +284,10 @@ pub struct ConfigNames {
     pub version: u32,
     /// Infix of atomic-write temporary files (`.<file>.<infix>-<pid>-<id>`).
     pub temp_file_infix: &'static str,
+    /// Type name in the errors for a config file of the wrong shape
+    /// (`expected struct <name>`); earlier releases printed their Rust type
+    /// name there. A Rust identifier.
+    pub type_name: &'static str,
 }
 
 /// Environment variables read by the client or passed to its own children.
