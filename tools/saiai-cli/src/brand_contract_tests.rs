@@ -791,6 +791,8 @@ fn cli_sources() -> Vec<(String, String)> {
 }
 
 /// Text before the first inline test module (`#[cfg(test)]` + `mod x {`).
+/// Relies on the repository convention that inline test modules sit at the
+/// end of a file; production code after one would not be scanned.
 fn production_part(text: &str) -> &str {
     let mut offset = 0;
     while let Some(found) = text[offset..].find("#[cfg(test)]\nmod ") {
@@ -817,13 +819,16 @@ fn saiai_environment_names(text: &str) -> BTreeSet<String> {
             .collect::<String>();
         let before = &text[..index];
         let after = &text[index + name.len()..];
-        let referenced = (before.ends_with('"') && after.starts_with('"'))
-            || (before.ends_with('\'') && after.starts_with('\''))
-            || before.ends_with("$env:")
-            || (before.ends_with("${env:") && after.starts_with('}'))
-            || (before.ends_with("${") && (after.starts_with('}') || after.starts_with(':')))
-            || (before.ends_with('$') && !before.ends_with("\\$"))
-            || (before.ends_with('%') && after.starts_with('%'));
+        // Names are all-uppercase; `SAIAI_Foo` is not a reference to `SAIAI_F`.
+        let complete = !after.starts_with(|ch: char| ch.is_ascii_alphanumeric());
+        let referenced = complete
+            && ((before.ends_with('"') && after.starts_with('"'))
+                || (before.ends_with('\'') && after.starts_with('\''))
+                || before.ends_with("$env:")
+                || (before.ends_with("${env:") && after.starts_with('}'))
+                || (before.ends_with("${") && (after.starts_with('}') || after.starts_with(':')))
+                || (before.ends_with('$') && !before.ends_with("\\$"))
+                || (before.ends_with('%') && after.starts_with('%')));
         if referenced {
             found.insert(name);
         }
@@ -834,7 +839,7 @@ fn saiai_environment_names(text: &str) -> BTreeSet<String> {
 #[test]
 fn environment_scanner_recognizes_every_reference_style() {
     let sample = r#"env::var("SAIAI_A"); .env('SAIAI_B', x); $env:SAIAI_C; ${env:SAIAI_D};
-${SAIAI_E:-x} "$SAIAI_F" %SAIAI_G% const SAIAI_NOT_ENV: &str = "x"; "__SAIAI_NULL__""#;
+${SAIAI_E:-x} "$SAIAI_F" %SAIAI_G% const SAIAI_NOT_ENV: &str = "x"; "__SAIAI_NULL__" $SAIAI_Foo"#;
     assert_eq!(
         saiai_environment_names(sample),
         [
