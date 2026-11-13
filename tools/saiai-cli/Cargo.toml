@@ -24,6 +24,12 @@ path = "src/main.rs"
 # never enabled for a release build.
 contract = []
 
+# Uses the contract entries from outside the library, as the SAIAI program's
+# own crate will: `cargo test --features contract --test contract_entry`.
+[[test]]
+name = "contract_entry"
+required-features = ["contract"]
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"

@@ -135,7 +135,7 @@ impl Identity {
         }
     }
 
-    pub fn load(root: &Path) -> Result<Option<Self>> {
+    pub(crate) fn load(root: &Path) -> Result<Option<Self>> {
         let path = root.join("desktop/claude/state/identity.json");
         match fs::read(&path) {
             Ok(bytes) => {
@@ -168,7 +168,7 @@ impl Identity {
     }
 
     #[cfg(any(target_os = "linux", test))]
-    pub fn prepare(root: &Path) -> Result<Self> {
+    pub(crate) fn prepare(root: &Path) -> Result<Self> {
         if let Some(identity) = Self::load(root)? {
             return Ok(identity);
         }
