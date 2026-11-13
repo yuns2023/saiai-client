@@ -835,7 +835,7 @@ fn claude_desktop_listener_answers_are_byte_identical() {
 
     let log = sandbox.home.with_file_name("desktop-proxy.log");
     let file = std::fs::File::create(&log).unwrap();
-    let _proxy = KillOnDrop(
+    let mut proxy = KillOnDrop(
         sandbox
             .command(&[])
             .env("SAIAI_UPSTREAM_PROXY", "direct")
@@ -847,18 +847,17 @@ fn claude_desktop_listener_answers_are_byte_identical() {
     // The listener writes its receipt after binding.
     let receipt = state.join("proxy.json");
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !receipt.is_file() && Instant::now() < deadline {
+    while !receipt.is_file() {
+        let exited = proxy.0.try_wait().unwrap();
+        if exited.is_some() || Instant::now() >= deadline {
+            panic!(
+                "no Claude Desktop listener receipt (proxy exit: {exited:?}); proxy log:\n{}",
+                String::from_utf8_lossy(&std::fs::read(&log).unwrap_or_default())
+            );
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let listen = read_json(&receipt)["listen"]
-        .as_str()
-        .unwrap_or_else(|| {
-            panic!(
-                "no Claude Desktop listener; proxy log:\n{}",
-                String::from_utf8_lossy(&std::fs::read(&log).unwrap_or_default())
-            )
-        })
-        .to_string();
+    let listen = read_json(&receipt)["listen"].as_str().unwrap().to_string();
 
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut roots = rustls::RootCertStore::empty();
@@ -888,7 +887,13 @@ fn claude_desktop_listener_answers_are_byte_identical() {
         let mut stream = rustls::StreamOwned::new(connection, tcp);
         stream.write_all(request.as_bytes()).unwrap();
         let mut response = Vec::new();
-        let _ = stream.read_to_end(&mut response);
+        // The proxy closes the connection after its answer; a TLS close
+        // without close_notify is tolerated, a timeout or other error is not.
+        match stream.read_to_end(&mut response) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            Err(error) => panic!("reading the {host} answer failed: {error}"),
+        }
         String::from_utf8(response).unwrap()
     };
 
