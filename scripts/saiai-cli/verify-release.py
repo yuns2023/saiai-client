@@ -231,7 +231,7 @@ def verify_claude_launcher(main: str) -> None:
         main.count("claude_launcher::run(") == 1,
         "optional Claude launcher must not become an initialization or default entrypoint",
     )
-    source = text("tools/saiai-cli/src/claude_launcher.rs")
+    source = text("tools/saiai-cli/kernel/src/claude_launcher.rs")
     production, separator, tests = source.partition("#[cfg(test)]\nmod tests")
     require(bool(separator), "optional Claude launcher has no regression tests")
     tests, test_end, trailing = tests.partition("\n}")
@@ -355,30 +355,38 @@ def verify_claude_launcher(main: str) -> None:
 
 def verify_cli() -> None:
     cargo = text("tools/saiai-cli/Cargo.toml")
+    kernel = text("tools/saiai-cli/kernel/Cargo.toml")
     require('version = "1.1.59"' in cargo, "CLI version is not 1.1.59")
-    require("saiai-core" not in cargo, "local-proxy client still links the V2 runtime core")
+    for manifest in (cargo, kernel):
+        require("saiai-core" not in manifest, "local-proxy client still links the V2 runtime core")
     for dependency in ("reqwest", "tokio", "tokio-tungstenite", "rustls", "rcgen", "zeroize", "libc"):
-        require(dependency in cargo, f"local-proxy dependency is missing: {dependency}")
+        require(dependency in kernel, f"local-proxy dependency is missing: {dependency}")
 
+    # The SAIAI program (workspace root) runs the kernel package `proxy-cli`
+    # (crate proxy_cli, no workspace of its own) with its brand and extension.
     require(
-        '[lib]\nname = "proxy_cli"\npath = "src/lib.rs"' in cargo
-        and '[[bin]]\nname = "saiai"\npath = "src/main.rs"' in cargo,
-        "CLI must build the saiai binary from the shared client library",
+        '[workspace]\nmembers = ["kernel"]' in cargo
+        and '[[bin]]\nname = "saiai"\npath = "src/main.rs"' in cargo
+        and 'proxy-cli = { path = "kernel" }' in cargo
+        and 'name = "proxy-cli"' in kernel
+        and '[lib]\nname = "proxy_cli"\npath = "src/lib.rs"' in kernel
+        and "[workspace]" not in kernel,
+        "CLI must build the saiai binary from the shared client kernel",
     )
-    # The binary only supplies the SAIAI brand and release facts; the client
-    # lives in lib.rs.
+    # The binary only supplies the SAIAI brand, extension and release facts;
+    # the client lives in the kernel.
     entry = text("tools/saiai-cli/src/main.rs")
     for required in (
-        "mod brand_saiai;",
+        "use saiai::{brand_saiai, gateway_saiai};",
         "proxy_cli::run(\n        &brand_saiai::SAIAI_BRAND,\n        proxy_cli::RuntimeContext {",
         'version: env!("CARGO_PKG_VERSION"),',
-        "gateway: &proxy_cli::gateway_saiai::SAIAI_GATEWAY,",
+        "gateway: &gateway_saiai::SAIAI_GATEWAY,",
     ):
         require(required in entry, f"CLI entry point is missing {required!r}")
     for withdrawn in WITHDRAWN_V2_MARKERS:
         require(withdrawn not in entry, f"CLI entry point exposes withdrawn V2 behavior: {withdrawn}")
 
-    main = text("tools/saiai-cli/src/lib.rs")
+    main = text("tools/saiai-cli/kernel/src/lib.rs")
     # User-visible text names the program through Brand placeholders; check
     # the text as the SAIAI build renders it. The binding check here is only
     # file-level (the bindings exist somewhere in lib.rs); that every
@@ -474,8 +482,9 @@ def verify_cli() -> None:
             withdrawn_direct_codex not in main,
             f"CLI still retains withdrawn direct Codex compatibility {withdrawn_direct_codex!r}",
         )
-    require(not (ROOT / "tools/saiai-cli/src/v2.rs").exists(), "V2 CLI module still exists")
-    proxy = text("tools/saiai-cli/src/local_proxy.rs")
+    for source_root in ("src", "kernel/src"):
+        require(not (ROOT / "tools/saiai-cli" / source_root / "v2.rs").exists(), "V2 CLI module still exists")
+    proxy = text("tools/saiai-cli/kernel/src/local_proxy.rs")
     require("ca_key_pem" in proxy, "local proxy does not require runtime CA material")
     require("piproxy-ca.key" not in proxy, "local proxy still embeds the historical shared CA key")
     require('const OPENAI_HOST: &str = "api.openai.com"' in proxy, "Codex OpenAI MITM route is missing")

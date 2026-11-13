@@ -43,7 +43,8 @@ fn client_proof_wire_names_are_frozen() {
     );
     let directory = tempfile::tempdir().unwrap();
     let state = directory.path().join("proof");
-    ClientProof::load(&state).unwrap();
+    crate::installed_saiai();
+    ClientProof::load_for_version(&state, "test-version").unwrap();
     let mut names = fs::read_dir(&state)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
@@ -90,7 +91,11 @@ async fn client_proof_enrollment_request_is_frozen() {
         String::from_utf8(request).unwrap()
     });
     let directory = tempfile::tempdir().unwrap();
-    let proof = Arc::new(ClientProof::load(directory.path()).unwrap());
+    crate::installed_saiai();
+    // The version the program passes: its own package version.
+    let proof = Arc::new(
+        ClientProof::load_for_version(directory.path(), env!("CARGO_PKG_VERSION")).unwrap(),
+    );
     // No retries and no inherited proxy: a broken contract fails fast.
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     tokio::time::timeout(

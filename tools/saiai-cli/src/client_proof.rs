@@ -20,7 +20,7 @@ use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-#[cfg(test)]
+#[cfg(all(test, feature = "contract"))]
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -382,13 +382,8 @@ impl std::fmt::Debug for ClientProof {
 
 impl ClientProof {
     /// Loads (or creates) the device key and per-Gateway device records under
-    /// `dir`. An unreadable key is replaced by a new one, i.e. a new device.
-    #[cfg(test)]
-    pub fn load(dir: &Path) -> Result<Self> {
-        Self::load_for_version(dir, env!("CARGO_PKG_VERSION"))
-    }
-
-    /// [`load`](Self::load) for a program that reports `client_version`.
+    /// `dir`, for a program that reports `client_version`. An unreadable key
+    /// is replaced by a new one, i.e. a new device.
     pub fn load_for_version(dir: &Path, client_version: &'static str) -> Result<Self> {
         let _lock = lock_state_dir(dir)?;
         let key = load_or_create_key(&dir.join(KEY_FILENAME))?;
@@ -440,7 +435,7 @@ impl ClientProof {
         true
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "contract"))]
     pub fn public_key(&self) -> &str {
         &self.public_key
     }
@@ -698,9 +693,19 @@ impl ClientSource for Arc<dyn crate::GatewayHttp> {
     }
 }
 
-#[cfg(test)]
+// The proof writes its files through the kernel's brand-aware atomic writer,
+// so its tests install the SAIAI brand through the contract entries.
+#[cfg(all(test, feature = "contract"))]
 mod tests {
     use super::*;
+
+    /// Loads (or creates) the proof under `dir` with the SAIAI brand
+    /// installed, for a program reporting version `test-version` (the release
+    /// version is checked by the SAIAI wire contract tests).
+    fn load(dir: &Path) -> Result<ClientProof> {
+        crate::installed_saiai();
+        ClientProof::load_for_version(dir, "test-version")
+    }
     use p256::ecdsa::VerifyingKey;
     use p256::ecdsa::signature::Verifier;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -826,8 +831,8 @@ mod tests {
     #[test]
     fn generated_device_pem_round_trips_and_is_private() {
         let directory = tempfile::tempdir().unwrap();
-        let first = ClientProof::load(directory.path()).unwrap();
-        let second = ClientProof::load(directory.path()).unwrap();
+        let first = load(directory.path()).unwrap();
+        let second = load(directory.path()).unwrap();
         assert_eq!(first.public_key, second.public_key);
         let pem = fs::read_to_string(directory.path().join(KEY_FILENAME)).unwrap();
         assert!(pem.starts_with(PEM_BEGIN));
@@ -847,12 +852,12 @@ mod tests {
     #[test]
     fn corrupted_device_pem_becomes_new_device_and_drops_old_records() {
         let directory = tempfile::tempdir().unwrap();
-        let first = ClientProof::load(directory.path()).unwrap();
+        let first = load(directory.path()).unwrap();
         first
             .record_device("https://gw.example", "k", "cd_OLDOLDOLDOLDOLDOLDOLD0")
             .unwrap();
         fs::write(directory.path().join(KEY_FILENAME), "not a key").unwrap();
-        let second = ClientProof::load(directory.path()).unwrap();
+        let second = load(directory.path()).unwrap();
         assert_eq!(
             fs::read(directory.path().join(format!("{KEY_FILENAME}.corrupt"))).unwrap(),
             b"not a key"
@@ -860,18 +865,18 @@ mod tests {
         assert_ne!(first.public_key, second.public_key);
         assert_eq!(second.device("https://gw.example", "k"), None);
         fs::write(directory.path().join(DEVICE_FILENAME), "{").unwrap();
-        let third = ClientProof::load(directory.path()).unwrap();
+        let third = load(directory.path()).unwrap();
         assert_eq!(third.public_key, second.public_key);
         assert_eq!(third.device("https://gw.example", "k"), None);
         fs::write(directory.path().join(KEY_FILENAME), [0xff, 0xfe, 0x00]).unwrap();
-        let fourth = ClientProof::load(directory.path()).unwrap();
+        let fourth = load(directory.path()).unwrap();
         assert_ne!(fourth.public_key, second.public_key);
     }
 
     #[test]
     fn invalid_persisted_records_are_dropped_and_other_process_records_merge() {
         let directory = tempfile::tempdir().unwrap();
-        let proof = ClientProof::load(directory.path()).unwrap();
+        let proof = load(directory.path()).unwrap();
         let path = directory.path().join(DEVICE_FILENAME);
         let file = json!({
             "public_key_sha256": proof.public_key_sha256,
@@ -883,7 +888,7 @@ mod tests {
             }},
         });
         fs::write(&path, file.to_string()).unwrap();
-        let loaded = ClientProof::load(directory.path()).unwrap();
+        let loaded = load(directory.path()).unwrap();
         assert_eq!(loaded.device("https://gw.example", "bad"), None);
         assert_eq!(loaded.device("https://gw.example", "empty"), None);
         assert!(loaded.device("https://gw.example", "gone").unwrap().revoked);
@@ -898,12 +903,12 @@ mod tests {
                 .is_err()
         );
         // A record written meanwhile by another process survives our write.
-        let other = ClientProof::load(directory.path()).unwrap();
+        let other = load(directory.path()).unwrap();
         other
             .record_device("https://other.example", "k", "cd_OTHEROTHEROTHEROTHER00")
             .unwrap();
         loaded.record_revoked("https://gw.example", "good").unwrap();
-        let merged = ClientProof::load(directory.path()).unwrap();
+        let merged = load(directory.path()).unwrap();
         assert!(merged.device("https://other.example", "k").is_some());
         assert!(merged.device("https://gw.example", "good").unwrap().revoked);
     }
@@ -914,7 +919,7 @@ mod tests {
         let loaders = (0..8)
             .map(|_| {
                 let dir = directory.path().to_path_buf();
-                std::thread::spawn(move || ClientProof::load(&dir).unwrap().public_key)
+                std::thread::spawn(move || load(&dir).unwrap().public_key)
             })
             .collect::<Vec<_>>();
         let keys = loaders
@@ -922,7 +927,7 @@ mod tests {
             .map(|loader| loader.join().unwrap())
             .collect::<HashSet<_>>();
         assert_eq!(keys.len(), 1);
-        let loaded = ClientProof::load(directory.path()).unwrap();
+        let loaded = load(directory.path()).unwrap();
         assert!(keys.contains(&loaded.public_key));
     }
 
@@ -933,7 +938,7 @@ mod tests {
         let dir = directory.path().to_path_buf();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let loader = std::thread::spawn(move || {
-            let proof = ClientProof::load(&dir).unwrap();
+            let proof = load(&dir).unwrap();
             done_tx.send(()).unwrap();
             proof.public_key
         });
@@ -949,9 +954,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join(KEY_FILENAME);
-        ClientProof::load(directory.path()).unwrap();
+        load(directory.path()).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        ClientProof::load(directory.path()).unwrap();
+        load(directory.path()).unwrap();
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -961,7 +966,7 @@ mod tests {
     #[test]
     fn enrollment_claims_are_deduped_and_on_demand_is_bounded() {
         let directory = tempfile::tempdir().unwrap();
-        let proof = ClientProof::load(directory.path()).unwrap();
+        let proof = load(directory.path()).unwrap();
         let gateway = "https://gw.example";
         assert!(proof.claim_enrollment(gateway, "route", false));
         assert!(!proof.claim_enrollment(gateway, "route", false));
@@ -970,7 +975,7 @@ mod tests {
             assert!(proof.claim_enrollment(gateway, &format!("extra-{index}"), true));
         }
         assert!(!proof.claim_enrollment(gateway, "one-too-many", true));
-        let fresh = ClientProof::load(tempfile::tempdir().unwrap().path()).unwrap();
+        let fresh = load(tempfile::tempdir().unwrap().path()).unwrap();
         fresh
             .record_device(gateway, "known", "cd_KNOWNKNOWNKNOWNKNOWN00")
             .unwrap();
@@ -986,7 +991,7 @@ mod tests {
     #[test]
     fn signs_only_with_active_device_and_fresh_nonce() {
         let directory = tempfile::tempdir().unwrap();
-        let proof = ClientProof::load(directory.path()).unwrap();
+        let proof = load(directory.path()).unwrap();
         let gateway = "https://gw.example";
         assert_eq!(proof.sign_request(gateway, "POST", "/v1/x", "k"), None);
         proof
@@ -1018,7 +1023,7 @@ mod tests {
             None
         );
         assert_eq!(proof.sign_request(gateway, "POST", "/v1/x", "k"), None);
-        let reloaded = ClientProof::load(directory.path()).unwrap();
+        let reloaded = load(directory.path()).unwrap();
         assert!(reloaded.device(gateway, "k").unwrap().revoked);
         assert_eq!(reloaded.sign_request(gateway, "POST", "/v1/x", "k"), None);
     }
@@ -1125,7 +1130,7 @@ mod tests {
         ])
         .await;
         let directory = tempfile::tempdir().unwrap();
-        let proof = Arc::new(ClientProof::load(directory.path()).unwrap());
+        let proof = Arc::new(load(directory.path()).unwrap());
         let device = Arc::clone(&proof)
             .enroll(
                 reqwest::Client::new(),
@@ -1151,10 +1156,10 @@ mod tests {
         let body: Value =
             serde_json::from_str(&request[request.find("\r\n\r\n").unwrap() + 4..]).unwrap();
         assert_eq!(body["public_key"], proof.public_key.as_str());
-        assert_eq!(body["client_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["client_version"], "test-version");
         assert_eq!(body["os"], std::env::consts::OS);
         assert_eq!(body["arch"], std::env::consts::ARCH);
-        let reloaded = ClientProof::load(directory.path()).unwrap();
+        let reloaded = load(directory.path()).unwrap();
         assert!(
             reloaded
                 .sign_request(&gateway, "GET", "/v1/models", "MOCK_ONLY_KEY")
@@ -1181,7 +1186,7 @@ mod tests {
         )])
         .await;
         let directory = tempfile::tempdir().unwrap();
-        let proof = Arc::new(ClientProof::load(directory.path()).unwrap());
+        let proof = Arc::new(load(directory.path()).unwrap());
         let source = Flaky(std::sync::atomic::AtomicUsize::new(0));
         let device = Arc::clone(&proof)
             .enroll(
@@ -1204,7 +1209,7 @@ mod tests {
         let (gateway, server) =
             mock_gateway(vec![(403, r#"{"code":"client_device_revoked"}"#)]).await;
         let directory = tempfile::tempdir().unwrap();
-        let proof = Arc::new(ClientProof::load(directory.path()).unwrap());
+        let proof = Arc::new(load(directory.path()).unwrap());
         proof
             .record_device(&gateway, "MOCK_ONLY_KEY", "cd_OLDOLDOLDOLDOLDOLDOLD0")
             .unwrap();
@@ -1224,7 +1229,7 @@ mod tests {
             None
         );
         // A restarted process neither re-enrolls nor signs for this Gateway.
-        let restarted = Arc::new(ClientProof::load(directory.path()).unwrap());
+        let restarted = Arc::new(load(directory.path()).unwrap());
         let device = Arc::clone(&restarted)
             .enroll(
                 reqwest::Client::new(),
@@ -1245,7 +1250,7 @@ mod tests {
     async fn enrollment_device_limit_with_truncated_body_still_stops() {
         let (gateway, server) = mock_gateway(vec![(429, "")]).await;
         let directory = tempfile::tempdir().unwrap();
-        let proof = Arc::new(ClientProof::load(directory.path()).unwrap());
+        let proof = Arc::new(load(directory.path()).unwrap());
         let device = Arc::clone(&proof)
             .enroll(
                 reqwest::Client::new(),
@@ -1263,7 +1268,7 @@ mod tests {
         let (gateway, server) =
             mock_gateway(vec![(429, r#"{"code":"client_device_limit"}"#)]).await;
         let directory = tempfile::tempdir().unwrap();
-        let proof = Arc::new(ClientProof::load(directory.path()).unwrap());
+        let proof = Arc::new(load(directory.path()).unwrap());
         let device = Arc::clone(&proof)
             .enroll(
                 reqwest::Client::new(),
@@ -1286,7 +1291,7 @@ mod tests {
         let gateway = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
         let directory = tempfile::tempdir().unwrap();
-        let proof = Arc::new(ClientProof::load(directory.path()).unwrap());
+        let proof = Arc::new(load(directory.path()).unwrap());
         let enrollment = tokio::spawn(Arc::clone(&proof).enroll(
             reqwest::Client::new(),
             gateway,

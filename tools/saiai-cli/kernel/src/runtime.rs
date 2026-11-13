@@ -94,10 +94,10 @@ fn uninstalled_gateway() -> &'static dyn GatewayExtension {
     panic!("the runtime context is installed by run() before any command executes")
 }
 
-// Unit tests see the SAIAI extension, matching the SAIAI fallback brand.
+// Unit tests see the kernel's own test extension.
 #[cfg(test)]
 fn uninstalled_gateway() -> &'static dyn GatewayExtension {
-    &crate::gateway_saiai::SAIAI_GATEWAY
+    &crate::gateway_test::TEST_GATEWAY
 }
 
 #[cfg(not(test))]
@@ -106,7 +106,8 @@ fn uninstalled_version() -> &'static str {
 }
 
 // Unit tests call library functions without going through `run`; they see
-// this package's own version, which is also the released SAIAI version.
+// this package's own version (the kernel's, not any distribution's release
+// version, which the distribution's own tests check).
 #[cfg(test)]
 fn uninstalled_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -116,15 +117,15 @@ fn uninstalled_version() -> &'static str {
 mod tests {
     use super::*;
 
-    // A local slot: these tests never touch the process-wide context
-    // (contract tests install the SAIAI context there).
+    // A local slot: these tests never touch the process-wide context, which
+    // other tests in this process may read.
     #[test]
     fn install_accepts_the_same_context_and_rejects_another_without_overwriting() {
         static OTHER: crate::gateway::NoGatewayExtension = crate::gateway::NoGatewayExtension;
         let slot = OnceLock::new();
         let first = RuntimeContext {
             version: "1.2.3",
-            gateway: &crate::gateway_saiai::SAIAI_GATEWAY,
+            gateway: &crate::gateway_test::TEST_GATEWAY,
         };
         install_into(&slot, first).unwrap();
         install_into(&slot, first).unwrap();

@@ -35,7 +35,7 @@ fn entries_need_an_installed_brand_and_keep_the_first_context() {
         ..SAIAI_VALUES
     };
     static NONE: proxy_cli::NoGatewayExtension = proxy_cli::NoGatewayExtension;
-    let saiai_gateway = &proxy_cli::gateway_saiai::SAIAI_GATEWAY;
+    let saiai_gateway = &saiai::gateway_saiai::SAIAI_GATEWAY;
     let version = env!("CARGO_PKG_VERSION");
 
     // Nothing installed: the entry refuses instead of guessing a brand.

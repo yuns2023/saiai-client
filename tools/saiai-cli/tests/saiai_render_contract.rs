@@ -31,7 +31,7 @@ fn saiai() -> &'static Brand {
         &brand_saiai::SAIAI_BRAND,
         proxy_cli::RuntimeContext {
             version: env!("CARGO_PKG_VERSION"),
-            gateway: &proxy_cli::gateway_saiai::SAIAI_GATEWAY,
+            gateway: &saiai::gateway_saiai::SAIAI_GATEWAY,
         },
     )
     .unwrap();
