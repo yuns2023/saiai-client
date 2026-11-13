@@ -2071,7 +2071,8 @@ mod tests {
         assert!(error.contains("HTTP 403"), "{error}");
 
         // A failing proxy is an error attributed to that proxy, never a
-        // silent direct connection.
+        // silent direct connection. (A dropped listener's port is not used:
+        // another process may take it over and answer anything.)
         let through = |port: u16| {
             Arc::new(Snapshot::new(
                 1,
@@ -2106,26 +2107,6 @@ mod tests {
             )),
             "{error}"
         );
-        // A closed proxy port: usually refused ("unreachable"); if another
-        // process reuses the port meanwhile, the tunnel fails instead. Both
-        // name the proxy, so neither went direct.
-        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = closed.local_addr().unwrap().port();
-        drop(closed);
-        let error = format!(
-            "{:#}",
-            through(port)
-                .connect(true, "api.saiai.top", 443)
-                .await
-                .unwrap_err()
-        );
-        let proxy = format!("upstream proxy http://127.0.0.1:{port} ");
-        assert!(
-            error.contains(&format!("{proxy}is unreachable"))
-                || error.contains(&format!("{proxy}failed to open a tunnel")),
-            "{error}"
-        );
-
         let unavailable = Arc::new(Snapshot::new(
             1,
             Policy::Unavailable("SOCKS".to_string()),
