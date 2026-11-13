@@ -1,14 +1,19 @@
-//! SAIAI distribution values for [`crate::brand::Brand`].
+//! SAIAI distribution values for [`Brand`]; compiled into the `saiai`
+//! program, which passes them to the client library.
 //!
 //! These are the names every installed SAIAI client already uses; see
 //! `brand_contract_tests` before changing any of them.
 
-use crate::brand::{
+use super::{
     Brand, CertificateNames, ClientProofNames, ConfigNames, EnvironmentNames, GatewayProtocolNames,
     OwnershipMarkers, PlaceholderIdentities, ServiceNames, UpdateNames,
 };
 
-pub(crate) const SAIAI_BRAND: Brand = Brand {
+/// The single SAIAI brand instance (a `static`, so every reference has the
+/// same address and repeated installation is recognized as the same brand).
+pub(crate) static SAIAI_BRAND: Brand = SAIAI_VALUES;
+
+pub(crate) const SAIAI_VALUES: Brand = Brand {
     binary_name: "saiai",
     home_dir_name: ".saiai",
     windows_app_dir_name: "SAIAI",

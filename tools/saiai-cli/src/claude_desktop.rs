@@ -8,7 +8,8 @@ use std::path::PathBuf;
 
 #[cfg(any(target_os = "linux", test))]
 pub(crate) const VERSION: &str = "4.23118.0";
-pub(crate) const TOKEN_PREFIX: &str = crate::brand::BRAND.placeholders.claude_desktop_token_prefix;
+pub(crate) const TOKEN_PREFIX: crate::brand::BrandValue<&'static str> =
+    crate::brand::BrandValue(|brand| brand.placeholders.claude_desktop_token_prefix);
 #[cfg(target_os = "linux")]
 pub(crate) const SCOPE: &str = "Claude Desktop: Code only; Chat and Cowork are not supported.";
 
@@ -137,7 +138,7 @@ impl Identity {
             Ok(bytes) => {
                 let identity: Self =
                     serde_json::from_slice(&bytes).context("invalid Claude Desktop identity")?;
-                if !identity.access_token.starts_with(TOKEN_PREFIX)
+                if !identity.access_token.starts_with(TOKEN_PREFIX.get())
                     || identity.access_token.len() < 32
                     || [
                         &identity.session,
