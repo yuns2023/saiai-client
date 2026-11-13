@@ -1918,6 +1918,32 @@ fn helper_scripts_render_to_the_shipped_saiai_scripts() {
     }
 }
 
+/// The update helper is assembled around user paths after the brand name is
+/// inserted: tokens inside those paths stay as typed and never fail.
+#[cfg(windows)]
+#[test]
+fn update_helper_keeps_token_like_user_paths_verbatim() {
+    let directory = Path::new(r"C:\Users\u\@@ENV@@\@@ID@@\@@OTHER@@");
+    let script = render_windows_update_script(
+        1,
+        &directory.join("saiai.exe"),
+        &directory.join(".saiai-update-1.exe"),
+        &directory.join(".saiai-update-1.ps1"),
+        &directory.join(".saiai-update-status.txt"),
+        true,
+        &"0".repeat(64),
+    )
+    .unwrap();
+    assert!(
+        script.contains(r"C:\Users\u\@@ENV@@\@@ID@@\@@OTHER@@\saiai.exe"),
+        "{script}"
+    );
+    assert!(
+        script.contains("function Invoke-SaiaiCommand([string]$verb) {"),
+        "{script}"
+    );
+}
+
 /// Wire names inside helper scripts under SAIAI, written out by hand.
 #[test]
 fn helper_script_names_are_frozen() {
@@ -1929,14 +1955,18 @@ fn helper_script_names_are_frozen() {
         crate::windows_desktop_runtime::helper_failure_prefix(),
         "SAIAI_DESKTOP_HELPER_FAILURE:"
     );
-    assert_eq!(
-        render("Where-Object { $_.Subject -match '(^|, )O=@@CA_ORG@@(,|$)' }"),
-        "Where-Object { $_.Subject -match '(^|, )O=SAIAI(,|$)' }"
+    // Production templates where they are reachable from tests.
+    assert!(
+        render(crate::STALE_CA_LISTING_SCRIPT)
+            .contains("Where-Object { $_.Subject -match '(^|, )O=SAIAI(,|$)' }")
     );
-    assert_eq!(
-        render("public static class @@ID@@PackageActivation {"),
-        "public static class SaiaiPackageActivation {"
-    );
+    let activation = render(crate::PACKAGE_ACTIVATION_SCRIPT);
+    assert!(activation.contains("public static class SaiaiPackageActivation {"));
+    assert!(activation.contains(
+        "[SaiaiPackageActivation]::Activate($env:SAIAI_DESKTOP_APP_ID,$env:SAIAI_DESKTOP_ACTIVATION_ARGS)"
+    ));
+    // The uninstall helpers are local constants of their functions; the
+    // namespace token is checked through the renderer.
     assert_eq!(
         render("Add-Type -Namespace @@ID@@Uninstall"),
         "Add-Type -Namespace SaiaiUninstall"

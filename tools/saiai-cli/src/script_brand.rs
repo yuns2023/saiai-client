@@ -9,11 +9,14 @@
 //!
 //! Escaping: instead of quoting, every value is restricted to a character set
 //! that cannot leave its position — no quotes, `$`, backtick, backslash,
-//! dot or other regex/PowerShell metacharacters — and a value outside it
-//! panics before any script runs. Templates are rendered before any
-//! user-controlled data is added, so data is never scanned for tokens.
+//! dot or other regex/PowerShell metacharacters. `brand::install` rejects a
+//! brand outside it before the program does anything ([`validate`]); the
+//! check at render time is only a second line of defense. Templates are
+//! rendered before any user-controlled data is added, so data is never
+//! scanned for tokens.
 
-use crate::brand::BRAND;
+use crate::brand::{BRAND, Brand};
+use anyhow::{Result, bail};
 
 /// Name of an environment variable handed to one of the program's helpers.
 // Helper scripts run only on Windows.
@@ -61,11 +64,20 @@ struct Values {
 }
 
 fn values() -> Values {
+    values_of(&BRAND).expect("the installed brand was validated by brand::install")
+}
+
+/// Checks the brand fields that are inserted into helper scripts.
+pub(crate) fn validate(brand: &Brand) -> Result<()> {
+    values_of(brand).map(|_| ())
+}
+
+fn values_of(brand: &Brand) -> Result<Values> {
     let values = Values {
-        env_prefix: BRAND.scripts.env_prefix,
-        identifier_prefix: BRAND.scripts.identifier_prefix,
-        app_dir: BRAND.windows_app_dir_name,
-        ca_organization: BRAND.certificates.ca_organization,
+        env_prefix: brand.scripts.env_prefix,
+        identifier_prefix: brand.scripts.identifier_prefix,
+        app_dir: brand.windows_app_dir_name,
+        ca_organization: brand.certificates.ca_organization,
     };
     for (field, value, valid) in [
         (
@@ -85,12 +97,11 @@ fn values() -> Values {
             valid_plain_name,
         ),
     ] {
-        assert!(
-            valid(value),
-            "brand {field} is not safe in helper scripts: {value:?}"
-        );
+        if !valid(value) {
+            bail!("brand {field} is not safe in helper scripts: {value:?}");
+        }
     }
-    values
+    Ok(values)
 }
 
 /// `[A-Z][A-Z0-9_]*_`

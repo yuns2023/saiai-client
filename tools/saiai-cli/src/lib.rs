@@ -2580,13 +2580,9 @@ fn windows_quote_activation_arg(arg: &str) -> String {
     quoted
 }
 
-#[cfg(target_os = "windows")]
-fn activate_windows_packaged_desktop(app_id: &str, arguments: &str) -> Result<u32> {
-    // The Store package must be activated by AppUserModelID. Starting its
-    // WindowsApps executable directly creates an unpackaged process and the
-    // official app then fails with "The process has no package identity".
-    // Pass only non-secret Chromium arguments through the broker.
-    const SCRIPT: &str = r#"
+/// Activates a Store package by AppUserModelID (brand template).
+#[cfg(any(target_os = "windows", test))]
+const PACKAGE_ACTIVATION_SCRIPT: &str = r#"
 $ErrorActionPreference='Stop'
 $source=@'
 using System;
@@ -2609,8 +2605,15 @@ public static class @@ID@@PackageActivation {
 Add-Type -TypeDefinition $source
 [@@ID@@PackageActivation]::Activate($env:@@ENV@@DESKTOP_APP_ID,$env:@@ENV@@DESKTOP_ACTIVATION_ARGS)
 "#;
+
+#[cfg(target_os = "windows")]
+fn activate_windows_packaged_desktop(app_id: &str, arguments: &str) -> Result<u32> {
+    // The Store package must be activated by AppUserModelID. Starting its
+    // WindowsApps executable directly creates an unpackaged process and the
+    // official app then fails with "The process has no package identity".
+    // Pass only non-secret Chromium arguments through the broker.
     let output = windows_desktop_runtime::powershell(
-        &script_brand::render(SCRIPT),
+        &script_brand::render(PACKAGE_ACTIVATION_SCRIPT),
         &[
             (
                 script_brand::env("DESKTOP_APP_ID").as_str(),
@@ -5874,6 +5877,10 @@ fn check_codex_environment_context_time(report: &mut DoctorReport, codex_dir: &P
 // leaves that carry an authority key identifier, but older SAIAI leaves did
 // not, and clients that build chains by subject name then fail with a
 // signature error. Report it; removal stays a user decision.
+/// Lists root CAs whose subject carries this brand's CA organization.
+#[cfg(any(target_os = "windows", test))]
+const STALE_CA_LISTING_SCRIPT: &str = "$ErrorActionPreference='Stop'; foreach ($store in 'CurrentUser','LocalMachine') { Get-ChildItem \"Cert:\\$store\\Root\" | Where-Object { $_.Subject -match '(^|, )O=@@CA_ORG@@(,|$)' } | ForEach-Object { $_.Thumbprint + ' ' + $store + ' ' + [Convert]::ToBase64String($_.RawData) } }";
+
 #[cfg(target_os = "windows")]
 fn check_stale_windows_saiai_cas(report: &mut DoctorReport, ca_path: &Path) {
     let current = fs::read(ca_path).ok().and_then(|pem| {
@@ -5885,9 +5892,7 @@ fn check_stale_windows_saiai_cas(report: &mut DoctorReport, ca_path: &Path) {
     let Some(current) = current else {
         return;
     };
-    let script = script_brand::render(
-        "$ErrorActionPreference='Stop'; foreach ($store in 'CurrentUser','LocalMachine') { Get-ChildItem \"Cert:\\$store\\Root\" | Where-Object { $_.Subject -match '(^|, )O=@@CA_ORG@@(,|$)' } | ForEach-Object { $_.Thumbprint + ' ' + $store + ' ' + [Convert]::ToBase64String($_.RawData) } }",
-    );
+    let script = script_brand::render(STALE_CA_LISTING_SCRIPT);
     let listing = command_output(
         "powershell",
         &["-NoProfile", "-NonInteractive", "-Command", script.as_str()],
