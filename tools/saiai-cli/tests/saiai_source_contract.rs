@@ -1013,9 +1013,24 @@ fn token_references(tokens: &[proc_macro2::TokenTree], found: &mut Vec<Result<St
             }
             _ => {}
         }
-        // Every group, attribute bodies included: function bodies, macro
-        // arguments (`format!(.., include_str!(..))`), `#[doc = include_str!(..)]`.
         if let proc_macro2::TokenTree::Group(group) = token {
+            // A bracket that is not an attribute body may still become one:
+            // a macro can keep a `#` and swap the bracket after it. So its
+            // `path = ...` follows the attribute rule, and a macro-built
+            // bracket (`[$tokens]`) is refused.
+            let before = |back: usize| index.checked_sub(back).and_then(|i| tokens.get(i));
+            let attribute_body =
+                is_punct(before(1), '#') || (is_punct(before(1), '!') && is_punct(before(2), '#'));
+            if group.delimiter() == Bracket && !attribute_body {
+                if has_metavariable(group.stream()) {
+                    found.push(Err(format!("{group} (macro-generated bracket)")));
+                }
+                let mut paths = Vec::new();
+                attribute_paths(group.stream(), false, &mut paths);
+                found.extend(paths);
+            }
+            // Every group, attribute bodies included: function bodies, macro
+            // arguments (`format!(.., include_str!(..))`), `#[doc = include_str!(..)]`.
             token_references(&group.stream().into_iter().collect::<Vec<_>>(), found);
         }
     }
@@ -1129,6 +1144,9 @@ mod documented;
         "macro_rules! m { ($($t:tt)*) => { $($t)* }; }\nm!(#[path = \"../outside.rs\"] mod outside;);",
         "const X: &[u8] = ::core::include_bytes!(\"../x\");",
         "macro_rules! m { ($h:tt) => { $h [path = \"../../outside.rs\"] mod outside; }; }\nm!(#);",
+        "macro_rules! m { ($h:tt $d:tt) => { $h [path = \"../../outside.rs\"] mod outside; }; }\nm!(#[doc = \"placeholder\"]);",
+        "macro_rules! m { ($h:tt $d:tt $p:ident) => { $h [$p = \"../../outside.rs\"] mod outside; }; }\nm!(#[doc = \"x\"] path);",
+        "macro_rules! m { ($h:tt $d:tt $b:tt) => { $h $b mod outside; }; }\nm!(#[doc = \"x\"] [path = \"../../outside.rs\"]);",
         "const X: &str = \"unterminated;",
     ] {
         let references = file_references(refused);
