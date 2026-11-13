@@ -209,6 +209,28 @@ class OptionalClaudeContractTests(unittest.TestCase):
         self.verify(launcher=self.inject('eprintln!["plain notice; braces \\x41 decoded"];'))
         self.verify(launcher=self.inject('// eprintln!("{token}") in a comment is not code\nconst NOTE: &str = "eprintln!(\\"{token}\\")";'))
 
+    def test_rejects_output_macro_aliases(self) -> None:
+        for behavior in (
+            'use std::eprintln as notice;\nnotice!("{token}");',
+            'use std::{eprintln as notice, env};\nnotice!("{token}");',
+            'use std::{\n    io,\n    eprint as note,\n};',
+            'pub(crate) use std::dbg as inspect;',
+            'use std::println as out;\nout!("plain");',
+        ):
+            with self.subTest(behavior=behavior):
+                with self.assertRaisesRegex(AssertionError, "under another name"):
+                    self.verify(launcher=self.inject(behavior))
+
+    def test_accepts_c_strings_and_argument_comments(self) -> None:
+        self.verify(launcher=self.inject('const NAME: &core::ffi::CStr = c"println!{}";\nconst RAW: &core::ffi::CStr = cr#"eprintln!("{token}")"#;'))
+        self.verify(launcher=self.inject('eprintln!("plain" /* note */);'))
+        self.verify(launcher=self.inject('eprintln!("{brand_product}" /* a */, /* b */ brand_product = BRAND.product_name);'))
+        self.verify(launcher=self.inject('// use std::eprintln as notice;\nconst TEXT: &str = "use std::println as out;";'))
+
+    def test_rejects_extra_arguments_hidden_behind_comments(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "interpolate credentials"):
+            self.verify(launcher=self.inject('eprintln!("plain" /* note */, "extra");'))
+
     def test_accepts_underscored_unicode_escape(self) -> None:
         self.verify(launcher=self.inject('eprintln!("notice \\u{4_1} \\u{4________1}");'))
 
@@ -221,6 +243,7 @@ class OptionalClaudeContractTests(unittest.TestCase):
 
     def test_rejects_stdout_in_any_delimiter(self) -> None:
         for behavior in ('println!["plain"];', 'print!{"plain"}', 'println /* x */ !("plain");',
+
                          'let quote = b\'"\';\nprintln!("plain");'):
             with self.subTest(behavior=behavior):
                 with self.assertRaisesRegex(AssertionError, "stdout"):

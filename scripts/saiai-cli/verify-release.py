@@ -83,7 +83,7 @@ def rust_trivia_end(source: str, index: int) -> int:
 def rust_string_literal(source: str, index: int) -> tuple[int, str] | None:
     """(end, decoded text) of the Rust string literal starting at `index`;
     raises UnreadableRustLiteral for an escape Rust would not accept."""
-    raw = re.match(r'b?r(#*)"', source[index:])
+    raw = re.match(r'[bc]?r(#*)"', source[index:])
     if raw:
         body = index + raw.end()
         terminator = '"' + raw.group(1)
@@ -91,7 +91,7 @@ def rust_string_literal(source: str, index: int) -> tuple[int, str] | None:
         if end < 0:
             raise UnreadableRustLiteral("unterminated raw string")
         return end + len(terminator), source[body:end]
-    plain = re.match(r'b?"', source[index:])
+    plain = re.match(r'[bc]?"', source[index:])
     if not plain:
         return None
     position = index + plain.end()
@@ -127,6 +127,33 @@ def rust_string_literal(source: str, index: int) -> tuple[int, str] | None:
     if position >= len(source):
         raise UnreadableRustLiteral("unterminated string")
     return position + 1, "".join(decoded)
+
+
+def rust_without_comments(source: str, blank_literals: bool = False) -> str:
+    """`source` with comments replaced by a space; string and char literals
+    are kept, or replaced by a space when `blank_literals`."""
+    output = []
+    index = 0
+    while index < len(source):
+        if source.startswith("//", index) or source.startswith("/*", index):
+            output.append(" ")
+            index = rust_trivia_end(source, index)
+            continue
+        previous = source[index - 1] if index else " "
+        end = None
+        if not (previous.isalnum() or previous == "_"):
+            literal = rust_string_literal(source, index)
+            char = re.match(
+                r"b?'(?:\\x[0-9a-fA-F]{2}|\\u\{[0-9a-fA-F_]+\}|\\.|[^\\'])'", source[index:]
+            )
+            end = literal[0] if literal else (index + char.end() if char else None)
+        if end is not None:
+            output.append(" " if blank_literals else source[index:end])
+            index = end
+            continue
+        output.append(source[index])
+        index += 1
+    return "".join(output)
 
 
 def rust_macro_invocations(source: str, names: str) -> list[tuple[str, str]]:
@@ -291,13 +318,20 @@ def verify_claude_launcher(main: str) -> None:
         invocations = rust_macro_invocations(production, r"e?print(?:ln)?|dbg")
     except UnreadableRustLiteral as error:
         require(False, f"optional Claude launcher has an unreadable string literal: {error}")
+    # An alias (`use std::eprintln as notice;`) would escape the name-based
+    # checks below, so output macros may not be imported under another name.
+    for item in re.findall(r"\buse\b[^;]*;", rust_without_comments(production, blank_literals=True)):
+        require(
+            re.search(r"\b(?:e?print(?:ln)?|dbg)\s+as\b", item) is None,
+            "Claude diagnostics must not import output macros under another name",
+        )
     for name, arguments in invocations:
         require(not name.startswith("print"), "Claude diagnostics must not use stdout")
         try:
             literal = rust_string_literal(arguments, rust_trivia_end(arguments, 0))
         except UnreadableRustLiteral as error:
             require(False, f"optional Claude diagnostics have an unreadable format string: {error}")
-        rest = arguments[literal[0]:] if literal else ""
+        rest = rust_without_comments(arguments[literal[0]:]) if literal else ""
         bound_arguments = re.fullmatch(r"((?:" + brand_argument + r")*)\s*,?\s*", rest)
         format_text = literal[1] if literal else ""
         used = set(re.findall(r"\{(brand_product|brand_binary)\}", format_text))
