@@ -1139,54 +1139,23 @@ fn after<'a>(_: &'a str) { env::var(\"SAIAI_AFTER\"); let _ = r#\"{\"SAIAI_RAW\"
 #[test]
 fn saiai_environment_variable_inventory_is_frozen() {
     let expected: &[(&str, &[&str])] = &[
+        // Prefix of the program's helper script variables (see
+        // `helper_environment_variables_are_written_and_read`).
+        ("SAIAI_", &["brand_saiai.rs"]),
         ("SAIAI_BINARY_UPDATED", &["brand_saiai.rs"]),
-        ("SAIAI_CA_FILES", &["uninstall.rs"]),
-        ("SAIAI_CA_THUMBPRINT", &["uninstall.rs"]),
-        ("SAIAI_CA_THUMBPRINTS", &["uninstall.rs"]),
         ("SAIAI_CHATGPT_BIN", &["brand_saiai.rs"]),
         ("SAIAI_CHATGPT_CHAT_PASSTHROUGH", &["brand_saiai.rs"]),
         ("SAIAI_CHATGPT_TIMEZONE", &["brand_saiai.rs"]),
-        ("SAIAI_CHECK_EXE", &["lib.rs"]),
-        ("SAIAI_CHECK_PID", &["lib.rs"]),
         ("SAIAI_CLAUDE_DESKTOP_ALLOW_UNTESTED", &["brand_saiai.rs"]),
-        ("SAIAI_CLEANUP_DIR", &["uninstall.rs"]),
-        ("SAIAI_CLEANUP_DIRS", &["uninstall.rs"]),
-        ("SAIAI_CLEANUP_FILES", &["uninstall.rs"]),
-        ("SAIAI_DESKTOP_ACTIVATION_ARGS", &["lib.rs"]),
-        ("SAIAI_DESKTOP_APP_ID", &["lib.rs"]),
         ("SAIAI_DESKTOP_BIN", &["brand_saiai.rs"]),
         ("SAIAI_DESKTOP_BROWSER_USE", &["brand_saiai.rs"]),
         ("SAIAI_HOME", &["brand_saiai.rs"]),
         ("SAIAI_INSTALL_DIR", &["brand_saiai.rs"]),
         ("SAIAI_OPENAI_TRACE", &["brand_saiai.rs"]),
         ("SAIAI_OPENAI_TRACE_PATH", &["brand_saiai.rs"]),
-        ("SAIAI_PATH_KIND", &["uninstall.rs"]),
-        ("SAIAI_PATH_NEW", &["uninstall.rs"]),
-        ("SAIAI_PATH_OLD", &["uninstall.rs"]),
         ("SAIAI_PROXY_VERBOSE", &["brand_saiai.rs"]),
-        (
-            "SAIAI_RUNTIME_APP_ID",
-            &["windows_desktop_inspect.ps1", "windows_desktop_runtime.rs"],
-        ),
-        ("SAIAI_RUNTIME_DIRECTORY", &["windows_desktop_runtime.rs"]),
-        (
-            "SAIAI_RUNTIME_PACKAGE_ROOT",
-            &["windows_desktop_inspect.ps1", "windows_desktop_runtime.rs"],
-        ),
-        (
-            "SAIAI_RUNTIME_REQUIRE_NO_ACTORS",
-            &["windows_desktop_inspect.ps1", "windows_desktop_runtime.rs"],
-        ),
         ("SAIAI_SKIP_START", &["brand_saiai.rs"]),
         ("SAIAI_UPSTREAM_PROXY", &["brand_saiai.rs"]),
-        (
-            "SAIAI_VSCODE_CA_PATH",
-            &["vscode.rs", "vscode_trust_windows.ps1"],
-        ),
-        (
-            "SAIAI_VSCODE_CA_SHA256",
-            &["vscode.rs", "vscode_trust_windows.ps1"],
-        ),
     ];
     let found = environment_inventory(&cli_sources());
     let found = found
@@ -1205,48 +1174,76 @@ fn saiai_environment_variable_inventory_is_frozen() {
     assert_eq!(found, expected);
 }
 
-/// Variables the binary hands to its own PowerShell helpers: the Rust side
-/// must still pass each name and a script must still read it.
+/// Variables the binary hands to its own PowerShell helpers. Both ends are
+/// templates of the same brand prefix: Rust passes `script_brand::env("X")`
+/// and the script reads `$env:@@ENV@@X`, from the same production files as
+/// before the names became templates; under SAIAI the names are unchanged.
 #[test]
 fn helper_environment_variables_are_written_and_read() {
     let sources = cli_sources();
-    let mut references = BTreeSet::new();
-    for (file, text) in &sources {
-        for (name, reference) in saiai_environment_references(text) {
-            references.insert((name, reference, file.ends_with(".rs")));
-        }
-    }
-    for name in [
-        "SAIAI_CA_FILES",
-        "SAIAI_CA_THUMBPRINT",
-        "SAIAI_CA_THUMBPRINTS",
-        "SAIAI_CHECK_EXE",
-        "SAIAI_CHECK_PID",
-        "SAIAI_CLEANUP_DIR",
-        "SAIAI_CLEANUP_DIRS",
-        "SAIAI_CLEANUP_FILES",
-        "SAIAI_DESKTOP_ACTIVATION_ARGS",
-        "SAIAI_DESKTOP_APP_ID",
-        "SAIAI_PATH_KIND",
-        "SAIAI_PATH_NEW",
-        "SAIAI_PATH_OLD",
-        "SAIAI_RUNTIME_APP_ID",
-        "SAIAI_RUNTIME_DIRECTORY",
-        "SAIAI_RUNTIME_PACKAGE_ROOT",
-        "SAIAI_RUNTIME_REQUIRE_NO_ACTORS",
-        "SAIAI_VSCODE_CA_PATH",
-        "SAIAI_VSCODE_CA_SHA256",
-    ] {
+    let expected: &[(&str, &[&str])] = &[
+        ("SAIAI_CA_FILES", &["uninstall.rs"]),
+        ("SAIAI_CA_THUMBPRINT", &["uninstall.rs"]),
+        ("SAIAI_CA_THUMBPRINTS", &["uninstall.rs"]),
+        ("SAIAI_CHECK_EXE", &["lib.rs"]),
+        ("SAIAI_CHECK_PID", &["lib.rs"]),
+        ("SAIAI_CLEANUP_DIR", &["uninstall.rs"]),
+        ("SAIAI_CLEANUP_DIRS", &["uninstall.rs"]),
+        ("SAIAI_CLEANUP_FILES", &["uninstall.rs"]),
+        ("SAIAI_DESKTOP_ACTIVATION_ARGS", &["lib.rs"]),
+        ("SAIAI_DESKTOP_APP_ID", &["lib.rs"]),
+        ("SAIAI_PATH_KIND", &["uninstall.rs"]),
+        ("SAIAI_PATH_NEW", &["uninstall.rs"]),
+        ("SAIAI_PATH_OLD", &["uninstall.rs"]),
+        (
+            "SAIAI_RUNTIME_APP_ID",
+            &["windows_desktop_inspect.ps1", "windows_desktop_runtime.rs"],
+        ),
+        ("SAIAI_RUNTIME_DIRECTORY", &["windows_desktop_runtime.rs"]),
+        (
+            "SAIAI_RUNTIME_PACKAGE_ROOT",
+            &["windows_desktop_inspect.ps1", "windows_desktop_runtime.rs"],
+        ),
+        (
+            "SAIAI_RUNTIME_REQUIRE_NO_ACTORS",
+            &["windows_desktop_inspect.ps1", "windows_desktop_runtime.rs"],
+        ),
+        (
+            "SAIAI_VSCODE_CA_PATH",
+            &["vscode.rs", "vscode_trust_windows.ps1"],
+        ),
+        (
+            "SAIAI_VSCODE_CA_SHA256",
+            &["vscode.rs", "vscode_trust_windows.ps1"],
+        ),
+    ];
+    let bounded = |text: &str, needle: &str| {
+        text.match_indices(needle).any(|(index, _)| {
+            !text[index + needle.len()..]
+                .starts_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+    };
+    for (name, files) in expected {
+        let suffix = name.strip_prefix("SAIAI_").unwrap();
+        assert_eq!(crate::script_brand::env(suffix), *name);
+        let writer = format!("script_brand::env(\"{suffix}\")");
+        let reader = format!("$env:@@ENV@@{suffix}");
         assert!(
-            references.contains(&(name.to_string(), Reference::Literal, true)),
+            sources
+                .iter()
+                .any(|(file, text)| file.ends_with(".rs") && text.contains(&writer)),
             "the binary no longer passes {name} to its helper"
         );
         assert!(
-            references
-                .iter()
-                .any(|(found, reference, _)| found == name && *reference == Reference::Script),
+            sources.values().any(|text| bounded(text, &reader)),
             "no helper script reads {name} any more"
         );
+        let users = sources
+            .iter()
+            .filter(|(_, text)| text.contains(&writer) || bounded(text, &reader))
+            .map(|(file, _)| file.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(&users, files, "files using {name}");
     }
 }
 
@@ -1292,7 +1289,7 @@ fn inline_contract_literals_are_present() {
             "is_service_file_name(&name, BRAND.service.launchd_label, \".plist\")",
         ),
         // Windows: stale CAs are recognized by organization.
-        ("lib.rs", "O=SAIAI(,|$)"),
+        ("lib.rs", "O=@@CA_ORG@@(,|$)"),
         // Windows per-user install directory known to uninstall.
         (
             "uninstall.rs",
@@ -1306,7 +1303,7 @@ fn inline_contract_literals_are_present() {
         // consumed by the launcher, removed by uninstall.
         (
             "windows_desktop_inspect.ps1",
-            "runtime_directory=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'SAIAI\\desktop-runtime'",
+            "runtime_directory=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) '@@APP_DIR@@\\desktop-runtime'",
         ),
         (
             "windows_desktop_runtime.rs",
@@ -1736,8 +1733,9 @@ fn library_takes_release_facts_from_the_entry_point() {
     );
 }
 
-/// The library core reads the brand the program installed; only the
-/// program side (`main.rs`) and the SAIAI values themselves name them.
+/// Blocks naming the SAIAI brand directly from library sources: only the
+/// program side (`main.rs`) and the SAIAI values themselves spell these
+/// names. A textual check, not a proof of the dependency boundary.
 #[test]
 fn only_the_program_names_the_saiai_brand() {
     let sources = cli_sources();
@@ -1865,13 +1863,68 @@ fn saiai_brand_values_are_frozen() {
     );
     assert_eq!(brand.winhttp_agent, "SAIAI");
     assert_eq!(brand.codex_daemon_client_name, "saiai_daemon_check");
+    assert_eq!(brand.scripts.env_prefix, "SAIAI_");
+    assert_eq!(brand.scripts.identifier_prefix, "Saiai");
+}
+
+/// Helper script templates render to exactly the scripts SAIAI shipped
+/// before they became templates (SHA-256 of the previous file contents).
+#[test]
+fn helper_scripts_render_to_the_shipped_saiai_scripts() {
+    use sha2::{Digest, Sha256};
+    for (template, expected) in [
+        (
+            include_str!("vscode_trust_windows.ps1"),
+            "92e176ca26965518366f792c9efc02610f439a099a7bfdee75326d3950c118cd",
+        ),
+        (
+            include_str!("windows_desktop_inspect.ps1"),
+            "3387f0e3ae941e20177c0ee3a76c3cce40bc395f4a7927ca4e4319f4b5c116f6",
+        ),
+    ] {
+        // `.gitattributes` checks scripts out with CRLF; hash the LF form
+        // stored in the repository.
+        let rendered = crate::script_brand::render(template).replace("\r\n", "\n");
+        assert_eq!(hex(&Sha256::digest(rendered.as_bytes())), expected);
+    }
+}
+
+/// Wire names inside helper scripts under SAIAI, written out by hand.
+#[test]
+fn helper_script_names_are_frozen() {
+    use crate::script_brand::{env, identifier_prefix, null_sentinel, render};
+    assert_eq!(env("CA_FILES"), "SAIAI_CA_FILES");
+    assert_eq!(null_sentinel(), "__SAIAI_NULL__");
+    assert_eq!(identifier_prefix(), "Saiai");
+    assert_eq!(
+        crate::windows_desktop_runtime::helper_failure_prefix(),
+        "SAIAI_DESKTOP_HELPER_FAILURE:"
+    );
+    assert_eq!(
+        render("Where-Object { $_.Subject -match '(^|, )O=@@CA_ORG@@(,|$)' }"),
+        "Where-Object { $_.Subject -match '(^|, )O=SAIAI(,|$)' }"
+    );
+    assert_eq!(
+        render("public static class @@ID@@PackageActivation {"),
+        "public static class SaiaiPackageActivation {"
+    );
+    assert_eq!(
+        render("Add-Type -Namespace @@ID@@Uninstall"),
+        "Add-Type -Namespace SaiaiUninstall"
+    );
+    assert_eq!(
+        render("'@@APP_DIR@@\\desktop-runtime'"),
+        "'SAIAI\\desktop-runtime'"
+    );
 }
 
 /// Executes the observer's production expression for the runtime directory.
 #[cfg(windows)]
 #[test]
 fn windows_desktop_runtime_directory_is_frozen() {
-    let line = include_str!("windows_desktop_inspect.ps1")
+    // The observer is a brand template; run what the program runs.
+    let observer = crate::script_brand::render(include_str!("windows_desktop_inspect.ps1"));
+    let line = observer
         .lines()
         .map(str::trim)
         .find_map(|line| line.strip_prefix("runtime_directory="))

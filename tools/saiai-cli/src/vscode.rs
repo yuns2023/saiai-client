@@ -36,16 +36,17 @@ pub fn trust_windows_current_user_ca(ca_cert: &Path) -> Result<()> {
     eprintln!(
         "Windows may show a Security Warning for the existing SAIAI CA (SHA-256: {hash}). Confirm that certificate within 90 seconds to finish VSCode setup."
     );
+    let script = crate::script_brand::render(include_str!("vscode_trust_windows.ps1"));
     let mut child = Command::new(program)
         .args([
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            include_str!("vscode_trust_windows.ps1"),
+            script.as_str(),
         ])
-        .env("SAIAI_VSCODE_CA_PATH", ca_cert)
-        .env("SAIAI_VSCODE_CA_SHA256", hash)
+        .env(crate::script_brand::env("VSCODE_CA_PATH"), ca_cert)
+        .env(crate::script_brand::env("VSCODE_CA_SHA256"), hash)
         .env_remove("PSModulePath")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -47,6 +47,7 @@ mod desktop_product;
 mod environment_scope;
 mod local_proxy;
 mod runtime;
+mod script_brand;
 mod uninstall;
 mod upstream_proxy;
 mod upstream_tls;
@@ -59,7 +60,7 @@ mod windows_desktop_runtime;
 use brand::{BRAND, BrandValue};
 pub use brand::{
     Brand, CertificateNames, ClientProofNames, ConfigNames, EnvironmentNames, GatewayProtocolNames,
-    OwnershipMarkers, PlaceholderIdentities, ServiceNames, UpdateNames,
+    OwnershipMarkers, PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
 };
 use desktop_product::DesktopProduct;
 pub use runtime::RuntimeContext;
@@ -2595,7 +2596,7 @@ public interface IApplicationActivationManager {
     void ActivateApplication([MarshalAs(UnmanagedType.LPWStr)] string appUserModelId,
         [MarshalAs(UnmanagedType.LPWStr)] string arguments, uint options, out uint processId);
 }
-public static class SaiaiPackageActivation {
+public static class @@ID@@PackageActivation {
     public static uint Activate(string appId, string arguments) {
         var clsid = new Guid("45BA127D-10A8-46EA-8AB7-56EA9078943C");
         var manager = (IApplicationActivationManager)Activator.CreateInstance(Type.GetTypeFromCLSID(clsid));
@@ -2606,13 +2607,19 @@ public static class SaiaiPackageActivation {
 }
 '@
 Add-Type -TypeDefinition $source
-[SaiaiPackageActivation]::Activate($env:SAIAI_DESKTOP_APP_ID,$env:SAIAI_DESKTOP_ACTIVATION_ARGS)
+[@@ID@@PackageActivation]::Activate($env:@@ENV@@DESKTOP_APP_ID,$env:@@ENV@@DESKTOP_ACTIVATION_ARGS)
 "#;
     let output = windows_desktop_runtime::powershell(
-        SCRIPT,
+        &script_brand::render(SCRIPT),
         &[
-            ("SAIAI_DESKTOP_APP_ID", OsStr::new(app_id)),
-            ("SAIAI_DESKTOP_ACTIVATION_ARGS", OsStr::new(arguments)),
+            (
+                script_brand::env("DESKTOP_APP_ID").as_str(),
+                OsStr::new(app_id),
+            ),
+            (
+                script_brand::env("DESKTOP_ACTIVATION_ARGS").as_str(),
+                OsStr::new(arguments),
+            ),
         ],
     )?;
     output
@@ -2755,24 +2762,25 @@ fn windows_write_internet_proxy(settings: &LegacyWindowsInternetProxySettings) -
     let enable = settings
         .proxy_enable
         .map(|value| value.to_string())
-        .unwrap_or_else(|| "__SAIAI_NULL__".to_string());
+        .unwrap_or_else(script_brand::null_sentinel);
     let server = settings
         .proxy_server
         .as_deref()
-        .unwrap_or("__SAIAI_NULL__")
-        .to_string();
+        .map_or_else(script_brand::null_sentinel, str::to_string);
     let auto = settings
         .auto_config_url
         .as_deref()
-        .unwrap_or("__SAIAI_NULL__")
-        .to_string();
+        .map_or_else(script_brand::null_sentinel, str::to_string);
+    let script = script_brand::render(
+        "& { param($e,$s,$a) $path='HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'; if($e -eq '__@@ENV@@NULL__'){Remove-ItemProperty $path -Name ProxyEnable -ErrorAction SilentlyContinue}else{Set-ItemProperty $path -Name ProxyEnable -Type DWord -Value ([int]$e)}; if($s -eq '__@@ENV@@NULL__'){Remove-ItemProperty $path -Name ProxyServer -ErrorAction SilentlyContinue}else{Set-ItemProperty $path -Name ProxyServer -Type String -Value $s}; if($a -eq '__@@ENV@@NULL__'){Remove-ItemProperty $path -Name AutoConfigURL -ErrorAction SilentlyContinue}else{Set-ItemProperty $path -Name AutoConfigURL -Type String -Value $a} }",
+    );
     command_output(
         "powershell",
         &[
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "& { param($e,$s,$a) $path='HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'; if($e -eq '__SAIAI_NULL__'){Remove-ItemProperty $path -Name ProxyEnable -ErrorAction SilentlyContinue}else{Set-ItemProperty $path -Name ProxyEnable -Type DWord -Value ([int]$e)}; if($s -eq '__SAIAI_NULL__'){Remove-ItemProperty $path -Name ProxyServer -ErrorAction SilentlyContinue}else{Set-ItemProperty $path -Name ProxyServer -Type String -Value $s}; if($a -eq '__SAIAI_NULL__'){Remove-ItemProperty $path -Name AutoConfigURL -ErrorAction SilentlyContinue}else{Set-ItemProperty $path -Name AutoConfigURL -Type String -Value $a} }",
+            script.as_str(),
             &enable,
             &server,
             &auto,
@@ -5877,14 +5885,12 @@ fn check_stale_windows_saiai_cas(report: &mut DoctorReport, ca_path: &Path) {
     let Some(current) = current else {
         return;
     };
+    let script = script_brand::render(
+        "$ErrorActionPreference='Stop'; foreach ($store in 'CurrentUser','LocalMachine') { Get-ChildItem \"Cert:\\$store\\Root\" | Where-Object { $_.Subject -match '(^|, )O=@@CA_ORG@@(,|$)' } | ForEach-Object { $_.Thumbprint + ' ' + $store + ' ' + [Convert]::ToBase64String($_.RawData) } }",
+    );
     let listing = command_output(
         "powershell",
-        &[
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "$ErrorActionPreference='Stop'; foreach ($store in 'CurrentUser','LocalMachine') { Get-ChildItem \"Cert:\\$store\\Root\" | Where-Object { $_.Subject -match '(^|, )O=SAIAI(,|$)' } | ForEach-Object { $_.Thumbprint + ' ' + $store + ' ' + [Convert]::ToBase64String($_.RawData) } }",
-        ],
+        &["-NoProfile", "-NonInteractive", "-Command", script.as_str()],
     );
     match listing {
         Ok(listing) => {
@@ -6796,7 +6802,7 @@ $statusPath = {}\r\n\
 $expectedHash = '{expected_sha256}'\r\n\
 $restartService = ${}\r\n\
 $stopped = $false\r\n\
-function Invoke-SaiaiCommand([string]$verb) {{\r\n\
+function Invoke-{id}Command([string]$verb) {{\r\n\
     $info = [Diagnostics.ProcessStartInfo]::new()\r\n\
     $info.FileName = $currentExe\r\n\
     $info.Arguments = $verb\r\n\
@@ -6816,7 +6822,7 @@ try {{\r\n\
     Wait-Process -Id {pid} -Timeout 30 -ErrorAction SilentlyContinue\r\n\
     if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ throw 'Updater process did not exit within 30 seconds' }}\r\n\
     Set-Content -LiteralPath $statusPath -Value 'pending: stopping SAIAI processes' -Encoding UTF8\r\n\
-    Invoke-SaiaiCommand 'stop'\r\n\
+    Invoke-{id}Command 'stop'\r\n\
     $stopped = $true\r\n\
     Set-Content -LiteralPath $statusPath -Value 'pending: replacing binary' -Encoding UTF8\r\n\
     $lastError = $null\r\n\
@@ -6843,7 +6849,7 @@ try {{\r\n\
     if ($actualHash -cne $expectedHash) {{ throw \"Installed SAIAI binary hash mismatch: $actualHash\" }}\r\n\
     if ($restartService) {{\r\n\
         Set-Content -LiteralPath $statusPath -Value 'pending: restarting proxy' -Encoding UTF8\r\n\
-        Invoke-SaiaiCommand 'restart'\r\n\
+        Invoke-{id}Command 'restart'\r\n\
     }}\r\n\
     Set-Content -LiteralPath $statusPath -Value \"updated: $actualHash\" -Encoding UTF8\r\n\
     Remove-Item -LiteralPath {} -Force -ErrorAction SilentlyContinue\r\n\
@@ -6851,7 +6857,7 @@ try {{\r\n\
     $failure = $_.Exception.Message\r\n\
     Set-Content -LiteralPath $statusPath -Value \"failed: $failure\" -Encoding UTF8\r\n\
     if ($stopped -and $restartService -and (Test-Path -LiteralPath $currentExe -PathType Leaf)) {{\r\n\
-        try {{ Invoke-SaiaiCommand 'start' }} catch {{}}\r\n\
+        try {{ Invoke-{id}Command 'start' }} catch {{}}\r\n\
     }}\r\n\
     exit 1\r\n\
 }}",
@@ -6860,6 +6866,7 @@ try {{\r\n\
         powershell_quote_path(status_path)?,
         if restart_service { "true" } else { "false" },
         powershell_quote_path(script_path)?,
+        id = script_brand::identifier_prefix(),
     ))
 }
 
@@ -7752,10 +7759,10 @@ fn legacy_windows_worker_matches(pid: u32, executables: &[PathBuf]) -> Result<bo
         .collect::<Vec<_>>()
         .join("\n");
     let output = ProcessCommand::new("powershell")
-        .env("SAIAI_CHECK_PID", pid.to_string())
-        .env("SAIAI_CHECK_EXE", executables)
+        .env(script_brand::env("CHECK_PID"), pid.to_string())
+        .env(script_brand::env("CHECK_EXE"), executables)
         .args(["-NoProfile", "-NonInteractive", "-Command",
-            r#"$ErrorActionPreference='Stop'; $p=Get-CimInstance Win32_Process -Filter ('ProcessId = '+$env:SAIAI_CHECK_PID); if (!$p) { exit 1 }; $actual=$p.ExecutablePath -replace '^\\\\\?\\',''; $expected=@($env:SAIAI_CHECK_EXE -split "`n" | Where-Object { ($_ -replace '^\\\\\?\\','') -ieq $actual }); if ($expected.Count -gt 0 -and $p.CommandLine -match '\s__run-background-proxy\s*$') { exit 0 }; exit 1"#])
+            &script_brand::render(r#"$ErrorActionPreference='Stop'; $p=Get-CimInstance Win32_Process -Filter ('ProcessId = '+$env:@@ENV@@CHECK_PID); if (!$p) { exit 1 }; $actual=$p.ExecutablePath -replace '^\\\\\?\\',''; $expected=@($env:@@ENV@@CHECK_EXE -split "`n" | Where-Object { ($_ -replace '^\\\\\?\\','') -ieq $actual }); if ($expected.Count -gt 0 -and $p.CommandLine -match '\s__run-background-proxy\s*$') { exit 0 }; exit 1"#)])
         .stdout(Stdio::null()).stderr(Stdio::null()).status()
         .context("cannot verify legacy SAIAI worker identity")?;
     Ok(output.success())

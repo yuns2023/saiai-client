@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 const RECEIPT_LIMIT: u64 = 16384;
 
 #[cfg(any(windows, test))]
-const HELPER_FAILURE_PREFIX: &str = "SAIAI_DESKTOP_HELPER_FAILURE:";
+/// `<helper env prefix>DESKTOP_HELPER_FAILURE:` marks a classified failure line.
+pub(crate) fn helper_failure_prefix() -> String {
+    crate::script_brand::env("DESKTOP_HELPER_FAILURE:")
+}
 
 #[cfg(any(windows, test))]
 const HELPER_FAILURE_REASONS: &[&str] = &[
@@ -63,13 +66,14 @@ fn helper_script(script: &str) -> String {
         .map(|category| format!("'{category}'"))
         .collect::<Vec<_>>()
         .join(",");
+    let prefix = helper_failure_prefix();
     format!(
         "try {{\n& {{\n{script}\n}}\n}} catch {{\n\
          $reason='unclassified_powershell_failure';\n\
          if($_.Exception.Message -cin @({reasons})){{$reason=$_.Exception.Message}};\n\
          $category=[string]$_.CategoryInfo.Category;\n\
          if($category -cnotin @({categories})){{$category='NotSpecified'}};\n\
-         [Console]::Out.WriteLine('{HELPER_FAILURE_PREFIX}'+(@{{reason=$reason;category=$category}}|ConvertTo-Json -Compress));\n\
+         [Console]::Out.WriteLine('{prefix}'+(@{{reason=$reason;category=$category}}|ConvertTo-Json -Compress));\n\
          exit 1\n}}"
     )
 }
@@ -102,7 +106,7 @@ fn helper_failure_diagnostic(output: &[u8]) -> Option<HelperFailure> {
     let encoded = std::str::from_utf8(output)
         .ok()?
         .trim()
-        .strip_prefix(HELPER_FAILURE_PREFIX)?;
+        .strip_prefix(helper_failure_prefix().as_str())?;
     let failure: HelperFailure = serde_json::from_str(encoded).ok()?;
     if !HELPER_FAILURE_REASONS.contains(&failure.reason.as_str())
         || !HELPER_FAILURE_CATEGORIES.contains(&failure.category.as_str())
@@ -629,8 +633,11 @@ fn powershell_with_failure(
 pub(crate) fn protect_directory(directory: &Path) -> Result<()> {
     reject_link(directory)?;
     powershell_with_failure(
-        r#"$ErrorActionPreference='Stop';$path=$env:SAIAI_RUNTIME_DIRECTORY;$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;$private=[Security.AccessControl.DirectorySecurity]::new();$private.SetOwner($sid);$private.SetAccessRuleProtection($true,$false);$rule=[Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow');$private.AddAccessRule($rule);[IO.Directory]::CreateDirectory($path,$private)|Out-Null;$item=Get-Item -LiteralPath $path;if($item.Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'runtime_reparse_point_refused'};$acl=Get-Acl -LiteralPath $path;if($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){throw 'foreign_runtime_owner'};[IO.Directory]::SetAccessControl($path,$private);'ok'"#,
-        &[("SAIAI_RUNTIME_DIRECTORY", directory.as_os_str())],
+        &crate::script_brand::render(r#"$ErrorActionPreference='Stop';$path=$env:@@ENV@@RUNTIME_DIRECTORY;$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;$private=[Security.AccessControl.DirectorySecurity]::new();$private.SetOwner($sid);$private.SetAccessRuleProtection($true,$false);$rule=[Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow');$private.AddAccessRule($rule);[IO.Directory]::CreateDirectory($path,$private)|Out-Null;$item=Get-Item -LiteralPath $path;if($item.Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'runtime_reparse_point_refused'};$acl=Get-Acl -LiteralPath $path;if($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value){throw 'foreign_runtime_owner'};[IO.Directory]::SetAccessControl($path,$private);'ok'"#),
+        &[(
+            crate::script_brand::env("RUNTIME_DIRECTORY").as_str(),
+            directory.as_os_str(),
+        )],
         runtime_directory_failure,
     )
     .context("Could not initialize the private Windows Desktop runtime directory")?;
@@ -640,18 +647,18 @@ pub(crate) fn protect_directory(directory: &Path) -> Result<()> {
 #[cfg(windows)]
 fn inspect_package(package: &Package, require_no_actors: bool) -> Result<Snapshot> {
     let output = powershell(
-        include_str!("windows_desktop_inspect.ps1"),
+        &crate::script_brand::render(include_str!("windows_desktop_inspect.ps1")),
         &[
             (
-                "SAIAI_RUNTIME_APP_ID",
+                crate::script_brand::env("RUNTIME_APP_ID").as_str(),
                 std::ffi::OsStr::new(&package.app_id),
             ),
             (
-                "SAIAI_RUNTIME_PACKAGE_ROOT",
+                crate::script_brand::env("RUNTIME_PACKAGE_ROOT").as_str(),
                 package.install_location.as_os_str(),
             ),
             (
-                "SAIAI_RUNTIME_REQUIRE_NO_ACTORS",
+                crate::script_brand::env("RUNTIME_REQUIRE_NO_ACTORS").as_str(),
                 std::ffi::OsStr::new(if require_no_actors { "1" } else { "0" }),
             ),
         ],
@@ -677,7 +684,8 @@ mod tests {
     fn helper_diagnostics_accept_only_bounded_known_fields() {
         for reason in HELPER_FAILURE_REASONS {
             let encoded = format!(
-                "{HELPER_FAILURE_PREFIX}{{\"reason\":\"{reason}\",\"category\":\"ObjectNotFound\"}}"
+                "{}{{\"reason\":\"{reason}\",\"category\":\"ObjectNotFound\"}}",
+                helper_failure_prefix()
             );
             let diagnostic = helper_failure_diagnostic(encoded.as_bytes())
                 .unwrap()
@@ -1513,8 +1521,9 @@ mod tests {
     fn native_observer_rebuilds_only_after_confirmed_actor_exit() {
         let script = include_str!("windows_desktop_inspect_tests.ps1").replace(
             "__OBSERVER_SOURCE__",
-            &base64::engine::general_purpose::STANDARD
-                .encode(include_str!("windows_desktop_inspect.ps1")),
+            &base64::engine::general_purpose::STANDARD.encode(crate::script_brand::render(
+                include_str!("windows_desktop_inspect.ps1"),
+            )),
         );
         let output = powershell(&script, &[]).unwrap();
         let cases: Vec<serde_json::Value> = serde_json::from_str(output.trim()).unwrap();

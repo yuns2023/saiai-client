@@ -128,7 +128,8 @@ impl AsRef<OsStr> for BrandValue<&'static str> {
 
 impl fmt::Display for BrandValue<&'static str> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.get())
+        // Delegate so width, precision and alignment behave like the string's.
+        fmt::Display::fmt(self.get(), formatter)
     }
 }
 
@@ -161,6 +162,7 @@ pub struct Brand {
     pub placeholders: PlaceholderIdentities,
     pub client_proof: ClientProofNames,
     pub gateway: GatewayProtocolNames,
+    pub scripts: ScriptNames,
     /// WinHTTP session agent used for proxy auto-configuration lookups.
     pub winhttp_agent: &'static str,
     /// `clientInfo.name` of the read-only Codex daemon initialization check.
@@ -260,6 +262,16 @@ pub struct PlaceholderIdentities {
     pub claude_desktop_token_prefix: &'static str,
     pub claude_desktop_session_prefix: &'static str,
     pub desktop_email: &'static str,
+}
+
+/// Names the program's own helper scripts use (see `script_brand`).
+pub struct ScriptNames {
+    /// Prefix of environment variables passed to helper scripts and of
+    /// internal helper markers; `[A-Z][A-Z0-9_]*_`.
+    pub env_prefix: &'static str,
+    /// Prefix of .NET types and PowerShell functions the helpers define;
+    /// `[A-Z][A-Za-z0-9]*`.
+    pub identifier_prefix: &'static str,
 }
 
 /// Names of Gateway endpoints and headers specific to this distribution.
