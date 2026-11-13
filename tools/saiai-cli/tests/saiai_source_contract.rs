@@ -967,10 +967,11 @@ fn token_references(tokens: &[proc_macro2::TokenTree], found: &mut Vec<Result<St
                 if is_punct(tokens.get(at), '!') {
                     at += 1;
                 }
-                // An attribute a macro assembles (`#[$attr]`, `# $tokens`)
-                // could carry a `path` this scan cannot see.
-                if is_punct(tokens.get(at), '$') {
-                    found.push(Err("# $... (macro-generated attribute)".to_string()));
+                // A `#` that does not start a complete attribute (`# $tokens`,
+                // a `#` passed to a macro) or an attribute a macro assembles
+                // (`#[$attr]`) could carry a `path` this scan cannot see.
+                if !is_group(tokens.get(at), Bracket) {
+                    found.push(Err("# without an attribute body".to_string()));
                 } else if let Some(proc_macro2::TokenTree::Group(group)) = tokens.get(at)
                     && group.delimiter() == Bracket
                 {
@@ -1127,6 +1128,7 @@ mod documented;
         "macro_rules! m { ($p:literal) => { #[path = $p] mod outside; }; }\nm!(\"../../outside.rs\");",
         "macro_rules! m { ($($t:tt)*) => { $($t)* }; }\nm!(#[path = \"../outside.rs\"] mod outside;);",
         "const X: &[u8] = ::core::include_bytes!(\"../x\");",
+        "macro_rules! m { ($h:tt) => { $h [path = \"../../outside.rs\"] mod outside; }; }\nm!(#);",
         "const X: &str = \"unterminated;",
     ] {
         let references = file_references(refused);
