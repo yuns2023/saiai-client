@@ -2189,3 +2189,37 @@ fn saiai_names_outside_the_brand_only_shrink() {
             .join("\n"),
     );
 }
+
+#[test]
+fn production_text_drops_test_items_and_keeps_production_code() {
+    let source = r##"fn kept_before() {}
+#[test]
+fn standalone() { let _ = "SAIAI fixture { }"; }
+#[tokio::test]
+#[ignore]
+async fn standalone_async() { if true { } }
+const MARKER_IN_TEXT: &str = "#[test] fn not_an_item() {}";
+#[test_case(1)]
+fn parameterized_kept(value: u8) {}
+#[cfg(test)]
+mod tests { fn inner() {} }
+fn kept_after() {}
+"##;
+    let kept = remove_rust_test_items(source);
+    for gone in [
+        "standalone",
+        "SAIAI fixture",
+        "standalone_async",
+        "mod tests",
+    ] {
+        assert!(!kept.contains(gone), "{gone} survived:\n{kept}");
+    }
+    for present in [
+        "fn kept_before() {}",
+        r##"const MARKER_IN_TEXT: &str = "#[test] fn not_an_item() {}";"##,
+        "#[test_case(1)]\nfn parameterized_kept(value: u8) {}",
+        "fn kept_after() {}",
+    ] {
+        assert!(kept.contains(present), "{present} lost:\n{kept}");
+    }
+}
