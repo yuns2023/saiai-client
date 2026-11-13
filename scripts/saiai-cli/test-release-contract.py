@@ -175,6 +175,8 @@ class OptionalClaudeContractTests(unittest.TestCase):
         for behavior in (
             'eprintln!("{brand_product}", brand_product = config.api_key);',
             'eprintln!("{brand_product} {token}", brand_product = BRAND.product_name);',
+            'eprintln!("{brand_product}");',
+            'eprintln!("{brand_product} {brand_binary}", brand_product = BRAND.product_name);',
         ):
             with self.subTest(behavior=behavior):
                 with self.assertRaisesRegex(AssertionError, "interpolate credentials"):

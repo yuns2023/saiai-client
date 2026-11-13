@@ -2285,7 +2285,7 @@ const BRAND_TEXT_GOLDEN: &str = include_str!("brand_text_golden.txt");
 
 /// Text that scripts, tests or tools outside this crate parse; each must stay
 /// in the frozen set (the consumer is named for the reviewer).
-const BRAND_TEXT_CONTRACTS: [(&str, &str, &str); 9] = [
+const BRAND_TEXT_CONTRACTS: [(&str, &str, &str); 11] = [
     (
         "lib.rs",
         "\"SAIAI LaunchAgent started.\"",
@@ -2331,7 +2331,57 @@ const BRAND_TEXT_CONTRACTS: [(&str, &str, &str); 9] = [
         "\"SAIAI uninstall plan\"",
         "scripts/saiai-cli/setup.sh, setup.ps1",
     ),
+    (
+        "lib.rs",
+        "\"SAIAI Desktop scope: Codex only; the official ChatGPT sidebar, ordinary Chat history, and settings are not supported.\"",
+        "scripts/saiai-cli/test-macos-service.py",
+    ),
+    (
+        "lib.rs",
+        "\"Trusted the SAIAI CA in the current user's NSS database for direct Linux Desktop (no system trust store or dialog).\"",
+        "scripts/saiai-cli/test-initialization-scope.py (must not appear)",
+    ),
 ];
+
+/// Top-level arguments of a call between `from` and `end` (the text after
+/// its format literal), each with whitespace collapsed.
+fn call_arguments(
+    text: &str,
+    literals: &[std::ops::Range<usize>],
+    from: usize,
+    end: usize,
+) -> Vec<String> {
+    let mut arguments = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0_usize;
+    let mut index = from;
+    while index < end {
+        if let Some(range) = literals.iter().find(|range| range.start == index) {
+            current.push_str(&text[range.clone()]);
+            index = range.end;
+            continue;
+        }
+        let ch = text[index..].chars().next().unwrap();
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                arguments.push(std::mem::take(&mut current));
+                index += 1;
+                continue;
+            }
+            _ => {}
+        }
+        current.push(ch);
+        index += ch.len_utf8();
+    }
+    arguments.push(current);
+    arguments
+        .iter()
+        .map(|argument| argument.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|argument| !argument.is_empty())
+        .collect()
+}
 
 /// End of the call whose arguments start at `from`: the `)` that closes it.
 fn enclosing_call_end(text: &str, literals: &[std::ops::Range<usize>], from: usize) -> usize {
@@ -2371,16 +2421,15 @@ fn rendered_brand_text() -> Vec<(String, String)> {
                 if !literal.contains(token) {
                     continue;
                 }
+                // A top-level argument exactly `name = BRAND.field`: the
+                // value printed is the field itself, nothing derived from it.
                 let arguments = bound.get_or_insert_with(|| {
                     let end = enclosing_call_end(&text, &literals, range.end);
-                    text[range.end..end]
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
+                    call_arguments(&text, &literals, range.end, end)
                 });
                 assert!(
-                    arguments.contains(binding),
-                    "{file}: {token} in {literal} is not bound by `{binding}`"
+                    arguments.iter().any(|argument| argument == binding),
+                    "{file}: {token} in {literal} is not bound by exactly `{binding}`"
                 );
                 restored = restored.replace(token, saiai);
             }
