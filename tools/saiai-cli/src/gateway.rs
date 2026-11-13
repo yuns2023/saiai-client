@@ -43,6 +43,37 @@ pub trait GatewayExtension: std::any::Any + Send + Sync {
     fn native_chat(&self) -> Option<NativeChatProtocol> {
         None
     }
+
+    /// Files this extension keeps in every environment directory, so that
+    /// uninstall recognizes them as the program's own. Readable without a
+    /// session, a key or the network.
+    fn owned_state_files(&self) -> &'static [StateFile] {
+        &[]
+    }
+}
+
+/// A file a Gateway extension keeps in an environment directory, with the
+/// files derived from it that are also its own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StateFile {
+    /// Plain basename: ASCII letters, digits, `.`, `-` and `_`, not `.`/`..`.
+    pub name: &'static str,
+    /// `<name>.bak-…` copies belong to it as well.
+    pub backups: bool,
+    /// `.<name>.<temp infix>-…` leftovers of an interrupted
+    /// [`write_file_atomically`](crate::write_file_atomically) belong to it.
+    pub atomic_temporaries: bool,
+}
+
+impl StateFile {
+    /// Whether `file_name` (a basename in an environment directory) is this
+    /// file or one derived from it; `temp_infix` is the brand's.
+    pub(crate) fn owns(&self, file_name: &str, temp_infix: &str) -> bool {
+        file_name == self.name
+            || (self.backups && file_name.starts_with(&format!("{}.bak-", self.name)))
+            || (self.atomic_temporaries
+                && file_name.starts_with(&format!(".{}.{temp_infix}-", self.name)))
+    }
 }
 
 /// What a session gets from the local proxy run that starts it.
@@ -219,6 +250,18 @@ pub(crate) fn validate_extension(extension: &dyn GatewayExtension) -> Result<()>
             anyhow::bail!("Gateway extension declares an unusable Chat updates path {path:?}");
         }
     }
+    for file in extension.owned_state_files() {
+        let name = file.name;
+        let valid = !name.is_empty()
+            && name.len() <= 255
+            && !matches!(name, "." | "..")
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'));
+        if !valid {
+            anyhow::bail!("Gateway extension declares an unusable state file name {name:?}");
+        }
+    }
     Ok(())
 }
 
@@ -344,5 +387,80 @@ mod tests {
     fn the_extension_without_protocol_signs_nothing() {
         assert!(NoGatewaySession.sign(&INPUT).is_empty());
         assert!(NoGatewayExtension.signature_headers().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod state_file_tests {
+    use super::*;
+
+    struct Files(&'static [StateFile]);
+
+    impl GatewayExtension for Files {
+        fn start(&self, _: GatewayStart) -> Arc<dyn GatewaySession> {
+            unreachable!("not started")
+        }
+        fn owned_state_files(&self) -> &'static [StateFile] {
+            self.0
+        }
+    }
+
+    const fn file(name: &'static str) -> StateFile {
+        StateFile {
+            name,
+            backups: true,
+            atomic_temporaries: true,
+        }
+    }
+
+    #[test]
+    fn a_state_file_owns_itself_its_backups_and_its_atomic_leftovers() {
+        let all = file("device.key");
+        for name in ["device.key", "device.key.bak-1", ".device.key.tmp-1-a"] {
+            assert!(all.owns(name, "tmp"), "{name}");
+        }
+        for name in [
+            "device.keyx",
+            "device.key.bak",
+            ".device.key.other-1",
+            "x.device.key",
+        ] {
+            assert!(!all.owns(name, "tmp"), "{name}");
+        }
+        let bare = StateFile {
+            name: "device.key",
+            backups: false,
+            atomic_temporaries: false,
+        };
+        assert!(bare.owns("device.key", "tmp"));
+        assert!(!bare.owns("device.key.bak-1", "tmp"));
+        assert!(!bare.owns(".device.key.tmp-1-a", "tmp"));
+    }
+
+    #[test]
+    fn state_file_names_are_plain_basenames() {
+        static GOOD: Files = Files(&[file("client-device.json"), file("a_b.c-d")]);
+        validate_extension(&GOOD).unwrap();
+        for name in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "a\\b",
+            "C:x",
+            "a b",
+            "a\0b",
+            "\u{e9}",
+            &"x".repeat(256),
+        ] {
+            let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+            let files: &'static [StateFile] = Box::leak(Box::new([file(leaked)]));
+            let error = validate_extension(&Files(files)).unwrap_err();
+            assert!(
+                error.to_string().contains("state file name"),
+                "{name:?}: {error}"
+            );
+        }
     }
 }

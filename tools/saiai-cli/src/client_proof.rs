@@ -30,20 +30,16 @@ macro_rules! eprintln {
     };
 }
 
-use crate::brand::BRAND;
-
-pub const HEADER_NAME: crate::brand::BrandValue<&'static str> =
-    crate::brand::BrandValue(|brand| brand.client_proof.header);
-const MESSAGE_DOMAIN: crate::brand::BrandValue<&'static str> =
-    crate::brand::BrandValue(|brand| brand.client_proof.message_domain);
-const KEY_FILENAME: crate::brand::BrandValue<&'static str> =
-    crate::brand::BrandValue(|brand| brand.client_proof.key_filename);
-const LOCK_FILENAME: crate::brand::BrandValue<&'static str> =
-    crate::brand::BrandValue(|brand| brand.client_proof.lock_filename);
-const DEVICE_FILENAME: crate::brand::BrandValue<&'static str> =
-    crate::brand::BrandValue(|brand| brand.client_proof.device_filename);
-const ENROLL_PATH: crate::brand::BrandValue<&'static str> =
-    crate::brand::BrandValue(|brand| brand.client_proof.enroll_path);
+/// Request header carrying the proof.
+pub const HEADER_NAME: &str = "x-saiai-client-proof";
+pub(crate) const MESSAGE_DOMAIN: &str = "saiai-client-proof-v1";
+pub(crate) const ENROLL_PATH: &str = "/api/v1/client/devices/enroll";
+/// Device key, device records and their lock, in the environment directory.
+pub(crate) const KEY_FILENAME: &str = "client-device-key";
+pub(crate) const LOCK_FILENAME: &str = "client-device.lock";
+pub(crate) const DEVICE_FILENAME: &str = "client-device.json";
+/// Unreadable key kept aside before a new device key is created.
+pub(crate) const CORRUPT_KEY_FILENAME: &str = "client-device-key.corrupt";
 const ENROLL_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_ENROLL_RESPONSE_BYTES: usize = 16 * 1024;
 /// Extra credentials (Bearers not configured on a route) enrolled on demand.
@@ -269,7 +265,7 @@ fn parse_key_file(bytes: &[u8]) -> Result<SigningKey> {
 /// when the returned file is dropped.
 fn lock_state_dir(dir: &Path) -> Result<fs::File> {
     fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    let path = dir.join(LOCK_FILENAME.get());
+    let path = dir.join(LOCK_FILENAME);
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -299,7 +295,7 @@ fn load_or_create_key(path: &Path) -> Result<SigningKey> {
                     "client proof: device key {} is unreadable ({err:#}); generating a new device key",
                     path.display()
                 );
-                let aside = path.with_file_name(BRAND.client_proof.corrupt_key_filename);
+                let aside = path.with_file_name(CORRUPT_KEY_FILENAME);
                 fs::rename(path, &aside)
                     .with_context(|| format!("failed to set aside {}", path.display()))?;
             }
@@ -309,7 +305,7 @@ fn load_or_create_key(path: &Path) -> Result<SigningKey> {
     }
     let key = generate_signing_key()?;
     let pem = encode_private_key_pem(&key)?;
-    super::write_bytes_atomic(path, pem.as_bytes(), 0o600)?;
+    crate::write_file_atomically(path, pem.as_bytes(), 0o600)?;
     Ok(key)
 }
 
@@ -389,16 +385,16 @@ impl ClientProof {
     /// `dir`. An unreadable key is replaced by a new one, i.e. a new device.
     #[cfg(test)]
     pub fn load(dir: &Path) -> Result<Self> {
-        Self::load_for_version(dir, crate::runtime::version())
+        Self::load_for_version(dir, env!("CARGO_PKG_VERSION"))
     }
 
     /// [`load`](Self::load) for a program that reports `client_version`.
     pub fn load_for_version(dir: &Path, client_version: &'static str) -> Result<Self> {
         let _lock = lock_state_dir(dir)?;
-        let key = load_or_create_key(&dir.join(KEY_FILENAME.get()))?;
+        let key = load_or_create_key(&dir.join(KEY_FILENAME))?;
         let public_point = key.verifying_key().to_encoded_point(false);
         let public_key_sha256 = format!("{:x}", Sha256::digest(public_point.as_bytes()));
-        let device_path = dir.join(DEVICE_FILENAME.get());
+        let device_path = dir.join(DEVICE_FILENAME);
         let gateways = read_device_file(&device_path, &public_key_sha256).unwrap_or_else(|err| {
             eprintln!("client proof: device file is unreadable ({err:#}); re-enrolling");
             DeviceMap::new()
@@ -519,7 +515,7 @@ impl ClientProof {
         // by another proxy process survive. Without the lock the change still
         // applies in memory for this process, but is not persisted.
         let file_lock = lock_state_dir(&self.dir);
-        let device_path = self.dir.join(DEVICE_FILENAME.get());
+        let device_path = self.dir.join(DEVICE_FILENAME);
         // Disk IO happens before taking the in-memory lock: forwarding reads
         // that lock and must never wait on a slow disk.
         let on_disk = if file_lock.is_ok() {
@@ -540,7 +536,7 @@ impl ClientProof {
         };
         let mut bytes = serde_json::to_vec_pretty(&file)?;
         bytes.push(b'\n');
-        super::write_bytes_atomic(&device_path, &bytes, 0o600)
+        crate::write_file_atomically(&device_path, &bytes, 0o600)
     }
 
     fn lock(&self) -> MutexGuard<'_, DeviceMap> {
@@ -702,12 +698,6 @@ impl ClientSource for Arc<dyn crate::gateway::GatewayHttp> {
     }
 }
 
-impl ClientSource for Arc<crate::upstream_proxy::HttpClients> {
-    async fn client_for(&self, url: &str) -> Result<reqwest::Client> {
-        self.for_url(url).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -839,12 +829,12 @@ mod tests {
         let first = ClientProof::load(directory.path()).unwrap();
         let second = ClientProof::load(directory.path()).unwrap();
         assert_eq!(first.public_key, second.public_key);
-        let pem = fs::read_to_string(directory.path().join(KEY_FILENAME.get())).unwrap();
+        let pem = fs::read_to_string(directory.path().join(KEY_FILENAME)).unwrap();
         assert!(pem.starts_with(PEM_BEGIN));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(directory.path().join(KEY_FILENAME.get()))
+            let mode = fs::metadata(directory.path().join(KEY_FILENAME))
                 .unwrap()
                 .permissions()
                 .mode();
@@ -861,7 +851,7 @@ mod tests {
         first
             .record_device("https://gw.example", "k", "cd_OLDOLDOLDOLDOLDOLDOLD0")
             .unwrap();
-        fs::write(directory.path().join(KEY_FILENAME.get()), "not a key").unwrap();
+        fs::write(directory.path().join(KEY_FILENAME), "not a key").unwrap();
         let second = ClientProof::load(directory.path()).unwrap();
         assert_eq!(
             fs::read(directory.path().join(format!("{KEY_FILENAME}.corrupt"))).unwrap(),
@@ -869,15 +859,11 @@ mod tests {
         );
         assert_ne!(first.public_key, second.public_key);
         assert_eq!(second.device("https://gw.example", "k"), None);
-        fs::write(directory.path().join(DEVICE_FILENAME.get()), "{").unwrap();
+        fs::write(directory.path().join(DEVICE_FILENAME), "{").unwrap();
         let third = ClientProof::load(directory.path()).unwrap();
         assert_eq!(third.public_key, second.public_key);
         assert_eq!(third.device("https://gw.example", "k"), None);
-        fs::write(
-            directory.path().join(KEY_FILENAME.get()),
-            [0xff, 0xfe, 0x00],
-        )
-        .unwrap();
+        fs::write(directory.path().join(KEY_FILENAME), [0xff, 0xfe, 0x00]).unwrap();
         let fourth = ClientProof::load(directory.path()).unwrap();
         assert_ne!(fourth.public_key, second.public_key);
     }
@@ -886,7 +872,7 @@ mod tests {
     fn invalid_persisted_records_are_dropped_and_other_process_records_merge() {
         let directory = tempfile::tempdir().unwrap();
         let proof = ClientProof::load(directory.path()).unwrap();
-        let path = directory.path().join(DEVICE_FILENAME.get());
+        let path = directory.path().join(DEVICE_FILENAME);
         let file = json!({
             "public_key_sha256": proof.public_key_sha256,
             "gateways": { "https://gw.example": {
@@ -962,7 +948,7 @@ mod tests {
     fn loose_device_pem_permissions_are_tightened() {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(KEY_FILENAME.get());
+        let path = directory.path().join(KEY_FILENAME);
         ClientProof::load(directory.path()).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         ClientProof::load(directory.path()).unwrap();

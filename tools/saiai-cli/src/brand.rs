@@ -257,8 +257,6 @@ pub struct Brand {
     pub update: UpdateNames,
     pub markers: OwnershipMarkers,
     pub placeholders: PlaceholderIdentities,
-    pub client_proof: ClientProofNames,
-    pub gateway: GatewayProtocolNames,
     pub scripts: ScriptNames,
     /// Inbound request headers only this program may produce; stripped from
     /// every request the proxy rebuilds (case-insensitive), in addition to
@@ -384,27 +382,6 @@ pub struct ScriptNames {
     /// Prefix of .NET types and PowerShell functions the helpers define;
     /// `[A-Z][A-Za-z0-9]*`.
     pub identifier_prefix: &'static str,
-}
-
-/// Names of Gateway endpoints and headers specific to this distribution.
-pub struct GatewayProtocolNames {
-    /// Native Chat update channel: a complete path starting with
-    /// `/backend-api/` and without the `/chatgpt` prefix (the local proxy
-    /// forwards it as `/chatgpt` + this path).
-    pub chat_updates_path: &'static str,
-    /// Response header marking a restored native Chat preference.
-    pub chat_preference_restored_header: &'static str,
-}
-
-pub struct ClientProofNames {
-    pub header: &'static str,
-    pub message_domain: &'static str,
-    pub enroll_path: &'static str,
-    pub key_filename: &'static str,
-    pub lock_filename: &'static str,
-    pub device_filename: &'static str,
-    /// Unreadable key kept aside before a new device key is created.
-    pub corrupt_key_filename: &'static str,
 }
 
 #[cfg(test)]

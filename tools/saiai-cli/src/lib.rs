@@ -63,13 +63,13 @@ mod windows_desktop_runtime;
 
 use brand::{BRAND, BrandText, BrandValue};
 pub use brand::{
-    Brand, CertificateNames, ClientProofNames, ConfigNames, EnvironmentNames, GatewayProtocolNames,
-    OwnershipMarkers, PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
+    Brand, CertificateNames, ConfigNames, EnvironmentNames, OwnershipMarkers,
+    PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
 };
 use desktop_product::DesktopProduct;
 pub use gateway::{
     ConfiguredRoute, GatewayExtension, GatewayHttp, GatewaySession, GatewayStart,
-    NativeChatProtocol, NoGatewayExtension, SignInput, Transport,
+    NativeChatProtocol, NoGatewayExtension, SignInput, StateFile, Transport, wire_target,
 };
 pub use runtime::RuntimeContext;
 
@@ -9014,6 +9014,16 @@ fn write_json_object(path: &Path, value: Value) -> Result<()> {
     write_bytes_atomic(path, &data, 0o600)
 }
 
+/// Replaces `path` with `data` atomically: the bytes go to a new temporary
+/// file `.<file name>.<brand temp infix>-<pid>-<random>` in the same
+/// directory (created with `unix_mode` on Unix, flushed to disk), which then
+/// replaces `path` in one step (`rename`; on Windows a replacing move). On
+/// failure the temporary file is removed and `path` is left as it was. The
+/// directory is created if missing. For Gateway extensions keeping state.
+pub fn write_file_atomically(path: &Path, data: &[u8], unix_mode: u32) -> Result<()> {
+    write_bytes_atomic(path, data, unix_mode)
+}
+
 fn write_bytes_atomic(path: &Path, data: &[u8], unix_mode: u32) -> Result<()> {
     #[cfg(not(unix))]
     let _ = unix_mode;
@@ -10118,6 +10128,18 @@ HTTPS_PROXY="http://127.0.0.1:1111"
                 r#"[2]"#,
                 Err(
                     r#"invalid length 1, expected struct SaiaiConfig with 10 elements at line 1 column 3"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k"]"#,
+                Err(
+                    r#"invalid length 3, expected struct SaiaiConfig with 10 elements at line 1 column 11"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k","l"]"#,
+                Err(
+                    r#"invalid length 4, expected struct SaiaiConfig with 10 elements at line 1 column 15"#,
                 ),
             ),
             (

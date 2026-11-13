@@ -7923,7 +7923,7 @@ mod tests {
         request
             .headers
             .iter()
-            .filter(|(name, _)| name.eq_ignore_ascii_case(client_proof::HEADER_NAME.get()))
+            .filter(|(name, _)| name.eq_ignore_ascii_case(client_proof::HEADER_NAME))
             .map(|(_, value)| value.as_str())
             .collect()
     }

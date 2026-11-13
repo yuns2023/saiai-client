@@ -5,8 +5,8 @@
 //! `brand_contract_tests` before changing any of them.
 
 use super::{
-    Brand, CertificateNames, ClientProofNames, ConfigNames, EnvironmentNames, GatewayProtocolNames,
-    OwnershipMarkers, PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
+    Brand, CertificateNames, ConfigNames, EnvironmentNames, OwnershipMarkers,
+    PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
 };
 
 /// The single SAIAI brand instance (a `static`, so every reference has the
@@ -82,19 +82,6 @@ pub(crate) const SAIAI_VALUES: Brand = Brand {
         claude_desktop_session_prefix: "saiai-local-",
         desktop_email: "saiai-local-proxy@example.invalid",
         synthetic_id_prefix: "saiai-local",
-    },
-    client_proof: ClientProofNames {
-        header: "x-saiai-client-proof",
-        message_domain: "saiai-client-proof-v1",
-        enroll_path: "/api/v1/client/devices/enroll",
-        key_filename: "client-device-key",
-        lock_filename: "client-device.lock",
-        device_filename: "client-device.json",
-        corrupt_key_filename: "client-device-key.corrupt",
-    },
-    gateway: GatewayProtocolNames {
-        chat_updates_path: "/backend-api/saiai/chat-updates",
-        chat_preference_restored_header: "x-saiai-chat-preference-restored",
     },
     sensitive_inbound_headers: &["x-saiai-client-proof"],
     scripts: ScriptNames {

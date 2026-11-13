@@ -599,13 +599,29 @@ fn uninstall_recognition_rules_are_frozen() {
             "saiai.lock",
             "saiai.pid",
             "saiai.log",
-            "client-device-key",
-            "client-device.json",
-            "client-device.lock",
-            "client-device-key.corrupt",
             "windows-packaged-proxy-lease.json",
         ]
     );
+    // The client proof files, declared by the SAIAI extension, are still the
+    // program's own, with their backups and atomic-write leftovers.
+    for file in [
+        "client-device-key",
+        "client-device.json",
+        "client-device.lock",
+        "client-device-key.corrupt",
+    ] {
+        for name in [
+            file.to_string(),
+            format!("{file}.bak-20261030-010203"),
+            format!(".{file}.saiai-tmp-1-abc"),
+        ] {
+            assert!(uninstall::is_app_home_file(&name), "{name}");
+        }
+        assert!(!uninstall::is_app_home_file(&format!(
+            ".{file}.aitp-tmp-1-abc"
+        )));
+        assert!(!uninstall::is_app_home_file(&format!("{file}x")));
+    }
     assert_eq!(uninstall::APP_HOME_DIRS, &["log-followers", "desktop"]);
     for name in [
         "config.json.bak-20261030-010203",
@@ -1378,12 +1394,9 @@ fn inline_contract_literals_are_present() {
         ),
         (
             "gateway_saiai.rs",
-            "preference_restored_header: brand.gateway.chat_preference_restored_header,",
+            "preference_restored_header: CHAT_PREFERENCE_RESTORED_HEADER,",
         ),
-        (
-            "gateway_saiai.rs",
-            "updates_path: brand.gateway.chat_updates_path,",
-        ),
+        ("gateway_saiai.rs", "updates_path: CHAT_UPDATES_PATH,"),
         (
             "gateway_saiai.rs",
             "rejected_device_proofs: &[\"saiai-local-proxy\"],",
@@ -1914,23 +1927,37 @@ fn saiai_brand_values_are_frozen() {
         "saiai-local-proxy@example.invalid"
     );
     assert_eq!(placeholders.synthetic_id_prefix, "saiai-local");
-    let proof = &brand.client_proof;
-    assert_eq!(proof.header, "x-saiai-client-proof");
-    assert_eq!(proof.message_domain, "saiai-client-proof-v1");
-    assert_eq!(proof.enroll_path, "/api/v1/client/devices/enroll");
-    assert_eq!(proof.key_filename, "client-device-key");
-    assert_eq!(proof.lock_filename, "client-device.lock");
-    assert_eq!(proof.device_filename, "client-device.json");
-    assert_eq!(proof.corrupt_key_filename, "client-device-key.corrupt");
+    // The client proof protocol: names of the SAIAI extension (no longer
+    // brand data), with the files it owns in each environment directory.
+    {
+        use crate::client_proof as proof;
+        assert_eq!(proof::HEADER_NAME, "x-saiai-client-proof");
+        assert_eq!(proof::MESSAGE_DOMAIN, "saiai-client-proof-v1");
+        assert_eq!(proof::ENROLL_PATH, "/api/v1/client/devices/enroll");
+        assert_eq!(proof::KEY_FILENAME, "client-device-key");
+        assert_eq!(proof::LOCK_FILENAME, "client-device.lock");
+        assert_eq!(proof::DEVICE_FILENAME, "client-device.json");
+        assert_eq!(proof::CORRUPT_KEY_FILENAME, "client-device-key.corrupt");
+        let family = |name| crate::StateFile {
+            name,
+            backups: true,
+            atomic_temporaries: true,
+        };
+        assert_eq!(
+            crate::GatewayExtension::owned_state_files(&crate::gateway_saiai::SAIAI_GATEWAY),
+            [
+                family("client-device-key"),
+                family("client-device.json"),
+                family("client-device.lock"),
+                family("client-device-key.corrupt"),
+            ]
+        );
+        assert_eq!(
+            crate::GatewayExtension::signature_headers(&crate::gateway_saiai::SAIAI_GATEWAY),
+            ["x-saiai-client-proof"]
+        );
+    }
     assert_eq!(certificates.ca_backup_prefix, "saiai-ca.");
-    assert_eq!(
-        brand.gateway.chat_updates_path,
-        "/backend-api/saiai/chat-updates"
-    );
-    assert_eq!(
-        brand.gateway.chat_preference_restored_header,
-        "x-saiai-chat-preference-restored"
-    );
     // SAIAI turns the Native Chat relay on with exactly its brand names and
     // the historical placeholder device proof it never forwards.
     assert_eq!(
@@ -1986,7 +2013,7 @@ fn protocol_reference_scanner_sees_paths_imports_and_types() {
         "use crate::client_proof::{self, ClientProof};",
         "let proof: Arc<ClientProof> = todo!();",
         "&proxy_cli::gateway_saiai::SAIAI_GATEWAY",
-        "client_proof::HEADER_NAME.get()",
+        "client_proof::HEADER_NAME",
     ] {
         assert!(protocol_reference(line).is_some(), "{line}");
     }
