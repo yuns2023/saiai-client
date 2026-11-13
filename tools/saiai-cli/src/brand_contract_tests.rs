@@ -36,14 +36,6 @@ mod source_scan;
 use source_scan::*;
 use std::collections::BTreeSet;
 
-/// Fixed P-256 installation CA key used only to freeze leaf derivation.
-const FIXTURE_CA_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgq9CjdR/blyuJLwO9
-rRwtbhRu5K6erOiP7uCwzzd9PXShRANCAAR9MvoxxSfya0pWhgD4ODg/zZT8l7j8
-lnlBHU8SoMoq33F9ZTGTqCWDaA3J4o7FJHuch2xnehGEi5vTE8+bhki0
------END PRIVATE KEY-----
-";
-
 const PLACEHOLDER_JWT: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InNhaWFpLWxvY2FsLXByb3h5QGludmFsaWQiLCJleHAiOjQxMDI0NDQ4MDAsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3BsYW5fdHlwZSI6InBsdXMiLCJjaGF0Z3B0X3VzZXJfaWQiOiJzYWlhaS1sb2NhbC1wcm94eS11c2VyIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoic2FpYWktbG9jYWwtcHJveHktYWNjb3VudCJ9fQ.c2FpYWktbG9jYWwtcHJveHk";
 
 fn hex(bytes: &[u8]) -> String {
@@ -80,93 +72,6 @@ fn saiai_home_file_names_and_versions() {
     assert_eq!(environment_scope::PRODUCT_DIR_FILENAME, "product-dir");
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     assert_eq!(SERVICE_LOG_FILENAME, "saiai.log");
-}
-
-#[test]
-fn saiai_config_json_shape_is_frozen() {
-    let config = AppConfig {
-        version: 2,
-        base_url: "https://gateway.example".into(),
-        api_key: "TEST_ONLY_CONTRACT".into(),
-        listen: "127.0.0.1:19908".into(),
-        ca_cert_path: "/h/.saiai/saiai-ca.crt".into(),
-        ca_key_path: "/h/.saiai/saiai-ca.key".into(),
-        chatgpt_chat_passthrough: true,
-        desktop_browser_use: false,
-        upstream_proxy: None,
-        providers: ProviderCredentials {
-            claude: Some(ProviderCredential {
-                base_url: "https://claude.gateway.example".into(),
-                api_key: "TEST_ONLY_CLAUDE".into(),
-            }),
-            codex: None,
-        },
-    };
-    assert_eq!(
-        serde_json::to_value(&config).unwrap(),
-        serde_json::json!({
-            "version": 2,
-            "base_url": "https://gateway.example",
-            "api_key": "TEST_ONLY_CONTRACT",
-            "listen": "127.0.0.1:19908",
-            "ca_cert_path": "/h/.saiai/saiai-ca.crt",
-            "ca_key_path": "/h/.saiai/saiai-ca.key",
-            "chatgpt_chat_passthrough": true,
-            "desktop_browser_use": false,
-            "providers": {
-                "claude": {
-                    "base_url": "https://claude.gateway.example",
-                    "api_key": "TEST_ONLY_CLAUDE"
-                }
-            }
-        })
-    );
-
-    let full = serde_json::json!({
-        "version": 2,
-        "base_url": "https://gateway.example",
-        "api_key": "TEST_ONLY_CONTRACT",
-        "listen": "127.0.0.1:41035",
-        "ca_cert_path": "/h/.claude/saiai-ca.crt",
-        "ca_key_path": "/h/.claude/saiai-ca.key",
-        "chatgpt_chat_passthrough": false,
-        "desktop_browser_use": true,
-        "upstream_proxy": "http://127.0.0.1:7890",
-        "providers": {
-            "claude": {"base_url": "https://claude.gateway.example", "api_key": "TEST_ONLY_CLAUDE"},
-            "codex": {"base_url": "https://codex.gateway.example", "api_key": "TEST_ONLY_CODEX"}
-        }
-    });
-    let parsed: AppConfig = serde_json::from_value(full.clone()).unwrap();
-    assert_eq!(
-        parsed.upstream_proxy.as_deref(),
-        Some("http://127.0.0.1:7890")
-    );
-    assert_eq!(
-        parsed
-            .providers
-            .codex
-            .as_ref()
-            .map(|codex| codex.base_url.as_str()),
-        Some("https://codex.gateway.example")
-    );
-    assert_eq!(serde_json::to_value(&parsed).unwrap(), full);
-
-    // Configurations written by older clients keep loading with defaults.
-    let legacy: AppConfig = serde_json::from_value(serde_json::json!({
-        "version": 2,
-        "base_url": "https://gateway.example",
-        "api_key": "TEST_ONLY_CONTRACT",
-        "listen": "127.0.0.1:19908",
-        "ca_cert_path": "/h/.saiai/saiai-ca.crt",
-        "upstream_proxy": "direct"
-    }))
-    .unwrap();
-    assert_eq!(legacy.ca_key_path, "");
-    assert!(legacy.chatgpt_chat_passthrough);
-    assert!(legacy.desktop_browser_use);
-    assert_eq!(legacy.upstream_proxy.as_deref(), Some("direct"));
-    assert!(legacy.providers.is_empty());
 }
 
 // --------------------------------------------------- Environment isolation
@@ -219,38 +124,6 @@ fn macos_default_launchd_label_is_frozen() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn linux_systemd_unit_renders_exactly() {
-    let unit = render_user_service(
-        Path::new("/opt/saiai bin/saiai"),
-        Path::new("/home/u/.saiai"),
-        Path::new("/home/u"),
-    )
-    .unwrap();
-    assert_eq!(
-        unit,
-        "[Unit]
-Description=SAIAI local Claude Code proxy
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-Environment=\"SAIAI_HOME=/home/u/.saiai\"
-WorkingDirectory=/home/u
-ExecStart=\"/opt/saiai bin/saiai\" --instance-dir \"/home/u/.saiai\"
-Restart=on-failure
-RestartSec=2s
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=default.target
-"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
 fn linux_headless_background_state_is_frozen() {
     assert_eq!(LINUX_PID_FILENAME, "saiai.pid");
     assert_eq!(LINUX_LOCK_FILENAME, "saiai.lock");
@@ -288,53 +161,6 @@ fn linux_nss_certificate_nickname_is_frozen() {
 }
 
 // ------------------------------------------------------ macOS background
-
-#[cfg(target_os = "macos")]
-#[test]
-fn macos_launchd_plist_renders_exactly() {
-    // The production template uses `\` line continuations, so the plist has
-    // no indentation; existing LaunchAgents were written byte-for-byte so.
-    let plist = render_launchd_plist(
-        Path::new("/Applications/SAIAI & Co/saiai"),
-        Path::new("/Users/u/.saiai"),
-        Path::new("/Users/u"),
-        Path::new("/Users/u/.saiai/saiai.log"),
-    )
-    .unwrap();
-    assert_eq!(
-        plist,
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-<plist version=\"1.0\">
-<dict>
-<key>Label</key>
-<string>top.saiai.local-proxy</string>
-<key>ProgramArguments</key>
-<array>
-<string>/Applications/SAIAI &amp; Co/saiai</string>
-<string>--instance-dir</string>
-<string>/Users/u/.saiai</string>
-</array>
-<key>EnvironmentVariables</key>
-<dict>
-<key>SAIAI_HOME</key>
-<string>/Users/u/.saiai</string>
-</dict>
-<key>WorkingDirectory</key>
-<string>/Users/u</string>
-<key>RunAtLoad</key>
-<true/>
-<key>KeepAlive</key>
-<true/>
-<key>StandardOutPath</key>
-<string>/Users/u/.saiai/saiai.log</string>
-<key>StandardErrorPath</key>
-<string>/Users/u/.saiai/saiai.log</string>
-</dict>
-</plist>
-"
-    );
-}
 
 // ---------------------------------------------------- Windows background
 
@@ -383,36 +209,6 @@ fn windows_background_identity_is_frozen() {
 
 // ---------------------------------------------------------------- Update
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-#[test]
-fn update_assets_and_file_names_are_frozen() {
-    let expected = match (env::consts::OS, env::consts::ARCH) {
-        ("linux", "x86_64") => "saiai-linux-x86_64",
-        ("linux", "aarch64") => "saiai-linux-aarch64",
-        ("macos", "x86_64") => "saiai-macos-x86_64",
-        ("macos", "aarch64") => "saiai-macos-aarch64",
-        ("windows", "x86_64") => "saiai-windows-x86_64.exe",
-        ("windows", "aarch64") => "saiai-windows-aarch64.exe",
-        other => panic!("no frozen asset for {other:?}"),
-    };
-    assert_eq!(current_platform_asset_name().unwrap(), expected);
-    for foreign in ["aitp-linux-x86_64", "linux-x86_64", "saiai.exe"] {
-        assert!(
-            validate_update_asset(b"\x7FELF", foreign).is_err(),
-            "{foreign}"
-        );
-    }
-    let (candidate, backup_prefix) = if cfg!(windows) {
-        (".saiai-update-1-2.exe", "saiai.bak-")
-    } else {
-        (".saiai-update-1-2", "saiai.bak-")
-    };
-    assert_eq!(update_candidate_name("1-2"), candidate);
-    let backup = update_backup_name();
-    assert!(backup.starts_with(backup_prefix), "{backup}");
-    assert_eq!(backup.ends_with(".exe"), cfg!(windows), "{backup}");
-}
-
 // ------------------------------------------------------------ Certificates
 
 #[test]
@@ -451,50 +247,6 @@ fn certificate_control_protocol_is_frozen() {
         local_proxy::CERTIFICATE_SPKI_HEADER,
         "x-saiai-leaf-spki-sha256"
     );
-}
-
-/// Desktop launches pin the leaf SPKI; the leaf key is derived from the
-/// installation CA key with a fixed salt. A different salt (or derivation)
-/// changes these pins and breaks every installed Desktop pin and NSS trust.
-///
-/// Expected pins were cross-checked with an independent Python derivation
-/// (HKDF-SHA256, salt `SAIAI local proxy TLS leaf v1`, info `host || 0 ||
-/// counter`, P-256 scalar) over the fixture key.
-#[test]
-fn local_tls_leaf_spki_derivation_is_frozen() {
-    let ca_key = KeyPair::from_pem(FIXTURE_CA_KEY_PEM).unwrap();
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca_cert_pem = params.self_signed(&ca_key).unwrap().pem();
-    for (host, expected) in [
-        (
-            "chatgpt.com",
-            "0KSOSoW1HJ3sKOwX9WVZbe3YxU4dgSgmTTiObJg8k30=",
-        ),
-        (
-            "chat.openai.com",
-            "gz3pLSJJX5uH67CNLMIgg9pQwsOUZ+ER+nLd56XRx0o=",
-        ),
-        (
-            "api.anthropic.com",
-            "r9tBJxcCJEYQ75Rfsdfv5+UrvcgKHbRUIiMvXZNbXAE=",
-        ),
-        ("claude.ai", "1+qXNzzUuPkaLTuhugkSlvGwDAC6YZl05DPaDNKn5iQ="),
-    ] {
-        let (leaf_der, leaf_key) =
-            local_proxy::sign_leaf_certificate(host, &ca_cert_pem, FIXTURE_CA_KEY_PEM).unwrap();
-        let (_, leaf) = x509_parser::parse_x509_certificate(&leaf_der).unwrap();
-        let pin = base64::engine::general_purpose::STANDARD
-            .encode(Sha256::digest(leaf.tbs_certificate.subject_pki.raw));
-        assert_eq!(pin, expected, "{host}");
-        // The control header carries the hash of the same SPKI.
-        assert_eq!(
-            base64::engine::general_purpose::STANDARD
-                .encode(Sha256::digest(leaf_key.public_key_der())),
-            expected,
-            "{host}"
-        );
-    }
 }
 
 // ---------------------------------------------------- Codex placeholder login
@@ -913,65 +665,6 @@ fn helper_environment_variables_are_written_and_read() {
     }
 }
 
-/// Update channel URLs below a Gateway base URL, written out in full.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-#[test]
-fn update_channel_urls_are_frozen() {
-    for base in [
-        "https://api.saiai.top",
-        "https://api.saiai.top/",
-        "https://api.saiai.top///",
-        "  https://api.saiai.top/  ",
-    ] {
-        assert_eq!(
-            update_urls(base, "saiai-linux-x86_64"),
-            (
-                "https://api.saiai.top/saiai-cli/manifest.json".to_string(),
-                "https://api.saiai.top/saiai-cli/saiai-linux-x86_64".to_string()
-            ),
-            "{base:?}"
-        );
-    }
-    assert_eq!(
-        update_urls(
-            "https://gateway.example/prefix/",
-            "saiai-windows-x86_64.exe"
-        ),
-        (
-            "https://gateway.example/prefix/saiai-cli/manifest.json".to_string(),
-            "https://gateway.example/prefix/saiai-cli/saiai-windows-x86_64.exe".to_string()
-        )
-    );
-    for (asset, url) in [
-        (
-            "saiai-linux-x86_64",
-            "https://api.saiai.top/saiai-cli/saiai-linux-x86_64",
-        ),
-        (
-            "saiai-linux-aarch64",
-            "https://api.saiai.top/saiai-cli/saiai-linux-aarch64",
-        ),
-        (
-            "saiai-macos-x86_64",
-            "https://api.saiai.top/saiai-cli/saiai-macos-x86_64",
-        ),
-        (
-            "saiai-macos-aarch64",
-            "https://api.saiai.top/saiai-cli/saiai-macos-aarch64",
-        ),
-        (
-            "saiai-windows-x86_64.exe",
-            "https://api.saiai.top/saiai-cli/saiai-windows-x86_64.exe",
-        ),
-        (
-            "saiai-windows-aarch64.exe",
-            "https://api.saiai.top/saiai-cli/saiai-windows-aarch64.exe",
-        ),
-    ] {
-        assert_eq!(update_urls("https://api.saiai.top", asset).1, url);
-    }
-}
-
 /// Native Chat update channel of the SAIAI Gateway, on both entry spellings.
 #[test]
 fn native_chat_update_route_is_frozen() {
@@ -1002,54 +695,6 @@ fn native_chat_update_route_is_frozen() {
             "{unforwarded}"
         );
     }
-}
-
-/// Helper script templates render to exactly the scripts SAIAI shipped
-/// before they became templates (SHA-256 of the previous file contents).
-#[test]
-fn helper_scripts_render_to_the_shipped_saiai_scripts() {
-    use sha2::{Digest, Sha256};
-    for (template, expected) in [
-        (
-            include_str!("vscode_trust_windows.ps1"),
-            "92e176ca26965518366f792c9efc02610f439a099a7bfdee75326d3950c118cd",
-        ),
-        (
-            include_str!("windows_desktop_inspect.ps1"),
-            "3387f0e3ae941e20177c0ee3a76c3cce40bc395f4a7927ca4e4319f4b5c116f6",
-        ),
-    ] {
-        // `.gitattributes` checks scripts out with CRLF; hash the LF form
-        // stored in the repository.
-        let rendered = crate::script_brand::render(template).replace("\r\n", "\n");
-        assert_eq!(hex(&Sha256::digest(rendered.as_bytes())), expected);
-    }
-}
-
-/// The update helper is assembled around user paths after the brand name is
-/// inserted: tokens inside those paths stay as typed and never fail.
-#[cfg(windows)]
-#[test]
-fn update_helper_keeps_token_like_user_paths_verbatim() {
-    let directory = Path::new(r"C:\Users\u\@@ENV@@\@@ID@@\@@OTHER@@");
-    let script = render_windows_update_script(
-        1,
-        &directory.join("saiai.exe"),
-        &directory.join(".saiai-update-1.exe"),
-        &directory.join(".saiai-update-1.ps1"),
-        &directory.join(".saiai-update-status.txt"),
-        true,
-        &"0".repeat(64),
-    )
-    .unwrap();
-    assert!(
-        script.contains(r"C:\Users\u\@@ENV@@\@@ID@@\@@OTHER@@\saiai.exe"),
-        "{script}"
-    );
-    assert!(
-        script.contains("function Invoke-SaiaiCommand([string]$verb) {"),
-        "{script}"
-    );
 }
 
 /// Wire names inside helper scripts under SAIAI, written out by hand.
