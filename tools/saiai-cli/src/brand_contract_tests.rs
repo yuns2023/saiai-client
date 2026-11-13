@@ -277,6 +277,8 @@ fn linux_nss_certificate_nickname_is_frozen() {
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_launchd_plist_renders_exactly() {
+    // The production template uses `\` line continuations, so the plist has
+    // no indentation; existing LaunchAgents were written byte-for-byte so.
     let plist = render_launchd_plist(
         Path::new("/Applications/SAIAI & Co/saiai"),
         Path::new("/Users/u/.saiai"),
@@ -290,29 +292,29 @@ fn macos_launchd_plist_renders_exactly() {
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
 <plist version=\"1.0\">
 <dict>
-  <key>Label</key>
-  <string>top.saiai.local-proxy</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/Applications/SAIAI &amp; Co/saiai</string>
-    <string>--instance-dir</string>
-    <string>/Users/u/.saiai</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>SAIAI_HOME</key>
-    <string>/Users/u/.saiai</string>
-  </dict>
-  <key>WorkingDirectory</key>
-  <string>/Users/u</string>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>/Users/u/.saiai/saiai.log</string>
-  <key>StandardErrorPath</key>
-  <string>/Users/u/.saiai/saiai.log</string>
+<key>Label</key>
+<string>top.saiai.local-proxy</string>
+<key>ProgramArguments</key>
+<array>
+<string>/Applications/SAIAI &amp; Co/saiai</string>
+<string>--instance-dir</string>
+<string>/Users/u/.saiai</string>
+</array>
+<key>EnvironmentVariables</key>
+<dict>
+<key>SAIAI_HOME</key>
+<string>/Users/u/.saiai</string>
+</dict>
+<key>WorkingDirectory</key>
+<string>/Users/u</string>
+<key>RunAtLoad</key>
+<true/>
+<key>KeepAlive</key>
+<true/>
+<key>StandardOutPath</key>
+<string>/Users/u/.saiai/saiai.log</string>
+<key>StandardErrorPath</key>
+<string>/Users/u/.saiai/saiai.log</string>
 </dict>
 </plist>
 "
