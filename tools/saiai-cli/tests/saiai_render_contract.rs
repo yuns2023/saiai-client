@@ -5,12 +5,15 @@
 
 use base64::Engine as _;
 #[allow(unused_imports)]
-use proxy_cli::contract::{certificates, config, scripts, service, update};
+use proxy_cli::contract::{
+    certificates, codex, config, environment, scripts, service, uninstall, update, vscode,
+};
 use proxy_cli::{
     Brand, CertificateNames, ConfigNames, EnvironmentNames, OwnershipMarkers,
     PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
 };
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 #[allow(unused_imports)]
 use std::path::{Path, PathBuf};
@@ -665,4 +668,215 @@ fn config_type_diagnostic_is_unchanged() {
         error,
         "invalid type: null, expected struct SaiaiConfig at line 1 column 4"
     );
+}
+
+// Thin unwrapping helpers so the assertions read as before.
+fn home_file(name: &str) -> bool {
+    uninstall::is_home_file(saiai(), name).unwrap()
+}
+fn program_file(name: &str) -> bool {
+    uninstall::is_program_file(saiai(), name).unwrap()
+}
+fn claude_ca_file(name: &str) -> bool {
+    uninstall::is_claude_ca_file(saiai(), name).unwrap()
+}
+fn product_of(name: &str) -> Option<&'static str> {
+    environment::product_of(saiai(), name).unwrap()
+}
+fn suffix(root: &Path, directory: &Path) -> String {
+    environment::service_suffix(saiai(), root, directory).unwrap()
+}
+fn placeholder_token(token: &str) -> bool {
+    codex::is_placeholder_access_token(saiai(), token).unwrap()
+}
+fn managed(settings: &str) -> bool {
+    vscode::has_managed_proxy(saiai(), settings).unwrap()
+}
+
+const PLACEHOLDER_JWT: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InNhaWFpLWxvY2FsLXByb3h5QGludmFsaWQiLCJleHAiOjQxMDI0NDQ4MDAsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3BsYW5fdHlwZSI6InBsdXMiLCJjaGF0Z3B0X3VzZXJfaWQiOiJzYWlhaS1sb2NhbC1wcm94eS11c2VyIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoic2FpYWktbG9jYWwtcHJveHktYWNjb3VudCJ9fQ.c2FpYWktbG9jYWwtcHJveHk";
+
+#[test]
+fn environment_isolation_names_are_frozen() {
+    assert_eq!(
+        environment::name(saiai(), "codex", Path::new("/work/project/codex")).unwrap(),
+        "codex-2da86b69bd2e5ac6a16af476"
+    );
+    assert_eq!(
+        suffix(
+            Path::new("/saiai"),
+            Path::new("/saiai/environments/codex-project")
+        ),
+        "-79ac17449adbff9bab473f32"
+    );
+    assert_eq!(suffix(Path::new("/saiai"), Path::new("/saiai")), "");
+    assert_eq!(
+        product_of("claude-2da86b69bd2e5ac6a16af476"),
+        Some("claude")
+    );
+    assert_eq!(product_of("codex-2da86b69bd2e5ac6a16af476"), Some("codex"));
+    assert_eq!(product_of("aitp-2da86b69bd2e5ac6a16af476"), None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_default_service_name_is_frozen() {
+    // The test process never resolves an isolated environment.
+    assert_eq!(environment::service_name(saiai()).unwrap(), "saiai.service");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_default_launchd_label_is_frozen() {
+    assert_eq!(
+        environment::launchd_label(saiai()).unwrap(),
+        "top.saiai.local-proxy"
+    );
+}
+
+#[test]
+fn codex_placeholder_login_is_frozen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("auth.json");
+    codex::placeholder_login(saiai(), &path).unwrap();
+    let auth: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(auth["auth_mode"], "chatgptAuthTokens");
+    assert_eq!(auth["OPENAI_API_KEY"], Value::Null);
+    assert_eq!(
+        auth["tokens"],
+        serde_json::json!({
+            "id_token": PLACEHOLDER_JWT,
+            "access_token": PLACEHOLDER_JWT,
+            "refresh_token": "",
+            "account_id": "saiai-local-proxy-account"
+        })
+    );
+    let decode = |part: &str| -> Value {
+        serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(part)
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let parts = PLACEHOLDER_JWT.split('.').collect::<Vec<_>>();
+    assert_eq!(
+        decode(parts[0]),
+        serde_json::json!({"alg": "none", "typ": "JWT"})
+    );
+    assert_eq!(
+        decode(parts[1]),
+        serde_json::json!({
+            "email": "saiai-local-proxy@invalid",
+            "exp": 4_102_444_800_u64,
+            "https://api.openai.com/auth": {
+                "chatgpt_plan_type": "plus",
+                "chatgpt_user_id": "saiai-local-proxy-user",
+                "chatgpt_account_id": "saiai-local-proxy-account"
+            }
+        })
+    );
+    // Placeholders written by older clients are still recognized as ours.
+    assert!(placeholder_token(PLACEHOLDER_JWT));
+    assert!(placeholder_token("saiai-local-proxy-placeholder-0123"));
+    assert!(!placeholder_token("aitp-local-proxy-placeholder-0123"));
+}
+
+#[test]
+fn codex_ide_env_block_renders_exactly() {
+    assert_eq!(
+        codex::ide_env(saiai(), "KEEP=1\n", "127.0.0.1:19908", "/h/.saiai/saiai-ca.crt").unwrap(),
+        "KEEP=1
+
+# BEGIN SAIAI CODEX IDE (managed)
+SSL_CERT_FILE=\"/h/.saiai/saiai-ca.crt\"
+HTTP_PROXY=\"http://127.0.0.1:19908\"
+HTTPS_PROXY=\"http://127.0.0.1:19908\"
+ALL_PROXY=\"http://127.0.0.1:19908\"
+NO_PROXY=\"localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local\"
+http_proxy=\"http://127.0.0.1:19908\"
+https_proxy=\"http://127.0.0.1:19908\"
+all_proxy=\"http://127.0.0.1:19908\"
+no_proxy=\"localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local\"
+# END SAIAI CODEX IDE (managed)
+"
+    );
+}
+
+#[test]
+fn vscode_ownership_marker_is_frozen() {
+    let merged = vscode::merge_settings(saiai(), "{}\n", "127.0.0.1:19908").unwrap();
+    assert!(
+        merged.contains("// SAIAI managed VSCode proxy: http://127.0.0.1:19908"),
+        "{merged}"
+    );
+    assert!(managed(
+        "{\n// SAIAI managed VSCode proxy: http://127.0.0.1:19908\n\"http.proxy\": \"http://127.0.0.1:19908\"\n}\n"
+    ));
+    assert!(!managed(
+        "{\n// AITP managed VSCode proxy: http://127.0.0.1:19908\n}\n"
+    ));
+}
+
+#[test]
+fn uninstall_recognition_rules_are_frozen() {
+    let (home_files, home_dirs) = uninstall::home_layout(saiai()).unwrap();
+    assert_eq!(
+        home_files,
+        &[
+            "config.json",
+            "saiai-ca.crt",
+            "saiai-ca.key",
+            "initialization.lock",
+            "saiai.lock",
+            "saiai.pid",
+            "saiai.log",
+            "windows-packaged-proxy-lease.json",
+        ]
+    );
+    // The client proof files, declared by the SAIAI extension, are still the
+    // program's own, with their backups and atomic-write leftovers.
+    for file in [
+        "client-device-key",
+        "client-device.json",
+        "client-device.lock",
+        "client-device-key.corrupt",
+    ] {
+        for name in [
+            file.to_string(),
+            format!("{file}.bak-20261030-010203"),
+            format!(".{file}.saiai-tmp-1-abc"),
+        ] {
+            assert!(home_file(&name), "{name}");
+        }
+        assert!(!home_file(&format!(".{file}.aitp-tmp-1-abc")));
+        assert!(!home_file(&format!("{file}x")));
+    }
+    assert_eq!(home_dirs, &["log-followers", "desktop"]);
+    for name in [
+        "config.json.bak-20261030-010203",
+        ".config.json.saiai-tmp-1-abc",
+        "saiai-ca.key.bak-1",
+    ] {
+        assert!(home_file(name), "{name}");
+    }
+    assert!(!home_file(".config.json.aitp-tmp-1-abc"));
+    for name in [
+        "saiai",
+        "saiai.exe",
+        "saiai-previous",
+        "saiai-previous.exe",
+        "saiai.bak-20261030-010203",
+        ".saiai-update-1-2.exe",
+        ".saiai-update-status.txt",
+        ".saiai.install.AbC123",
+        ".saiai.replace.0123.bak",
+    ] {
+        assert!(program_file(name), "{name}");
+    }
+    for name in ["aitp", "aitp.exe", "saiai-other", "saiai.bak"] {
+        assert!(!program_file(name), "{name}");
+    }
+    assert!(claude_ca_file("saiai-ca.crt"));
+    assert!(claude_ca_file("saiai-ca.key.bak-1"));
+    assert!(!claude_ca_file("aitp-ca.crt"));
 }
