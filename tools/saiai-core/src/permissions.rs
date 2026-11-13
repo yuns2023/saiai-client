@@ -9,7 +9,7 @@ use crate::{
     PrivatePermissionIssueCode, PrivatePermissionsAudit, Product, SaiaiCore,
 };
 
-const PRODUCT_MARKER_FILENAME: &str = ".saiai-managed-v2";
+pub(crate) const PRODUCT_MARKER_FILENAME: &str = ".saiai-managed-v2";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum ManagedObjectKind {

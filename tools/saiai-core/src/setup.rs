@@ -19,8 +19,8 @@ use crate::{
     SetupIssueCode, SetupState, SetupStatus,
 };
 
-const PRODUCT_MARKER_FILENAME: &str = ".saiai-managed-v2";
-const PRODUCT_MARKER: &[u8] = b"saiai-managed-client-home-v2\n";
+pub(crate) const PRODUCT_MARKER_FILENAME: &str = ".saiai-managed-v2";
+pub(crate) const PRODUCT_MARKER: &[u8] = b"saiai-managed-client-home-v2\n";
 const UNSAFE_GATEWAY_CREDENTIAL_MESSAGE: &str =
     "the Gateway URL contains a stored API key; run `saiai revoke --all` to reset this V2 state";
 
@@ -1931,7 +1931,7 @@ impl Drop for TransactionLock {
 }
 
 #[cfg(windows)]
-fn transaction_mutex_name(paths: &AppPaths) -> std::ffi::OsString {
+pub(crate) fn transaction_mutex_name(paths: &AppPaths) -> std::ffi::OsString {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for path in [paths.config_dir(), paths.data_dir(), paths.state_dir()] {
         let normalized = path.to_string_lossy().replace('/', "\\").to_lowercase();

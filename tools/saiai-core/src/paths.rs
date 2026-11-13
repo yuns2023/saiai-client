@@ -162,7 +162,7 @@ impl AppPaths {
         self.state_dir.join("transaction.lock")
     }
 
-    fn discover_with(get: impl Fn(&str) -> Option<OsString>) -> Result<Self> {
+    pub(crate) fn discover_with(get: impl Fn(&str) -> Option<OsString>) -> Result<Self> {
         #[cfg(target_os = "linux")]
         {
             let home = absolute_env_path(&get, "HOME").ok_or(Error::PathDiscovery(

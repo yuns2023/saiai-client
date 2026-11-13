@@ -20,6 +20,9 @@ mod setup;
 #[cfg(windows)]
 mod windows_acl;
 
+#[cfg(test)]
+mod brand_contract_tests;
+
 /// Claude Code environment variable controlling its stream-idle threshold.
 pub const CLAUDE_STREAM_IDLE_TIMEOUT_ENV: &str = "CLAUDE_STREAM_IDLE_TIMEOUT_MS";
 /// Ten-minute value used for the managed Claude Code stream-idle threshold.

@@ -29,6 +29,8 @@ use toml_edit::{DocumentMut, Item, Table, value};
 use url::Url;
 use uuid::Uuid;
 
+#[cfg(test)]
+mod brand_contract_tests;
 mod claude_desktop;
 mod claude_desktop_fixtures;
 mod claude_launcher;
