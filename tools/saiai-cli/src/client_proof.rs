@@ -20,6 +20,7 @@ use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -91,19 +92,6 @@ pub fn proof_header(
 ) -> String {
     let signature = sign_message(key, &proof_message(method, target, ts, nonce, api_key));
     format!("v1.{device_id}.{ts}.{nonce}.{signature}")
-}
-
-/// Request target exactly as written on the wire for an absolute URL.
-pub fn wire_target(url: &Url) -> String {
-    let mut target = url.path().to_string();
-    if target.is_empty() {
-        target.push('/');
-    }
-    if let Some(query) = url.query() {
-        target.push('?');
-        target.push_str(query);
-    }
-    target
 }
 
 /// Fallible OS randomness: an RNG failure means "no signature", never a
@@ -377,6 +365,8 @@ pub struct ClientProof {
     public_key_sha256: String,
     gateways: Mutex<DeviceMap>,
     enrollments: Mutex<EnrollmentClaims>,
+    /// Released program version reported at enrollment.
+    client_version: &'static str,
 }
 
 #[derive(Default)]
@@ -397,7 +387,13 @@ impl std::fmt::Debug for ClientProof {
 impl ClientProof {
     /// Loads (or creates) the device key and per-Gateway device records under
     /// `dir`. An unreadable key is replaced by a new one, i.e. a new device.
+    #[cfg(test)]
     pub fn load(dir: &Path) -> Result<Self> {
+        Self::load_for_version(dir, crate::runtime::version())
+    }
+
+    /// [`load`](Self::load) for a program that reports `client_version`.
+    pub fn load_for_version(dir: &Path, client_version: &'static str) -> Result<Self> {
         let _lock = lock_state_dir(dir)?;
         let key = load_or_create_key(&dir.join(KEY_FILENAME.get()))?;
         let public_point = key.verifying_key().to_encoded_point(false);
@@ -414,6 +410,7 @@ impl ClientProof {
             public_key_sha256,
             gateways: Mutex::new(gateways),
             enrollments: Mutex::new(EnrollmentClaims::default()),
+            client_version,
         })
     }
 
@@ -561,7 +558,7 @@ impl ClientProof {
     ) -> EnrollOutcome {
         let body = json!({
             "public_key": self.public_key,
-            "client_version": crate::runtime::version(),
+            "client_version": self.client_version,
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
         });
@@ -699,6 +696,12 @@ impl ClientSource for reqwest::Client {
     }
 }
 
+impl ClientSource for Arc<dyn crate::gateway::GatewayHttp> {
+    async fn client_for(&self, url: &str) -> Result<reqwest::Client> {
+        crate::gateway::GatewayHttp::client_for(&**self, url).await
+    }
+}
+
 impl ClientSource for Arc<crate::upstream_proxy::HttpClients> {
     async fn client_for(&self, url: &str) -> Result<reqwest::Client> {
         self.for_url(url).await
@@ -822,7 +825,11 @@ mod tests {
             ("wss://gw.example/v1/responses?", "/v1/responses?"),
             ("http://gw.example/v1/x?a=%2Fb&a=a+b", "/v1/x?a=%2Fb&a=a+b"),
         ] {
-            assert_eq!(wire_target(&Url::parse(url).unwrap()), target, "{url}");
+            assert_eq!(
+                crate::gateway::wire_target(&Url::parse(url).unwrap()),
+                target,
+                "{url}"
+            );
         }
     }
 

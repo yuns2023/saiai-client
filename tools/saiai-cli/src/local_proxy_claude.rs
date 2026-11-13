@@ -289,15 +289,17 @@ fn oauth(request: &IncomingRequest, path: &str, id: &Identity, now: Instant) -> 
 }
 
 fn public_request_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "accept"
-            | "accept-language"
-            | "user-agent"
-            | "if-none-match"
-            | "if-modified-since"
-            | "range"
-    )
+    // Reserved headers are refused before the allowlist is consulted.
+    !crate::gateway::is_reserved_inbound_header(name)
+        && matches!(
+            name.to_ascii_lowercase().as_str(),
+            "accept"
+                | "accept-language"
+                | "user-agent"
+                | "if-none-match"
+                | "if-modified-since"
+                | "range"
+        )
 }
 fn public_response_header(name: &str, value: &str) -> bool {
     should_forward_response_header(name)
@@ -322,7 +324,7 @@ async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-async fn models(state: &State, id: &Identity) -> Result<Vec<Value>> {
+pub(super) async fn models(state: &State, id: &Identity) -> Result<Vec<Value>> {
     if let Some((at, models)) = MODELS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -343,13 +345,14 @@ async fn models(state: &State, id: &Identity) -> Result<Vec<Value>> {
             .header("anthropic-version", "2023-06-01")
             .timeout(Duration::from_secs(30));
         let parsed = Url::parse(&url)?;
-        if let Some(proof) = state.client_proof_header(
+        for (name, value) in state.gateway_signature(
+            crate::gateway::Transport::Http,
             route,
             "GET",
-            &client_proof::wire_target(&parsed),
+            &crate::gateway::wire_target(&parsed),
             Some(&route.api_key),
         ) {
-            request = request.header(client_proof::HEADER_NAME.get(), proof);
+            request = request.header(name, value);
         }
         let response = request.send().await?.error_for_status()?;
         let body: Value = serde_json::from_slice(&bounded_body(response).await?)?;

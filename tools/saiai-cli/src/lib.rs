@@ -45,6 +45,10 @@ mod codex_daemon;
 mod codex_diagnostics;
 mod desktop_product;
 mod environment_scope;
+mod gateway;
+// SAIAI Gateway extension; only the program entry point names it.
+#[doc(hidden)]
+pub mod gateway_saiai;
 mod local_proxy;
 mod runtime;
 mod script_brand;
@@ -63,6 +67,10 @@ pub use brand::{
     OwnershipMarkers, PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
 };
 use desktop_product::DesktopProduct;
+pub use gateway::{
+    ConfiguredRoute, GatewayExtension, GatewayHttp, GatewaySession, GatewayStart,
+    NoGatewayExtension, SignInput, Transport,
+};
 pub use runtime::RuntimeContext;
 
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
@@ -3942,7 +3950,7 @@ fn run_local_proxy(verbose: bool) -> Result<()> {
         verbose,
         chatgpt_chat_passthrough: cfg.chatgpt_chat_passthrough,
         desktop_browser_use: cfg.desktop_browser_use,
-        client_proof_dir: saiai_config_dir().ok(),
+        gateway_state_dir: saiai_config_dir().ok(),
         desktop_config_root: if cfg!(target_os = "linux") {
             Some(saiai_config_dir()?)
         } else {

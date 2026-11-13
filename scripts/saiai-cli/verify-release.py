@@ -177,6 +177,7 @@ def verify_cli() -> None:
         "mod brand_saiai;",
         "proxy_cli::run(\n        &brand_saiai::SAIAI_BRAND,\n        proxy_cli::RuntimeContext {",
         'version: env!("CARGO_PKG_VERSION"),',
+        "gateway: &proxy_cli::gateway_saiai::SAIAI_GATEWAY,",
     ):
         require(required in entry, f"CLI entry point is missing {required!r}")
     for withdrawn in WITHDRAWN_V2_MARKERS:

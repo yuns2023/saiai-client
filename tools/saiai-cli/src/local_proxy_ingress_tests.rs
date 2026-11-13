@@ -16,7 +16,7 @@ fn state(root: Option<&std::path::Path>, upstream: Option<String>) -> Arc<State>
             verbose: false,
             chatgpt_chat_passthrough: false,
             desktop_browser_use: true,
-            client_proof_dir: None,
+            gateway_state_dir: None,
             desktop_config_root: root.map(std::path::Path::to_path_buf),
             upstream_proxy: upstream,
         })
@@ -171,7 +171,7 @@ async fn main_oauth_update_and_profile_keep_the_original_response_bytes() {
 async fn main_preserves_provider_and_reserved_bearers_and_does_not_inspect_email() {
     let (url, server) = capture_gateway_requests(2, 0).await;
     let (mut state, root) = proof_test_state(&url, &url, None);
-    state.client_proof = std::sync::OnceLock::new();
+    state.gateway_session = std::sync::OnceLock::new();
     crate::claude_desktop::Identity::prepare(root.path()).unwrap();
     fs::write(
         root.path().join("desktop/claude/state/identity.json"),
@@ -254,7 +254,7 @@ async fn desktop_classification_works_without_client_proof_storage() {
     let root = tempfile::tempdir().unwrap();
     crate::claude_desktop::Identity::prepare(root.path()).unwrap();
     let state = state(Some(root.path()), None);
-    assert!(state.client_proof_dir.is_none());
+    assert!(state.gateway_state_dir.is_none());
     for (host, path, code) in [
         ("claude.ai", "/api/account", 200),
         ("claude.ai", "/api/unknown", 501),
@@ -329,7 +329,7 @@ async fn run_without_desktop_identity_keeps_only_main_entry_and_creates_no_deskt
         verbose: false,
         chatgpt_chat_passthrough: false,
         desktop_browser_use: true,
-        client_proof_dir: None,
+        gateway_state_dir: None,
         desktop_config_root: Some(root.path().to_path_buf()),
         upstream_proxy: Some("direct".into()),
     };
@@ -368,7 +368,7 @@ async fn run_without_desktop_identity_keeps_only_main_entry_and_creates_no_deskt
 async fn main_openai_replace_preserves_x_api_key() {
     let (url, server) = capture_gateway_requests(1, 0).await;
     let (mut state, _root) = proof_test_state(&url, &url, None);
-    state.client_proof = std::sync::OnceLock::new();
+    state.gateway_session = std::sync::OnceLock::new();
     let response = tls_request(
         Arc::new(state),
         EntryPoint::Main,
@@ -512,4 +512,131 @@ async fn desktop_listener_does_not_mitm_openai_hosts() {
         assert!(EntryPoint::ClaudeDesktop.manages(host));
     }
     assert!(!EntryPoint::Main.manages("claude.ai"));
+}
+
+/// The third signing exit: every page of the Claude Desktop model catalog is
+/// signed for its final target (encoded `after_id`) with the route key.
+#[tokio::test]
+async fn claude_model_catalog_pages_are_each_signed_with_the_route_key() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut captured = Vec::new();
+        for body in [
+            r#"{"data":[{"id":"m-1"}],"has_more":true,"last_id":"m 1/x"}"#,
+            r#"{"data":[{"id":"m-2"}],"has_more":false}"#,
+        ] {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let request = read_http_request(&mut reader).await.unwrap();
+                if request.target.ends_with("/client/devices/enroll") {
+                    reader
+                        .get_mut()
+                        .write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                        .await
+                        .unwrap();
+                    continue;
+                }
+                captured.push(request);
+                reader
+                    .get_mut()
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                break;
+            }
+        }
+        captured
+    });
+    let (state, root) = proof_test_state(&url, &url, Some("MOCK_ONLY_GATEWAY"));
+    let identity = crate::claude_desktop::Identity::prepare(root.path()).unwrap();
+    let models = claude_desktop::models(&state, &identity).await.unwrap();
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["m-1", "m-2"]
+    );
+    let captured = server.await.unwrap();
+    let proof = super::tests::saiai_proof(&state);
+    let mut nonces = std::collections::HashSet::new();
+    for (request, target) in captured
+        .iter()
+        .zip(["/v1/models", "/v1/models?after_id=m+1%2Fx"])
+    {
+        assert_eq!(request.target, target);
+        assert_eq!(
+            header_value(&request.headers, "authorization"),
+            Some("Bearer MOCK_ONLY_GATEWAY")
+        );
+        let header = header_value(&request.headers, "x-saiai-client-proof").expect("signed page");
+        super::tests::verify_proof(&proof, header, "GET", target, "MOCK_ONLY_GATEWAY");
+        assert!(nonces.insert(header.split('.').nth(3).unwrap().to_string()));
+    }
+}
+
+/// Without a Gateway extension nothing is loaded, stored or signed, while
+/// the brand's sensitive inbound headers are still never relayed.
+#[tokio::test]
+async fn no_gateway_extension_stores_and_signs_nothing() {
+    static NONE: crate::gateway::NoGatewayExtension = crate::gateway::NoGatewayExtension;
+    let (url, server) = capture_gateway_requests(1, 0).await;
+    let (mut state, root) = proof_test_state(&url, &url, None);
+    state.gateway = &NONE;
+    state.gateway_session = std::sync::OnceLock::new();
+    let state_dir = tempfile::tempdir().unwrap();
+    state.gateway_state_dir = Some(state_dir.path().to_path_buf());
+    let state = Arc::new(state);
+    state.start_gateway_session();
+    let response = tls_request(
+        Arc::clone(&state),
+        EntryPoint::Main,
+        ANTHROPIC_HOST,
+        b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nx-saiai-client-proof: v1.MOCK_SPOOFED\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
+    )
+    .await;
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+    let (requests, enrollments) = server.await.unwrap();
+    assert!(enrollments.is_empty());
+    assert_eq!(
+        header_value(&requests[0].headers, "x-saiai-client-proof"),
+        None
+    );
+    assert_eq!(fs::read_dir(state_dir.path()).unwrap().count(), 0);
+    drop(root);
+}
+
+/// Inbound proofs are stripped from the first request on, whether or not the
+/// extension ever loads its key (here the key directory is a file).
+#[tokio::test]
+async fn reserved_headers_are_stripped_even_when_the_extension_fails_to_load() {
+    let (url, server) = capture_gateway_requests(1, 0).await;
+    let (mut state, root) = proof_test_state(&url, &url, None);
+    state.gateway_session = std::sync::OnceLock::new();
+    let blocked = root.path().join("not-a-directory");
+    fs::write(&blocked, b"file").unwrap();
+    state.gateway_state_dir = Some(blocked);
+    let state = Arc::new(state);
+    state.start_gateway_session();
+    let response = tls_request(
+        Arc::clone(&state),
+        EntryPoint::Main,
+        ANTHROPIC_HOST,
+        b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nX-SAIAI-Client-Proof: v1.MOCK_SPOOFED\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
+    )
+    .await;
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+    let (requests, _) = server.await.unwrap();
+    assert_eq!(
+        header_value(&requests[0].headers, "x-saiai-client-proof"),
+        None
+    );
 }
