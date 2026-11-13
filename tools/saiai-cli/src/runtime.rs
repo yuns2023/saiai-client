@@ -17,9 +17,10 @@ pub struct RuntimeContext {
     pub version: &'static str,
     /// Gateway behavior of this distribution; `&NoGatewayExtension` for a
     /// Gateway without extra protocol. Pass a named `static`. Identity is the
-    /// concrete type at its address: zero-sized extensions carry no state, so
-    /// two statics of the same zero-sized type are the same logical extension
-    /// (they may share an address); different types are always told apart.
+    /// concrete type at its address. Zero-sized extensions carry no state:
+    /// two statics of the same zero-sized type that share an address count as
+    /// one logical extension (distinct statics are not guaranteed to be told
+    /// apart); different types are always told apart.
     pub gateway: &'static dyn GatewayExtension,
 }
 
