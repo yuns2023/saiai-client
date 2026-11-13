@@ -1277,6 +1277,21 @@ async fn no_chat_relay_refuses_every_spelling_of_a_relay_path() {
             "/v1/responses/%2e%2e/%2E%2E/chatgpt/backend-api/models",
         ),
         (OPENAI_HOST, "/v1/models/../codex/images/generations"),
+        // Escapes a Gateway base path such as https://gateway/prefix.
+        (
+            OPENAI_HOST,
+            "/v1/responses/../../../prefix/chatgpt/backend-api/models",
+        ),
+        (
+            OPENAI_HOST,
+            "/v1/responses/../../../prefix/v1/codex/images/generations",
+        ),
+        (OPENAI_HOST, "/v1/responses/.%2E/x"),
+        (OPENAI_HOST, "/v1/responses/./compact"),
+        (
+            OPENAI_HOST,
+            "/v1/responses\\..\\..\\chatgpt/backend-api/models",
+        ),
         (OPENAI_HOST, "/chatgpt"),
         (OPENAI_HOST, "/chatgpt?x=1"),
         (CHATGPT_HOST, "/chatgpt/backend-api/f/conversation"),

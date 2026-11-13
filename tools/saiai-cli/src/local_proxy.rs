@@ -1382,7 +1382,7 @@ async fn serve_managed_tls_on(
             // client, or Codex images, however spelled) are refused
             // explicitly — before any WebSocket upgrade, and never answered
             // with an empty success.
-            if chat.is_none() && is_chat_relay_namespace(&request.target) {
+            if chat.is_none() && may_reach_chat_relay(&request.target) {
                 let resp = chat_relay_disabled_response();
                 write_static_response(
                     reader.get_mut(),
@@ -2669,18 +2669,26 @@ pub(crate) fn is_forwarded_chatgpt_path(path: &str) -> bool {
 }
 
 /// Codex image endpoints, a part of the Gateway's ChatGPT relay.
-/// Whether `target` lies in the Chat relay namespace (`/chatgpt`, Codex
-/// images). Judged on the raw path and on the path the outgoing URL resolves
-/// to, so dot segments (`..`, `%2e%2e`) cannot step into the namespace.
-fn is_chat_relay_namespace(target: &str) -> bool {
-    let inside = |path: &str| {
-        path == "/chatgpt" || path.starts_with("/chatgpt/") || is_codex_images_path(path)
-    };
-    request_path(target).is_ok_and(|path| inside(&path))
-        || path_query_from_target(target)
-            .ok()
-            .and_then(|path| Url::parse(&format!("http://localhost{path}")).ok())
-            .is_some_and(|url| inside(url.path()))
+/// Whether `target` may reach the Chat relay (`/chatgpt`, Codex images).
+/// The outgoing URL is the Gateway base URL followed by the target, so a
+/// path with dot segments (`..`, `%2e%2e`, backslashes) could resolve into
+/// the relay below any base path; such a path counts as reaching it.
+fn may_reach_chat_relay(target: &str) -> bool {
+    request_path(target).is_ok_and(|path| {
+        path == "/chatgpt"
+            || path.starts_with("/chatgpt/")
+            || is_codex_images_path(&path)
+            || has_dot_segments(&path)
+    })
+}
+
+/// Whether URL parsing would rewrite `path` by resolving dot segments.
+fn has_dot_segments(path: &str) -> bool {
+    path.contains('\\')
+        || path.split('/').any(|segment| {
+            let segment = segment.to_ascii_lowercase().replace("%2e", ".");
+            segment == "." || segment == ".."
+        })
 }
 
 fn is_codex_images_path(path: &str) -> bool {
@@ -3023,7 +3031,7 @@ fn chatgpt_chat_disabled_response(
         Some(chat) => normalize_chatgpt_chat_target_with(&request.target, chat).is_ok(),
         None => {
             normalize_ordinary_chat_target(&request.target, None).is_ok()
-                || is_chat_relay_namespace(&request.target)
+                || may_reach_chat_relay(&request.target)
         }
     };
     covered.then(chat_relay_disabled_response)
@@ -4205,6 +4213,26 @@ mod tests {
                 .unwrap_or_else(|| panic!("{target}"));
             assert_eq!(response.status, StatusCode::NOT_IMPLEMENTED);
             assert_eq!(response.reason, "chat_mode_temporarily_disabled");
+        }
+        assert!(has_dot_segments("/v1/responses/%2E%2e/x"));
+        assert!(has_dot_segments("/v1/responses/./x"));
+        assert!(has_dot_segments("/v1/responses\\x"));
+        for path in [
+            "/v1/responses",
+            "/v1/responses/..x",
+            "/v1/models/gpt-5.3-codex",
+            "/v1/.well",
+        ] {
+            assert!(!has_dot_segments(path), "{path}");
+        }
+        // Ordinary Codex traffic stays open, including relay-looking queries.
+        for target in [
+            "/v1/responses",
+            "/v1/responses/compact",
+            "/v1/models?client_version=0.1.0",
+            "/v1/responses?x=/chatgpt/../..",
+        ] {
+            assert!(!may_reach_chat_relay(target), "{target}");
         }
         for target in [
             "/backend-api/codex/responses",
