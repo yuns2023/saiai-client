@@ -2545,36 +2545,124 @@ fn call_arguments_finds_standalone_named_arguments() {
     );
 }
 
+/// Kernel modules the SAIAI side names through a module path, in `text`
+/// (comments and string contents ignored, spacing around `::` allowed):
+/// `crate::m`, `super::m`, `$crate::m`, and `m` at the start of an item in a
+/// `use crate::{…}` / `use super::{…}` group, for each private module `m`.
+fn kernel_module_paths(text: &str, private: &[String]) -> Vec<String> {
+    // Blank literals, drop comments, then remove spacing around `::`.
+    let mut code = strip_rust_comments(text);
+    for range in rust_literal_ranges(&code).into_iter().rev() {
+        code.replace_range(range, "\"\"");
+    }
+    let mut compact = String::new();
+    for part in code.split("::") {
+        if !compact.is_empty() {
+            compact = compact.trim_end().to_string() + "::";
+        }
+        compact.push_str(if compact.is_empty() {
+            part
+        } else {
+            part.trim_start()
+        });
+    }
+    let ident = |ch: char| ch.is_ascii_alphanumeric() || ch == '_';
+    let mut found = Vec::new();
+    for root in ["crate::", "super::"] {
+        for (index, _) in compact.match_indices(root) {
+            let rest = &compact[index + root.len()..];
+            let mut heads = Vec::new();
+            if let Some(group) = rest.strip_prefix('{') {
+                // Items at any nesting depth start after `{` or `,`.
+                let mut depth = 0;
+                let mut start = true;
+                for (offset, ch) in group.char_indices() {
+                    match ch {
+                        '{' => {
+                            depth += 1;
+                            start = true;
+                        }
+                        '}' if depth == 0 => break,
+                        '}' => depth -= 1,
+                        ',' => start = true,
+                        ch if start && ident(ch) => {
+                            heads.push(&group[offset..]);
+                            start = false;
+                        }
+                        ch if !ch.is_whitespace() => start = false,
+                        _ => {}
+                    }
+                }
+            } else {
+                heads.push(rest);
+            }
+            for head in heads {
+                let name: String = head.chars().take_while(|ch| ident(*ch)).collect();
+                if private.contains(&name) {
+                    found.push(format!("{root}{name}"));
+                }
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn kernel_module_path_scanner_sees_aliases_groups_and_spacing() {
+    let private = vec!["gateway".to_string(), "brand".to_string()];
+    for text in [
+        "use crate::gateway as g;",
+        "use crate::gateway;",
+        "let x = crate :: gateway :: wire_target(url);",
+        "use crate::{gateway::GatewayHttp};",
+        "use crate::{ Brand, gateway::{GatewayHttp, StateFile} };",
+        "use crate::{\n    GatewayHttp,\n    brand,\n};",
+        "$crate::gateway::X",
+        "use super::brand::BRAND;",
+    ] {
+        assert!(!kernel_module_paths(text, &private).is_empty(), "{text}");
+    }
+    for text in [
+        "use crate::{GatewayHttp, StateFile, write_file_atomically};",
+        "crate::GatewayHttp::client_for(&**self, url)",
+        "use crate::client_proof::{self, ClientProof};",
+        "let text = \"crate::gateway::X\"; // crate::gateway::Y",
+        "use super::*;",
+        "fn gateway() {}",
+    ] {
+        assert_eq!(
+            kernel_module_paths(text, &private),
+            Vec::<String>::new(),
+            "{text}"
+        );
+    }
+}
+
 /// The SAIAI side reaches the kernel only through the crate root's public
-/// items (`crate::X`), never a kernel module path (`crate::module::X`), so it
+/// items (`crate::X`), never a private kernel module (any spelling), so it
 /// can move out of the library unchanged. Tests in these files included.
 #[test]
 fn saiai_side_uses_only_the_public_kernel_root() {
     const SAIAI_SIDE: [&str; 3] = ["client_proof", "gateway_saiai", "brand_saiai"];
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let lib = fs::read_to_string(root.join("lib.rs")).unwrap();
+    // Every module lib.rs declares, minus the public ones and the SAIAI side.
+    let private: Vec<String> = lib
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("mod "))
+        .filter_map(|rest| rest.strip_suffix(';'))
+        .map(str::to_string)
+        .filter(|name| !SAIAI_SIDE.contains(&name.as_str()))
+        .collect();
+    assert!(private.contains(&"gateway".to_string()), "{private:?}");
+    assert!(private.contains(&"local_proxy".to_string()), "{private:?}");
     for module in SAIAI_SIDE {
         let file = format!("{module}.rs");
-        let text = strip_rust_comments(&fs::read_to_string(root.join(&file)).unwrap());
-        let mut seen = 0;
-        for pattern in ["crate::", "super::"] {
-            for (index, _) in text.match_indices(pattern) {
-                let rest = &text[index + pattern.len()..];
-                let name: String = rest
-                    .chars()
-                    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-                    .collect();
-                // A lowercase name followed by `::` is a module path;
-                // `crate::Type::method` names a public root item.
-                let module = name.starts_with(|ch: char| ch.is_ascii_lowercase());
-                if module && rest[name.len()..].starts_with("::") {
-                    assert!(
-                        SAIAI_SIDE.contains(&name.as_str()),
-                        "{file} reaches into kernel module `{name}`: {pattern}{name}::"
-                    );
-                }
-                seen += 1;
-            }
-        }
-        assert!(seen > 0, "{file}: no crate paths found; scanner broken?");
+        let text = fs::read_to_string(root.join(&file)).unwrap();
+        let paths = kernel_module_paths(&text, &private);
+        assert!(
+            paths.is_empty(),
+            "{file} reaches into kernel modules: {paths:?}"
+        );
     }
 }

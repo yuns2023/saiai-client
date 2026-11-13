@@ -267,11 +267,12 @@ pub(crate) fn validate_extension(extension: &dyn GatewayExtension) -> Result<()>
                 && (stem.starts_with("COM") || stem.starts_with("LPT"))
                 && matches!(stem.as_bytes()[3], b'1'..=b'9'));
         // The longest name the program derives from it must still fit a
-        // 255-byte file name: `<name>.bak-<15-digit timestamp>` and
+        // 255-byte file name: `<name>.bak-<timestamp>` (at most 25 bytes,
+        // `%Y%m%d-%H%M%S%.9f`) and
         // `.<name>.<temp infix>-<pid up to 10 digits>-<32 hex digits>`.
         let infix = crate::brand::brand().config.temp_file_infix;
         let derived = [
-            (file.backups, ".bak-".len() + 15),
+            (file.backups, ".bak-".len() + 25),
             (file.atomic_temporaries, 2 + infix.len() + 1 + 10 + 1 + 32),
         ]
         .iter()
@@ -466,7 +467,7 @@ mod state_file_tests {
     }
 
     /// With the SAIAI infix (9 bytes) an atomic-write leftover adds 55
-    /// bytes, a backup 20: the longest allowed names are 200 and 235.
+    /// bytes, a backup 30: the longest allowed names are 200 and 225.
     #[test]
     fn state_file_names_leave_room_for_derived_names() {
         let named = |length: usize, backups, atomic_temporaries| {
@@ -480,8 +481,8 @@ mod state_file_tests {
         };
         named(200, true, true).unwrap();
         assert!(named(201, true, true).is_err());
-        named(235, true, false).unwrap();
-        assert!(named(236, true, false).is_err());
+        named(225, true, false).unwrap();
+        assert!(named(226, true, false).is_err());
         named(255, false, false).unwrap();
         assert!(named(256, false, false).is_err());
     }
