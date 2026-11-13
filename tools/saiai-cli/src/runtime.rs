@@ -116,7 +116,8 @@ fn uninstalled_version() -> &'static str {
 mod tests {
     use super::*;
 
-    // A local slot: the process-wide context is never installed by tests.
+    // A local slot: these tests never touch the process-wide context
+    // (contract tests install the SAIAI context there).
     #[test]
     fn install_accepts_the_same_context_and_rejects_another_without_overwriting() {
         static OTHER: crate::gateway::NoGatewayExtension = crate::gateway::NoGatewayExtension;

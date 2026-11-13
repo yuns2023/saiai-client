@@ -18,12 +18,38 @@ pub fn install(brand: &'static Brand, context: RuntimeContext) -> Result<()> {
     crate::runtime::install(context)
 }
 
-/// Fails unless `brand` is the installed brand (the same instance).
+/// Fails unless `brand` is the installed brand (the same instance); the
+/// unit-test fallback brand does not count as installed.
 fn installed(brand: &'static Brand) -> Result<()> {
-    if !std::ptr::eq(crate::brand::brand(), brand) {
-        bail!("contract entry called with a brand other than the installed one");
+    check_installed(crate::brand::installed(), brand)
+}
+
+fn check_installed(installed: Option<&'static Brand>, brand: &'static Brand) -> Result<()> {
+    match installed {
+        None => bail!("contract entry called before a brand was installed"),
+        Some(installed) if !std::ptr::eq(installed, brand) => {
+            bail!("contract entry called with a brand other than the installed one")
+        }
+        Some(_) => Ok(()),
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_entry_needs_the_installed_brand_itself() {
+        static OTHER: Brand = Brand {
+            binary_name: "other",
+            ..crate::brand_saiai::SAIAI_VALUES
+        };
+        let saiai = &crate::brand_saiai::SAIAI_BRAND;
+        assert!(check_installed(None, saiai).is_err());
+        assert!(check_installed(Some(&OTHER), saiai).is_err());
+        assert!(check_installed(Some(saiai), &OTHER).is_err());
+        check_installed(Some(saiai), saiai).unwrap();
+    }
 }
 
 /// The local answers of the Codex / ChatGPT Desktop sidecar.
