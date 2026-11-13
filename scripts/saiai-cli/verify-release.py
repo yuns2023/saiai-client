@@ -180,9 +180,9 @@ def verify_cli() -> None:
         "initialize_codex_local_proxy",
         "start_managed_service_after_initialization",
         "initialization_requires_proxy_refresh",
-        '"SAIAI_BINARY_UPDATED"',
+        "env::var(BRAND.env.binary_updated)",
         "binary and runtime configuration are unchanged",
-        '"SAIAI_SKIP_START"',
+        "env::var(BRAND.env.skip_start)",
         "SAIAI configured Codex for local-proxy OAuth mode.",
         "configure_codex_oauth_local_proxy",
         "write_codex_ide_env(&env_path, &proxy_init.listen",
@@ -199,7 +199,7 @@ def verify_cli() -> None:
         '"features.respect_system_proxy={}"',
         'directory.join("node_modules/@openai/codex/bin/codex.js")',
         'home.join(".local/bin/codex")',
-        '"SAIAI_HOME"',
+        "env_dir_override(BRAND.env.home)",
         'settings.remove("oauthAccount")',
         'state.remove("oauthAccount")',
         "remove_if_exists_with_backup(credentials_path",
@@ -222,6 +222,13 @@ def verify_cli() -> None:
         "run_windows_background_proxy_worker",
     ):
         require(required in main, f"CLI contract is missing {required!r}")
+    brand = text("tools/saiai-cli/src/brand_saiai.rs")
+    for required in (
+        'binary_updated: "SAIAI_BINARY_UPDATED"',
+        'skip_start: "SAIAI_SKIP_START"',
+        'home: "SAIAI_HOME"',
+    ):
+        require(required in brand, f"SAIAI brand is missing {required!r}")
     for withdrawn in WITHDRAWN_V2_MARKERS:
         require(withdrawn not in main, f"CLI still exposes withdrawn V2 behavior: {withdrawn}")
     verify_claude_launcher(main)

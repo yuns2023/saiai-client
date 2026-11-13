@@ -29,12 +29,14 @@ macro_rules! eprintln {
     };
 }
 
-pub const HEADER_NAME: &str = "x-saiai-client-proof";
-const MESSAGE_DOMAIN: &str = "saiai-client-proof-v1";
-const KEY_FILENAME: &str = "client-device-key";
-const LOCK_FILENAME: &str = "client-device.lock";
-const DEVICE_FILENAME: &str = "client-device.json";
-const ENROLL_PATH: &str = "/api/v1/client/devices/enroll";
+use crate::brand::BRAND;
+
+pub const HEADER_NAME: &str = BRAND.client_proof.header;
+const MESSAGE_DOMAIN: &str = BRAND.client_proof.message_domain;
+const KEY_FILENAME: &str = BRAND.client_proof.key_filename;
+const LOCK_FILENAME: &str = BRAND.client_proof.lock_filename;
+const DEVICE_FILENAME: &str = BRAND.client_proof.device_filename;
+const ENROLL_PATH: &str = BRAND.client_proof.enroll_path;
 const ENROLL_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_ENROLL_RESPONSE_BYTES: usize = 16 * 1024;
 /// Extra credentials (Bearers not configured on a route) enrolled on demand.
@@ -303,7 +305,7 @@ fn load_or_create_key(path: &Path) -> Result<SigningKey> {
                     "client proof: device key {} is unreadable ({err:#}); generating a new device key",
                     path.display()
                 );
-                let aside = path.with_file_name(format!("{KEY_FILENAME}.corrupt"));
+                let aside = path.with_file_name(BRAND.client_proof.corrupt_key_filename);
                 fs::rename(path, &aside)
                     .with_context(|| format!("failed to set aside {}", path.display()))?;
             }

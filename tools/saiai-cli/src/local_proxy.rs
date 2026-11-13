@@ -38,6 +38,7 @@ mod claude_desktop;
 #[path = "local_proxy_ingress_tests.rs"]
 mod ingress_tests;
 
+use crate::brand::BRAND;
 use crate::client_proof::{self, ClientProof};
 use crate::upstream_proxy::{HttpClients, Snapshot, UpstreamProxy};
 use crate::upstream_tls;
@@ -55,7 +56,7 @@ const CHAT_OPENAI_HOST: &str = "chat.openai.com";
 // as chatgpt.com; otherwise CONNECT falls through to the real provider with
 // the SAIAI placeholder and the app appears logged out.
 const CHATGPT_AUX_HOST: &str = "ab.chatgpt.com";
-pub(crate) const CERTIFICATE_CONTROL_HOST: &str = "certificate.saiai.local";
+pub(crate) const CERTIFICATE_CONTROL_HOST: &str = BRAND.certificates.control_host;
 // Third-party telemetry and error-reporting intake hosts that the local proxy
 // refuses with 403 before any upstream connect.  Exact hosts must be measured
 // from the clients SAIAI launches; the Sentry suffixes generalise measured
@@ -73,9 +74,9 @@ const TELEMETRY_DENY_EXACT_HOSTS: &[&str] = &[
 // that varies, so these are matched as label-boundary suffixes.  sentry.io
 // itself, docs, and `mcp.sentry.dev` stay reachable.
 const TELEMETRY_DENY_HOST_SUFFIXES: &[&str] = &[".ingest.sentry.io", ".ingest.us.sentry.io"];
-pub(crate) const CERTIFICATE_SPKI_HEADER: &str = "x-saiai-leaf-spki-sha256";
-const CHATGPT_CHAT_PASSTHROUGH_ENV: &str = "SAIAI_CHATGPT_CHAT_PASSTHROUGH";
-const SAIAI_DESKTOP_EMAIL: &str = "saiai-local-proxy@example.invalid";
+pub(crate) const CERTIFICATE_SPKI_HEADER: &str = BRAND.certificates.spki_header;
+const CHATGPT_CHAT_PASSTHROUGH_ENV: &str = BRAND.env.chatgpt_chat_passthrough;
+const SAIAI_DESKTOP_EMAIL: &str = BRAND.placeholders.desktop_email;
 const DESKTOP_STATSIG_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 // Codex Desktop 26.908.4834.0 / Statsig JS 3.33.4 gates bundled locale
 // messages behind layer 72216192. Keep this local bootstrap deliberately
@@ -101,7 +102,7 @@ const DESKTOP_CONTROL_GATES: [&str; 5] = [
     "1892382740",
     "1146407612",
 ];
-const DESKTOP_BROWSER_USE_ENV: &str = "SAIAI_DESKTOP_BROWSER_USE";
+const DESKTOP_BROWSER_USE_ENV: &str = BRAND.env.desktop_browser_use;
 static DESKTOP_STATSIG_BROWSER_PAYLOAD: LazyLock<String> =
     LazyLock::new(|| desktop_statsig_base(DesktopFeatures { browser_use: true }).to_string());
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
@@ -264,11 +265,11 @@ struct OpenAITrace {
 
 impl OpenAITrace {
     fn from_env() -> Result<Option<Arc<Self>>> {
-        if env::var("SAIAI_OPENAI_TRACE").ok().as_deref() != Some("1") {
+        if env::var(BRAND.env.openai_trace).ok().as_deref() != Some("1") {
             return Ok(None);
         }
-        let path = env::var("SAIAI_OPENAI_TRACE_PATH")
-            .unwrap_or_else(|_| "/tmp/saiai-openai-trace.jsonl".to_string());
+        let path = env::var(BRAND.env.openai_trace_path)
+            .unwrap_or_else(|_| format!("/tmp/{}-openai-trace.jsonl", BRAND.binary_name));
         let path = std::path::PathBuf::from(path);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| {
@@ -476,7 +477,7 @@ impl State {
         // This is an opt-in operator diagnostic for a single inherited service
         // process. It never enables body tracing; verbose records remain
         // limited to request metadata and response outcomes.
-        let verbose = cfg.verbose || env::var("SAIAI_PROXY_VERBOSE").ok().as_deref() == Some("1");
+        let verbose = cfg.verbose || env::var(BRAND.env.proxy_verbose).ok().as_deref() == Some("1");
         let browser_use = desktop_browser_use_setting(
             env::var(DESKTOP_BROWSER_USE_ENV).ok().as_deref(),
             cfg.desktop_browser_use,
@@ -2239,7 +2240,7 @@ where
         for key in ["content-length", "etag", "content-md5", "digest"] {
             headers.remove(key);
         }
-        headers.insert("x-saiai-chat-preference-restored", "1".parse()?);
+        headers.insert(BRAND.gateway.chat_preference_restored_header, "1".parse()?);
     }
     let mut result = tungstenite::http::Response::builder()
         .status(status)
@@ -2587,7 +2588,7 @@ fn is_forwarded_openai_path(path: &str) -> bool {
         || is_forwarded_chatgpt_path(path)
 }
 
-fn is_forwarded_chatgpt_path(path: &str) -> bool {
+pub(crate) fn is_forwarded_chatgpt_path(path: &str) -> bool {
     path == "/chatgpt/backend-api/models"
         || path == "/chatgpt/backend-api/devicecheck"
         || path == "/chatgpt/backend-api/ios/attestation_challenge"
@@ -2602,7 +2603,7 @@ fn is_forwarded_chatgpt_path(path: &str) -> bool {
         || path.starts_with("/chatgpt/backend-api/files/download/")
         || path == "/chatgpt/backend-api/estuary/content"
         || path == "/chatgpt/backend-api/celsius/ws/user"
-        || path == "/chatgpt/backend-api/saiai/chat-updates"
+        || path.strip_prefix("/chatgpt") == Some(BRAND.gateway.chat_updates_path)
         || is_chatgpt_owned_conversation_path(path.strip_prefix("/chatgpt").unwrap_or(path))
 }
 
@@ -2708,7 +2709,7 @@ fn normalize_chatgpt_gateway_target(target: &str) -> Result<String> {
     })
 }
 
-fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
+pub(crate) fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
     let path = request_path(target)?;
     if path == "/api/estuary/upload_content_bytes" {
         return Ok(format!("/chatgpt{target}"));
@@ -2733,7 +2734,7 @@ fn normalize_chatgpt_chat_target(target: &str) -> Result<String> {
         || path.starts_with("/backend-api/files/download/")
         || path == "/backend-api/estuary/content"
         || path == "/backend-api/celsius/ws/user"
-        || path == "/backend-api/saiai/chat-updates"
+        || path == BRAND.gateway.chat_updates_path
         || is_chatgpt_owned_conversation_path(&path);
     if !allowed {
         bail!("unsupported ChatGPT ordinary Chat path: {path}");
@@ -3364,10 +3365,10 @@ fn oauth_claim_account_id(headers: &[(String, String)]) -> Option<String> {
 }
 
 fn desktop_account_id_fallback() -> Option<String> {
-    let root = env::var_os("SAIAI_HOME")
+    let root = env::var_os(BRAND.env.home)
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".saiai"))
+            env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(BRAND.home_dir_name))
         })?;
     let value = fs::read_to_string(root.join("desktop/account-id")).ok()?;
     let value = value.trim();
@@ -3547,7 +3548,7 @@ fn desktop_leaf_key(ca_key: &KeyPair, host: &str) -> Result<KeyPair> {
     // Preserve the existing leaf-only pin boundary instead of pinning a CA
     // certificate anywhere in a Chromium-supplied chain.
     let private_der = Zeroizing::new(ca_key.serialize_der());
-    let hkdf = hkdf::Hkdf::<Sha256>::new(Some(b"SAIAI local proxy TLS leaf v1"), &private_der);
+    let hkdf = hkdf::Hkdf::<Sha256>::new(Some(BRAND.certificates.tls_leaf_salt), &private_der);
     let mut seed = Zeroizing::new([0_u8; 32]);
     for counter in 0_u8..16 {
         let mut info = host.as_bytes().to_vec();

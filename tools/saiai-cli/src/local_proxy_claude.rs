@@ -1,5 +1,6 @@
 //! Claude Desktop control plane; all real credentials remain in the parent proxy.
 use super::*;
+use crate::brand::BRAND;
 use crate::claude_desktop::Identity;
 use crate::claude_desktop_fixtures::{self as fixtures, Route};
 
@@ -71,8 +72,8 @@ fn classify_request(state: &State, request: &IncomingRequest) -> Result<Credenti
         .iter()
         .filter_map(|(_, value)| bearer_token(value))
         .any(|token| {
-            token.starts_with("saiai-desktop-")
-                || token.starts_with("saiai-local-proxy-placeholder-")
+            token.starts_with(BRAND.placeholders.desktop_token_prefix)
+                || token.starts_with(BRAND.placeholders.legacy_codex_token_prefix)
                 || token.starts_with("sk-ant")
         })
     {
@@ -89,8 +90,8 @@ fn classify_credential(headers: &[&str], expected: Option<&str>) -> Result<Crede
     let desktop = tokens.iter().any(|t| Some(*t) == expected);
     let reserved = tokens.iter().any(|t| {
         t.starts_with("sk-ant")
-            || t.starts_with("saiai-desktop-")
-            || t.starts_with("saiai-local-proxy-placeholder-")
+            || t.starts_with(BRAND.placeholders.desktop_token_prefix)
+            || t.starts_with(BRAND.placeholders.legacy_codex_token_prefix)
     });
     if desktop && headers.len() == 1 {
         return Ok(CredentialPolicy::DesktopPlaceholder);
