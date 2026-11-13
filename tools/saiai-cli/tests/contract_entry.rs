@@ -66,7 +66,9 @@ fn entries_need_an_installed_brand_and_keep_the_first_context() {
     assert!(proxy_cli::contract::install(&SAIAI_BRAND, context(version, &NONE)).is_err());
     assert!(desktop::sidecar(&OTHER, &AUTOMATIONS, true).is_err());
 
-    // The first context is still the one in use.
+    // The first context is still the one in use: installing it again is
+    // accepted, and the entry answers as before.
+    proxy_cli::contract::install(&SAIAI_BRAND, context(version, saiai_gateway)).unwrap();
     let answer = desktop::sidecar(&SAIAI_BRAND, &AUTOMATIONS, true)
         .unwrap()
         .unwrap();
