@@ -10103,6 +10103,35 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         }
     }
 
+    /// Each config file key lands in its own struct field (a renamed or
+    /// swapped key would still round-trip as JSON, so read the fields).
+    #[test]
+    fn app_config_keys_map_to_their_fields() {
+        let config: AppConfig = serde_json::from_str(
+            r#"{"version":7,"base_url":"b","api_key":"k","listen":"l","ca_cert_path":"cc","ca_key_path":"ck","chatgpt_chat_passthrough":false,"desktop_browser_use":true,"upstream_proxy":"u","providers":{"claude":{"base_url":"cb","api_key":"ck2"},"codex":{"base_url":"xb","api_key":"xk"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.version, 7);
+        assert_eq!(config.base_url, "b");
+        assert_eq!(config.api_key, "k");
+        assert_eq!(config.listen, "l");
+        assert_eq!(config.ca_cert_path, "cc");
+        assert_eq!(config.ca_key_path, "ck");
+        assert!(!config.chatgpt_chat_passthrough);
+        assert!(config.desktop_browser_use);
+        assert_eq!(config.upstream_proxy.as_deref(), Some("u"));
+        let claude = config.providers.claude.as_ref().unwrap();
+        assert_eq!(
+            (claude.base_url.as_str(), claude.api_key.as_str()),
+            ("cb", "ck2")
+        );
+        let codex = config.providers.codex.as_ref().unwrap();
+        assert_eq!(
+            (codex.base_url.as_str(), codex.api_key.as_str()),
+            ("xb", "xk")
+        );
+    }
+
     /// The struct's field order, `APP_CONFIG_FIELDS` and the array reader
     /// agree: an object serializes its keys in that order, and the same
     /// values as an array read back the same config.

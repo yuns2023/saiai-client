@@ -31,7 +31,9 @@ fn saiai() -> &'static Brand {
     &brand_saiai::SAIAI_BRAND
 }
 
-/// A config file as the program reads and rewrites it, as JSON.
+/// A config file's text through the program's serde decoder and encoder
+/// (compact JSON; the program writes the file pretty-printed, and file-read
+/// error context is not part of this check), as a JSON value.
 fn decoded(json: &str) -> serde_json::Value {
     serde_json::from_str(&config::decode(saiai(), json).unwrap().unwrap()).unwrap()
 }
