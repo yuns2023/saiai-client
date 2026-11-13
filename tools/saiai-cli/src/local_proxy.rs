@@ -55,7 +55,7 @@ const CHAT_OPENAI_HOST: &str = "chat.openai.com";
 // as chatgpt.com; otherwise CONNECT falls through to the real provider with
 // the SAIAI placeholder and the app appears logged out.
 const CHATGPT_AUX_HOST: &str = "ab.chatgpt.com";
-const CERTIFICATE_CONTROL_HOST: &str = "certificate.saiai.local";
+pub(crate) const CERTIFICATE_CONTROL_HOST: &str = "certificate.saiai.local";
 // Third-party telemetry and error-reporting intake hosts that the local proxy
 // refuses with 403 before any upstream connect.  Exact hosts must be measured
 // from the clients SAIAI launches; the Sentry suffixes generalise measured
@@ -73,7 +73,7 @@ const TELEMETRY_DENY_EXACT_HOSTS: &[&str] = &[
 // that varies, so these are matched as label-boundary suffixes.  sentry.io
 // itself, docs, and `mcp.sentry.dev` stay reachable.
 const TELEMETRY_DENY_HOST_SUFFIXES: &[&str] = &[".ingest.sentry.io", ".ingest.us.sentry.io"];
-const CERTIFICATE_SPKI_HEADER: &str = "x-saiai-leaf-spki-sha256";
+pub(crate) const CERTIFICATE_SPKI_HEADER: &str = "x-saiai-leaf-spki-sha256";
 const CHATGPT_CHAT_PASSTHROUGH_ENV: &str = "SAIAI_CHATGPT_CHAT_PASSTHROUGH";
 const SAIAI_DESKTOP_EMAIL: &str = "saiai-local-proxy@example.invalid";
 const DESKTOP_STATSIG_MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -3496,7 +3496,7 @@ fn build_leaf_server_config(
     })
 }
 
-fn sign_leaf_certificate(
+pub(crate) fn sign_leaf_certificate(
     host: &str,
     ca_cert_pem: &str,
     ca_key_pem: &str,

@@ -20,5 +20,6 @@ CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" \
 
 echo "[pre-push] client: release contract"
 (cd "$repo_root" && python3 scripts/saiai-cli/test-release-contract.py)
+(cd "$repo_root" && python3 scripts/saiai-cli/test-brand-contract.py)
 (cd "$repo_root" && bash scripts/saiai-cli/test-setup-wrappers.sh)
 (cd "$repo_root" && python3 scripts/saiai-cli/verify-release.py)

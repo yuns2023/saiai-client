@@ -17,7 +17,7 @@ use crate::{
 
 pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 2;
 
-const BOOTSTRAP_PATH: &str = "/api/v1/client/bootstrap";
+pub(crate) const BOOTSTRAP_PATH: &str = "/api/v1/client/bootstrap";
 const MAX_BOOTSTRAP_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_GATEWAY_VERSION_BYTES: usize = 128;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -267,7 +267,7 @@ fn build_product_artifacts(
     }
 }
 
-fn generate_installation_ca() -> Result<(String, String)> {
+pub(crate) fn generate_installation_ca() -> Result<(String, String)> {
     let key = KeyPair::generate().map_err(|error| Error::InvalidArtifact {
         artifact: "saiai-ca.key",
         reason: format!("could not generate installation key: {error}"),
@@ -297,7 +297,7 @@ fn generate_installation_ca() -> Result<(String, String)> {
     Ok((certificate.pem(), key.serialize_pem()))
 }
 
-fn build_codex_config(
+pub(crate) fn build_codex_config(
     service_root: &GatewayUrl,
     capabilities: &BootstrapCapabilities,
 ) -> Result<String> {

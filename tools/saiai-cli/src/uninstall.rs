@@ -18,7 +18,7 @@ const PLAN_MARKER: &str = "SAIAI uninstall plan";
 #[cfg(windows)]
 const RELAUNCH_FLAG: &str = "--relaunched-from";
 const ENVIRONMENTS_DIR: &str = "environments";
-const SAIAI_HOME_FILES: &[&str] = &[
+pub(crate) const SAIAI_HOME_FILES: &[&str] = &[
     crate::SAIAI_CONFIG_FILENAME,
     crate::SAIAI_CA_FILENAME,
     crate::SAIAI_CA_KEY_FILENAME,
@@ -32,7 +32,7 @@ const SAIAI_HOME_FILES: &[&str] = &[
     "client-device-key.corrupt",
     "windows-packaged-proxy-lease.json",
 ];
-const SAIAI_HOME_DIRS: &[&str] = &["log-followers", "desktop"];
+pub(crate) const SAIAI_HOME_DIRS: &[&str] = &["log-followers", "desktop"];
 const CLAUDE_GENERIC_ENV: &[&str] = &[
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     "ENABLE_PROMPT_CACHING_1H",
@@ -1427,7 +1427,7 @@ fn plan_nss(files: &[PathBuf], plan: &mut Plan) {
 
 // ------------------------------------------------------------------ Data
 
-fn is_saiai_home_file(name: &str) -> bool {
+pub(crate) fn is_saiai_home_file(name: &str) -> bool {
     SAIAI_HOME_FILES.iter().any(|file| {
         name == *file
             || name.starts_with(&format!("{file}.bak-"))
@@ -1435,7 +1435,7 @@ fn is_saiai_home_file(name: &str) -> bool {
     })
 }
 
-fn is_claude_ca_file(name: &str) -> bool {
+pub(crate) fn is_claude_ca_file(name: &str) -> bool {
     [crate::SAIAI_CA_FILENAME, crate::SAIAI_CA_KEY_FILENAME]
         .iter()
         .any(|file| name == *file || name.starts_with(&format!("{file}.bak-")))
@@ -1542,7 +1542,7 @@ fn plan_data(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
 
 // --------------------------------------------------------------- Program
 
-fn is_program_file(name: &str) -> bool {
+pub(crate) fn is_program_file(name: &str) -> bool {
     matches!(
         name,
         "saiai" | "saiai.exe" | "saiai-previous" | "saiai-previous.exe"
