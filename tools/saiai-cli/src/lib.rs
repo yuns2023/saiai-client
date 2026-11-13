@@ -42,6 +42,7 @@ mod codex_diagnostics;
 mod desktop_product;
 mod environment_scope;
 mod local_proxy;
+mod runtime;
 mod uninstall;
 mod upstream_proxy;
 mod upstream_tls;
@@ -53,6 +54,7 @@ mod windows_desktop_runtime;
 
 use brand::BRAND;
 use desktop_product::DesktopProduct;
+pub use runtime::RuntimeContext;
 
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
 #[cfg(target_os = "linux")]
@@ -259,7 +261,11 @@ fn is_managed_claude_env(key: &str) -> bool {
             .any(|prefix| key.to_ascii_uppercase().starts_with(prefix))
 }
 
-fn main() -> Result<()> {
+/// Runs one command of the client. `context` carries facts about the final
+/// program (its release version) that the library must not take from its
+/// own package metadata.
+pub fn run(context: RuntimeContext) -> Result<()> {
+    runtime::install(context);
     let mut args = env::args().skip(1).collect::<Vec<_>>();
     let selector = environment_scope::parse_selector(&mut args)?;
     let command = parse_command(&args)?;
@@ -3841,7 +3847,7 @@ struct LinuxServiceLock {
 }
 
 fn print_version() -> Result<()> {
-    println!("{} {}", BRAND.binary_name, env!("CARGO_PKG_VERSION"));
+    println!("{} {}", BRAND.binary_name, runtime::version());
     Ok(())
 }
 
@@ -4154,7 +4160,7 @@ fn run_service_stop() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn run_service_status() -> Result<()> {
-    println!("{} {}", BRAND.binary_name, env!("CARGO_PKG_VERSION"));
+    println!("{} {}", BRAND.binary_name, runtime::version());
     print_process_env_conflicts_for_status();
     print_claude_settings_overrides_for_status();
     match read_saiai_config() {
@@ -4229,7 +4235,7 @@ fn run_service_status() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn run_service_status() -> Result<()> {
-    println!("{} {}", BRAND.binary_name, env!("CARGO_PKG_VERSION"));
+    println!("{} {}", BRAND.binary_name, runtime::version());
     print_process_env_conflicts_for_status();
     print_claude_settings_overrides_for_status();
     match read_saiai_config() {
@@ -4257,7 +4263,7 @@ fn run_service_status() -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn run_service_status() -> Result<()> {
-    println!("{} {}", BRAND.binary_name, env!("CARGO_PKG_VERSION"));
+    println!("{} {}", BRAND.binary_name, runtime::version());
     print_process_env_conflicts_for_status();
     print_claude_settings_overrides_for_status();
     match read_saiai_config() {
@@ -4508,7 +4514,7 @@ fn run_update() -> Result<()> {
         .with_context(|| format!("failed to read {}", current_exe.display()))?;
     let current_sha256 = sha256_hex(&current_bytes);
 
-    println!("Current: saiai {}", env!("CARGO_PKG_VERSION"));
+    println!("Current: saiai {}", runtime::version());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -4519,7 +4525,7 @@ fn run_update() -> Result<()> {
     let manifest = runtime.block_on(download_update_manifest(&manifest_url, &egress))?;
     let expected_sha256 = if let Some(manifest) = manifest {
         let remote_version = manifest.version.trim();
-        let ordering = compare_versions(remote_version, env!("CARGO_PKG_VERSION"))
+        let ordering = compare_versions(remote_version, runtime::version())
             .with_context(|| format!("failed to compare remote version {remote_version:?}"))?;
         let asset_info = manifest
             .assets
@@ -4534,12 +4540,12 @@ fn run_update() -> Result<()> {
         if ordering == Ordering::Less {
             println!(
                 "Already current: saiai {} (remote saiai {remote_version})",
-                env!("CARGO_PKG_VERSION")
+                runtime::version()
             );
             return Ok(());
         }
         if ordering == Ordering::Equal && current_sha256 == expected {
-            println!("Already current: saiai {}", env!("CARGO_PKG_VERSION"));
+            println!("Already current: saiai {}", runtime::version());
             return Ok(());
         }
         if ordering == Ordering::Equal {
@@ -4641,11 +4647,7 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
     let mut report = DoctorReport::new();
     report.ok(
         "version",
-        format!(
-            "{} {} ({target:?})",
-            BRAND.binary_name,
-            env!("CARGO_PKG_VERSION")
-        ),
+        format!("{} {} ({target:?})", BRAND.binary_name, runtime::version()),
     );
     check_current_binary(&mut report);
     // These checks apply Claude Code's conflict rules; SAIAI-managed Codex
@@ -10118,7 +10120,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
 
     #[test]
     fn windows_workspace_target_is_resolved_only_for_guarded_cold_launch() {
-        let source = include_str!("main.rs");
+        let source = include_str!("lib.rs");
         let branch = source
             .split("let target = if matches!(decision, windows_desktop_runtime::Decision::Cold) {")
             .nth(1)
@@ -10441,7 +10443,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
 
     #[test]
     fn shared_proxy_and_codex_paths_do_not_emit_claude_only_warnings() {
-        let main = include_str!("main.rs");
+        let main = include_str!("lib.rs");
         let claude_only = [
             "warn_process_env_conflicts(",
             "warn_claude_settings_overrides(",
@@ -10479,7 +10481,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
 
     #[test]
     fn doctor_runs_claude_environment_checks_only_for_claude_targets() {
-        let main = include_str!("main.rs");
+        let main = include_str!("lib.rs");
         let doctor = top_level_fn_bodies(main, "run_doctor(")[0];
         let first_claude_gate = doctor.find("if check_claude {").unwrap();
         for check in [

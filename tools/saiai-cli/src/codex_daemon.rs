@@ -573,7 +573,7 @@ fn probe_inner(socket: &Path, home: &Path) -> Result<Snapshot> {
         json!({
             "clientInfo": {
                 "name": crate::brand::BRAND.codex_daemon_client_name,
-                "version": env!("CARGO_PKG_VERSION")
+                "version": crate::runtime::version()
             },
             "capabilities": {"experimentalApi": true}
         }),

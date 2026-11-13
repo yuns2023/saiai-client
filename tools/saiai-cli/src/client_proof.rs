@@ -555,7 +555,7 @@ impl ClientProof {
     ) -> EnrollOutcome {
         let body = json!({
             "public_key": self.public_key,
-            "client_version": env!("CARGO_PKG_VERSION"),
+            "client_version": crate::runtime::version(),
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
         });

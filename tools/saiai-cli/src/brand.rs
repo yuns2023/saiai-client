@@ -145,8 +145,9 @@ pub(crate) struct PlaceholderIdentities {
 
 /// Names of Gateway endpoints and headers specific to this distribution.
 pub(crate) struct GatewayProtocolNames {
-    /// Native Chat update channel below `/backend-api` (also served below
-    /// `/chatgpt/backend-api` on the Gateway side).
+    /// Native Chat update channel: a complete path starting with
+    /// `/backend-api/` and without the `/chatgpt` prefix (the local proxy
+    /// forwards it as `/chatgpt` + this path).
     pub chat_updates_path: &'static str,
     /// Response header marking a restored native Chat preference.
     pub chat_preference_restored_header: &'static str,

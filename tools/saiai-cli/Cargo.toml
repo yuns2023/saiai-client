@@ -9,6 +9,16 @@ homepage = "https://saiai.top"
 repository = "https://github.com/yuns2023/saiai-client"
 publish = false
 
+# The shared client is a library; this package's binary only supplies the
+# release facts (version) and keeps the installed program name.
+[lib]
+name = "proxy_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "saiai"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"

@@ -1098,7 +1098,7 @@ mod tests {
                 assert!(!source.contains(forbidden));
             }
         }
-        let main = include_str!("main.rs");
+        let main = include_str!("lib.rs");
         let launcher = main
             .split("fn run_windows_packaged_desktop(")
             .nth(1)
@@ -1643,7 +1643,7 @@ mod tests {
 
     #[test]
     fn packaged_dispatch_guards_before_proxy_mutation_and_ignores_broker_liveness() {
-        let main = include_str!("main.rs");
+        let main = include_str!("lib.rs");
         let dispatch = main
             .split("fn run_windows_desktop(")
             .nth(1)

@@ -32,13 +32,13 @@ class CredentialScanTests(unittest.TestCase):
 
 class OptionalClaudeContractTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.main = VERIFIER.text("tools/saiai-cli/src/main.rs")
+        self.main = VERIFIER.text("tools/saiai-cli/src/lib.rs")
         self.launcher = VERIFIER.text("tools/saiai-cli/src/claude_launcher.rs")
         self.original_text = VERIFIER.text
 
     def verify(self, main: str | None = None, launcher: str | None = None) -> None:
         def read(relative: str) -> str:
-            if relative == "tools/saiai-cli/src/main.rs":
+            if relative == "tools/saiai-cli/src/lib.rs":
                 return self.main if main is None else main
             if relative == "tools/saiai-cli/src/claude_launcher.rs":
                 return self.launcher if launcher is None else launcher
