@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const MARKER: &str = "// SAIAI managed VSCode proxy: ";
+const MARKER: &str = crate::brand::BRAND.markers.vscode_proxy;
 
 pub fn certificate_trust(home: &Path, ca_cert: &Path) -> Result<bool> {
     let (program, app) = certificate_loader_program(home).context(

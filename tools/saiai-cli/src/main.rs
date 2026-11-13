@@ -29,8 +29,10 @@ use toml_edit::{DocumentMut, Item, Table, value};
 use url::Url;
 use uuid::Uuid;
 
+mod brand;
 #[cfg(test)]
 mod brand_contract_tests;
+mod brand_saiai;
 mod claude_desktop;
 mod claude_desktop_fixtures;
 mod claude_launcher;
@@ -49,11 +51,12 @@ mod windows_background;
 #[cfg(any(windows, test))]
 mod windows_desktop_runtime;
 
+use brand::BRAND;
 use desktop_product::DesktopProduct;
 
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
 #[cfg(target_os = "linux")]
-const SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME: &str = "saiai-local-proxy";
+const SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME: &str = BRAND.certificates.nss_nickname;
 const USAGE: &str = "\
 Usage:
   saiai --environment claude|codex|default <command>              # select a proxy environment
@@ -83,11 +86,11 @@ Use --configure-vscode-editor with init/init-codex to opt into the editor-wide p
 On Windows, --trust-vscode-ca also opts into CurrentUser Root trust and editor setup;
 use it only after consenting to this user-wide trust.";
 
-const SAIAI_CA_FILENAME: &str = "saiai-ca.crt";
-const SAIAI_CA_KEY_FILENAME: &str = "saiai-ca.key";
+const SAIAI_CA_FILENAME: &str = BRAND.certificates.ca_cert_filename;
+const SAIAI_CA_KEY_FILENAME: &str = BRAND.certificates.ca_key_filename;
 #[cfg(target_os = "windows")]
 const WINDOWS_PACKAGED_PROXY_LEASE_FILENAME: &str = "windows-packaged-proxy-lease.json";
-const SAIAI_CONFIG_VERSION: u32 = 2;
+const SAIAI_CONFIG_VERSION: u32 = BRAND.config.version;
 const CLAUDE_STREAM_IDLE_TIMEOUT_MS: &str = "600000";
 const DEFAULT_LOCAL_PROXY_LISTEN: &str = "127.0.0.1:19908";
 // Claude's updater goes through the local proxy like everything else; the
@@ -97,7 +100,7 @@ const DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12
 // Written by Client 1.1.0–1.1.57; recognized by uninstall and migrated at
 // local proxy startup.
 const LEGACY_DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local,downloads.claude.ai";
-const SAIAI_CONFIG_FILENAME: &str = "config.json";
+const SAIAI_CONFIG_FILENAME: &str = BRAND.config.filename;
 
 // `saiai codex` owns these variables only in the Codex child process. The
 // invoking shell and the user's system environment are never modified.
@@ -118,17 +121,17 @@ const CODEX_MANAGED_ENV: &[&str] = &[
     "no_proxy",
 ];
 const CODEX_LOCAL_PROXY_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local";
-const CODEX_IDE_ENV_BEGIN: &str = "# BEGIN SAIAI CODEX IDE (managed)";
-const CODEX_IDE_ENV_END: &str = "# END SAIAI CODEX IDE (managed)";
+const CODEX_IDE_ENV_BEGIN: &str = BRAND.markers.codex_ide_env_begin;
+const CODEX_IDE_ENV_END: &str = BRAND.markers.codex_ide_env_end;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-const CODEX_CERTIFICATE_CONTROL_HOST: &str = "certificate.saiai.local";
+const CODEX_CERTIFICATE_CONTROL_HOST: &str = BRAND.certificates.control_host;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-const CODEX_CERTIFICATE_SPKI_HEADER: &str = "x-saiai-leaf-spki-sha256";
-const CODEX_PLACEHOLDER_ACCOUNT_ID: &str = "saiai-local-proxy-account";
+const CODEX_CERTIFICATE_SPKI_HEADER: &str = BRAND.certificates.spki_header;
+const CODEX_PLACEHOLDER_ACCOUNT_ID: &str = BRAND.placeholders.codex_account_id;
 // Structurally valid but unsigned and therefore unusable against OpenAI. The
 // local proxy replaces request authentication at the Gateway boundary; these
 // claims only let Codex's local app-server expose an authenticated UI state.
-const CODEX_PLACEHOLDER_ID_TOKEN: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InNhaWFpLWxvY2FsLXByb3h5QGludmFsaWQiLCJleHAiOjQxMDI0NDQ4MDAsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X3BsYW5fdHlwZSI6InBsdXMiLCJjaGF0Z3B0X3VzZXJfaWQiOiJzYWlhaS1sb2NhbC1wcm94eS11c2VyIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoic2FpYWktbG9jYWwtcHJveHktYWNjb3VudCJ9fQ.c2FpYWktbG9jYWwtcHJveHk";
+const CODEX_PLACEHOLDER_ID_TOKEN: &str = BRAND.placeholders.codex_token;
 // Electron's Desktop shell decodes the access token as a JWT before it asks
 // its app-server for account state. Reuse the unsigned local-only token for
 // both fields; the local proxy replaces authorization before Gateway egress.
@@ -140,7 +143,7 @@ const CODEX_PLACEHOLDER_ACCESS_TOKEN: &str = CODEX_PLACEHOLDER_ID_TOKEN;
 // Codex resolves its timezone through iana-time-zone, which ignores `TZ` on
 // Linux and Windows. Codex time reporting is disabled through the managed
 // `include_environment_context_time = false` configuration key instead.
-const SAIAI_CHATGPT_TIMEZONE_ENV: &str = "SAIAI_CHATGPT_TIMEZONE";
+const SAIAI_CHATGPT_TIMEZONE_ENV: &str = BRAND.env.chatgpt_timezone;
 
 // Codex >= 0.163.0 omits the machine timezone and current date from the
 // model-visible <environment_context> only when this top-level key is false.
@@ -233,19 +236,19 @@ const MACOS_LAUNCHCTL_COMMAND: &str = "/bin/launchctl";
 #[cfg(target_os = "macos")]
 const MACOS_TAIL_COMMAND: &str = "/usr/bin/tail";
 #[cfg(target_os = "linux")]
-const SAIAI_LINUX_PID_FILENAME: &str = "saiai.pid";
+const SAIAI_LINUX_PID_FILENAME: &str = BRAND.service.pid_filename;
 #[cfg(target_os = "linux")]
-const SAIAI_LINUX_LOCK_FILENAME: &str = "saiai.lock";
+const SAIAI_LINUX_LOCK_FILENAME: &str = BRAND.service.lock_filename;
 #[cfg(target_os = "linux")]
 const SAIAI_LINUX_BACKGROUND_COMMAND: &str = "__run-background-proxy";
 #[cfg(target_os = "linux")]
 const SAIAI_LINUX_BACKGROUND_STATE_VERSION: u32 = 1;
 #[cfg(target_os = "windows")]
-const SAIAI_WINDOWS_PID_FILENAME: &str = "saiai.pid";
+const SAIAI_WINDOWS_PID_FILENAME: &str = BRAND.service.pid_filename;
 #[cfg(target_os = "windows")]
 const SAIAI_WINDOWS_BACKGROUND_COMMAND: &str = "__run-background-proxy";
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-const SAIAI_SERVICE_LOG_FILENAME: &str = "saiai.log";
+const SAIAI_SERVICE_LOG_FILENAME: &str = BRAND.service.log_filename;
 
 fn is_managed_claude_env(key: &str) -> bool {
     CLAUDE_MANAGED_ROUTING_ENV
@@ -635,9 +638,9 @@ fn generate_installation_ca() -> Result<(String, String)> {
         .collect();
     distinguished_name.push(
         DnType::CommonName,
-        format!("SAIAI local installation CA {suffix}"),
+        format!("{} {suffix}", BRAND.certificates.ca_common_name_prefix),
     );
-    distinguished_name.push(DnType::OrganizationName, "SAIAI");
+    distinguished_name.push(DnType::OrganizationName, BRAND.certificates.ca_organization);
     params.distinguished_name = distinguished_name;
     let certificate = params
         .self_signed(&key)
@@ -1596,7 +1599,8 @@ fn write_codex_local_proxy_auth_at(
 }
 
 fn is_codex_placeholder_access_token(token: &str) -> bool {
-    token.starts_with("saiai-local-proxy-placeholder-") || token == CODEX_PLACEHOLDER_ACCESS_TOKEN
+    token.starts_with(BRAND.placeholders.legacy_codex_token_prefix)
+        || token == CODEX_PLACEHOLDER_ACCESS_TOKEN
 }
 
 /// `None` when auth.json holds no real ChatGPT login; otherwise the access
@@ -1757,7 +1761,7 @@ fn run_linux_desktop(product: DesktopProduct, args: &[String]) -> Result<()> {
     prepare_isolated_desktop_state(&desktop_root, &desktop_codex)?;
     ensure_desktop_nss_ca(&desktop_home, &cfg.ca_cert_path)?;
 
-    let executable = env::var_os("SAIAI_CHATGPT_BIN")
+    let executable = env::var_os(BRAND.env.chatgpt_bin)
         .map(PathBuf::from)
         .filter(|path| path.is_file())
         .or_else(|| {
@@ -1996,7 +2000,7 @@ fn resolve_macos_chatgpt_executable() -> Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn resolve_macos_desktop_override() -> Result<Option<PathBuf>> {
-    for variable in ["SAIAI_DESKTOP_BIN", "SAIAI_CHATGPT_BIN"] {
+    for variable in [BRAND.env.desktop_bin, BRAND.env.chatgpt_bin] {
         if let Some(raw) = env::var_os(variable) {
             let path = PathBuf::from(raw);
             if !is_unix_executable(&path) {
@@ -2747,7 +2751,7 @@ fn windows_write_internet_proxy(settings: &LegacyWindowsInternetProxySettings) -
 }
 #[cfg(target_os = "windows")]
 fn resolve_windows_desktop_override() -> Result<Option<PathBuf>> {
-    for variable in ["SAIAI_DESKTOP_BIN", "SAIAI_CHATGPT_BIN"] {
+    for variable in [BRAND.env.desktop_bin, BRAND.env.chatgpt_bin] {
         if let Some(raw) = env::var_os(variable) {
             let path = PathBuf::from(raw);
             if !path.is_file() {
@@ -2801,7 +2805,7 @@ fn resolve_chatgpt_timezone() -> Result<Option<String>> {
     };
     let value = raw
         .to_str()
-        .context("SAIAI_CHATGPT_TIMEZONE must be valid UTF-8")?
+        .with_context(|| format!("{SAIAI_CHATGPT_TIMEZONE_ENV} must be valid UTF-8"))?
         .trim();
     resolve_chatgpt_timezone_value(Some(value))
 }
@@ -3837,7 +3841,7 @@ struct LinuxServiceLock {
 }
 
 fn print_version() -> Result<()> {
-    println!("saiai {}", env!("CARGO_PKG_VERSION"));
+    println!("{} {}", BRAND.binary_name, env!("CARGO_PKG_VERSION"));
     Ok(())
 }
 
@@ -4150,7 +4154,7 @@ fn run_service_stop() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn run_service_status() -> Result<()> {
-    println!("saiai {}", env!("CARGO_PKG_VERSION"));
+    println!("{} {}", BRAND.binary_name, env!("CARGO_PKG_VERSION"));
     print_process_env_conflicts_for_status();
     print_claude_settings_overrides_for_status();
     match read_saiai_config() {
@@ -4225,7 +4229,7 @@ fn run_service_status() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn run_service_status() -> Result<()> {
-    println!("saiai {}", env!("CARGO_PKG_VERSION"));
+    println!("{} {}", BRAND.binary_name, env!("CARGO_PKG_VERSION"));
     print_process_env_conflicts_for_status();
     print_claude_settings_overrides_for_status();
     match read_saiai_config() {
@@ -4253,7 +4257,7 @@ fn run_service_status() -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn run_service_status() -> Result<()> {
-    println!("saiai {}", env!("CARGO_PKG_VERSION"));
+    println!("{} {}", BRAND.binary_name, env!("CARGO_PKG_VERSION"));
     print_process_env_conflicts_for_status();
     print_claude_settings_overrides_for_status();
     match read_saiai_config() {
@@ -4450,12 +4454,12 @@ fn update_refresh_failure_is_recoverable(proxy_reachable: bool) -> bool {
 }
 
 fn start_managed_service_after_initialization(config_changed: bool) -> Result<()> {
-    if should_skip_initialization_proxy_start(env::var("SAIAI_SKIP_START").ok().as_deref()) {
+    if should_skip_initialization_proxy_start(env::var(BRAND.env.skip_start).ok().as_deref()) {
         println!("SAIAI local proxy start skipped (SAIAI_SKIP_START=1).");
         return Ok(());
     }
     let binary_changed =
-        binary_changed_during_initialization(env::var("SAIAI_BINARY_UPDATED").ok().as_deref());
+        binary_changed_during_initialization(env::var(BRAND.env.binary_updated).ok().as_deref());
     let managed_service_active = managed_service_is_active();
     let proxy_reachable = configured_local_proxy_reachable();
     if !initialization_requires_proxy_refresh(
@@ -4478,8 +4482,9 @@ fn run_update() -> Result<()> {
     let cfg = read_saiai_config()?;
     let asset = current_platform_asset_name()?;
     let base = cfg.base_url.trim().trim_end_matches('/');
-    let manifest_url = format!("{base}/saiai-cli/manifest.json");
-    let url = format!("{}/saiai-cli/{asset}", base);
+    let channel = BRAND.update.channel_path;
+    let manifest_url = format!("{base}/{channel}/manifest.json");
+    let url = format!("{base}/{channel}/{asset}");
     let current_exe = env::current_exe().context("failed to resolve current saiai executable")?;
     let current_exe = fs::canonicalize(&current_exe).unwrap_or_else(|_| current_exe.clone());
     let parent = current_exe
@@ -4510,7 +4515,7 @@ fn run_update() -> Result<()> {
             .with_context(|| format!("failed to compare remote version {remote_version:?}"))?;
         let asset_info = manifest
             .assets
-            .get(asset)
+            .get(&asset)
             .with_context(|| format!("manifest does not include asset {asset}"))?;
         let expected = asset_info.sha256.trim().to_ascii_lowercase();
         if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -4540,7 +4545,7 @@ fn run_update() -> Result<()> {
 
     println!("Downloading: {url}");
     let bytes = runtime.block_on(download_update_asset(&url, &egress))?;
-    validate_update_asset(&bytes, asset)?;
+    validate_update_asset(&bytes, &asset)?;
     if let Some(expected) = &expected_sha256 {
         let actual = sha256_hex(&bytes);
         if actual != *expected {
@@ -4558,7 +4563,11 @@ fn run_update() -> Result<()> {
 
     let candidate_version = command_stdout(&candidate_path, &["--version"])
         .with_context(|| format!("failed to run {}", candidate_path.display()))?;
-    if !candidate_version.trim_start().starts_with("saiai ") {
+    if !candidate_version
+        .trim_start()
+        .strip_prefix(BRAND.binary_name)
+        .is_some_and(|rest| rest.starts_with(' '))
+    {
         let _ = fs::remove_file(&candidate_path);
         bail!("downloaded binary did not report a SAIAI version: {candidate_version:?}");
     }
@@ -4624,7 +4633,11 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
     let mut report = DoctorReport::new();
     report.ok(
         "version",
-        format!("saiai {} ({target:?})", env!("CARGO_PKG_VERSION")),
+        format!(
+            "{} {} ({target:?})",
+            BRAND.binary_name,
+            env!("CARGO_PKG_VERSION")
+        ),
     );
     check_current_binary(&mut report);
     // These checks apply Claude Code's conflict rules; SAIAI-managed Codex
@@ -6463,7 +6476,8 @@ fn compare_versions(left: &str, right: &str) -> Result<Ordering> {
 fn parse_version_parts(raw: &str) -> Result<Vec<u64>> {
     let version = raw
         .trim()
-        .strip_prefix("saiai ")
+        .strip_prefix(BRAND.binary_name)
+        .and_then(|rest| rest.strip_prefix(' '))
         .unwrap_or(raw.trim())
         .trim()
         .trim_start_matches('v');
@@ -6495,27 +6509,37 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn current_platform_asset_name() -> Result<&'static str> {
-    match (env::consts::OS, env::consts::ARCH) {
-        ("linux", "x86_64") => Ok("saiai-linux-x86_64"),
-        ("linux", "aarch64") => Ok("saiai-linux-aarch64"),
-        ("macos", "x86_64") => Ok("saiai-macos-x86_64"),
-        ("macos", "aarch64") => Ok("saiai-macos-aarch64"),
-        ("windows", "x86_64") => Ok("saiai-windows-x86_64.exe"),
-        ("windows", "aarch64") => Ok("saiai-windows-aarch64.exe"),
+fn current_platform_asset_name() -> Result<String> {
+    let platform = match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => "linux-x86_64",
+        ("linux", "aarch64") => "linux-aarch64",
+        ("macos", "x86_64") => "macos-x86_64",
+        ("macos", "aarch64") => "macos-aarch64",
+        ("windows", "x86_64") => "windows-x86_64.exe",
+        ("windows", "aarch64") => "windows-aarch64.exe",
         (os, arch) => bail!("unsupported {os} architecture for update: {arch}"),
-    }
+    };
+    Ok(format!("{}{platform}", BRAND.update.asset_prefix))
+}
+
+/// Platform part of a release asset name of this brand (`linux-x86_64`, …).
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn asset_platform(asset: &str) -> &str {
+    asset
+        .strip_prefix(BRAND.update.asset_prefix)
+        .unwrap_or_default()
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn validate_update_asset(bytes: &[u8], asset: &str) -> Result<()> {
-    if asset.starts_with("saiai-linux-") {
+    let platform = asset_platform(asset);
+    if platform.starts_with("linux-") {
         return validate_elf_asset(bytes, asset);
     }
-    if asset.starts_with("saiai-macos-") {
+    if platform.starts_with("macos-") {
         return validate_macho_asset(bytes, asset);
     }
-    if asset.starts_with("saiai-windows-") {
+    if platform.starts_with("windows-") {
         return validate_pe_asset(bytes, asset);
     }
     bail!("unsupported update asset {asset}");
@@ -6527,8 +6551,8 @@ fn validate_elf_asset(bytes: &[u8], asset: &str) -> Result<()> {
         bail!("downloaded {asset} is not an ELF executable");
     }
     let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
-    match (asset, machine) {
-        ("saiai-linux-x86_64", 62) | ("saiai-linux-aarch64", 183) => Ok(()),
+    match (asset_platform(asset), machine) {
+        ("linux-x86_64", 62) | ("linux-aarch64", 183) => Ok(()),
         _ => bail!("downloaded {asset} has unexpected ELF machine id {machine}"),
     }
 }
@@ -6539,8 +6563,8 @@ fn validate_macho_asset(bytes: &[u8], asset: &str) -> Result<()> {
         bail!("downloaded {asset} is not a 64-bit Mach-O executable");
     }
     let cpu_type = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-    match (asset, cpu_type) {
-        ("saiai-macos-x86_64", 0x0100_0007) | ("saiai-macos-aarch64", 0x0100_000c) => Ok(()),
+    match (asset_platform(asset), cpu_type) {
+        ("macos-x86_64", 0x0100_0007) | ("macos-aarch64", 0x0100_000c) => Ok(()),
         _ => bail!("downloaded {asset} has unexpected Mach-O CPU type {cpu_type:#x}"),
     }
 }
@@ -6559,8 +6583,8 @@ fn validate_pe_asset(bytes: &[u8], asset: &str) -> Result<()> {
         bail!("downloaded {asset} is missing a PE signature");
     }
     let machine = u16::from_le_bytes([bytes[pe_offset + 4], bytes[pe_offset + 5]]);
-    match (asset, machine) {
-        ("saiai-windows-x86_64.exe", 0x8664) | ("saiai-windows-aarch64.exe", 0xaa64) => Ok(()),
+    match (asset_platform(asset), machine) {
+        ("windows-x86_64.exe", 0x8664) | ("windows-aarch64.exe", 0xaa64) => Ok(()),
         _ => bail!("downloaded {asset} has unexpected PE machine id {machine:#x}"),
     }
 }
@@ -6598,18 +6622,26 @@ fn command_stdout(path: &Path, args: &[&str]) -> Result<String> {
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn update_candidate_name(unique: &str) -> String {
     if cfg!(windows) {
-        format!(".saiai-update-{unique}.exe")
+        format!("{}{unique}.exe", BRAND.update.candidate_prefix)
     } else {
-        format!(".saiai-update-{unique}")
+        format!("{}{unique}", BRAND.update.candidate_prefix)
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn update_backup_name() -> String {
     if cfg!(windows) {
-        format!("saiai.bak-{}.exe", Utc::now().format("%Y%m%d-%H%M%S"))
+        format!(
+            "{}{}.exe",
+            BRAND.update.backup_prefix,
+            Utc::now().format("%Y%m%d-%H%M%S")
+        )
     } else {
-        format!("saiai.bak-{}", Utc::now().format("%Y%m%d-%H%M%S"))
+        format!(
+            "{}{}",
+            BRAND.update.backup_prefix,
+            Utc::now().format("%Y%m%d-%H%M%S")
+        )
     }
 }
 
@@ -6669,7 +6701,7 @@ fn finalize_update(
     fs::write(&script_path, script)
         .with_context(|| format!("failed to write {}", script_path.display()))?;
     if let Err(err) = ProcessCommand::new("powershell")
-        .env("SAIAI_HOME", saiai_config_dir()?)
+        .env(BRAND.env.home, saiai_config_dir()?)
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CODEX_HOME")
         .arg("-NoProfile")
@@ -6788,7 +6820,7 @@ fn windows_update_status_path(current_exe: &Path) -> Result<PathBuf> {
     Ok(current_exe
         .parent()
         .context("failed to resolve SAIAI executable directory")?
-        .join(".saiai-update-status.txt"))
+        .join(BRAND.update.status_filename))
 }
 
 #[cfg(target_os = "windows")]
@@ -6875,7 +6907,7 @@ StandardError=journal\n\
 \n\
 [Install]\n\
 WantedBy=default.target\n",
-        systemd_quote(&format!("SAIAI_HOME={saiai_home}"))?,
+        systemd_quote(&format!("{}={saiai_home}", BRAND.env.home))?,
         systemd_path_setting(&working_dir)?,
         systemd_quote(&exe)?,
         systemd_quote(&saiai_home)?
@@ -7016,7 +7048,7 @@ fn render_launchd_plist(
   </array>\n\
   <key>EnvironmentVariables</key>\n\
   <dict>\n\
-    <key>SAIAI_HOME</key>\n\
+    <key>{home_variable}</key>\n\
     <string>{saiai_home}</string>\n\
   </dict>\n\
   <key>WorkingDirectory</key>\n\
@@ -7031,7 +7063,8 @@ fn render_launchd_plist(
   <string>{log_path}</string>\n\
 </dict>\n\
 </plist>\n",
-        environment_scope::launchd_label()
+        environment_scope::launchd_label(),
+        home_variable = BRAND.env.home,
     ))
 }
 
@@ -7156,7 +7189,7 @@ fn start_linux_background_proxy(cfg: &SaiaiConfig) -> Result<u32> {
     let exe = env::current_exe().context("failed to resolve current saiai executable")?;
     let mut child = ProcessCommand::new(exe)
         .arg(SAIAI_LINUX_BACKGROUND_COMMAND)
-        .env("SAIAI_HOME", &saiai_home)
+        .env(BRAND.env.home, &saiai_home)
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CODEX_HOME")
         .stdin(Stdio::null())
@@ -7549,7 +7582,7 @@ fn start_windows_background_proxy() -> Result<u32> {
     let mut child = ProcessCommand::new(exe)
         .arg(SAIAI_WINDOWS_BACKGROUND_COMMAND)
         .arg("--instance-v2")
-        .env("SAIAI_HOME", &saiai_home)
+        .env(BRAND.env.home, &saiai_home)
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CODEX_HOME")
         .stdin(Stdio::null())
@@ -7754,7 +7787,7 @@ fn lock_windows_service_at(dir: &Path) -> Result<fs::File> {
         .read(true)
         .write(true)
         .truncate(false)
-        .open(dir.join("saiai.lock"))?;
+        .open(dir.join(BRAND.service.lock_filename))?;
     file.lock().context("cannot lock selected SAIAI service")?;
     Ok(file)
 }
@@ -8120,11 +8153,11 @@ fn saiai_config_dir() -> Result<PathBuf> {
     if let Some(scope) = environment_scope::active() {
         return Ok(scope.directory.clone());
     }
-    if let Some(dir) = env_dir_override("SAIAI_HOME") {
+    if let Some(dir) = env_dir_override(BRAND.env.home) {
         return Ok(dir);
     }
     let home = home_dir().context("failed to resolve home directory")?;
-    Ok(home.join(".saiai"))
+    Ok(home.join(BRAND.home_dir_name))
 }
 
 fn saiai_config_path() -> Result<PathBuf> {
@@ -8311,9 +8344,10 @@ fn write_bytes_atomic(path: &Path, data: &[u8], unix_mode: u32) -> Result<()> {
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
-        .unwrap_or("saiai");
+        .unwrap_or(BRAND.binary_name);
     let tmp_path = parent.join(format!(
-        ".{name}.saiai-tmp-{}-{}",
+        ".{name}.{}-{}-{}",
+        BRAND.config.temp_file_infix,
         std::process::id(),
         Uuid::new_v4().simple()
     ));

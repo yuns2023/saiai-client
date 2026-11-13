@@ -28,7 +28,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, lookup_host};
 
-pub(crate) const UPSTREAM_PROXY_ENV: &str = "SAIAI_UPSTREAM_PROXY";
+pub(crate) const UPSTREAM_PROXY_ENV: &str = crate::brand::BRAND.env.upstream_proxy;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PROXY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);

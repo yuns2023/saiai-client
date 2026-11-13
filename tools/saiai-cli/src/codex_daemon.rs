@@ -39,7 +39,9 @@ const UPDATE_TIMEOUT: Duration = Duration::from_secs(330);
 
 pub(crate) fn after_initialization(home: &Path) {
     if crate::should_skip_initialization_proxy_start(
-        std::env::var("SAIAI_SKIP_START").ok().as_deref(),
+        std::env::var(crate::brand::BRAND.env.skip_start)
+            .ok()
+            .as_deref(),
     ) {
         println!("Codex daemon refresh skipped (SAIAI_SKIP_START=1).");
         return;

@@ -1,5 +1,6 @@
 //! `saiai uninstall`: a read-only discovery builds the plan; execution removes
 //! only SAIAI-created files and values exactly equal to what SAIAI wrote.
+use crate::brand::BRAND;
 use crate::{environment_scope, vscode};
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value};
@@ -23,9 +24,9 @@ pub(crate) const SAIAI_HOME_FILES: &[&str] = &[
     crate::SAIAI_CA_FILENAME,
     crate::SAIAI_CA_KEY_FILENAME,
     "initialization.lock",
-    "saiai.lock",
-    "saiai.pid",
-    "saiai.log",
+    BRAND.service.lock_filename,
+    BRAND.service.pid_filename,
+    BRAND.service.log_filename,
     "client-device-key",
     "client-device.json",
     "client-device.lock",
@@ -463,13 +464,14 @@ fn discover_layout(args: &Args) -> Result<Discovery> {
     let exe = env::current_exe().ok();
     let exe_dir = exe.as_ref().and_then(|exe| {
         let name = exe.file_name()?.to_str()?;
-        matches!(name, "saiai" | "saiai.exe")
+        BRAND
+            .is_executable_name(name)
             .then(|| exe.parent().map(Path::to_path_buf))
             .flatten()
     });
     let default_install_dir = default_install_dir();
     let mut install_dirs = Vec::new();
-    match crate::env_dir_override("SAIAI_INSTALL_DIR") {
+    match crate::env_dir_override(BRAND.env.install_dir) {
         Some(dir) => install_dirs.push(dir),
         None => install_dirs.extend(default_install_dir.clone()),
     }
@@ -483,12 +485,12 @@ fn discover_layout(args: &Args) -> Result<Discovery> {
     #[cfg(windows)]
     let worker_executables = install_dirs
         .iter()
-        .map(|dir| dir.join("saiai.exe"))
+        .map(|dir| dir.join(format!("{}.exe", BRAND.binary_name)))
         .chain(exe)
         .chain(env::current_exe().ok())
         .collect();
-    let raw_home = crate::env_dir_override("SAIAI_HOME")
-        .or_else(|| crate::home_dir().map(|home| home.join(".saiai")));
+    let raw_home = crate::env_dir_override(BRAND.env.home)
+        .or_else(|| crate::home_dir().map(|home| home.join(BRAND.home_dir_name)));
     let home_is_link = raw_home.is_some_and(|path| {
         fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
     });
@@ -767,7 +769,7 @@ fn collect_backups(dir: &Path, exclude_saiai_ca: bool, plan: &mut Plan) {
         .filter_map(|entry| {
             let name = entry.file_name().to_str()?.to_string();
             (name.contains(".bak-")
-                && !(exclude_saiai_ca && name.starts_with("saiai-ca."))
+                && !(exclude_saiai_ca && name.starts_with(&ca_file_prefix()))
                 && entry.file_type().is_ok_and(|kind| kind.is_file()))
             .then(|| entry.path())
         })
@@ -1431,8 +1433,18 @@ pub(crate) fn is_saiai_home_file(name: &str) -> bool {
     SAIAI_HOME_FILES.iter().any(|file| {
         name == *file
             || name.starts_with(&format!("{file}.bak-"))
-            || name.starts_with(&format!(".{file}.saiai-tmp-"))
+            || name.starts_with(&format!(".{file}.{}-", BRAND.config.temp_file_infix))
     })
+}
+
+/// `<ca stem>.` shared by the CA certificate, its key and their backups.
+fn ca_file_prefix() -> String {
+    let (stem, _) = BRAND
+        .certificates
+        .ca_cert_filename
+        .split_once('.')
+        .unwrap_or((BRAND.certificates.ca_cert_filename, ""));
+    format!("{stem}.")
 }
 
 pub(crate) fn is_claude_ca_file(name: &str) -> bool {
@@ -1532,7 +1544,9 @@ fn plan_data(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
     }
     #[cfg(windows)]
     if let Some(local) = env::var_os("LOCALAPPDATA") {
-        let runtime = PathBuf::from(local).join("SAIAI").join("desktop-runtime");
+        let runtime = PathBuf::from(local)
+            .join(BRAND.windows_app_dir_name)
+            .join("desktop-runtime");
         if runtime.is_dir() {
             plan.remove_tree(Area::Data, runtime);
         }
@@ -1543,13 +1557,13 @@ fn plan_data(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
 // --------------------------------------------------------------- Program
 
 pub(crate) fn is_program_file(name: &str) -> bool {
-    matches!(
-        name,
-        "saiai" | "saiai.exe" | "saiai-previous" | "saiai-previous.exe"
-    ) || name.starts_with("saiai.bak-")
-        || name.starts_with(".saiai-update-")
-        || name.starts_with(".saiai.install.")
-        || name.starts_with(".saiai.replace.")
+    let binary = BRAND.binary_name;
+    BRAND.is_executable_name(name)
+        || name.strip_suffix(".exe").unwrap_or(name) == format!("{binary}-previous")
+        || name.starts_with(BRAND.update.backup_prefix)
+        || name.starts_with(BRAND.update.candidate_prefix)
+        || name.starts_with(&format!(".{binary}.install."))
+        || name.starts_with(&format!(".{binary}.replace."))
 }
 
 fn default_install_dir() -> Option<PathBuf> {
@@ -1557,11 +1571,19 @@ fn default_install_dir() -> Option<PathBuf> {
     {
         env::var_os("LOCALAPPDATA")
             .filter(|value| !value.is_empty())
-            .map(|local| PathBuf::from(local).join("SAIAI").join("bin"))
+            .map(|local| {
+                PathBuf::from(local)
+                    .join(BRAND.windows_app_dir_name)
+                    .join("bin")
+            })
             .or_else(|| {
                 env::var_os("USERPROFILE")
                     .filter(|value| !value.is_empty())
-                    .map(|home| PathBuf::from(home).join("AppData/Local/SAIAI/bin"))
+                    .map(|home| {
+                        // One component, spelled exactly as before (`/` separators).
+                        PathBuf::from(home)
+                            .join(format!("AppData/Local/{}/bin", BRAND.windows_app_dir_name))
+                    })
             })
     }
     #[cfg(not(windows))]
@@ -1595,7 +1617,8 @@ fn same_file(left: &Path, right: &Path) -> bool {
 
 fn is_main_program(path: &Path) -> bool {
     path.file_name()
-        .is_some_and(|name| name == "saiai" || name == "saiai.exe")
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| BRAND.is_executable_name(name))
 }
 
 /// Auxiliary files go first and the main program last, so any failure keeps
@@ -1715,7 +1738,8 @@ fn plan_services(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
         .iter()
         .map(|instance| {
             format!(
-                "saiai{}.service",
+                "{}{}.service",
+                BRAND.service.systemd_unit_prefix,
                 environment_scope::service_suffix_for(&discovery.root, &instance.dir)
             )
         })
@@ -1724,7 +1748,8 @@ fn plan_services(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
         if let Ok(entries) = fs::read_dir(dir) {
             names.extend(entries.flatten().filter_map(|entry| {
                 let name = entry.file_name().to_str()?.to_string();
-                is_service_file_name(&name, "saiai", ".service").then_some(name)
+                is_service_file_name(&name, BRAND.service.systemd_unit_prefix, ".service")
+                    .then_some(name)
             }));
         }
     }
@@ -1797,7 +1822,8 @@ fn plan_services(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
         .iter()
         .map(|instance| {
             format!(
-                "top.saiai.local-proxy{}",
+                "{}{}",
+                BRAND.service.launchd_label,
                 environment_scope::service_suffix_for(&discovery.root, &instance.dir)
             )
         })
@@ -1805,7 +1831,7 @@ fn plan_services(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
     if let Ok(entries) = fs::read_dir(&agents) {
         labels.extend(entries.flatten().filter_map(|entry| {
             let name = entry.file_name().to_str()?.to_string();
-            is_service_file_name(&name, "top.saiai.local-proxy", ".plist")
+            is_service_file_name(&name, BRAND.service.launchd_label, ".plist")
                 .then(|| name.trim_end_matches(".plist").to_string())
         }));
     }
@@ -2175,11 +2201,14 @@ fn relaunch_outside_install_dir(plan: &Plan, args: &Args) -> Result<Option<i32>>
     if !locked {
         return Ok(None);
     }
-    let directory =
-        env::temp_dir().join(format!("saiai-uninstall-{}", uuid::Uuid::new_v4().simple()));
+    let directory = env::temp_dir().join(format!(
+        "{}-uninstall-{}",
+        BRAND.binary_name,
+        uuid::Uuid::new_v4().simple()
+    ));
     fs::create_dir(&directory)
         .with_context(|| format!("failed to create {}", directory.display()))?;
-    let copy = directory.join("saiai.exe");
+    let copy = directory.join(format!("{}.exe", BRAND.binary_name));
     fs::copy(&exe, &copy).with_context(|| format!("failed to copy {}", exe.display()))?;
     println!();
     println!("Continuing from a temporary copy so the installed program can be removed.");
@@ -2213,7 +2242,7 @@ fn schedule_temporary_copy_removal() {
         .filter(|dir| {
             dir.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("saiai-uninstall-"))
+                .is_some_and(|name| name.starts_with(&format!("{}-uninstall-", BRAND.binary_name)))
         })
     else {
         return;
@@ -2306,11 +2335,13 @@ fn execute_remove_file(path: &Path, args: &Args) -> Result<Outcome> {
         {
             // The waiting parent still runs this image. Windows allows moving
             // it on the same volume; it is deleted after the parent exits.
-            let temporary = env::current_exe()
-                .ok()
-                .and_then(|exe| exe.parent().map(|dir| dir.join("installed-saiai.exe")));
+            let temporary = env::current_exe().ok().and_then(|exe| {
+                exe.parent()
+                    .map(|dir| dir.join(format!("installed-{}.exe", BRAND.binary_name)))
+            });
             let beside = path.with_file_name(format!(
-                ".saiai.replace.{}.bak",
+                ".{}.replace.{}.bak",
+                BRAND.binary_name,
                 uuid::Uuid::new_v4().simple()
             ));
             let remove_parent = default_install_dir()

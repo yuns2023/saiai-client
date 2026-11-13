@@ -1109,49 +1109,40 @@ fn after<'a>(_: &'a str) { env::var(\"SAIAI_AFTER\"); let _ = r#\"{\"SAIAI_RAW\"
 }
 
 /// Every `SAIAI_*` environment variable the client reads or hands to its own
-/// helper processes and scripts, with the production files that use it.
+/// helper processes and scripts, with the production files that spell it.
+/// Names owned by the brand are spelled only in `brand_saiai.rs`; their
+/// consumers are pinned by `brand_environment_fields_have_every_consumer`.
 /// Users, installers, services and older clients set these names; renaming
 /// or dropping one anywhere is a breaking change, and adding one should be a
 /// conscious decision recorded here.
 #[test]
 fn saiai_environment_variable_inventory_is_frozen() {
     let expected: &[(&str, &[&str])] = &[
-        ("SAIAI_BINARY_UPDATED", &["main.rs"]),
+        ("SAIAI_BINARY_UPDATED", &["brand_saiai.rs"]),
         ("SAIAI_CA_FILES", &["uninstall.rs"]),
         ("SAIAI_CA_THUMBPRINT", &["uninstall.rs"]),
         ("SAIAI_CA_THUMBPRINTS", &["uninstall.rs"]),
-        ("SAIAI_CHATGPT_BIN", &["main.rs"]),
-        ("SAIAI_CHATGPT_CHAT_PASSTHROUGH", &["local_proxy.rs"]),
-        ("SAIAI_CHATGPT_TIMEZONE", &["main.rs"]),
+        ("SAIAI_CHATGPT_BIN", &["brand_saiai.rs"]),
+        ("SAIAI_CHATGPT_CHAT_PASSTHROUGH", &["brand_saiai.rs"]),
+        ("SAIAI_CHATGPT_TIMEZONE", &["brand_saiai.rs"]),
         ("SAIAI_CHECK_EXE", &["main.rs"]),
         ("SAIAI_CHECK_PID", &["main.rs"]),
-        (
-            "SAIAI_CLAUDE_DESKTOP_ALLOW_UNTESTED",
-            &["claude_desktop.rs"],
-        ),
+        ("SAIAI_CLAUDE_DESKTOP_ALLOW_UNTESTED", &["brand_saiai.rs"]),
         ("SAIAI_CLEANUP_DIR", &["uninstall.rs"]),
         ("SAIAI_CLEANUP_DIRS", &["uninstall.rs"]),
         ("SAIAI_CLEANUP_FILES", &["uninstall.rs"]),
         ("SAIAI_DESKTOP_ACTIVATION_ARGS", &["main.rs"]),
         ("SAIAI_DESKTOP_APP_ID", &["main.rs"]),
-        ("SAIAI_DESKTOP_BIN", &["main.rs"]),
-        ("SAIAI_DESKTOP_BROWSER_USE", &["local_proxy.rs"]),
-        (
-            "SAIAI_HOME",
-            &[
-                "environment_scope.rs",
-                "local_proxy.rs",
-                "main.rs",
-                "uninstall.rs",
-            ],
-        ),
-        ("SAIAI_INSTALL_DIR", &["uninstall.rs"]),
-        ("SAIAI_OPENAI_TRACE", &["local_proxy.rs"]),
-        ("SAIAI_OPENAI_TRACE_PATH", &["local_proxy.rs"]),
+        ("SAIAI_DESKTOP_BIN", &["brand_saiai.rs"]),
+        ("SAIAI_DESKTOP_BROWSER_USE", &["brand_saiai.rs"]),
+        ("SAIAI_HOME", &["brand_saiai.rs"]),
+        ("SAIAI_INSTALL_DIR", &["brand_saiai.rs"]),
+        ("SAIAI_OPENAI_TRACE", &["brand_saiai.rs"]),
+        ("SAIAI_OPENAI_TRACE_PATH", &["brand_saiai.rs"]),
         ("SAIAI_PATH_KIND", &["uninstall.rs"]),
         ("SAIAI_PATH_NEW", &["uninstall.rs"]),
         ("SAIAI_PATH_OLD", &["uninstall.rs"]),
-        ("SAIAI_PROXY_VERBOSE", &["local_proxy.rs"]),
+        ("SAIAI_PROXY_VERBOSE", &["brand_saiai.rs"]),
         (
             "SAIAI_RUNTIME_APP_ID",
             &["windows_desktop_inspect.ps1", "windows_desktop_runtime.rs"],
@@ -1165,8 +1156,8 @@ fn saiai_environment_variable_inventory_is_frozen() {
             "SAIAI_RUNTIME_REQUIRE_NO_ACTORS",
             &["windows_desktop_inspect.ps1", "windows_desktop_runtime.rs"],
         ),
-        ("SAIAI_SKIP_START", &["codex_daemon.rs", "main.rs"]),
-        ("SAIAI_UPSTREAM_PROXY", &["upstream_proxy.rs"]),
+        ("SAIAI_SKIP_START", &["brand_saiai.rs"]),
+        ("SAIAI_UPSTREAM_PROXY", &["brand_saiai.rs"]),
         (
             "SAIAI_VSCODE_CA_PATH",
             &["vscode.rs", "vscode_trust_windows.ps1"],
@@ -1247,27 +1238,49 @@ fn inline_contract_literals_are_present() {
     for (file, needle) in [
         // Self-update channel below the configured Gateway base URL, and the
         // version prefix an update candidate must print.
-        ("main.rs", "\"{base}/saiai-cli/manifest.json\""),
-        ("main.rs", "\"{}/saiai-cli/{asset}\""),
-        ("main.rs", "starts_with(\"saiai \")"),
-        // Service identities: the start side and the uninstall discovery.
-        ("environment_scope.rs", "\"saiai{}.service\""),
-        ("environment_scope.rs", "\"top.saiai.local-proxy{}\""),
-        ("uninstall.rs", "\"saiai{}.service\""),
+        ("main.rs", "let channel = BRAND.update.channel_path;"),
+        ("main.rs", "\"{base}/{channel}/manifest.json\""),
+        ("main.rs", "\"{base}/{channel}/{asset}\""),
         (
-            "uninstall.rs",
-            "is_service_file_name(&name, \"saiai\", \".service\")",
+            "main.rs",
+            "!candidate_version\n        .trim_start()\n        .strip_prefix(BRAND.binary_name)\n        .is_some_and(|rest| rest.starts_with(' '))",
         ),
-        ("uninstall.rs", "\"top.saiai.local-proxy{}\""),
+        // Service identities: the start side and the uninstall discovery.
+        (
+            "environment_scope.rs",
+            "\"{}{}.service\",\n        BRAND.service.systemd_unit_prefix,",
+        ),
+        (
+            "environment_scope.rs",
+            "\"{}{}\",\n        BRAND.service.launchd_label,",
+        ),
         (
             "uninstall.rs",
-            "is_service_file_name(&name, \"top.saiai.local-proxy\", \".plist\")",
+            "\"{}{}.service\",\n                BRAND.service.systemd_unit_prefix,",
+        ),
+        (
+            "uninstall.rs",
+            "is_service_file_name(&name, BRAND.service.systemd_unit_prefix, \".service\")",
+        ),
+        (
+            "uninstall.rs",
+            "\"{}{}\",\n                BRAND.service.launchd_label,",
+        ),
+        (
+            "uninstall.rs",
+            "is_service_file_name(&name, BRAND.service.launchd_label, \".plist\")",
         ),
         // Windows: stale CAs are recognized by organization.
         ("main.rs", "O=SAIAI(,|$)"),
         // Windows per-user install directory known to uninstall.
-        ("uninstall.rs", ".join(\"SAIAI\").join(\"bin\")"),
-        ("uninstall.rs", "AppData/Local/SAIAI/bin"),
+        (
+            "uninstall.rs",
+            ".join(BRAND.windows_app_dir_name)\n                    .join(\"bin\")",
+        ),
+        (
+            "uninstall.rs",
+            ".join(format!(\"AppData/Local/{}/bin\", BRAND.windows_app_dir_name))",
+        ),
         // Windows Desktop runtime directory: produced by the observer script,
         // consumed by the launcher, removed by uninstall.
         (
@@ -1279,19 +1292,28 @@ fn inline_contract_literals_are_present() {
             "pub runtime_directory: String,",
         ),
         ("main.rs", "PathBuf::from(&initial.runtime_directory)"),
-        ("uninstall.rs", ".join(\"SAIAI\").join(\"desktop-runtime\")"),
+        (
+            "uninstall.rs",
+            ".join(BRAND.windows_app_dir_name)\n            .join(\"desktop-runtime\")",
+        ),
         // The installer's "binary replaced" flag is read here.
         (
             "main.rs",
-            "binary_changed_during_initialization(env::var(\"SAIAI_BINARY_UPDATED\")",
+            "binary_changed_during_initialization(env::var(BRAND.env.binary_updated)",
         ),
         // Desktop synthetic identity returned by the local sidecars.
-        ("local_proxy.rs", "\"saiai-local-proxy@example.invalid\""),
+        (
+            "local_proxy.rs",
+            "const SAIAI_DESKTOP_EMAIL: &str = BRAND.placeholders.desktop_email;",
+        ),
         ("local_proxy.rs", "\"userID\":\"saiai-local-proxy-user\""),
         ("local_proxy.rs", "\"stableID\":\"saiai-local-proxy\""),
         ("local_proxy.rs", "\"x-saiai-chat-preference-restored\""),
         // Atomic temporary files that uninstall recognizes.
-        ("main.rs", "\".{name}.saiai-tmp-{}-{}\""),
+        (
+            "main.rs",
+            "\".{name}.{}-{}-{}\",\n        BRAND.config.temp_file_infix,",
+        ),
     ] {
         let text = sources
             .get(file)
@@ -1301,6 +1323,157 @@ fn inline_contract_literals_are_present() {
             "SAIAI contract literal disappeared from tools/saiai-cli/src/{file}: {needle}"
         );
     }
+}
+
+/// Every brand-owned environment variable is still read (or passed) by each
+/// production file that used the literal name before it moved to the brand.
+#[test]
+fn brand_environment_fields_have_every_consumer() {
+    let sources = cli_sources();
+    let expected: &[(&str, &[&str])] = &[
+        (
+            "BRAND.env.home",
+            &[
+                "environment_scope.rs",
+                "local_proxy.rs",
+                "main.rs",
+                "uninstall.rs",
+            ],
+        ),
+        ("BRAND.env.install_dir", &["uninstall.rs"]),
+        ("BRAND.env.skip_start", &["codex_daemon.rs", "main.rs"]),
+        ("BRAND.env.binary_updated", &["main.rs"]),
+        ("BRAND.env.upstream_proxy", &["upstream_proxy.rs"]),
+        ("BRAND.env.chatgpt_timezone", &["main.rs"]),
+        ("BRAND.env.chatgpt_bin", &["main.rs"]),
+        ("BRAND.env.desktop_bin", &["main.rs"]),
+        ("BRAND.env.chatgpt_chat_passthrough", &["local_proxy.rs"]),
+        ("BRAND.env.desktop_browser_use", &["local_proxy.rs"]),
+        ("BRAND.env.openai_trace", &["local_proxy.rs"]),
+        ("BRAND.env.openai_trace_path", &["local_proxy.rs"]),
+        ("BRAND.env.proxy_verbose", &["local_proxy.rs"]),
+        (
+            "BRAND.env.claude_desktop_allow_untested",
+            &["claude_desktop.rs"],
+        ),
+    ];
+    for (field, files) in expected {
+        // `BRAND.env.openai_trace` is a prefix of `…_trace_path`.
+        let users = sources
+            .iter()
+            .filter(|(_, text)| {
+                text.match_indices(field).any(|(index, _)| {
+                    !text[index + field.len()..]
+                        .starts_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_')
+                })
+            })
+            .map(|(file, _)| file.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(&users, files, "consumers of {field}");
+    }
+}
+
+/// The SAIAI values of every brand field, written out by hand. A refactor
+/// may move or rename the fields, never change these values.
+#[test]
+fn saiai_brand_values_are_frozen() {
+    let brand = crate::brand::BRAND;
+    assert_eq!(brand.binary_name, "saiai");
+    assert_eq!(brand.home_dir_name, ".saiai");
+    assert_eq!(brand.windows_app_dir_name, "SAIAI");
+    assert_eq!(brand.config.filename, "config.json");
+    assert_eq!(brand.config.version, 2);
+    assert_eq!(brand.config.temp_file_infix, "saiai-tmp");
+    let env = &brand.env;
+    assert_eq!(
+        [
+            env.home,
+            env.install_dir,
+            env.skip_start,
+            env.binary_updated,
+            env.upstream_proxy,
+            env.chatgpt_timezone,
+            env.chatgpt_bin,
+            env.desktop_bin,
+            env.chatgpt_chat_passthrough,
+            env.desktop_browser_use,
+            env.openai_trace,
+            env.openai_trace_path,
+            env.proxy_verbose,
+            env.claude_desktop_allow_untested,
+        ],
+        [
+            "SAIAI_HOME",
+            "SAIAI_INSTALL_DIR",
+            "SAIAI_SKIP_START",
+            "SAIAI_BINARY_UPDATED",
+            "SAIAI_UPSTREAM_PROXY",
+            "SAIAI_CHATGPT_TIMEZONE",
+            "SAIAI_CHATGPT_BIN",
+            "SAIAI_DESKTOP_BIN",
+            "SAIAI_CHATGPT_CHAT_PASSTHROUGH",
+            "SAIAI_DESKTOP_BROWSER_USE",
+            "SAIAI_OPENAI_TRACE",
+            "SAIAI_OPENAI_TRACE_PATH",
+            "SAIAI_PROXY_VERBOSE",
+            "SAIAI_CLAUDE_DESKTOP_ALLOW_UNTESTED",
+        ]
+    );
+    let certificates = &brand.certificates;
+    assert_eq!(certificates.ca_cert_filename, "saiai-ca.crt");
+    assert_eq!(certificates.ca_key_filename, "saiai-ca.key");
+    assert_eq!(
+        certificates.ca_common_name_prefix,
+        "SAIAI local installation CA"
+    );
+    assert_eq!(certificates.ca_organization, "SAIAI");
+    assert_eq!(certificates.nss_nickname, "saiai-local-proxy");
+    assert_eq!(certificates.tls_leaf_salt, b"SAIAI local proxy TLS leaf v1");
+    assert_eq!(certificates.control_host, "certificate.saiai.local");
+    assert_eq!(certificates.spki_header, "x-saiai-leaf-spki-sha256");
+    let service = &brand.service;
+    assert_eq!(service.systemd_unit_prefix, "saiai");
+    assert_eq!(service.launchd_label, "top.saiai.local-proxy");
+    assert_eq!(service.pid_filename, "saiai.pid");
+    assert_eq!(service.lock_filename, "saiai.lock");
+    assert_eq!(service.log_filename, "saiai.log");
+    let update = &brand.update;
+    assert_eq!(update.channel_path, "saiai-cli");
+    assert_eq!(update.asset_prefix, "saiai-");
+    assert_eq!(update.candidate_prefix, ".saiai-update-");
+    assert_eq!(update.backup_prefix, "saiai.bak-");
+    assert_eq!(update.status_filename, ".saiai-update-status.txt");
+    let markers = &brand.markers;
+    assert_eq!(
+        markers.codex_ide_env_begin,
+        "# BEGIN SAIAI CODEX IDE (managed)"
+    );
+    assert_eq!(markers.codex_ide_env_end, "# END SAIAI CODEX IDE (managed)");
+    assert_eq!(markers.vscode_proxy, "// SAIAI managed VSCode proxy: ");
+    let placeholders = &brand.placeholders;
+    assert_eq!(placeholders.codex_account_id, "saiai-local-proxy-account");
+    assert_eq!(placeholders.codex_token, PLACEHOLDER_JWT);
+    assert_eq!(
+        placeholders.legacy_codex_token_prefix,
+        "saiai-local-proxy-placeholder-"
+    );
+    assert_eq!(placeholders.desktop_token_prefix, "saiai-desktop-");
+    assert_eq!(
+        placeholders.claude_desktop_token_prefix,
+        "saiai-desktop-claude-"
+    );
+    assert_eq!(placeholders.claude_desktop_session_prefix, "saiai-local-");
+    assert_eq!(
+        placeholders.desktop_email,
+        "saiai-local-proxy@example.invalid"
+    );
+    let proof = &brand.client_proof;
+    assert_eq!(proof.header, "x-saiai-client-proof");
+    assert_eq!(proof.message_domain, "saiai-client-proof-v1");
+    assert_eq!(proof.enroll_path, "/api/v1/client/devices/enroll");
+    assert_eq!(proof.key_filename, "client-device-key");
+    assert_eq!(proof.lock_filename, "client-device.lock");
+    assert_eq!(proof.device_filename, "client-device.json");
 }
 
 /// Executes the observer's production expression for the runtime directory.

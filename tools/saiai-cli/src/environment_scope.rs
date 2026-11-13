@@ -1,5 +1,6 @@
 //! Resolve once, before side effects. Config paths and service identities must
 //! use the same selection, including children started by a launcher.
+use crate::brand::BRAND;
 use crate::{Command, DoctorTarget};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -72,9 +73,9 @@ pub(crate) fn environment_product(name: &str) -> Option<&'static str> {
 /// Normalized user home and SAIAI root, resolved exactly like `initialize`.
 pub(crate) fn layout() -> Result<(PathBuf, PathBuf)> {
     let home = normalize(&crate::home_dir().context("failed to resolve home directory")?)?;
-    let root = match override_dir("SAIAI_HOME")? {
+    let root = match override_dir(BRAND.env.home)? {
         Some(directory) => directory,
-        None => normalize(&home.join(".saiai"))?,
+        None => normalize(&home.join(BRAND.home_dir_name))?,
     };
     Ok((home, root))
 }
@@ -345,14 +346,16 @@ pub(crate) fn isolated() -> bool {
 #[cfg(target_os = "linux")]
 pub(crate) fn service_name() -> String {
     format!(
-        "saiai{}.service",
+        "{}{}.service",
+        BRAND.service.systemd_unit_prefix,
         active().map_or_else(String::new, Scope::service_suffix)
     )
 }
 #[cfg(target_os = "macos")]
 pub(crate) fn launchd_label() -> String {
     format!(
-        "top.saiai.local-proxy{}",
+        "{}{}",
+        BRAND.service.launchd_label,
         active().map_or_else(String::new, Scope::service_suffix)
     )
 }

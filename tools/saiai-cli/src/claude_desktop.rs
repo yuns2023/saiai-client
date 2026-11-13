@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 #[cfg(any(target_os = "linux", test))]
 pub(crate) const VERSION: &str = "4.23118.0";
-pub(crate) const TOKEN_PREFIX: &str = "saiai-desktop-claude-";
+pub(crate) const TOKEN_PREFIX: &str = crate::brand::BRAND.placeholders.claude_desktop_token_prefix;
 #[cfg(target_os = "linux")]
 pub(crate) const SCOPE: &str = "Claude Desktop: Code only; Chat and Cowork are not supported.";
 
@@ -121,7 +121,10 @@ impl Identity {
             ),
             refresh_token: format!("{TOKEN_PREFIX}refresh-{}", uuid::Uuid::new_v4().simple()),
             session: format!(
-                "saiai-local-{}{}",
+                "{}{}{}",
+                crate::brand::BRAND
+                    .placeholders
+                    .claude_desktop_session_prefix,
                 uuid::Uuid::new_v4().simple(),
                 uuid::Uuid::new_v4().simple()
             ),
@@ -183,7 +186,11 @@ pub(crate) fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
-    let temp = parent.join(format!(".saiai-{}.tmp", uuid::Uuid::new_v4()));
+    let temp = parent.join(format!(
+        ".{}-{}.tmp",
+        crate::brand::BRAND.binary_name,
+        uuid::Uuid::new_v4()
+    ));
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -307,7 +314,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         let version = installed_version()?;
         check_version(
             &version,
-            std::env::var("SAIAI_CLAUDE_DESKTOP_ALLOW_UNTESTED").as_deref() == Ok("1"),
+            std::env::var(crate::brand::BRAND.env.claude_desktop_allow_untested).as_deref()
+                == Ok("1"),
         )?;
         let executable = Path::new("/usr/bin/claude-desktop");
         if !executable.is_file() {
