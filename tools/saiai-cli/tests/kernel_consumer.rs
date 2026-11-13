@@ -6,7 +6,9 @@
 //! than from SAIAI.
 
 use proxy_cli::contract::desktop::{self, Request};
-use proxy_cli::contract::{codex, config, environment, scripts, uninstall, update, vscode};
+use proxy_cli::contract::{
+    claude_desktop, codex, config, environment, scripts, service, uninstall, update, vscode,
+};
 use proxy_cli::{
     Brand, CertificateNames, ConfigNames, EnvironmentNames, NoGatewayExtension, OwnershipMarkers,
     PlaceholderIdentities, RuntimeContext, ScriptNames, ServiceNames, UpdateNames,
@@ -137,6 +139,56 @@ fn entries_refuse_a_brand_that_is_not_installed() {
     assert!(uninstall::is_home_file(&OTHER, "x").is_err());
     assert!(uninstall::is_program_file(&OTHER, "x").is_err());
     assert!(uninstall::is_claude_ca_file(&OTHER, "x").is_err());
+    assert!(service::owns_listener(&OTHER, "x").is_err());
+    assert!(scripts::env(&OTHER, "X").is_err());
+    assert!(scripts::null_sentinel(&OTHER).is_err());
+    assert!(scripts::identifier_prefix(&OTHER).is_err());
+    #[cfg(windows)]
+    assert!(scripts::helper_failure_prefix(&OTHER).is_err());
+    assert!(desktop::chat_relay_target(&OTHER, "/x").is_err());
+    assert!(desktop::is_forwarded_chat_path(&OTHER, "/x").is_err());
+    assert!(claude_desktop::load_identity(&OTHER, directory.path()).is_err());
+}
+
+#[test]
+fn listener_and_helper_names_use_the_installed_brand() {
+    assert!(service::owns_listener(ktest(), "my-ktest-worker").unwrap());
+    assert!(service::owns_listener(ktest(), "KTEST.exe").unwrap());
+    assert!(!service::owns_listener(ktest(), "saiai").unwrap());
+    assert_eq!(scripts::env(ktest(), "CA_FILES").unwrap(), "KTEST_CA_FILES");
+    assert_eq!(scripts::null_sentinel(ktest()).unwrap(), "__KTEST_NULL__");
+    assert_eq!(scripts::identifier_prefix(ktest()).unwrap(), "Ktest");
+    #[cfg(windows)]
+    assert_eq!(
+        scripts::helper_failure_prefix(ktest()).unwrap(),
+        "KTEST_DESKTOP_HELPER_FAILURE:"
+    );
+    assert!(
+        scripts::render(ktest(), scripts::UNINSTALL_USER_PATH)
+            .unwrap()
+            .contains("Add-Type -Namespace KtestUninstall")
+    );
+}
+
+#[test]
+fn without_a_chat_relay_nothing_is_relayed() {
+    // NoGatewayExtension has no Chat relay.
+    assert!(
+        desktop::chat_relay_target(ktest(), "/backend-api/saiai/chat-updates")
+            .unwrap()
+            .is_err()
+    );
+    assert!(!desktop::is_forwarded_chat_path(ktest(), "/chatgpt/backend-api/models").unwrap());
+}
+
+#[test]
+fn no_persisted_desktop_identity_loads_as_none() {
+    let root = tempfile::tempdir().unwrap();
+    assert!(
+        claude_desktop::load_identity(ktest(), root.path())
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]

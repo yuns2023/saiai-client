@@ -383,7 +383,7 @@ def verify_cli() -> None:
     # the text as the SAIAI build renders it. The binding check here is only
     # file-level (the bindings exist somewhere in lib.rs); that every
     # placeholder is bound in its own call is proven by the Rust test
-    # brand_contract_tests::brand_text_renders_the_frozen_saiai_bytes.
+    # saiai_source_contract::brand_text_renders_the_frozen_saiai_bytes.
     for binding in ("brand_binary = BRAND.binary_name", "brand_product = BRAND.product_name"):
         require(binding in main, f"CLI text is missing the brand binding {binding!r}")
     main = main.replace("{brand_binary}", "saiai").replace("{brand_product}", "SAIAI")

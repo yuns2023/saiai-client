@@ -3,8 +3,8 @@
 
 Expected values are hand-written literals describing what published clients,
 installers and the update channel already depend on. They must not be read
-from the scripts under test or from a future brand definition. See
-tools/saiai-cli/src/brand_contract_tests.rs for the client half.
+from the scripts under test or from a future brand definition. See the
+tools/saiai-cli/tests/saiai_*.rs contract tests for the client half.
 """
 
 from __future__ import annotations

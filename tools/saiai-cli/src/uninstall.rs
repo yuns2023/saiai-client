@@ -2171,6 +2171,23 @@ try{
     Ok(())
 }
 
+/// Replaces the user PATH value and broadcasts the change (brand template).
+#[cfg(any(windows, test, feature = "contract"))]
+pub(crate) const USER_PATH_SCRIPT: &str = r#"
+$ErrorActionPreference='Stop'
+$k=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment',$true)
+try{
+  $current=[string]$k.GetValue('Path',$null,'DoNotExpandEnvironmentNames')
+  if($current -cne $env:@@ENV@@PATH_OLD -or [string]$k.GetValueKind('Path') -cne $env:@@ENV@@PATH_KIND){throw 'the user PATH changed since the plan was shown'}
+  if([string]::IsNullOrEmpty($env:@@ENV@@PATH_NEW)){$k.DeleteValue('Path',$false)}
+  else{$k.SetValue('Path',$env:@@ENV@@PATH_NEW,[Microsoft.Win32.RegistryValueKind]$env:@@ENV@@PATH_KIND)}
+}finally{$k.Close()}
+Add-Type -Namespace @@ID@@Uninstall -Name Native -MemberDefinition '[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'
+$result=[UIntPtr]::Zero
+[void][@@ID@@Uninstall.Native]::SendMessageTimeout([IntPtr]0xffff,0x1A,[UIntPtr]::Zero,'Environment',2,5000,[ref]$result)
+'updated'
+"#;
+
 #[cfg(windows)]
 fn execute_user_path(
     directory: &Path,
@@ -2185,22 +2202,8 @@ fn execute_user_path(
             brand_windows_setup = BRAND.update.windows_setup_command
         )));
     }
-    const SCRIPT: &str = r#"
-$ErrorActionPreference='Stop'
-$k=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment',$true)
-try{
-  $current=[string]$k.GetValue('Path',$null,'DoNotExpandEnvironmentNames')
-  if($current -cne $env:@@ENV@@PATH_OLD -or [string]$k.GetValueKind('Path') -cne $env:@@ENV@@PATH_KIND){throw 'the user PATH changed since the plan was shown'}
-  if([string]::IsNullOrEmpty($env:@@ENV@@PATH_NEW)){$k.DeleteValue('Path',$false)}
-  else{$k.SetValue('Path',$env:@@ENV@@PATH_NEW,[Microsoft.Win32.RegistryValueKind]$env:@@ENV@@PATH_KIND)}
-}finally{$k.Close()}
-Add-Type -Namespace @@ID@@Uninstall -Name Native -MemberDefinition '[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'
-$result=[UIntPtr]::Zero
-[void][@@ID@@Uninstall.Native]::SendMessageTimeout([IntPtr]0xffff,0x1A,[UIntPtr]::Zero,'Environment',2,5000,[ref]$result)
-'updated'
-"#;
     powershell(
-        &crate::script_brand::render(SCRIPT),
+        &crate::script_brand::render(USER_PATH_SCRIPT),
         &[
             (
                 crate::script_brand::env("PATH_OLD").as_str(),
