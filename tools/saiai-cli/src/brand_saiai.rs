@@ -92,6 +92,7 @@ pub(crate) const SAIAI_VALUES: Brand = Brand {
         chat_updates_path: "/backend-api/saiai/chat-updates",
         chat_preference_restored_header: "x-saiai-chat-preference-restored",
     },
+    sensitive_inbound_headers: &["x-saiai-client-proof"],
     scripts: ScriptNames {
         env_prefix: "SAIAI_",
         identifier_prefix: "Saiai",

@@ -446,3 +446,170 @@ fn client_proof_enrollment_reports_the_release_version() {
         serde_json::from_str(&request[request.find("\r\n\r\n").unwrap() + 4..]).unwrap();
     assert_eq!(body["client_version"], release_version().as_str());
 }
+
+/// The running SAIAI proxy signs Gateway requests with its device proof and
+/// never relays a proof header a client sent.
+#[test]
+fn proxy_signs_gateway_requests_and_strips_inbound_proofs() {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let sandbox = Sandbox::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let gateway = format!("http://{}", listener.local_addr().unwrap());
+    let (sender, receiver) = std::sync::mpsc::channel::<String>();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_gateway = Arc::clone(&stop);
+    let gateway_thread = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while Instant::now() < deadline && !stop_gateway.load(Ordering::SeqCst) {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            let _ = stream.set_nonblocking(false);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while let Ok(read) = stream.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&request).to_string();
+                if let Some(split) = text.find("\r\n\r\n") {
+                    let length = text[..split]
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= split + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let text = String::from_utf8_lossy(&request).to_string();
+            let body = if text.starts_with("POST /api/v1/client/devices/enroll ") {
+                r#"{"device_id":"cd_EEEEEEEEEEEEEEEEEEEEEE","status":"active"}"#
+            } else {
+                "{}"
+            };
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            if sender.send(text).is_err() {
+                return;
+            }
+        }
+    });
+    sandbox.run(&mut sandbox.command(&[
+        "init",
+        "--base-url",
+        &gateway,
+        "--api-key",
+        "TEST_ONLY_CONTRACT_SIGNED",
+    ]));
+    let config = read_json(&sandbox.home.join(".saiai/config.json"));
+    let listen = config["listen"].as_str().unwrap().to_string();
+    let ca = std::fs::read(config["ca_cert_path"].as_str().unwrap()).unwrap();
+    let log = sandbox.home.with_file_name("signing-proxy.log");
+    let file = std::fs::File::create(&log).unwrap();
+    let mut proxy = sandbox
+        .command(&[])
+        .env("SAIAI_UPSTREAM_PROXY", "direct")
+        .stdout(file.try_clone().unwrap())
+        .stderr(file)
+        .spawn()
+        .unwrap();
+
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in rustls_pemfile::certs(&mut std::io::Cursor::new(&ca)) {
+        roots.add(certificate.unwrap()).unwrap();
+    }
+    let tls = Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let send = || -> Option<()> {
+        let mut tcp = std::net::TcpStream::connect(&listen).ok()?;
+        tcp.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+        tcp.write_all(
+            b"CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n",
+        )
+        .ok()?;
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            tcp.read_exact(&mut byte).ok()?;
+            head.push(byte[0]);
+        }
+        let connection = rustls::ClientConnection::new(
+            Arc::clone(&tls),
+            "api.anthropic.com".try_into().unwrap(),
+        )
+        .ok()?;
+        let mut stream = rustls::StreamOwned::new(connection, tcp);
+        stream
+            .write_all(b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nX-Saiai-Client-Proof: v1.MOCK_SPOOFED\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}")
+            .ok()?;
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+        Some(())
+    };
+
+    // Enrollment first, then requests until the device record is in use.
+    let mut forwarded = None;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline && forwarded.is_none() {
+        let _ = send();
+        while let Ok(request) = receiver.recv_timeout(Duration::from_millis(500)) {
+            if request.starts_with("POST /v1/messages ")
+                && request
+                    .to_ascii_lowercase()
+                    .contains("x-saiai-client-proof: v1.cd_eeee")
+            {
+                forwarded = Some(request);
+            }
+        }
+    }
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+    stop.store(true, Ordering::SeqCst);
+    drop(receiver);
+    let _ = gateway_thread.join();
+    let request = forwarded.unwrap_or_else(|| {
+        panic!(
+            "no signed Gateway request within 60 s; proxy log:\n{}",
+            String::from_utf8_lossy(&std::fs::read(&log).unwrap_or_default())
+        )
+    });
+    let proofs = request
+        .lines()
+        .filter(|line| {
+            line.to_ascii_lowercase()
+                .starts_with("x-saiai-client-proof:")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(proofs.len(), 1, "{request}");
+    assert!(!proofs[0].contains("MOCK_SPOOFED"), "{request}");
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer test_only_contract_signed"),
+        "{request}"
+    );
+}

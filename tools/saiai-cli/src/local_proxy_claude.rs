@@ -288,16 +288,21 @@ fn oauth(request: &IncomingRequest, path: &str, id: &Identity, now: Instant) -> 
     (200, token_response(id))
 }
 
-fn public_request_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "accept"
-            | "accept-language"
-            | "user-agent"
-            | "if-none-match"
-            | "if-modified-since"
-            | "range"
-    )
+pub(super) fn public_request_header(
+    name: &str,
+    extension: &dyn crate::gateway::GatewayExtension,
+) -> bool {
+    // Reserved headers are refused before the allowlist is consulted.
+    !crate::gateway::is_reserved_inbound_header(extension, name)
+        && matches!(
+            name.to_ascii_lowercase().as_str(),
+            "accept"
+                | "accept-language"
+                | "user-agent"
+                | "if-none-match"
+                | "if-modified-since"
+                | "range"
+        )
 }
 fn public_response_header(name: &str, value: &str) -> bool {
     should_forward_response_header(name)
@@ -322,7 +327,7 @@ async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-async fn models(state: &State, id: &Identity) -> Result<Vec<Value>> {
+pub(super) async fn models(state: &State, id: &Identity) -> Result<Vec<Value>> {
     if let Some((at, models)) = MODELS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -341,17 +346,31 @@ async fn models(state: &State, id: &Identity) -> Result<Vec<Value>> {
             .get(&url)
             .bearer_auth(&*route.api_key)
             .header("anthropic-version", "2023-06-01")
-            .timeout(Duration::from_secs(30));
-        let parsed = Url::parse(&url)?;
-        if let Some(proof) = state.client_proof_header(
+            .timeout(Duration::from_secs(30))
+            .build()?;
+        // Like the other exits: sign the finished request, then insert.
+        let signed_target = crate::gateway::wire_target(request.url());
+        let bearer = request
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            // Exactly what `bearer_auth` wrote: the route key, untrimmed.
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::to_string);
+        for (name, value) in state.gateway_signature(
+            crate::gateway::Transport::Http,
             route,
-            "GET",
-            &client_proof::wire_target(&parsed),
-            Some(&route.api_key),
+            request.method().as_str(),
+            &signed_target,
+            bearer.as_deref(),
         ) {
-            request = request.header(client_proof::HEADER_NAME.get(), proof);
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(&value) {
+                request
+                    .headers_mut()
+                    .insert(reqwest::header::HeaderName::from_static(name), value);
+            }
         }
-        let response = request.send().await?.error_for_status()?;
+        let response = client.execute(request).await?.error_for_status()?;
         let body: Value = serde_json::from_slice(&bounded_body(response).await?)?;
         let data = body
             .get("data")
@@ -425,7 +444,7 @@ async fn public(
         .header("accept-encoding", "identity")
         .timeout(Duration::from_secs(30));
     for (name, value) in &request.headers {
-        if public_request_header(name)
+        if public_request_header(name, state.gateway)
             && !(bootstrap && name.to_ascii_lowercase().starts_with("if-"))
         {
             builder = builder.header(name, value);
@@ -790,7 +809,7 @@ mod tests {
             "referer",
             "x-account-id",
         ] {
-            assert!(!public_request_header(name));
+            assert!(!public_request_header(name, crate::runtime::gateway()));
         }
         for cookie in [
             "sessionKey=secret; Secure",

@@ -56,6 +56,15 @@ fn install_into(slot: &OnceLock<&'static Brand>, brand: &'static Brand) -> Resul
 /// variable positions must stay inert there.
 fn validate(brand: &Brand) -> Result<()> {
     crate::script_brand::validate(brand)?;
+    for name in brand.sensitive_inbound_headers {
+        let valid = !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+        if !valid || crate::gateway::is_protected_header(name) {
+            bail!("brand sensitive_inbound_headers entry is not a usable header name: {name:?}");
+        }
+    }
     let env = &brand.env;
     for (field, name) in [
         ("env.home", env.home),
@@ -203,6 +212,10 @@ pub struct Brand {
     pub client_proof: ClientProofNames,
     pub gateway: GatewayProtocolNames,
     pub scripts: ScriptNames,
+    /// Inbound request headers only this program may produce; stripped from
+    /// every request the proxy rebuilds (case-insensitive), in addition to
+    /// the Gateway extension's signature headers. Lowercase.
+    pub sensitive_inbound_headers: &'static [&'static str],
     /// WinHTTP session agent used for proxy auto-configuration lookups.
     pub winhttp_agent: &'static str,
     /// `clientInfo.name` of the read-only Codex daemon initialization check.
