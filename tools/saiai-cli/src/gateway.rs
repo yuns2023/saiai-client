@@ -263,7 +263,7 @@ pub(crate) fn validate_extension(extension: &dyn GatewayExtension) -> Result<()>
         let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
             || (stem.len() == 4
                 && (stem.starts_with("COM") || stem.starts_with("LPT"))
-                && stem.as_bytes()[3].is_ascii_digit());
+                && matches!(stem.as_bytes()[3], b'1'..=b'9'));
         let valid = !name.is_empty()
             && name.len() <= 255
             && !name.ends_with('.')
@@ -458,6 +458,7 @@ mod state_file_tests {
             file(".hidden"),
             file("console.log"),
             file("COM10"),
+            file("COM0"),
         ]);
         validate_extension(&GOOD).unwrap();
         for name in [
