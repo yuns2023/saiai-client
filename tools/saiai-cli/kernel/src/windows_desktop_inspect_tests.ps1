@@ -1,8 +1,8 @@
 $ErrorActionPreference = 'Stop'
 $observer = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__OBSERVER_SOURCE__'))
-$root = 'C:\SAIAI-TEST-ONLY'
-$env:SAIAI_RUNTIME_APP_ID = 'OpenAI.Codex_TEST_ONLY!App'
-$env:SAIAI_RUNTIME_PACKAGE_ROOT = $root
+$root = 'C:\KERNEL-TEST-ONLY'
+$env:@@ENV@@RUNTIME_APP_ID = 'OpenAI.Codex_TEST_ONLY!App'
+$env:@@ENV@@RUNTIME_PACKAGE_ROOT = $root
 $cases = @(
     'gone_then_valid', 'gone_then_empty', 'gone_then_foreign_owner',
     'gone_early_path_then_valid', 'gone_early_session_then_valid',
@@ -45,7 +45,7 @@ $reports = @(@{name='native_exit_proof';passed=$true})
 foreach ($case in $cases) {
     $reports += & {
         $state = @{name=$case;reads=0;pauses=0;metadata_reads=0;actors=@{}}
-        $env:SAIAI_RUNTIME_REQUIRE_NO_ACTORS = if ($case -like 'refresh_*') { '1' } else { '0' }
+        $env:@@ENV@@RUNTIME_REQUIRE_NO_ACTORS = if ($case -like 'refresh_*') { '1' } else { '0' }
         $entrypoint = Join-Path $root 'app\ChatGPT.exe'
         $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         $started = [DateTime]::Parse('2026-01-01T00:00:00Z').ToUniversalTime()
@@ -91,7 +91,7 @@ foreach ($case in $cases) {
                 if ($state.name -in @('refresh_unrelated_codex','unrelated_codex')) {
                     $actor = New-FixtureActor 201 $false
                     $actor.ProcessName = 'Codex'
-                    $actor.Path = 'C:\SAIAI-TEST-ONLY-CLI\codex.exe'
+                    $actor.Path = 'C:\KERNEL-TEST-ONLY-CLI\codex.exe'
                     return $actor
                 }
                 if ($state.name -eq 'inventory_limit') {
@@ -108,7 +108,7 @@ foreach ($case in $cases) {
                 if ($state.name -in @('gone_then_empty','gone_early_path_then_empty')) { return @() }
                 $actor = New-FixtureActor 201 $false
                 if ($state.name -in @('foreign_session','gone_early_path_then_foreign_session')) { $actor.SessionId=0 }
-                if ($state.name -in @('foreign_path','gone_early_path_then_foreign_path')) { $actor.Path='C:\SAIAI-FOREIGN-TEST-ONLY\ChatGPT.exe' }
+                if ($state.name -in @('foreign_path','gone_early_path_then_foreign_path')) { $actor.Path='C:\KERNEL-FOREIGN-TEST-ONLY\ChatGPT.exe' }
                 if ($state.name -in @('live_path_unavailable','early_exit_proof_denied')) { $actor.Path=$null }
                 if ($state.name -eq 'live_path_read_failed') {
                     $actor.PSObject.Properties.Remove('Path')
@@ -127,7 +127,7 @@ foreach ($case in $cases) {
                 PackageFamilyName='OpenAI.Codex_TEST_ONLY';InstallLocation=$root
                 Publisher='CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B';SignatureKind='Store';Status='Ok';Version='1.0.0.0'
             }
-            if ($state.name -in @('package_root_changed','changed_root_not_signed','changed_root_foreign_publisher')) { $package.InstallLocation='C:\SAIAI-TEST-ONLY-UPDATED' }
+            if ($state.name -in @('package_root_changed','changed_root_not_signed','changed_root_foreign_publisher')) { $package.InstallLocation='C:\KERNEL-TEST-ONLY-UPDATED' }
             if ($state.name -eq 'package_app_id_changed') { $package.PackageFamilyName='OpenAI.Codex_FOREIGN_TEST_ONLY' }
             if ($state.name -in @('package_publisher_changed','changed_root_foreign_publisher')) { $package.Publisher='TEST_ONLY_FOREIGN_PUBLISHER' }
             if ($state.name -eq 'package_not_store_signed') { $package.SignatureKind='Developer' }

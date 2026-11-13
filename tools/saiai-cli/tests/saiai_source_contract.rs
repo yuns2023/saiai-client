@@ -797,63 +797,178 @@ fn only_the_extension_side_uses_the_client_proof_protocol() {
     }
 }
 
-/// Kernel production lines that still contain `saiai` (any case), one
-/// `file<TAB>line` per occurrence, whitespace collapsed (the SAIAI program's
-/// own sources may name SAIAI). The test requires the list to equal the code
-/// exactly; that it only ever shrinks is enforced by review of this file's
-/// diff, not by the test. Empty since the SAIAI extension left the kernel
-/// (C4c).
-const SAIAI_RESIDUE: &str = include_str!("data/brand_residue.txt");
-
-fn saiai_residue_lines() -> Vec<String> {
-    let mut lines = Vec::new();
-    let kernel = kernel_files();
-    for (file, text) in cli_sources() {
-        if !kernel.contains(&file) {
-            continue;
-        }
-        for line in text.lines() {
-            if line.to_ascii_lowercase().contains("saiai") {
-                let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
-                lines.push(format!("{file}\t{line}"));
+/// Every file below `kernel/`, recursively.
+fn kernel_tree() -> Vec<std::path::PathBuf> {
+    fn walk(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, files);
+            } else {
+                files.push(path);
             }
         }
     }
-    lines.sort();
-    lines
+    let mut files = Vec::new();
+    walk(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("kernel"),
+        &mut files,
+    );
+    files.sort();
+    files
+}
+
+/// Registered exceptions to the kernel's SAIAI-free rule:
+/// `(path below kernel/, whitespace-collapsed line)`, each with its reason.
+/// Empty: the kernel is distribution-neutral.
+const KERNEL_SAIAI_EXCEPTIONS: &[(&str, &str)] = &[];
+
+/// No file below `kernel/` (code, tests, comments, scripts, manifest) spells
+/// `saiai` in any case: the directory can stand alone as a public
+/// repository, and every SAIAI value reaches the kernel through the brand
+/// and Gateway extension the program passes in.
+#[test]
+fn the_kernel_directory_never_names_saiai() {
+    let kernel = Path::new(env!("CARGO_MANIFEST_DIR")).join("kernel");
+    let files = kernel_tree();
+    assert!(files.iter().any(|file| file.ends_with("Cargo.toml")));
+    assert!(files.iter().any(|file| file.ends_with("lib.rs")));
+    let mut found = Vec::new();
+    for file in &files {
+        let relative = file
+            .strip_prefix(&kernel)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let bytes = fs::read(file).unwrap();
+        if relative.to_ascii_lowercase().contains("saiai") {
+            found.push(format!("{relative}\t(file name)"));
+        }
+        for line in String::from_utf8_lossy(&bytes).lines() {
+            if !line.to_ascii_lowercase().contains("saiai") {
+                continue;
+            }
+            let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !KERNEL_SAIAI_EXCEPTIONS.contains(&(relative.as_str(), line.as_str())) {
+                found.push(format!("{relative}\t{line}"));
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "kernel/ names SAIAI (read the value from Brand, use the test brand in tests):\n{}",
+        found.join("\n")
+    );
+}
+
+/// Arguments of `#[path = ...]`, `include_str!`, `include_bytes!` and
+/// `include!` in `text`, as written (`None` when not a plain string literal).
+fn file_references(text: &str) -> Vec<Option<String>> {
+    let mut found = Vec::new();
+    for (start, _) in text.match_indices("#[path") {
+        let rest = text[start + "#[path".len()..].trim_start();
+        let literal = rest
+            .strip_prefix('=')
+            .map(str::trim_start)
+            .and_then(|rest| rest.strip_prefix('"'))
+            .and_then(|rest| rest.split_once('"'))
+            .filter(|(_, after)| after.trim_start().starts_with(']'))
+            .map(|(path, _)| path.to_string());
+        found.push(literal);
+    }
+    for macro_name in ["include_str!", "include_bytes!", "include!"] {
+        for (start, _) in text.match_indices(macro_name) {
+            if text[..start].ends_with(|ch: char| ch.is_alphanumeric() || ch == '_') {
+                continue;
+            }
+            let rest = text[start + macro_name.len()..].trim_start();
+            let literal = rest
+                .strip_prefix('(')
+                .map(str::trim_start)
+                .and_then(|rest| rest.strip_prefix('"'))
+                .and_then(|rest| rest.split_once('"'))
+                .filter(|(_, after)| after.trim_start().starts_with(')'))
+                .map(|(path, _)| path.to_string());
+            found.push(literal);
+        }
+    }
+    found
+}
+
+/// Whether `reference`, written in `file` (below `root`), stays below `root`.
+/// `#[path]` and the include macros both resolve against the file's own
+/// directory here; `#[path]` inside an inline module of a non-`mod.rs` file
+/// would resolve deeper, so this is the stricter reading.
+fn stays_inside(root: &Path, file: &Path, reference: &str) -> bool {
+    if reference.starts_with('/') || reference.starts_with('\\') || reference.contains(':') {
+        return false;
+    }
+    let mut depth = file
+        .parent()
+        .unwrap()
+        .strip_prefix(root)
+        .unwrap()
+        .components()
+        .count() as isize;
+    for part in reference.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => depth -= 1,
+            _ => depth += 1,
+        }
+        if depth < 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Kernel sources reference only files inside `kernel/`, by plain string
+/// literals (no `concat!`/`env!` paths), so the directory builds and tests on
+/// its own.
+#[test]
+fn kernel_sources_reference_no_file_outside_the_kernel() {
+    let kernel = Path::new(env!("CARGO_MANIFEST_DIR")).join("kernel");
+    let mut checked = 0;
+    for file in kernel_tree() {
+        if file.extension().is_none_or(|extension| extension != "rs") {
+            continue;
+        }
+        let text = fs::read_to_string(&file).unwrap();
+        for reference in file_references(&text) {
+            checked += 1;
+            match reference {
+                Some(path) if stays_inside(&kernel, &file, &path) => {}
+                other => panic!("{} references {other:?} outside kernel/", file.display()),
+            }
+        }
+    }
+    // The kernel embeds its helper scripts and fixtures with include_str!.
+    assert!(checked > 0);
 }
 
 #[test]
-fn saiai_names_outside_the_brand_only_shrink() {
-    let mut expected: Vec<String> = SAIAI_RESIDUE
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect();
-    expected.sort();
-    let actual = saiai_residue_lines();
-    let added: Vec<_> = actual
-        .iter()
-        .filter(|line| !expected.contains(line))
-        .collect();
-    let removed: Vec<_> = expected
-        .iter()
-        .filter(|line| !actual.contains(line))
-        .collect();
-    assert!(
-        added.is_empty() && removed.is_empty() && actual == expected,
-        "SAIAI name residue changed.\nNew (read the value from Brand instead):\n{}\nGone (delete from brand_residue.txt):\n{}",
-        added
-            .iter()
-            .map(|line| line.as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        removed
-            .iter()
-            .map(|line| line.as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
+fn kernel_file_reference_scanner_sees_every_form() {
+    let text = "#[path = \"../../src/x.rs\"]\nmod x;\n#[path=\"y.rs\"] mod y;\nconst A: &str = include_str!(\"a.ps1\");\nconst B: &[u8] = include_bytes! (\"../b\");\ninclude!(concat!(env!(\"OUT_DIR\"), \"/c.rs\"));\nmy_include_str!(\"ignored\");";
+    assert_eq!(
+        file_references(text),
+        vec![
+            Some("../../src/x.rs".to_string()),
+            Some("y.rs".to_string()),
+            Some("a.ps1".to_string()),
+            Some("../b".to_string()),
+            None,
+        ]
     );
+    let root = Path::new("/k");
+    let file = Path::new("/k/src/lib.rs");
+    assert!(stays_inside(root, file, "brand_test.rs"));
+    assert!(stays_inside(root, file, "../Cargo.toml"));
+    assert!(stays_inside(root, file, "fixtures/./a/../b.json"));
+    assert!(!stays_inside(root, file, "../../src/brand_saiai.rs"));
+    assert!(!stays_inside(root, file, "../../kernel/src/x.rs"));
+    assert!(!stays_inside(root, file, "/etc/passwd"));
+    assert!(!stays_inside(root, file, "C:\\x.rs"));
 }
 
 #[test]

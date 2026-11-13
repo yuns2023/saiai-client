@@ -78,7 +78,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         })?);
         apply_environment(&mut start, &config, token);
         // The service follows the user's own proxy for its egress; only the
-        // Claude child is pointed at SAIAI.
+        // Claude child is pointed at this proxy.
         restore_user_proxy_environment(&mut start);
         crate::environment_scope::pin_start(&mut start)?;
         let status = start
@@ -308,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn service_start_keeps_the_user_proxy_while_claude_gets_saiai() {
+    fn service_start_keeps_the_user_proxy_while_claude_gets_the_proxy() {
         // Windows environment names are case-insensitive, so look them up
         // the same way.
         fn child_env(command: &Command, name: &str) -> Option<std::ffi::OsString> {
@@ -319,7 +319,7 @@ mod tests {
                 .and_then(|(_, value)| value.map(OsStr::to_os_string))
         }
         let config = config();
-        let mut start = Command::new("saiai");
+        let mut start = Command::new("ktest");
         apply_environment(&mut start, &config, "token");
         restore_user_proxy_environment(&mut start);
         for name in ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"] {

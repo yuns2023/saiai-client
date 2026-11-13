@@ -133,17 +133,17 @@ mod tests {
 
     #[test]
     fn brand_values_are_checked_against_script_injection() {
-        assert!(valid_env_prefix("SAIAI_"));
-        assert!(valid_identifier("Saiai"));
-        assert!(valid_plain_name("SAIAI"));
-        for value in ["", "SAIAI", "saiai_", "SA$AI_", "SA'_", "SA`_", "SA I_"] {
+        assert!(valid_env_prefix("KTEST_"));
+        assert!(valid_identifier("Ktest"));
+        assert!(valid_plain_name("KTEST"));
+        for value in ["", "KTEST", "ktest_", "SA$AI_", "SA'_", "SA`_", "SA I_"] {
             assert!(!valid_env_prefix(value), "{value:?}");
         }
-        for value in ["", "saiai", "Sai-ai", "Sai.ai", "Sai'ai", "Sai$x"] {
+        for value in ["", "ktest", "Sai-ai", "Sai.ai", "Sai'ai", "Sai$x"] {
             assert!(!valid_identifier(value), "{value:?}");
         }
         for value in [
-            "", " SAIAI", "SA'AI", "SA$AI", "SA`AI", "SA\\AI", "SA.AI", "SA(AI)", "SA|AI", "SA;AI",
+            "", " KTEST", "SA'AI", "SA$AI", "SA`AI", "SA\\AI", "SA.AI", "SA(AI)", "SA|AI", "SA;AI",
         ] {
             assert!(!valid_plain_name(value), "{value:?}");
         }
@@ -153,11 +153,11 @@ mod tests {
     fn rendering_replaces_every_token_with_the_installed_brand() {
         assert_eq!(
             render("$env:@@ENV@@X [@@ID@@Y] '@@APP_DIR@@\\z' 'O=@@CA_ORG@@'"),
-            "$env:SAIAI_X [SaiaiY] 'SAIAI\\z' 'O=SAIAI'"
+            "$env:KTEST_X [KtestY] 'KTEST\\z' 'O=KTEST'"
         );
-        assert_eq!(env("CA_FILES"), "SAIAI_CA_FILES");
-        assert_eq!(null_sentinel(), "__SAIAI_NULL__");
-        assert_eq!(identifier_prefix(), "Saiai");
+        assert_eq!(env("CA_FILES"), "KTEST_CA_FILES");
+        assert_eq!(null_sentinel(), "__KTEST_NULL__");
+        assert_eq!(identifier_prefix(), "Ktest");
     }
 
     #[test]

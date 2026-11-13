@@ -363,13 +363,13 @@ mod tests {
     fn an_entry_needs_the_installed_brand_itself() {
         static OTHER: Brand = Brand {
             binary_name: "other",
-            ..crate::brand_saiai::SAIAI_VALUES
+            ..crate::brand_test::KTEST_VALUES
         };
-        let saiai = &crate::brand_saiai::SAIAI_BRAND;
-        assert!(check_installed(None, saiai).is_err());
-        assert!(check_installed(Some(&OTHER), saiai).is_err());
-        assert!(check_installed(Some(saiai), &OTHER).is_err());
-        check_installed(Some(saiai), saiai).unwrap();
+        let ktest = &crate::brand_test::KTEST_BRAND;
+        assert!(check_installed(None, ktest).is_err());
+        assert!(check_installed(Some(&OTHER), ktest).is_err());
+        assert!(check_installed(Some(ktest), &OTHER).is_err());
+        check_installed(Some(ktest), ktest).unwrap();
     }
 }
 

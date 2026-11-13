@@ -55,7 +55,7 @@ pub(crate) fn environment_name(product: &str, directory: &Path) -> String {
     format!("{product}-{}", digest(directory))
 }
 
-/// Product of an `environments/<name>` directory created by SAIAI.
+/// Product of an `environments/<name>` directory created by this program.
 pub(crate) fn environment_product(name: &str) -> Option<&'static str> {
     let (product, hash) = name.split_once('-')?;
     let product = match product {
@@ -70,7 +70,7 @@ pub(crate) fn environment_product(name: &str) -> Option<&'static str> {
     .then_some(product)
 }
 
-/// Normalized user home and SAIAI root, resolved exactly like `initialize`.
+/// Normalized user home and program root, resolved exactly like `initialize`.
 pub(crate) fn layout() -> Result<(PathBuf, PathBuf)> {
     let home = normalize(&crate::home_dir().context("failed to resolve home directory")?)?;
     let root = match override_dir(BRAND.env.home)? {
@@ -312,7 +312,7 @@ fn legacy_route_matches(root: &Path, product: &str) -> Result<bool> {
     Ok(raw.contains(expected.trim()))
 }
 
-/// Let `saiai uninstall` map this isolated environment to its product
+/// Let `uninstall` map this isolated environment to its product
 /// directory later. Only initialization creates a missing environment.
 pub(crate) fn record_product_dir(create: bool) -> Result<()> {
     let Some(scope) = active().filter(|scope| scope.isolated) else {
@@ -396,7 +396,7 @@ mod tests {
     }
     #[test]
     fn default_and_projects_have_distinct_service_identities() {
-        let root = PathBuf::from("/saiai");
+        let root = PathBuf::from("/ktest");
         let default = Scope::new(root.clone(), root.clone());
         let a = Scope::new(root.clone(), root.join("environments/a"));
         let b = Scope::new(root.clone(), root.join("environments/b"));

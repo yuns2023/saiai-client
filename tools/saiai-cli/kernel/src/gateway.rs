@@ -454,7 +454,7 @@ mod state_file_tests {
         assert!(!bare.owns(".device.key.tmp-1-a", "tmp"));
     }
 
-    /// With the SAIAI infix (9 bytes) an atomic-write leftover adds 55
+    /// With the test brand's infix (9 bytes) an atomic-write leftover adds 55
     /// bytes, a backup 30: the longest allowed names are 200 and 225.
     #[test]
     fn state_file_names_leave_room_for_derived_names() {
