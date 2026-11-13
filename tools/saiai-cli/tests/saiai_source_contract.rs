@@ -1437,9 +1437,16 @@ fn brand_value_constants_read_their_brand_field() {
             "placeholders.claude_desktop_token_prefix",
         ),
     ];
+    // A textual check of each definition (string contents blanked, so a
+    // literal cannot stand in for code); it does not expand macros or
+    // resolve names.
     for (file, name, value_type, field) in bindings {
+        let mut code = production_text(&sources[*file], "rs");
+        for range in rust_literal_ranges(&code).into_iter().rev() {
+            code.replace_range(range, "\"\"");
+        }
         // Whitespace removed; `crate::brand::` paths and visibility dropped.
-        let code = production_text(&sources[*file], "rs")
+        let code = code
             .split_whitespace()
             .collect::<String>()
             .replace("crate::brand::", "")
