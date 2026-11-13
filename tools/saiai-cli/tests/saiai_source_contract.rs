@@ -886,8 +886,14 @@ fn sibling_name(token: &proc_macro2::TokenTree) -> Option<String> {
     plain.then(|| name.to_string())
 }
 
+/// An identifier's name without a raw `r#` prefix.
+fn ident_name(ident: &proc_macro2::Ident) -> String {
+    let text = ident.to_string();
+    text.strip_prefix("r#").unwrap_or(&text).to_string()
+}
+
 fn is_ident(token: Option<&proc_macro2::TokenTree>, name: &str) -> bool {
-    matches!(token, Some(proc_macro2::TokenTree::Ident(ident)) if ident == name)
+    matches!(token, Some(proc_macro2::TokenTree::Ident(ident)) if ident_name(ident) == name)
 }
 
 fn is_punct(token: Option<&proc_macro2::TokenTree>, ch: char) -> bool {
@@ -959,14 +965,17 @@ fn token_references(tokens: &[proc_macro2::TokenTree], found: &mut Vec<Result<St
                     attribute_paths(group.stream(), inline, found);
                 }
             }
+            // These names may appear only as a direct call (never passed to
+            // another macro, aliased or imported, which this scan cannot follow).
             proc_macro2::TokenTree::Ident(ident)
                 if ["include", "include_str", "include_bytes"]
-                    .iter()
-                    .any(|name| ident == name)
-                    && is_punct(tokens.get(index + 1), '!') =>
+                    .contains(&ident_name(ident).as_str()) =>
             {
+                let call = is_punct(tokens.get(index + 1), '!');
                 let argument = match tokens.get(index + 2) {
-                    Some(proc_macro2::TokenTree::Group(group)) if ident != "include" => {
+                    Some(proc_macro2::TokenTree::Group(group))
+                        if call && ident_name(ident) != "include" =>
+                    {
                         let inner: Vec<_> = group.stream().into_iter().collect();
                         match inner.as_slice() {
                             [only] => sibling_name(only),
@@ -987,15 +996,10 @@ fn token_references(tokens: &[proc_macro2::TokenTree], found: &mut Vec<Result<St
             }
             _ => {}
         }
-        // Groups that are not attribute bodies: function bodies, macro
-        // arguments (`format!(.., include_str!(..))`), modules, ...
+        // Every group, attribute bodies included: function bodies, macro
+        // arguments (`format!(.., include_str!(..))`), `#[doc = include_str!(..)]`.
         if let proc_macro2::TokenTree::Group(group) = token {
-            let is_attribute = is_punct(index.checked_sub(1).and_then(|i| tokens.get(i)), '#')
-                || (is_punct(index.checked_sub(1).and_then(|i| tokens.get(i)), '!')
-                    && is_punct(index.checked_sub(2).and_then(|i| tokens.get(i)), '#'));
-            if !(is_attribute && group.delimiter() == Bracket) {
-                token_references(&group.stream().into_iter().collect::<Vec<_>>(), found);
-            }
+            token_references(&group.stream().into_iter().collect::<Vec<_>>(), found);
         }
     }
 }
@@ -1096,6 +1100,12 @@ mod documented;
         "const X: &str = include_str!(\"sub/x.txt\");",
         "const X: &str = include_str!(\"..\");",
         "fn f() { g(include_str!(\"../x\")); }",
+        "#[doc = include_str!(\"../../outside.md\")]\npub struct Example;",
+        "#[cfg_attr(doc, doc = include_str!(\"../outside.md\"))]\npub struct Example;",
+        "const X: &str = r#include_str!(\"../../outside.txt\");",
+        "#[r#path = \"../outside.rs\"]\nmod x;",
+        "macro_rules! load { ($r:ident, $f:literal) => { $r!($f) }; }\nconst X: &str = load!(include_str, \"../../outside.txt\");",
+        "use std::include_str as read;\nconst X: &str = read!(\"../x\");",
         "const X: &str = \"unterminated;",
     ] {
         let references = file_references(refused);
