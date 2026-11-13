@@ -740,7 +740,9 @@ struct TestProofSession;
 
 impl crate::gateway::GatewayExtension for TestProof {
     fn signature_headers(&self) -> &'static [&'static str] {
-        &["x-test-proof"]
+        // `user-agent` is on the Claude public fetch allowlist: reserving it
+        // proves that exit consults the extension, not only its allowlist.
+        &["x-test-proof", "user-agent"]
     }
 
     fn start(
@@ -848,6 +850,15 @@ async fn extension_reserved_headers_are_dropped_by_plain_http_proxy_and_claude_p
     assert!(!claude_desktop::public_request_header(
         "X-Test-Proof",
         &TEST_PROOF
+    ));
+    // Allowlisted, yet reserved by this extension: refused.
+    assert!(!claude_desktop::public_request_header(
+        "User-Agent",
+        &TEST_PROOF
+    ));
+    assert!(claude_desktop::public_request_header(
+        "User-Agent",
+        crate::runtime::gateway()
     ));
     assert!(claude_desktop::public_request_header("accept", &TEST_PROOF));
 }
