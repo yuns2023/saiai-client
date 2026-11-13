@@ -9946,16 +9946,24 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert!(validate_chatgpt_timezone("/etc/passwd").is_err());
     }
 
+    /// The shared name check (Linux, macOS and Windows) names the brand's
+    /// environment variable exactly as before.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn chatgpt_timezone_name_error_names_the_environment_variable() {
+        let error = validate_chatgpt_timezone_name("../etc/passwd").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "SAIAI_CHATGPT_TIMEZONE must be an IANA timezone such as America/Los_Angeles"
+        );
+    }
+
     /// The timezone diagnostics name the brand's environment variable
     /// exactly as before (outer message; the I/O cause follows in the chain).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn chatgpt_timezone_errors_name_the_environment_variable() {
         for (value, message) in [
-            (
-                "../etc/passwd",
-                "SAIAI_CHATGPT_TIMEZONE must be an IANA timezone such as America/Los_Angeles",
-            ),
             (
                 "Mars/Olympus_Mons",
                 "SAIAI_CHATGPT_TIMEZONE does not exist in /usr/share/zoneinfo/Mars/Olympus_Mons",
