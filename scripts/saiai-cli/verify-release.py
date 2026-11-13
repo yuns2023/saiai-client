@@ -165,7 +165,22 @@ def verify_cli() -> None:
     for dependency in ("reqwest", "tokio", "tokio-tungstenite", "rustls", "rcgen", "zeroize", "libc"):
         require(dependency in cargo, f"local-proxy dependency is missing: {dependency}")
 
-    main = text("tools/saiai-cli/src/main.rs")
+    require(
+        '[lib]\nname = "proxy_cli"\npath = "src/lib.rs"' in cargo
+        and '[[bin]]\nname = "saiai"\npath = "src/main.rs"' in cargo,
+        "CLI must build the saiai binary from the shared client library",
+    )
+    # The binary only supplies release facts; the client lives in lib.rs.
+    entry = text("tools/saiai-cli/src/main.rs")
+    for required in (
+        "proxy_cli::run(proxy_cli::RuntimeContext {",
+        'version: env!("CARGO_PKG_VERSION"),',
+    ):
+        require(required in entry, f"CLI entry point is missing {required!r}")
+    for withdrawn in WITHDRAWN_V2_MARKERS:
+        require(withdrawn not in entry, f"CLI entry point exposes withdrawn V2 behavior: {withdrawn}")
+
+    main = text("tools/saiai-cli/src/lib.rs")
     for required in (
         "saiai start",
         "saiai stop",

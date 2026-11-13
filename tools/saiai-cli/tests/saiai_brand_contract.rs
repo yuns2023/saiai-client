@@ -344,3 +344,105 @@ fn saiai_upstream_proxy_variable_is_honored() {
         "{invalid}"
     );
 }
+
+/// The running proxy enrolls its client proof device with the configured
+/// Gateway and reports the released program version (supplied by the
+/// binary's entry point, not the library's package metadata).
+#[test]
+fn client_proof_enrollment_reports_the_release_version() {
+    use std::io::{Read, Write};
+    let sandbox = Sandbox::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let gateway = format!("http://{}", listener.local_addr().unwrap());
+    let (sender, receiver) = std::sync::mpsc::channel::<String>();
+    // Bounded mock Gateway: answers until it has seen one enrollment or the
+    // deadline passes, so the thread always ends and can be joined.
+    listener.set_nonblocking(true).unwrap();
+    let gateway_thread = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while Instant::now() < deadline {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            let _ = stream.set_nonblocking(false);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while let Ok(read) = stream.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&request).to_string();
+                if let Some(split) = text.find("\r\n\r\n") {
+                    let length = text[..split]
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= split + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let text = String::from_utf8_lossy(&request).to_string();
+            let enrollment = text.starts_with("POST /api/v1/client/devices/enroll ");
+            let (status, body) = if enrollment {
+                (
+                    "200 OK",
+                    r#"{"device_id":"cd_DDDDDDDDDDDDDDDDDDDDDD","status":"active"}"#,
+                )
+            } else {
+                ("404 Not Found", "{}")
+            };
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            if enrollment {
+                let _ = sender.send(text);
+                return;
+            }
+        }
+    });
+    sandbox.run(&mut sandbox.command(&[
+        "init-codex",
+        "--base-url",
+        &gateway,
+        "--api-key",
+        "TEST_ONLY_CONTRACT_PROOF",
+    ]));
+    let log = sandbox.home.with_file_name("proxy.log");
+    let file = std::fs::File::create(&log).unwrap();
+    let mut proxy = sandbox
+        .command(&[])
+        .env("SAIAI_UPSTREAM_PROXY", "direct")
+        .stdout(file.try_clone().unwrap())
+        .stderr(file)
+        .spawn()
+        .unwrap();
+    let request = receiver.recv_timeout(Duration::from_secs(60));
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+    let _ = gateway_thread.join();
+    let request = request.unwrap_or_else(|_| {
+        panic!(
+            "no enrollment within 60 s; proxy log:\n{}",
+            String::from_utf8_lossy(&std::fs::read(&log).unwrap_or_default())
+        )
+    });
+    let body: serde_json::Value =
+        serde_json::from_str(&request[request.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+    assert_eq!(body["client_version"], release_version().as_str());
+}

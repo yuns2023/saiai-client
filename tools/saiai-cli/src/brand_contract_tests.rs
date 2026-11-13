@@ -1146,14 +1146,14 @@ fn saiai_environment_variable_inventory_is_frozen() {
         ("SAIAI_CHATGPT_BIN", &["brand_saiai.rs"]),
         ("SAIAI_CHATGPT_CHAT_PASSTHROUGH", &["brand_saiai.rs"]),
         ("SAIAI_CHATGPT_TIMEZONE", &["brand_saiai.rs"]),
-        ("SAIAI_CHECK_EXE", &["main.rs"]),
-        ("SAIAI_CHECK_PID", &["main.rs"]),
+        ("SAIAI_CHECK_EXE", &["lib.rs"]),
+        ("SAIAI_CHECK_PID", &["lib.rs"]),
         ("SAIAI_CLAUDE_DESKTOP_ALLOW_UNTESTED", &["brand_saiai.rs"]),
         ("SAIAI_CLEANUP_DIR", &["uninstall.rs"]),
         ("SAIAI_CLEANUP_DIRS", &["uninstall.rs"]),
         ("SAIAI_CLEANUP_FILES", &["uninstall.rs"]),
-        ("SAIAI_DESKTOP_ACTIVATION_ARGS", &["main.rs"]),
-        ("SAIAI_DESKTOP_APP_ID", &["main.rs"]),
+        ("SAIAI_DESKTOP_ACTIVATION_ARGS", &["lib.rs"]),
+        ("SAIAI_DESKTOP_APP_ID", &["lib.rs"]),
         ("SAIAI_DESKTOP_BIN", &["brand_saiai.rs"]),
         ("SAIAI_DESKTOP_BROWSER_USE", &["brand_saiai.rs"]),
         ("SAIAI_HOME", &["brand_saiai.rs"]),
@@ -1259,11 +1259,11 @@ fn inline_contract_literals_are_present() {
     for (file, needle) in [
         // Self-update channel below the configured Gateway base URL, and the
         // version prefix an update candidate must print.
-        ("main.rs", "let channel = BRAND.update.channel_path;"),
-        ("main.rs", "\"{base}/{channel}/manifest.json\""),
-        ("main.rs", "\"{base}/{channel}/{asset}\""),
+        ("lib.rs", "let channel = BRAND.update.channel_path;"),
+        ("lib.rs", "\"{base}/{channel}/manifest.json\""),
+        ("lib.rs", "\"{base}/{channel}/{asset}\""),
         (
-            "main.rs",
+            "lib.rs",
             "!candidate_version\n        .trim_start()\n        .strip_prefix(BRAND.binary_name)\n        .is_some_and(|rest| rest.starts_with(' '))",
         ),
         // Service identities: the start side and the uninstall discovery.
@@ -1292,7 +1292,7 @@ fn inline_contract_literals_are_present() {
             "is_service_file_name(&name, BRAND.service.launchd_label, \".plist\")",
         ),
         // Windows: stale CAs are recognized by organization.
-        ("main.rs", "O=SAIAI(,|$)"),
+        ("lib.rs", "O=SAIAI(,|$)"),
         // Windows per-user install directory known to uninstall.
         (
             "uninstall.rs",
@@ -1312,14 +1312,14 @@ fn inline_contract_literals_are_present() {
             "windows_desktop_runtime.rs",
             "pub runtime_directory: String,",
         ),
-        ("main.rs", "PathBuf::from(&initial.runtime_directory)"),
+        ("lib.rs", "PathBuf::from(&initial.runtime_directory)"),
         (
             "uninstall.rs",
             ".join(BRAND.windows_app_dir_name)\n            .join(\"desktop-runtime\")",
         ),
         // The installer's "binary replaced" flag is read here.
         (
-            "main.rs",
+            "lib.rs",
             "binary_changed_during_initialization(env::var(BRAND.env.binary_updated)",
         ),
         // Desktop synthetic identity returned by the local sidecars.
@@ -1335,7 +1335,7 @@ fn inline_contract_literals_are_present() {
         ),
         // Atomic temporary files that uninstall recognizes.
         (
-            "main.rs",
+            "lib.rs",
             "\".{name}.{}-{}-{}\",\n        BRAND.config.temp_file_infix,",
         ),
     ] {
@@ -1361,18 +1361,18 @@ fn brand_environment_fields_are_used_by_the_same_files() {
             "BRAND.env.home",
             &[
                 "environment_scope.rs",
+                "lib.rs",
                 "local_proxy.rs",
-                "main.rs",
                 "uninstall.rs",
             ],
         ),
         ("BRAND.env.install_dir", &["uninstall.rs"]),
-        ("BRAND.env.skip_start", &["codex_daemon.rs", "main.rs"]),
-        ("BRAND.env.binary_updated", &["main.rs"]),
+        ("BRAND.env.skip_start", &["codex_daemon.rs", "lib.rs"]),
+        ("BRAND.env.binary_updated", &["lib.rs"]),
         ("BRAND.env.upstream_proxy", &["upstream_proxy.rs"]),
-        ("BRAND.env.chatgpt_timezone", &["main.rs"]),
-        ("BRAND.env.chatgpt_bin", &["main.rs"]),
-        ("BRAND.env.desktop_bin", &["main.rs"]),
+        ("BRAND.env.chatgpt_timezone", &["lib.rs"]),
+        ("BRAND.env.chatgpt_bin", &["lib.rs"]),
+        ("BRAND.env.desktop_bin", &["lib.rs"]),
         ("BRAND.env.chatgpt_chat_passthrough", &["local_proxy.rs"]),
         ("BRAND.env.desktop_browser_use", &["local_proxy.rs"]),
         ("BRAND.env.openai_trace", &["local_proxy.rs"]),
@@ -1443,38 +1443,38 @@ fn brand_environment_call_sites_are_pinned() {
         // Desktop executable overrides: `DESKTOP_BIN` wins over `CHATGPT_BIN`
         // on macOS and Windows; Linux only honors `CHATGPT_BIN`.
         (
-            "main.rs",
+            "lib.rs",
             "resolve_macos_desktop_override",
             "for variable in [BRAND.env.desktop_bin, BRAND.env.chatgpt_bin] {",
         ),
         (
-            "main.rs",
+            "lib.rs",
             "resolve_windows_desktop_override",
             "for variable in [BRAND.env.desktop_bin, BRAND.env.chatgpt_bin] {",
         ),
         (
-            "main.rs",
+            "lib.rs",
             "run_linux_desktop",
             "env::var_os(BRAND.env.chatgpt_bin)",
         ),
         // Every service/helper child is pinned to the resolved home.
         (
-            "main.rs",
+            "lib.rs",
             "finalize_update",
             ".env(BRAND.env.home, saiai_config_dir()?)",
         ),
         (
-            "main.rs",
+            "lib.rs",
             "start_linux_background_proxy",
             ".env(BRAND.env.home, &saiai_home)",
         ),
         (
-            "main.rs",
+            "lib.rs",
             "start_windows_background_proxy",
             ".env(BRAND.env.home, &saiai_home)",
         ),
         (
-            "main.rs",
+            "lib.rs",
             "saiai_config_dir",
             "env_dir_override(BRAND.env.home)",
         ),
@@ -1500,38 +1500,38 @@ fn brand_environment_call_sites_are_pinned() {
         ),
         // Timezone opt-in: read once, never leaked to Desktop children.
         (
-            "main.rs",
+            "lib.rs",
             "resolve_chatgpt_timezone",
             "env::var_os(SAIAI_CHATGPT_TIMEZONE_ENV)",
         ),
         (
-            "main.rs",
+            "lib.rs",
             "run_windows_packaged_desktop",
             "env::var_os(SAIAI_CHATGPT_TIMEZONE_ENV).is_some()",
         ),
         (
-            "main.rs",
+            "lib.rs",
             "run_linux_desktop",
             "command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV);",
         ),
         (
-            "main.rs",
+            "lib.rs",
             "run_macos_desktop",
             "command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV);",
         ),
         (
-            "main.rs",
+            "lib.rs",
             "run_windows_desktop",
             "command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV);",
         ),
         // Installer hand-off and configure-only switch.
         (
-            "main.rs",
+            "lib.rs",
             "start_managed_service_after_initialization",
             "env::var(BRAND.env.skip_start)",
         ),
         (
-            "main.rs",
+            "lib.rs",
             "start_managed_service_after_initialization",
             "env::var(BRAND.env.binary_updated)",
         ),
@@ -1585,7 +1585,7 @@ fn brand_environment_call_sites_are_pinned() {
     // The aliases those call sites use still name the brand fields.
     for (file, needle) in [
         (
-            "main.rs",
+            "lib.rs",
             "const SAIAI_CHATGPT_TIMEZONE_ENV: &str = BRAND.env.chatgpt_timezone;",
         ),
         (
@@ -1694,6 +1694,35 @@ fn native_chat_update_route_is_frozen() {
             "{unforwarded}"
         );
     }
+}
+
+/// The library never reports its own package metadata as the program's: a
+/// distribution binary supplies the release facts through `RuntimeContext`.
+#[test]
+fn library_takes_release_facts_from_the_entry_point() {
+    let sources = cli_sources();
+    for (file, text) in &sources {
+        // `env!`/`option_env!` with an ordinary string literal naming any
+        // `CARGO_*` variable, with or without whitespace or line breaks.
+        // Raw strings (`env!(r"CARGO_…")`) and `concat!`-built names are
+        // not detected.
+        let compact = text.split_whitespace().collect::<String>();
+        if file != "main.rs" {
+            assert!(
+                !compact.contains("env!(\"CARGO_"),
+                "{file} reads compile-time Cargo metadata"
+            );
+        }
+    }
+    let entry = &sources["main.rs"];
+    assert!(
+        entry.contains("proxy_cli::run(proxy_cli::RuntimeContext {"),
+        "{entry}"
+    );
+    assert!(
+        entry.contains("version: env!(\"CARGO_PKG_VERSION\"),"),
+        "{entry}"
+    );
 }
 
 /// The SAIAI values of every brand field, written out by hand. A refactor
