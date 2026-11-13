@@ -719,17 +719,16 @@ fn certificate_control_endpoint_is_frozen() {
         let recorded = sandbox.home.with_file_name("desktop-args.txt");
         std::fs::write(
             &recorder,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
-                recorded.display()
-            ),
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CONTRACT_DESKTOP_ARGS\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755)).unwrap();
         sandbox.run(
             sandbox
                 .command(&["desktop"])
-                .env("SAIAI_CHATGPT_BIN", &recorder),
+                .env("SAIAI_CHATGPT_BIN", &recorder)
+                .env("CONTRACT_DESKTOP_ARGS", &recorded)
+                .env_remove("SAIAI_CHATGPT_TIMEZONE"),
         );
         std::fs::read_to_string(&recorded).unwrap()
     });
