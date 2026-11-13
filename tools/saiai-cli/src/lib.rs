@@ -10103,279 +10103,90 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         }
     }
 
-    /// config.json shapes and their exact results, frozen from the release
-    /// before the configuration type was renamed: every error names the type
-    /// as earlier releases did, including array-form length errors, with
-    /// serde_json's line and column.
+    /// Serialization omits an absent upstream proxy and absent provider
+    /// routes, and a config from an older client decodes to the defaults —
+    /// checked on the struct itself, not through a round trip that a
+    /// matching decode/encode mistake would hide.
     #[test]
-    fn config_json_shapes_and_diagnostics_are_frozen() {
-        let cases: &[(&str, Result<&str, &str>)] = &[
-            (
-                r#"1"#,
-                Err(r#"invalid type: integer `1`, expected struct SaiaiConfig at line 1 column 1"#),
-            ),
-            (
-                r#""x""#,
-                Err(r#"invalid type: string "x", expected struct SaiaiConfig at line 1 column 3"#),
-            ),
-            (
-                r#"true"#,
-                Err(
-                    r#"invalid type: boolean `true`, expected struct SaiaiConfig at line 1 column 4"#,
-                ),
-            ),
-            (
-                r#"null"#,
-                Err(r#"invalid type: null, expected struct SaiaiConfig at line 1 column 4"#),
-            ),
-            (
-                r#"1.5"#,
-                Err(
-                    r#"invalid type: floating point `1.5`, expected struct SaiaiConfig at line 1 column 3"#,
-                ),
-            ),
-            (
-                r#"[]"#,
-                Err(
-                    r#"invalid length 0, expected struct SaiaiConfig with 10 elements at line 1 column 2"#,
-                ),
-            ),
-            (
-                r#"[2]"#,
-                Err(
-                    r#"invalid length 1, expected struct SaiaiConfig with 10 elements at line 1 column 3"#,
-                ),
-            ),
-            (
-                r#"[2,"u","k"]"#,
-                Err(
-                    r#"invalid length 3, expected struct SaiaiConfig with 10 elements at line 1 column 11"#,
-                ),
-            ),
-            (
-                r#"[2,"u","k","l"]"#,
-                Err(
-                    r#"invalid length 4, expected struct SaiaiConfig with 10 elements at line 1 column 15"#,
-                ),
-            ),
-            (
-                r#"[2,"u","k","l","c"]"#,
-                Ok(
-                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
-                ),
-            ),
-            (
-                r#"[2,"u","k","l","c","kp",true,false,null,{}]"#,
-                Ok(
-                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"kp","chatgpt_chat_passthrough":true,"desktop_browser_use":false,"providers":{}}"#,
-                ),
-            ),
-            (
-                r#"[2,"u","k","l","c","kp",true,false,null,{},1]"#,
-                Err(r#"trailing characters at line 1 column 44"#),
-            ),
-            (
-                r#"["2"]"#,
-                Err(r#"invalid type: string "2", expected u32 at line 1 column 4"#),
-            ),
-            (
-                r#"{}"#,
-                Err(r#"missing field `version` at line 1 column 2"#),
-            ),
-            (
-                r#"{"version":2}"#,
-                Err(r#"missing field `base_url` at line 1 column 13"#),
-            ),
-            (
-                r#"{"version":2,"version":3,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}"#,
-                Err(r#"duplicate field `version` at line 1 column 22"#),
-            ),
-            (
-                r#"{"version":"2","base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}"#,
-                Err(r#"invalid type: string "2", expected u32 at line 1 column 14"#),
-            ),
-            (
-                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","extra":1}"#,
-                Ok(
-                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
-                ),
-            ),
-            (
-                r#"
+    fn app_config_omits_absent_fields_and_defaults_missing_ones() {
+        let config = AppConfig {
+            version: 1,
+            base_url: "b".into(),
+            api_key: "k".into(),
+            listen: "l".into(),
+            ca_cert_path: "cc".into(),
+            ca_key_path: "ck".into(),
+            chatgpt_chat_passthrough: true,
+            desktop_browser_use: false,
+            upstream_proxy: None,
+            providers: ProviderCredentials {
+                claude: Some(ProviderCredential {
+                    base_url: "cb".into(),
+                    api_key: "ck2".into(),
+                }),
+                codex: None,
+            },
+        };
+        let value = serde_json::to_value(&config).unwrap();
+        let keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert!(!keys.contains(&"upstream_proxy"), "{keys:?}");
+        assert_eq!(
+            value["providers"],
+            serde_json::json!({"claude": {"base_url": "cb", "api_key": "ck2"}})
+        );
+        let empty = AppConfig {
+            providers: ProviderCredentials::default(),
+            ..config.clone()
+        };
+        assert_eq!(
+            serde_json::to_value(&empty).unwrap()["providers"],
+            serde_json::json!({})
+        );
 
-   null"#,
-                Err(r#"invalid type: null, expected struct SaiaiConfig at line 3 column 7"#),
-            ),
-            (
-                r#"
-  [
- 2,
- "u"
- ]"#,
-                Err(
-                    r#"invalid length 2, expected struct SaiaiConfig with 10 elements at line 5 column 2"#,
-                ),
-            ),
-            (
-                r#"{
-  "version": 2
-}"#,
-                Err(r#"missing field `base_url` at line 3 column 1"#),
-            ),
-            (
-                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}"#,
-                Ok(
-                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
-                ),
-            ),
-            // Field-level edge cases, same source release.
-            (
-                r#"[2,"u","k","l","c","kp"]"#,
-                Ok(
-                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"kp","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
-                ),
-            ),
-            (
-                r#"[2,"u","k","l","c","kp",false]"#,
-                Ok(
-                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"kp","chatgpt_chat_passthrough":false,"desktop_browser_use":true,"providers":{}}"#,
-                ),
-            ),
-            (
-                r#"[2,"u","k","l","c","kp",false,false]"#,
-                Ok(
-                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"kp","chatgpt_chat_passthrough":false,"desktop_browser_use":false,"providers":{}}"#,
-                ),
-            ),
-            (
-                r#"[2,"u","k","l","c","kp",false,false,"direct"]"#,
-                Ok(
-                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"kp","chatgpt_chat_passthrough":false,"desktop_browser_use":false,"upstream_proxy":"direct","providers":{}}"#,
-                ),
-            ),
-            (
-                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","chatgpt_chat_passthrough":null}"#,
-                Err(r#"invalid type: null, expected a boolean at line 1 column 105"#),
-            ),
-            (
-                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","chatgpt_chat_passthrough":"yes"}"#,
-                Err(r#"invalid type: string "yes", expected a boolean at line 1 column 106"#),
-            ),
-            (
-                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","desktop_browser_use":null}"#,
-                Err(r#"invalid type: null, expected a boolean at line 1 column 100"#),
-            ),
-            (
-                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","desktop_browser_use":"no"}"#,
-                Err(r#"invalid type: string "no", expected a boolean at line 1 column 100"#),
-            ),
-            (
-                r#"[2,"u","k","l","c","kp",null]"#,
-                Err(r#"invalid type: null, expected a boolean at line 1 column 28"#),
-            ),
-            (
-                r#"[2,"u","k","l","c","kp",true,"x"]"#,
-                Err(r#"invalid type: string "x", expected a boolean at line 1 column 32"#),
-            ),
-            (
-                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":null}"#,
-                Err(r#"invalid type: null, expected a string at line 1 column 92"#),
-            ),
-            (
-                r#"[2,"u","k","l","c",null]"#,
-                Err(r#"invalid type: null, expected a string at line 1 column 23"#),
-            ),
-            (
-                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","providers":null}"#,
-                Err(
-                    r#"invalid type: null, expected struct ProviderCredentials at line 1 column 90"#,
-                ),
-            ),
-            (
-                r#"[2,"u","k","l","c","kp",true,true,null,null]"#,
-                Err(
-                    r#"invalid type: null, expected struct ProviderCredentials at line 1 column 43"#,
-                ),
-            ),
-            (
-                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}"#,
-                Ok(
-                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
-                ),
-            ),
-            (
-                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","upstream_proxy":null}"#,
-                Ok(
-                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
-                ),
-            ),
-            (
-                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","upstream_proxy":"direct"}"#,
-                Ok(
-                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"upstream_proxy":"direct","providers":{}}"#,
-                ),
-            ),
-            (
-                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","upstream_proxy":5}"#,
-                Err(r#"invalid type: integer `5`, expected a string at line 1 column 92"#),
-            ),
-            (
-                r#"[2,"u","k","l","c","kp",true,true,5]"#,
-                Err(r#"invalid type: integer `5`, expected a string at line 1 column 35"#),
-            ),
-            (
-                r#"{"version":null,"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}"#,
-                Err(r#"invalid type: null, expected u32 at line 1 column 15"#),
-            ),
-            (
-                r#"{"upstream_proxy":null,"upstream_proxy":"direct","version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}"#,
-                Err(r#"duplicate field `upstream_proxy` at line 1 column 39"#),
-            ),
-            (
-                r#"{"providers":{},"upstream_proxy":"direct","desktop_browser_use":false,"chatgpt_chat_passthrough":false,"ca_key_path":"kp","ca_cert_path":"c","listen":"l","api_key":"k","base_url":"u","version":2}"#,
-                Ok(
-                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"kp","chatgpt_chat_passthrough":false,"desktop_browser_use":false,"upstream_proxy":"direct","providers":{}}"#,
-                ),
-            ),
-            (
-                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","extra":{"a":[1,{"b":null}]},"more":[1,[2,{}]]}"#,
-                Ok(
-                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
-                ),
-            ),
-            (
-                r#"[2,"u","k","l","c",]"#,
-                Err(r#"trailing comma at line 1 column 20"#),
-            ),
-            (
-                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c",}"#,
-                Err(r#"trailing comma at line 1 column 75"#),
-            ),
-            (
-                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"} {}"#,
-                Err(r#"trailing characters at line 1 column 76"#),
-            ),
-            (
-                r#"[2,"u","k","l","c"] 1"#,
-                Err(r#"trailing characters at line 1 column 21"#),
-            ),
-            (
-                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}
+        let legacy: AppConfig = serde_json::from_str(
+            r#"{"version":1,"base_url":"b","api_key":"k","listen":"l","ca_cert_path":"cc"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.ca_key_path, "");
+        assert!(legacy.chatgpt_chat_passthrough);
+        assert!(legacy.desktop_browser_use);
+        assert_eq!(legacy.upstream_proxy, None);
+        assert!(legacy.providers.is_empty());
+        assert!(legacy.providers.claude.is_none() && legacy.providers.codex.is_none());
+    }
 
-  null"#,
-                Err(r#"trailing characters at line 3 column 3"#),
-            ),
-        ];
-        for (input, expected) in cases {
-            let actual = serde_json::from_str::<AppConfig>(input)
-                .map(|config| serde_json::to_string(&config).unwrap())
-                .map_err(|error| error.to_string());
-            assert_eq!(
-                actual.as_deref().map_err(String::as_str),
-                *expected,
-                "{input:?}"
-            );
-        }
+    /// Each config file key lands in its own struct field (a renamed or
+    /// swapped key would still round-trip as JSON, so read the fields).
+    #[test]
+    fn app_config_keys_map_to_their_fields() {
+        let config: AppConfig = serde_json::from_str(
+            r#"{"version":7,"base_url":"b","api_key":"k","listen":"l","ca_cert_path":"cc","ca_key_path":"ck","chatgpt_chat_passthrough":false,"desktop_browser_use":true,"upstream_proxy":"u","providers":{"claude":{"base_url":"cb","api_key":"ck2"},"codex":{"base_url":"xb","api_key":"xk"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.version, 7);
+        assert_eq!(config.base_url, "b");
+        assert_eq!(config.api_key, "k");
+        assert_eq!(config.listen, "l");
+        assert_eq!(config.ca_cert_path, "cc");
+        assert_eq!(config.ca_key_path, "ck");
+        assert!(!config.chatgpt_chat_passthrough);
+        assert!(config.desktop_browser_use);
+        assert_eq!(config.upstream_proxy.as_deref(), Some("u"));
+        let claude = config.providers.claude.as_ref().unwrap();
+        assert_eq!(
+            (claude.base_url.as_str(), claude.api_key.as_str()),
+            ("cb", "ck2")
+        );
+        let codex = config.providers.codex.as_ref().unwrap();
+        assert_eq!(
+            (codex.base_url.as_str(), codex.api_key.as_str()),
+            ("xb", "xk")
+        );
     }
 
     /// The struct's field order, `APP_CONFIG_FIELDS` and the array reader
@@ -10455,17 +10266,6 @@ HTTPS_PROXY="http://127.0.0.1:1111"
                 .unwrap();
             assert_eq!(error.to_string(), message, "{input}");
         }
-    }
-
-    /// A config.json whose root is not an object reports the same serde
-    /// diagnostic as before the configuration type was renamed.
-    #[test]
-    fn config_type_diagnostic_is_unchanged() {
-        let error = serde_json::from_str::<AppConfig>("null").err().unwrap();
-        assert_eq!(
-            error.to_string(),
-            "invalid type: null, expected struct SaiaiConfig at line 1 column 4"
-        );
     }
 
     #[test]

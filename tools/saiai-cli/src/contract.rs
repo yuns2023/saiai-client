@@ -34,6 +34,158 @@ fn check_installed(installed: Option<&'static Brand>, brand: &'static Brand) -> 
     }
 }
 
+/// Service files the program installs for its background proxy.
+pub mod service {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use super::*;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::path::Path;
+
+    /// The systemd user unit for `exe` serving the environment `app_home`.
+    #[cfg(target_os = "linux")]
+    pub fn systemd_unit(
+        brand: &'static Brand,
+        exe: &Path,
+        app_home: &Path,
+        working_dir: &Path,
+    ) -> Result<String> {
+        installed(brand)?;
+        crate::render_user_service(exe, app_home, working_dir)
+    }
+
+    /// The LaunchAgent property list for `exe` serving `app_home`.
+    #[cfg(target_os = "macos")]
+    pub fn launchd_plist(
+        brand: &'static Brand,
+        exe: &Path,
+        app_home: &Path,
+        working_dir: &Path,
+        log: &Path,
+    ) -> Result<String> {
+        installed(brand)?;
+        crate::render_launchd_plist(exe, app_home, working_dir, log)
+    }
+}
+
+/// The configuration file (`config.json`).
+pub mod config {
+    use super::*;
+
+    /// Reads config file text with the program's own decoder and writes the
+    /// result back as compact JSON: the written text, or the decoder's error
+    /// text (with serde_json's line and column).
+    pub fn decode(
+        brand: &'static Brand,
+        json: &str,
+    ) -> Result<std::result::Result<String, String>> {
+        installed(brand)?;
+        Ok(serde_json::from_str::<crate::AppConfig>(json)
+            .map(|config| serde_json::to_string(&config).expect("a config always serializes"))
+            .map_err(|error| error.to_string()))
+    }
+}
+
+/// The program's helper script templates and their rendering.
+pub mod scripts {
+    use super::*;
+
+    /// The VSCode certificate trust helper template (Windows).
+    pub const VSCODE_TRUST_WINDOWS: &str = include_str!("vscode_trust_windows.ps1");
+    /// The Windows Desktop inspection helper template.
+    pub const WINDOWS_DESKTOP_INSPECT: &str = include_str!("windows_desktop_inspect.ps1");
+
+    /// A helper script template rendered for the installed brand.
+    pub fn render(brand: &'static Brand, template: &str) -> Result<String> {
+        installed(brand)?;
+        Ok(crate::script_brand::render(template))
+    }
+
+    /// The Windows self-update helper script.
+    #[cfg(target_os = "windows")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn windows_update(
+        brand: &'static Brand,
+        pid: u32,
+        current_exe: &std::path::Path,
+        candidate_path: &std::path::Path,
+        script_path: &std::path::Path,
+        status_path: &std::path::Path,
+        restart_service: bool,
+        expected_sha256: &str,
+    ) -> Result<String> {
+        installed(brand)?;
+        crate::render_windows_update_script(
+            pid,
+            current_exe,
+            candidate_path,
+            script_path,
+            status_path,
+            restart_service,
+            expected_sha256,
+        )
+    }
+}
+
+/// The local TLS leaf certificates the proxy presents.
+pub mod certificates {
+    use super::*;
+
+    /// The leaf certificate for `host` (DER) and its public key (DER),
+    /// derived from the installation CA as the proxy derives it.
+    pub fn leaf(
+        brand: &'static Brand,
+        host: &str,
+        ca_cert_pem: &str,
+        ca_key_pem: &str,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        installed(brand)?;
+        let (der, key) = crate::local_proxy::sign_leaf_certificate(host, ca_cert_pem, ca_key_pem)?;
+        Ok((der, key.public_key_der()))
+    }
+}
+
+/// The self-update channel and file names.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub mod update {
+    use super::*;
+
+    /// Update coordinates for a Gateway base URL and a release asset.
+    #[derive(Debug, PartialEq)]
+    pub struct Names {
+        pub manifest_url: String,
+        pub asset_url: String,
+        /// This platform's release asset.
+        pub current_asset: String,
+        /// The staged replacement for `unique`.
+        pub candidate: String,
+        /// A previous executable kept now (timestamped).
+        pub backup: String,
+    }
+
+    pub fn names(
+        brand: &'static Brand,
+        base_url: &str,
+        asset: &str,
+        unique: &str,
+    ) -> Result<Names> {
+        installed(brand)?;
+        let (manifest_url, asset_url) = crate::update_urls(base_url, asset);
+        Ok(Names {
+            manifest_url,
+            asset_url,
+            current_asset: crate::current_platform_asset_name()?,
+            candidate: crate::update_candidate_name(unique),
+            backup: crate::update_backup_name(),
+        })
+    }
+
+    /// Whether `bytes` would be accepted as the release asset `asset`.
+    pub fn validate_asset(brand: &'static Brand, bytes: &[u8], asset: &str) -> Result<()> {
+        installed(brand)?;
+        crate::validate_update_asset(bytes, asset)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

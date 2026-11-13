@@ -30,6 +30,10 @@ contract = []
 name = "contract_entry"
 required-features = ["contract"]
 
+[[test]]
+name = "saiai_render_contract"
+required-features = ["contract"]
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"

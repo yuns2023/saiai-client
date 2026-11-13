@@ -43,7 +43,7 @@ jobs:
         run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml
 
       - name: Test contract entries
-        run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --features contract --test contract_entry
+        run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --features contract --test contract_entry --test saiai_render_contract
 
       - name: Verify standalone release contract
         run: |
@@ -111,6 +111,13 @@ jobs:
       - name: Build release binary
         if: runner.os != 'Linux'
         run: cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml --release --target ${{ matrix.target }}
+
+      # The release itself checks the platform-gated SAIAI goldens (LaunchAgent
+      # plist, Windows update helper) through the contract entries, natively.
+      - name: Test contract entries on this platform
+        if: runner.os == 'macOS' || matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --features contract --test contract_entry --test saiai_render_contract
 
       - name: Verify native Windows Desktop runtime
         if: matrix.target == 'x86_64-pc-windows-msvc'
