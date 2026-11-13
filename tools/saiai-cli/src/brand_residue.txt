@@ -535,14 +535,11 @@ upstream_proxy.rs	Err("proxy auto-configuration returned this SAIAI proxy itself
 upstream_proxy.rs	let message = "the configured upstream proxy is this SAIAI proxy itself".to_string();
 upstream_tls.rs	"warning: SAIAI installation CA is unreadable; trusting only bundled root certificates"
 vscode.rs	"Windows may show a Security Warning for the existing SAIAI CA (SHA-256: {hash}). Confirm that certificate within 90 seconds to finish VSCode setup."
-vscode.rs	"{\n // SAIAI managed VSCode proxy: http://127.0.0.1:19908\n broken json\n"
-vscode.rs	"{\n // SAIAI managed VSCode proxy: http://127.0.0.1:19908\n}\n"
 vscode.rs	.context("SAIAI ownership marker disappeared during removal")?;
 vscode.rs	bail!("VSCode settings contain multiple SAIAI ownership markers");
 vscode.rs	bail!("VSCode settings contain multiple SAIAI ownership markers");
 vscode.rs	bail!("VSCode's certificate loader could not verify the SAIAI CA");
 vscode.rs	bail!("VSCode's {key} is not configured for the current SAIAI proxy");
-vscode.rs	r#"{"description": "// SAIAI managed VSCode proxy: http://127.0.0.1:19908"}"#
 windows_background.rs	.context("cannot read SAIAI process creation time");
 windows_background.rs	.context("cannot terminate selected SAIAI process");
 windows_background.rs	bail!("selected SAIAI process did not exit after termination");

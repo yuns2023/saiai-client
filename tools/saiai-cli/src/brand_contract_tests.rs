@@ -968,21 +968,27 @@ fn strip_rust_comments(text: &str) -> String {
     output
 }
 
-/// Removes every item annotated exactly `#[cfg(test)]` (module, fn, use, …),
-/// matching braces outside literals, and keeps everything after it.
+/// Removes every item annotated exactly `#[cfg(test)]` (module, fn, use, …)
+/// and every standalone `#[test]` / `#[tokio::test]` function, matching
+/// braces outside literals, and keeps everything after it.
 fn remove_rust_test_items(text: &str) -> String {
+    const MARKERS: [&str; 3] = ["#[cfg(test)]", "#[test]", "#[tokio::test]"];
     let mask = literal_mask(text);
     let in_literal = |index: usize| mask[index];
     let mut output = String::new();
     let mut copied = 0;
     let mut search = 0;
-    while let Some(found) = text[search..].find("#[cfg(test)]") {
+    while let Some((found, marker)) = MARKERS
+        .iter()
+        .filter_map(|marker| text[search..].find(marker).map(|found| (found, marker)))
+        .min()
+    {
         let start = search + found;
         if in_literal(start) {
             search = start + 1;
             continue;
         }
-        let mut index = start + "#[cfg(test)]".len();
+        let mut index = start + marker.len();
         // Braces end an item body; `;` ends an item only outside any
         // bracket, so `fn f(x: [u8; 1])` is not cut at the array length.
         let (mut braces, mut nested) = (0_usize, 0_usize);
