@@ -1702,8 +1702,10 @@ fn native_chat_update_route_is_frozen() {
 fn library_takes_release_facts_from_the_entry_point() {
     let sources = cli_sources();
     for (file, text) in &sources {
-        // Any `env!`/`option_env!` spelling, with or without whitespace,
-        // of Cargo-provided package, crate or binary metadata.
+        // `env!`/`option_env!` with an ordinary string literal naming any
+        // `CARGO_*` variable, with or without whitespace or line breaks.
+        // Raw strings (`env!(r"CARGO_…")`) and `concat!`-built names are
+        // not detected.
         let compact = text.split_whitespace().collect::<String>();
         if file != "main.rs" {
             assert!(

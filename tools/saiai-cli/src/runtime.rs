@@ -21,7 +21,11 @@ static CONTEXT: OnceLock<RuntimeContext> = OnceLock::new();
 /// Installs the context once per process; `run` does this before parsing.
 /// A later `run` in the same process must describe the same program.
 pub(crate) fn install(context: RuntimeContext) -> Result<()> {
-    let installed = CONTEXT.get_or_init(|| context);
+    install_into(&CONTEXT, context)
+}
+
+fn install_into(slot: &OnceLock<RuntimeContext>, context: RuntimeContext) -> Result<()> {
+    let installed = slot.get_or_init(|| context);
     if *installed != context {
         bail!("this process already runs as version {}", installed.version);
     }
@@ -46,4 +50,21 @@ fn uninstalled_version() -> &'static str {
 #[cfg(test)]
 fn uninstalled_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A local slot: the process-wide context is never installed by tests.
+    #[test]
+    fn install_accepts_the_same_context_and_rejects_another_without_overwriting() {
+        let slot = OnceLock::new();
+        let first = RuntimeContext { version: "1.2.3" };
+        install_into(&slot, first).unwrap();
+        install_into(&slot, first).unwrap();
+        let error = install_into(&slot, RuntimeContext { version: "9.9.9" }).unwrap_err();
+        assert!(error.to_string().contains("1.2.3"), "{error}");
+        assert_eq!(slot.get(), Some(&first));
+    }
 }
