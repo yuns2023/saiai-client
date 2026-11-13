@@ -1501,6 +1501,7 @@ dependencies = [
  "dunce",
  "futures-util",
  "p256",
+ "proc-macro2",
  "proxy-cli",
  "rand 0.10.2",
  "rcgen",

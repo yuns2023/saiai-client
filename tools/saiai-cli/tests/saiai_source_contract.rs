@@ -870,137 +870,151 @@ fn the_kernel_directory_never_names_saiai() {
     );
 }
 
-fn is_ident_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-fn skip_whitespace(text: &[u8], mut at: usize) -> usize {
-    while at < text.len() && text[at].is_ascii_whitespace() {
-        at += 1;
-    }
-    at
-}
-
-/// A plain string literal naming a sibling file (`"name.ext"`: letters,
-/// digits, `_`, `-`, `.`, not only dots) at `at`, and the index after it.
-fn sibling_name(text: &[u8], at: usize) -> Option<(String, usize)> {
-    let rest = text.get(at..)?.strip_prefix(b"\"")?;
-    let end = rest.iter().position(|&byte| byte == b'"')?;
-    let name = &rest[..end];
+/// `"name.ext"`: a plain string literal naming a sibling file (letters,
+/// digits, `_`, `-`, `.`, not only dots).
+fn sibling_name(token: &proc_macro2::TokenTree) -> Option<String> {
+    let proc_macro2::TokenTree::Literal(literal) = token else {
+        return None;
+    };
+    let text = literal.to_string();
+    let name = text.strip_prefix('"')?.strip_suffix('"')?;
     let plain = !name.is_empty()
-        && !name.iter().all(|&byte| byte == b'.')
+        && !name.chars().all(|ch| ch == '.')
         && name
-            .iter()
-            .all(|&byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
-    plain.then(|| (String::from_utf8(name.to_vec()).unwrap(), at + 1 + end + 1))
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'));
+    plain.then(|| name.to_string())
 }
 
-/// File references in Rust source `text`: every `include!`,
-/// `include_str!` and `include_bytes!` call and every `path = ...` inside an
-/// attribute (`#[path]`, `#[cfg_attr(..., path = ...)]`), whitespace between
-/// tokens allowed. `Ok(name)` is a sibling file name; `Err(form)` is anything
-/// else (another directory, escapes, raw strings, macros, `include!`, or a
-/// `#[path]` on an inline module), which the kernel does not use.
-fn file_references(text: &str) -> Vec<Result<String, String>> {
-    let bytes = text.as_bytes();
-    let mut found = Vec::new();
-    let excerpt = |at: usize| text[at..].chars().take(60).collect::<String>();
-    for (start, _) in text.match_indices("include") {
-        if start > 0 && is_ident_byte(bytes[start - 1]) {
-            continue;
-        }
-        let mut at = start + "include".len();
-        let mut plain_include = true;
-        for suffix in ["_str", "_bytes"] {
-            if bytes[at..].starts_with(suffix.as_bytes()) {
-                at += suffix.len();
-                plain_include = false;
-                break;
-            }
-        }
-        if bytes.get(at).is_some_and(|&byte| is_ident_byte(byte)) {
-            continue;
-        }
-        let at = skip_whitespace(bytes, at);
-        if bytes.get(at) != Some(&b'!') {
-            continue;
-        }
-        let at = skip_whitespace(bytes, at + 1);
-        let literal = (!plain_include && bytes.get(at) == Some(&b'('))
-            .then(|| sibling_name(bytes, skip_whitespace(bytes, at + 1)))
-            .flatten()
-            .filter(|(_, end)| bytes.get(skip_whitespace(bytes, *end)) == Some(&b')'));
-        found.push(literal.map(|(name, _)| name).ok_or_else(|| excerpt(start)));
+fn is_ident(token: Option<&proc_macro2::TokenTree>, name: &str) -> bool {
+    matches!(token, Some(proc_macro2::TokenTree::Ident(ident)) if ident == name)
+}
+
+fn is_punct(token: Option<&proc_macro2::TokenTree>, ch: char) -> bool {
+    matches!(token, Some(proc_macro2::TokenTree::Punct(punct)) if punct.as_char() == ch)
+}
+
+fn is_group(token: Option<&proc_macro2::TokenTree>, delimiter: proc_macro2::Delimiter) -> bool {
+    matches!(token, Some(proc_macro2::TokenTree::Group(group)) if group.delimiter() == delimiter)
+}
+
+/// Whether the item starting at `tokens[at]` (outer attributes skipped) is
+/// an inline `mod name { ... }`.
+fn is_inline_module(tokens: &[proc_macro2::TokenTree], mut at: usize) -> bool {
+    use proc_macro2::Delimiter::{Brace, Bracket, Parenthesis};
+    while is_punct(tokens.get(at), '#') && is_group(tokens.get(at + 1), Bracket) {
+        at += 2;
     }
-    for (start, _) in text.match_indices('#') {
-        let mut at = skip_whitespace(bytes, start + 1);
-        if bytes.get(at) == Some(&b'!') {
-            at = skip_whitespace(bytes, at + 1);
+    if is_ident(tokens.get(at), "pub") {
+        at += 1;
+        if is_group(tokens.get(at), Parenthesis) {
+            at += 1;
         }
-        if bytes.get(at) != Some(&b'[') {
-            continue;
+    }
+    is_ident(tokens.get(at), "mod") && is_group(tokens.get(at + 2), Brace)
+}
+
+/// `path = ...` values inside one attribute body (any depth, so
+/// `cfg_attr(..., path = ...)` counts). `inline` is whether the attribute
+/// annotates an inline module.
+fn attribute_paths(
+    body: proc_macro2::TokenStream,
+    inline: bool,
+    found: &mut Vec<Result<String, String>>,
+) {
+    let tokens: Vec<_> = body.into_iter().collect();
+    for (index, token) in tokens.iter().enumerate() {
+        if let proc_macro2::TokenTree::Group(group) = token {
+            attribute_paths(group.stream(), inline, found);
         }
-        // The attribute body up to its closing bracket (string-aware).
-        let (mut depth, mut end, mut in_string) = (0usize, at, false);
-        while end < bytes.len() {
-            match bytes[end] {
-                b'\\' if in_string => end += 1,
-                b'"' => in_string = !in_string,
-                b'[' if !in_string => depth += 1,
-                b']' if !in_string => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
+        if is_ident(Some(token), "path") && is_punct(tokens.get(index + 1), '=') {
+            let value = tokens.get(index + 2);
+            let name = value
+                .and_then(sibling_name)
+                .filter(|name| name.ends_with(".rs") && !inline);
+            found.push(name.ok_or_else(|| {
+                format!(
+                    "path = {}{}",
+                    value.map(ToString::to_string).unwrap_or_default(),
+                    if inline { " on an inline module" } else { "" }
+                )
+            }));
+        }
+    }
+}
+
+fn token_references(tokens: &[proc_macro2::TokenTree], found: &mut Vec<Result<String, String>>) {
+    use proc_macro2::Delimiter::Bracket;
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            proc_macro2::TokenTree::Punct(punct) if punct.as_char() == '#' => {
+                let mut at = index + 1;
+                if is_punct(tokens.get(at), '!') {
+                    at += 1;
                 }
-                _ => {}
+                if let Some(proc_macro2::TokenTree::Group(group)) = tokens.get(at)
+                    && group.delimiter() == Bracket
+                {
+                    let inline = is_inline_module(tokens, at + 1);
+                    attribute_paths(group.stream(), inline, found);
+                }
             }
-            end += 1;
-        }
-        let body = &text[at..end.min(bytes.len())];
-        for (offset, _) in body.match_indices("path") {
-            let position = at + offset;
-            let after = position + "path".len();
-            if is_ident_byte(bytes[position - 1])
-                || bytes.get(after).is_some_and(|&byte| is_ident_byte(byte))
+            proc_macro2::TokenTree::Ident(ident)
+                if ["include", "include_str", "include_bytes"]
+                    .iter()
+                    .any(|name| ident == name)
+                    && is_punct(tokens.get(index + 1), '!') =>
             {
-                continue;
+                let argument = match tokens.get(index + 2) {
+                    Some(proc_macro2::TokenTree::Group(group)) if ident != "include" => {
+                        let inner: Vec<_> = group.stream().into_iter().collect();
+                        match inner.as_slice() {
+                            [only] => sibling_name(only),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                found.push(argument.ok_or_else(|| {
+                    format!(
+                        "{ident}!{}",
+                        tokens
+                            .get(index + 2)
+                            .map(ToString::to_string)
+                            .unwrap_or_default()
+                    )
+                }));
             }
-            let equals = skip_whitespace(bytes, after);
-            if bytes.get(equals) != Some(&b'=') {
-                continue;
-            }
-            let literal = sibling_name(bytes, skip_whitespace(bytes, equals + 1))
-                .map(|(name, _)| name)
-                .filter(|_| !annotates_inline_module(bytes, end + 1));
-            found.push(literal.ok_or_else(|| excerpt(start)));
+            _ => {}
         }
+        // Groups that are not attribute bodies: function bodies, macro
+        // arguments (`format!(.., include_str!(..))`), modules, ...
+        if let proc_macro2::TokenTree::Group(group) = token {
+            let is_attribute = is_punct(index.checked_sub(1).and_then(|i| tokens.get(i)), '#')
+                || (is_punct(index.checked_sub(1).and_then(|i| tokens.get(i)), '!')
+                    && is_punct(index.checked_sub(2).and_then(|i| tokens.get(i)), '#'));
+            if !(is_attribute && group.delimiter() == Bracket) {
+                token_references(&group.stream().into_iter().collect::<Vec<_>>(), found);
+            }
+        }
+    }
+}
+
+/// File references in Rust source `text`, read from its tokens (comments
+/// and the contents of string literals are not code): every `include!`,
+/// `include_str!` and `include_bytes!` call and every `path = ...` inside an
+/// attribute (`#[path]`, `#[cfg_attr(..., path = ...)]`). `Ok(name)` is a
+/// sibling file name (a `.rs` file for `path`); `Err(form)` is anything else
+/// (another directory, escapes, raw strings, computed paths, `include!`, or
+/// a `path` on an inline module), which the kernel does not use. Source that
+/// does not lex is one `Err`.
+fn file_references(text: &str) -> Vec<Result<String, String>> {
+    let mut found = Vec::new();
+    match text.parse::<proc_macro2::TokenStream>() {
+        Ok(stream) => token_references(&stream.into_iter().collect::<Vec<_>>(), &mut found),
+        Err(error) => found.push(Err(format!("does not lex: {error}"))),
     }
     found
-}
-
-/// Whether the item after the attribute ending at `at` (other attributes
-/// skipped) is an inline `mod name { ... }`.
-fn annotates_inline_module(text: &[u8], mut at: usize) -> bool {
-    loop {
-        at = skip_whitespace(text, at);
-        if text.get(at) != Some(&b'#') {
-            break;
-        }
-        let Some(close) = text[at..].iter().position(|&byte| byte == b']') else {
-            return false;
-        };
-        at += close + 1;
-    }
-    for word in ["pub(crate)", "pub", "mod"] {
-        if text[at..].starts_with(word.as_bytes()) {
-            at = skip_whitespace(text, at + word.len());
-        }
-    }
-    while text.get(at).is_some_and(|&byte| is_ident_byte(byte)) {
-        at += 1;
-    }
-    text.get(skip_whitespace(text, at)) == Some(&b'{')
 }
 
 /// Kernel sources reference only sibling files inside `kernel/` (plain
@@ -1036,29 +1050,53 @@ fn kernel_sources_reference_no_file_outside_the_kernel() {
 
 #[test]
 fn kernel_file_reference_scanner_sees_every_form() {
-    let allowed = "#[path = \"y.rs\"]\nmod y;\n#[cfg(test)]\n#[path=\"z_tests.rs\"] pub(crate) mod z;\nconst A: &str = include_str!(\"a.ps1\");\nconst B: &[u8] = include_bytes! ( \"b.js\" );\nmy_include_str!(\"ignored\");\nlet path = \"../ignored\";\n// include the x\n";
+    let allowed = r##"
+#[path = "y.rs"]
+mod y;
+#[cfg(test)]
+#[path="z_tests.rs"] pub(crate) mod z;
+const A: &str = include_str!("a.ps1");
+const B: &[u8] = include_bytes! ( "b.js" );
+fn f() { let _ = format!("{}", include_str!("c.txt")); }
+my_include_str!("ignored");
+fn g() { let path = "../ignored"; }
+// include_str!("../comment") and #[path = "../comment.rs"]
+/* #[path = "../block.rs"] */
+const EXAMPLE: &str = r#"#[path = "../../example.rs"]"#;
+#[doc = "the path = value"]
+mod documented;
+"##;
     assert_eq!(
         file_references(allowed),
         vec![
-            Ok("a.ps1".to_string()),
-            Ok("b.js".to_string()),
             Ok("y.rs".to_string()),
             Ok("z_tests.rs".to_string()),
+            Ok("a.ps1".to_string()),
+            Ok("b.js".to_string()),
+            Ok("c.txt".to_string()),
         ]
     );
     for refused in [
         "#[path = \"../../src/x.rs\"]\nmod x;",
         "#[ path = \"../../outside.rs\"]\nmod x;",
+        "#[path/**/= \"../../outside.rs\"]\nmod x;",
         "#[cfg_attr(unix, path = \"../outside.rs\")]\nmod x;",
-        "#[cfg_attr(unix, path = \"x.rs\")]\nmod x { }",
+        "#[cfg_attr(test, doc = r#\"\" ]\"#, path = \"../../outside.rs\")]\nmod x;",
+        "#[path = \"fragment.inc\"]\nmod fragment;",
+        "#[path = \"x.rs\"]\nmod x { }",
+        "#[path = \"x.rs\"]\n#[doc = \"]\"]\nmod x {}",
+        "#[path = \"x.rs\"]\npub (crate) mod x {}",
         "#[path = \"..\"]\nmod inner {\n}",
         "const X: &str = include_str ! (\"../../outside.txt\");",
+        "const X: &str = include_str/**/!(\"../../outside.txt\");",
         "const X: &str = include_str!(\"..\\x2f..\\x2foutside.txt\");",
         "const X: &str = include_str!(r\"outside.txt\");",
         "const X: &[u8] = include_bytes!(concat!(env!(\"OUT_DIR\"), \"/c\"));",
-        "include!(\"fragment.inc\");",
+        "include!(\"fragment.rs\");",
         "const X: &str = include_str!(\"sub/x.txt\");",
         "const X: &str = include_str!(\"..\");",
+        "fn f() { g(include_str!(\"../x\")); }",
+        "const X: &str = \"unterminated;",
     ] {
         let references = file_references(refused);
         assert!(
