@@ -82,25 +82,82 @@ impl Process {
     }
 
     pub fn stop(&self) -> Result<()> {
-        if !self.running() {
-            return Ok(());
+        match self.wait(0) {
+            Wait::Exited => return Ok(()),
+            Wait::TimedOut => {}
+            Wait::Failed(error) => return Err(error).with_context(wait_failed),
         }
-        if unsafe { TerminateProcess(self.handle, 0) } == 0 && self.running() {
-            return Err(std::io::Error::last_os_error()).with_context(|| {
-                format!(
-                    "cannot terminate selected {brand_product} process",
-                    brand_product = BRAND.product_name
-                )
-            });
-        }
-        if unsafe { WaitForSingleObject(self.handle, 10_000) } != 0 {
-            bail!(
-                "selected {brand_product} process did not exit after termination",
-                brand_product = BRAND.product_name
-            );
-        }
-        Ok(())
+        // Read the error at once: the waits below overwrite the thread's
+        // last error.
+        let terminate_error = if unsafe { TerminateProcess(self.handle, 0) } == 0 {
+            Some(std::io::Error::last_os_error())
+        } else {
+            None
+        };
+        finish_stop(terminate_error, |milliseconds| self.wait(milliseconds))
     }
+
+    /// Waits on this verified handle (never a PID reopened later).
+    fn wait(&self, milliseconds: u32) -> Wait {
+        match unsafe { WaitForSingleObject(self.handle, milliseconds) } {
+            WAIT_OBJECT_0 => Wait::Exited,
+            WAIT_TIMEOUT => Wait::TimedOut,
+            WAIT_FAILED => Wait::Failed(std::io::Error::last_os_error()),
+            other => Wait::Failed(std::io::Error::other(format!(
+                "unexpected wait result {other:#x}"
+            ))),
+        }
+    }
+}
+
+const WAIT_OBJECT_0: u32 = 0;
+const WAIT_TIMEOUT: u32 = 258;
+const WAIT_FAILED: u32 = 0xFFFF_FFFF;
+const ERROR_ACCESS_DENIED: i32 = 5;
+const EXIT_WAIT_MILLISECONDS: u32 = 10_000;
+
+#[derive(Debug)]
+enum Wait {
+    Exited,
+    TimedOut,
+    Failed(std::io::Error),
+}
+
+/// Outcome of a stop after `TerminateProcess`. Termination counts only when
+/// the process is seen to exit. Access denied usually means the process is
+/// already exiting, so it gets the same bounded wait; if the process is
+/// still there afterwards the original termination error is returned.
+/// Other termination errors succeed only if the process has already exited.
+fn finish_stop(
+    terminate_error: Option<std::io::Error>,
+    wait: impl FnOnce(u32) -> Wait,
+) -> Result<()> {
+    let milliseconds = match &terminate_error {
+        None => EXIT_WAIT_MILLISECONDS,
+        Some(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => EXIT_WAIT_MILLISECONDS,
+        Some(_) => 0,
+    };
+    match (wait(milliseconds), terminate_error) {
+        (Wait::Exited, _) => Ok(()),
+        (Wait::Failed(error), _) => Err(error).with_context(wait_failed),
+        (Wait::TimedOut, Some(error)) => Err(error).with_context(|| {
+            format!(
+                "cannot terminate selected {brand_product} process",
+                brand_product = BRAND.product_name
+            )
+        }),
+        (Wait::TimedOut, None) => bail!(
+            "selected {brand_product} process did not exit after termination",
+            brand_product = BRAND.product_name
+        ),
+    }
+}
+
+fn wait_failed() -> String {
+    format!(
+        "cannot wait for selected {brand_product} process to exit",
+        brand_product = BRAND.product_name
+    )
 }
 
 impl Drop for Process {
@@ -108,5 +165,97 @@ impl Drop for Process {
         unsafe {
             CloseHandle(self.handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn os_error(code: i32) -> std::io::Error {
+        std::io::Error::from_raw_os_error(code)
+    }
+
+    fn os_code(error: &anyhow::Error) -> Option<i32> {
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .and_then(std::io::Error::raw_os_error)
+    }
+
+    #[test]
+    fn access_denied_counts_only_once_the_process_has_exited() {
+        let waited = Cell::new(None);
+        finish_stop(Some(os_error(ERROR_ACCESS_DENIED)), |ms| {
+            waited.set(Some(ms));
+            Wait::Exited
+        })
+        .unwrap();
+        assert_eq!(waited.get(), Some(EXIT_WAIT_MILLISECONDS));
+
+        // Still running after the bounded wait: the original error, kept.
+        let error =
+            finish_stop(Some(os_error(ERROR_ACCESS_DENIED)), |_| Wait::TimedOut).unwrap_err();
+        assert_eq!(os_code(&error), Some(ERROR_ACCESS_DENIED));
+        assert_eq!(error.to_string(), "cannot terminate selected SAIAI process");
+    }
+
+    #[test]
+    fn other_termination_errors_are_not_waited_out() {
+        let waited = Cell::new(None);
+        let error = finish_stop(Some(os_error(6)), |ms| {
+            waited.set(Some(ms));
+            Wait::TimedOut
+        })
+        .unwrap_err();
+        assert_eq!(waited.get(), Some(0));
+        assert_eq!(os_code(&error), Some(6));
+        // Already gone: nothing left to stop.
+        finish_stop(Some(os_error(6)), |_| Wait::Exited).unwrap();
+    }
+
+    #[test]
+    fn a_failed_wait_is_reported_as_such() {
+        for terminate_error in [None, Some(os_error(ERROR_ACCESS_DENIED))] {
+            let error = finish_stop(terminate_error, |_| Wait::Failed(os_error(6))).unwrap_err();
+            assert_eq!(os_code(&error), Some(6));
+            assert_eq!(
+                error.to_string(),
+                "cannot wait for selected SAIAI process to exit"
+            );
+        }
+        let error = finish_stop(None, |_| Wait::TimedOut).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "selected SAIAI process did not exit after termination"
+        );
+    }
+
+    /// The real path on a child process: one that is running (no
+    /// grandchildren), and one that exited before the stop. The window
+    /// between the running check and TerminateProcess is covered by the
+    /// decision tests above.
+    #[test]
+    fn stop_terminates_a_running_child_and_accepts_one_that_already_exited() {
+        let mut running = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let process = Process::open(running.id(), true).unwrap().unwrap();
+        assert!(process.running());
+        process.stop().unwrap();
+        assert!(!process.running());
+        running.wait().unwrap();
+
+        let mut quick = std::process::Command::new("cmd")
+            .args(["/D", "/C", "exit 0"])
+            .spawn()
+            .unwrap();
+        let process = Process::open(quick.id(), true).unwrap().unwrap();
+        quick.wait().unwrap();
+        process.stop().unwrap();
+        assert!(!process.running());
     }
 }

@@ -294,3 +294,4 @@
 ["windows_desktop_runtime.rs","\"Cannot safely reuse the running OpenAI Desktop. Use its normal File > Quit, then retry `saiai desktop codex`. No Desktop process was stopped.\""]
 ["windows_desktop_runtime.rs","\"Official Codex package changed or is not ready. Wait for its update to finish, then retry `saiai desktop codex`; if Desktop is open, use normal File > Quit first. No Desktop process was stopped or adopted.\""]
 ["lib.rs","\"struct SaiaiConfig\""]
+["windows_background.rs","\"cannot wait for selected SAIAI process to exit\""]
