@@ -69,6 +69,37 @@ async fn tls_request(state: Arc<State>, entry: EntryPoint, host: &str, request: 
     let mut tls = connector.connect(name, stream).await.unwrap();
     tls.write_all(request).await.unwrap();
     let mut response = Vec::new();
+    while !response.ends_with(b"\r\n\r\n") {
+        match timeout(Duration::from_secs(5), tls.read_u8())
+            .await
+            .unwrap()
+        {
+            Ok(byte) => response.push(byte),
+            Err(_) => break,
+        }
+    }
+    if response.starts_with(b"HTTP/1.1 101") {
+        // An upgraded relay stays open; the head is the answer.
+        task.abort();
+        return response;
+    }
+    let head_text = String::from_utf8_lossy(&response).to_ascii_lowercase();
+    if !head_text.contains("\r\nconnection: close\r\n")
+        && let Some(length) = head_text
+            .split("\r\n")
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+    {
+        // A kept-alive answer ends at its declared length.
+        let mut body = vec![0; length];
+        timeout(Duration::from_secs(5), tls.read_exact(&mut body))
+            .await
+            .unwrap()
+            .unwrap();
+        response.extend(body);
+        task.abort();
+        return response;
+    }
     // The existing server closes the TCP stream without a TLS close_notify.
     let result = timeout(Duration::from_secs(5), tls.read_to_end(&mut response))
         .await
@@ -953,5 +984,247 @@ async fn model_catalog_exit_passes_the_finished_request_to_the_extension() {
             "/v1/models".to_string(),
             Some(" MOCK_SPACED_KEY ".to_string())
         )]
+    );
+}
+
+/// Gateway that accepts requests forever and reports each one.
+async fn recording_gateway() -> (
+    String,
+    tokio::sync::mpsc::UnboundedReceiver<IncomingRequest>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let Ok(request) = read_http_request(&mut reader).await else {
+                continue;
+            };
+            if request.target.ends_with("/client/devices/enroll") {
+                let _ = reader
+                    .get_mut()
+                    .write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                    .await;
+                continue;
+            }
+            let key = header_value(&request.headers, "sec-websocket-key").map(str::to_owned);
+            let _ = sender.send(request);
+            let Some(key) = key else {
+                let _ = reader
+                    .get_mut()
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                    .await;
+                continue;
+            };
+            let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+            let _ = reader
+                .get_mut()
+                .write_all(format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes())
+                .await;
+            // End the session with a proper closing handshake.
+            let mut socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                reader.into_inner(),
+                tungstenite::protocol::Role::Server,
+                None,
+            )
+            .await;
+            tokio::spawn(async move {
+                let _ = socket.close(None).await;
+                while let Some(Ok(_)) = futures_util::StreamExt::next(&mut socket).await {}
+            });
+        }
+    });
+    (url, receiver, task)
+}
+
+const WS_HEADERS: &str = "Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n";
+
+/// Native Chat relay matrix: Gateway capability × user switch × HTTP/WS ×
+/// chatgpt.com native paths and api.openai.com `/chatgpt/` paths. Codex
+/// traffic and the local Desktop compatibility layer are never affected;
+/// refused relay requests get the explicit JSON answer and never leave.
+#[tokio::test]
+async fn native_chat_relay_follows_the_gateway_capability_and_the_user_switch() {
+    static NONE: crate::gateway::NoGatewayExtension = crate::gateway::NoGatewayExtension;
+    for capability in [true, false] {
+        for passthrough in [true, false] {
+            let (url, mut forwarded, task) = recording_gateway().await;
+            let (mut state, _root) = proof_test_state(&url, &url, None);
+            state.gateway_session = std::sync::OnceLock::new();
+            state.chatgpt_chat_passthrough = passthrough;
+            if !capability {
+                state.gateway = &NONE;
+            }
+            let state = Arc::new(state);
+            let relay = capability && passthrough;
+            let cases: Vec<(&str, String, Option<&str>)> = vec![
+                // (host, request, Gateway target when forwarded)
+                (
+                    CHATGPT_HOST,
+                    "POST /backend-api/f/conversation HTTP/1.1\r\nHost: chatgpt.com\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}".into(),
+                    relay.then_some("/chatgpt/backend-api/f/conversation"),
+                ),
+                (
+                    OPENAI_HOST,
+                    "POST /chatgpt/backend-api/f/conversation HTTP/1.1\r\nHost: api.openai.com\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}".into(),
+                    // An already prefixed path never depended on the user
+                    // switch; it follows the Gateway capability only.
+                    capability.then_some("/chatgpt/backend-api/f/conversation"),
+                ),
+                (
+                    CHATGPT_HOST,
+                    "POST /backend-api/codex/images/generations HTTP/1.1\r\nHost: chatgpt.com\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}".into(),
+                    capability.then_some("/v1/codex/images/generations"),
+                ),
+                (
+                    OPENAI_HOST,
+                    "POST /v1/codex/images/generations HTTP/1.1\r\nHost: api.openai.com\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}".into(),
+                    capability.then_some("/v1/codex/images/generations"),
+                ),
+                (
+                    CHATGPT_HOST,
+                    "POST /backend-api/codex/responses HTTP/1.1\r\nHost: chatgpt.com\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}".into(),
+                    Some("/v1/responses"),
+                ),
+                (
+                    OPENAI_HOST,
+                    "POST /v1/responses HTTP/1.1\r\nHost: api.openai.com\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}".into(),
+                    Some("/v1/responses"),
+                ),
+                (
+                    CHATGPT_HOST,
+                    format!("GET /backend-api/celsius/ws/user HTTP/1.1\r\nHost: chatgpt.com\r\n{WS_HEADERS}\r\n"),
+                    relay.then_some("/chatgpt/backend-api/celsius/ws/user"),
+                ),
+                (
+                    OPENAI_HOST,
+                    format!("GET /chatgpt/backend-api/celsius/ws/user HTTP/1.1\r\nHost: api.openai.com\r\n{WS_HEADERS}\r\n"),
+                    capability.then_some("/chatgpt/backend-api/celsius/ws/user"),
+                ),
+                (
+                    OPENAI_HOST,
+                    format!("GET /v1/responses HTTP/1.1\r\nHost: api.openai.com\r\n{WS_HEADERS}\r\n"),
+                    Some("/v1/responses"),
+                ),
+            ];
+            for (host, request, expected) in &cases {
+                let label = format!(
+                    "capability={capability} passthrough={passthrough} {host} {}",
+                    request.lines().next().unwrap()
+                );
+                let response = tls_request(
+                    Arc::clone(&state),
+                    EntryPoint::Main,
+                    host,
+                    request.as_bytes(),
+                )
+                .await;
+                match expected {
+                    Some(target) => {
+                        let seen = timeout(Duration::from_secs(5), forwarded.recv())
+                            .await
+                            .unwrap_or_else(|_| panic!("not forwarded: {label}"))
+                            .unwrap();
+                        assert_eq!(seen.target, *target, "{label}");
+                    }
+                    None => {
+                        let text = String::from_utf8_lossy(&response);
+                        assert!(text.starts_with("HTTP/1.1 501"), "{label}: {text}");
+                        assert!(
+                            text.contains("chat_mode_temporarily_disabled"),
+                            "{label}: {text}"
+                        );
+                        assert!(forwarded.try_recv().is_err(), "forwarded anyway: {label}");
+                    }
+                }
+            }
+            // The local Desktop compatibility layer answers either way.
+            let response = tls_request(
+                Arc::clone(&state),
+                EntryPoint::Main,
+                CHATGPT_HOST,
+                b"GET /backend-api/me HTTP/1.1\r\nHost: chatgpt.com\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            assert!(
+                response.starts_with(b"HTTP/1.1 200"),
+                "{}",
+                String::from_utf8_lossy(&response)
+            );
+            assert!(forwarded.try_recv().is_err());
+            task.abort();
+        }
+    }
+}
+
+/// Without a Chat relay the forwarder never extracts the device-proof cookie
+/// nor rewrites a Chat initialization response, even when a request reaches
+/// it directly.
+#[tokio::test]
+async fn no_chat_relay_means_no_device_cookie_and_no_preference_rewrite() {
+    static NONE: crate::gateway::NoGatewayExtension = crate::gateway::NoGatewayExtension;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let upstream =
+        br#"{"default_model_slug":"gpt-6-pro","intended_default_model_slug":"gpt-6-pro"}"#;
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let captured = read_http_request(&mut reader).await.unwrap();
+        reader
+            .get_mut()
+            .write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", upstream.len()).as_bytes())
+            .await
+            .unwrap();
+        reader.get_mut().write_all(upstream).await.unwrap();
+        captured
+    });
+    let (mut state, root) = proof_test_state(&url, &url, None);
+    state.gateway = &NONE;
+    state.gateway_session = std::sync::OnceLock::new();
+    // The user switch is on: only the missing capability holds both back.
+    state.chatgpt_chat_passthrough = true;
+    let preferences = root.path().join(".codex-global-state.json");
+    fs::write(
+        &preferences,
+        br#"{"electron-persisted-atom-state":{"chatgpt-last-selected-model-v1":{"slug":"gpt-5-6-thinking"}}}"#,
+    )
+    .unwrap();
+    let request = IncomingRequest {
+        method: "POST".into(),
+        target: "/chatgpt/backend-api/conversation/init".into(),
+        http_version: "HTTP/1.1".into(),
+        body: br#"{"conversation_origin":null,"requested_default_model":null}"#.to_vec(),
+        headers: vec![(
+            "Cookie".into(),
+            "session=MOCK_ONLY_AUTH; _devicecheck=MOCK_ONLY_PROOF".into(),
+        )],
+    };
+    let (mut writer, mut output) = tokio::io::duplex(16384);
+    forward_to_saiai_with_preferences_path(
+        &state,
+        &mut writer,
+        request,
+        true,
+        GatewayRoute::OpenAI,
+        CredentialPolicy::Replace,
+        Some(&preferences),
+    )
+    .await
+    .unwrap();
+    drop(writer);
+    let mut response = Vec::new();
+    output.read_to_end(&mut response).await.unwrap();
+    let captured = server.await.unwrap();
+    assert_eq!(header_value(&captured.headers, "cookie"), None);
+    let text = String::from_utf8_lossy(&response).to_ascii_lowercase();
+    assert!(!text.contains("chat-preference-restored"), "{text}");
+    // The upstream initialization answer passes through unrewritten.
+    assert!(
+        String::from_utf8_lossy(&response).contains(std::str::from_utf8(upstream).unwrap()),
+        "{text}"
     );
 }
