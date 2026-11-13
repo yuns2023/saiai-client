@@ -4,7 +4,8 @@
 //! environment isolation). Expected values are hand-written literals, except
 //! the release version (read from Cargo.toml), the CA suffix (hash of the
 //! generated key) and environment digests of temporary paths; see
-//! `src/brand_contract_tests.rs` for the in-process half of the contract.
+//! `src/brand_contract_tests.rs` and `tests/saiai_render_contract.rs` for the
+//! in-process half of the contract.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -611,5 +612,142 @@ fn proxy_signs_gateway_requests_and_strips_inbound_proofs() {
             .to_ascii_lowercase()
             .contains("authorization: bearer test_only_contract_signed"),
         "{request}"
+    );
+}
+
+/// The running proxy answers the certificate control request that
+/// `saiai desktop` and `doctor` send: a fixed host, a fixed status line and
+/// header name, and one base64 SHA-256 SPKI pin per managed Desktop host, the
+/// first being the leaf actually served for `api.openai.com`.
+#[test]
+fn certificate_control_endpoint_is_frozen() {
+    use base64::Engine as _;
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    let sandbox = Sandbox::new();
+    sandbox.run(&mut sandbox.command(&[
+        "init",
+        "--base-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "TEST_ONLY_CONTRACT_CONTROL",
+    ]));
+    let config = read_json(&sandbox.home.join(".saiai/config.json"));
+    let listen = config["listen"].as_str().unwrap().to_string();
+    let ca = std::fs::read(config["ca_cert_path"].as_str().unwrap()).unwrap();
+    let log = sandbox.home.with_file_name("control-proxy.log");
+    let file = std::fs::File::create(&log).unwrap();
+    let mut proxy = sandbox
+        .command(&[])
+        .env("SAIAI_UPSTREAM_PROXY", "direct")
+        .stdout(file.try_clone().unwrap())
+        .stderr(file)
+        .spawn()
+        .unwrap();
+
+    let connect = |host: &str| -> Option<(std::net::TcpStream, String)> {
+        let mut tcp = std::net::TcpStream::connect(&listen).ok()?;
+        tcp.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+        tcp.write_all(
+            format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n").as_bytes(),
+        )
+        .ok()?;
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            tcp.read_exact(&mut byte).ok()?;
+            head.push(byte[0]);
+        }
+        Some((tcp, String::from_utf8(head).ok()?))
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let control = loop {
+        if let Some((_, head)) = connect("certificate.saiai.local") {
+            break Some(head);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let served = control.as_ref().and_then(|_| {
+        let (tcp, _) = connect("api.openai.com")?;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut roots = rustls::RootCertStore::empty();
+        for certificate in rustls_pemfile::certs(&mut std::io::Cursor::new(&ca)) {
+            roots.add(certificate.unwrap()).unwrap();
+        }
+        let tls = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let connection =
+            rustls::ClientConnection::new(tls, "api.openai.com".try_into().unwrap()).ok()?;
+        let mut stream = rustls::StreamOwned::new(connection, tcp);
+        while stream.conn.is_handshaking() {
+            stream.conn.complete_io(&mut stream.sock).ok()?;
+        }
+        let leaf = stream.conn.peer_certificates()?.first()?.as_ref().to_vec();
+        let (_, certificate) = x509_parser::parse_x509_certificate(&leaf).ok()?;
+        Some(
+            base64::engine::general_purpose::STANDARD
+                .encode(Sha256::digest(certificate.public_key().raw)),
+        )
+    });
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+    let head = control.unwrap_or_else(|| {
+        panic!(
+            "no control response within 60 s; proxy log:\n{}",
+            String::from_utf8_lossy(&std::fs::read(&log).unwrap_or_default())
+        )
+    });
+    let pins = head
+        .strip_prefix("HTTP/1.1 200 Connection Established\r\nx-saiai-leaf-spki-sha256: ")
+        .and_then(|rest| rest.strip_suffix("\r\nConnection: close\r\n\r\n"))
+        .unwrap_or_else(|| panic!("{head:?}"))
+        .split(',')
+        .collect::<Vec<_>>();
+    assert_eq!(pins.len(), 4, "{head:?}");
+    for pin in &pins {
+        let digest = base64::engine::general_purpose::STANDARD
+            .decode(pin)
+            .unwrap_or_else(|error| panic!("{pin}: {error}"));
+        assert_eq!(digest.len(), 32, "{pin}");
+    }
+    assert_eq!(served.as_deref(), Some(pins[0]), "{head:?}");
+}
+
+/// `saiai uninstall --dry-run --yes` prints the plan under the SAIAI heading
+/// and changes nothing. The full uninstall lifecycle (refusals, `--yes`,
+/// unknown environments, legacy layouts) runs against the real binary in
+/// `scripts/saiai-cli/test-uninstall.py` on Linux CI.
+#[test]
+fn uninstall_dry_run_plan_is_frozen() {
+    let sandbox = Sandbox::new();
+    sandbox.run(&mut sandbox.command(&[
+        "init",
+        "--base-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "TEST_ONLY_CONTRACT_UNINSTALL",
+    ]));
+    let root = sandbox.home.join(".saiai");
+    let before = std::fs::read(root.join("config.json")).unwrap();
+    let output = sandbox.run(&mut sandbox.command(&["uninstall", "--dry-run", "--yes"]));
+    let rest = output
+        .strip_prefix("SAIAI uninstall plan\nSAIAI home: ")
+        .unwrap_or_else(|| panic!("{output}"));
+    let (home, _) = rest.split_once('\n').unwrap();
+    assert!(same_path(home, &root), "{output}");
+    assert!(
+        output.ends_with("\nDry run: nothing was changed.\n"),
+        "{output}"
+    );
+    assert_eq!(std::fs::read(root.join("config.json")).unwrap(), before);
+    assert!(
+        sandbox.home.join(".claude/saiai-ca.crt").exists(),
+        "{output}"
     );
 }

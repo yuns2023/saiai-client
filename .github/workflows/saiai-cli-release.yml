@@ -43,7 +43,7 @@ jobs:
         run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml
 
       - name: Test contract entries
-        run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --features contract --test contract_entry --test saiai_render_contract
+        run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --features contract --test contract_entry --test saiai_render_contract --test kernel_consumer
 
       - name: Verify standalone release contract
         run: |
@@ -117,7 +117,7 @@ jobs:
       - name: Test contract entries on this platform
         if: runner.os == 'macOS' || matrix.target == 'x86_64-pc-windows-msvc'
         shell: bash
-        run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --features contract --test contract_entry --test saiai_render_contract
+        run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --features contract --test contract_entry --test saiai_render_contract --test kernel_consumer
 
       - name: Verify native Windows Desktop runtime
         if: matrix.target == 'x86_64-pc-windows-msvc'

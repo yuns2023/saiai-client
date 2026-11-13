@@ -186,6 +186,133 @@ pub mod update {
     }
 }
 
+/// Environment (profile) directory and service naming.
+pub mod environment {
+    use super::*;
+    use std::path::Path;
+
+    /// `<product>-<digest>` naming the environment of `directory`.
+    pub fn name(brand: &'static Brand, product: &str, directory: &Path) -> Result<String> {
+        installed(brand)?;
+        Ok(crate::environment_scope::environment_name(
+            product, directory,
+        ))
+    }
+
+    /// Service-name suffix of the environment `directory` below `root`.
+    pub fn service_suffix(brand: &'static Brand, root: &Path, directory: &Path) -> Result<String> {
+        installed(brand)?;
+        Ok(crate::environment_scope::service_suffix_for(
+            root, directory,
+        ))
+    }
+
+    /// Product of an environment directory name, if it is one of ours.
+    pub fn product_of(brand: &'static Brand, name: &str) -> Result<Option<&'static str>> {
+        installed(brand)?;
+        Ok(crate::environment_scope::environment_product(name))
+    }
+
+    /// The systemd unit name of the process's environment.
+    #[cfg(target_os = "linux")]
+    pub fn service_name(brand: &'static Brand) -> Result<String> {
+        installed(brand)?;
+        Ok(crate::environment_scope::service_name())
+    }
+
+    /// The LaunchAgent label of the process's environment.
+    #[cfg(target_os = "macos")]
+    pub fn launchd_label(brand: &'static Brand) -> Result<String> {
+        installed(brand)?;
+        Ok(crate::environment_scope::launchd_label())
+    }
+}
+
+/// The files the program manages for Codex.
+pub mod codex {
+    use super::*;
+    use std::path::Path;
+
+    /// Writes the placeholder ChatGPT login to the auth file at `path`.
+    pub fn placeholder_login(brand: &'static Brand, path: &Path) -> Result<()> {
+        installed(brand)?;
+        crate::ensure_codex_local_proxy_auth(path)
+    }
+
+    /// Whether `token` is a placeholder access token this program wrote.
+    pub fn is_placeholder_access_token(brand: &'static Brand, token: &str) -> Result<bool> {
+        installed(brand)?;
+        Ok(crate::is_codex_placeholder_access_token(token))
+    }
+
+    /// The IDE environment file `existing` with the managed proxy block.
+    pub fn ide_env(
+        brand: &'static Brand,
+        existing: &str,
+        listen: &str,
+        ca_cert_path: &str,
+    ) -> Result<String> {
+        installed(brand)?;
+        Ok(crate::merge_codex_ide_env(existing, listen, ca_cert_path))
+    }
+}
+
+/// The program's VSCode settings changes.
+pub mod vscode {
+    use super::*;
+
+    /// VSCode settings `existing` with the managed proxy for `listen`.
+    pub fn merge_settings(brand: &'static Brand, existing: &str, listen: &str) -> Result<String> {
+        installed(brand)?;
+        crate::vscode::merge_settings(existing, listen)
+    }
+
+    /// Whether VSCode settings carry this program's managed proxy marker.
+    pub fn has_managed_proxy(brand: &'static Brand, settings: &str) -> Result<bool> {
+        installed(brand)?;
+        Ok(crate::vscode::has_managed_proxy(settings))
+    }
+}
+
+/// Which files uninstall treats as the program's own.
+pub mod uninstall {
+    use super::*;
+
+    /// The program's own files in an environment directory (without the
+    /// Gateway extension's) and the directories it owns there.
+    pub fn home_layout(
+        brand: &'static Brand,
+    ) -> Result<(Vec<&'static str>, &'static [&'static str])> {
+        installed(brand)?;
+        Ok((
+            crate::uninstall::APP_HOME_FILES
+                .iter()
+                .map(crate::brand::BrandValue::get)
+                .collect(),
+            crate::uninstall::APP_HOME_DIRS,
+        ))
+    }
+
+    /// Whether `name` in an environment directory is the program's (its own
+    /// files and the installed extension's, with backups and leftovers).
+    pub fn is_home_file(brand: &'static Brand, name: &str) -> Result<bool> {
+        installed(brand)?;
+        Ok(crate::uninstall::is_app_home_file(name))
+    }
+
+    /// Whether `name` next to the executable is a program file.
+    pub fn is_program_file(brand: &'static Brand, name: &str) -> Result<bool> {
+        installed(brand)?;
+        Ok(crate::uninstall::is_program_file(name))
+    }
+
+    /// Whether `name` is the program's CA file in the Claude configuration.
+    pub fn is_claude_ca_file(brand: &'static Brand, name: &str) -> Result<bool> {
+        installed(brand)?;
+        Ok(crate::uninstall::is_claude_ca_file(name))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
