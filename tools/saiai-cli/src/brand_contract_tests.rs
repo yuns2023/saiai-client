@@ -14,12 +14,23 @@
 //! - Prefer asserting rendered output (unit files, plists, auth files, config
 //!   JSON) over asserting a constant.
 //! - The source inventories at the end are the weakest tier: they only prove a
-//!   literal still exists somewhere in the sources. When a refactor removes
-//!   such a literal, replace that entry with a behavioral assertion of the same
-//!   literal value instead of deleting it.
+//!   literal is still used by a named production file. When a refactor
+//!   removes such a literal, replace that entry with a behavioral assertion of
+//!   the same literal value instead of deleting it.
+//!
+//! A few expectations are computed at run time because the input itself is
+//! not fixed. None of them reads the value under test from production code:
+//! - the release version is parsed from this package's `Cargo.toml` (the
+//!   version is bumped every release; the contract is "equal to the shipped
+//!   version", not a particular number);
+//! - the installation CA name suffix is the SHA-256 of the freshly generated
+//!   key, recomputed here from the key the code returned;
+//! - environment directory digests in the black-box tests hash a temporary
+//!   path (the in-process tests use fixed paths and literal digests);
+//! - `std::env::consts::OS`/`ARCH` select which literal asset name applies.
 
 use super::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Fixed P-256 installation CA key used only to freeze leaf derivation.
 const FIXTURE_CA_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
@@ -756,17 +767,20 @@ fn desktop_synthetic_identity_is_frozen() {
 }
 
 // ------------------------------------------------------- Source inventories
+//
+// Source inventories are the weakest tier: they are not behavioral golden
+// tests. They pin *where* a literal is used in production code, per file, so
+// that a consumer kept on the old value cannot hide another consumer that was
+// changed. Comments and `#[cfg(test)]` items are removed before matching.
 
-/// Production sources of the CLI (Rust plus bundled PowerShell/JavaScript),
-/// recursively. Test-only files (`*_tests.*`) and inline `#[cfg(test)] mod
-/// … {` blocks are dropped so that a name kept alive only by an old test
-/// cannot hide a removed production use.
-fn cli_sources() -> Vec<(String, String)> {
-    fn collect(directory: &Path, sources: &mut Vec<(String, String)>) {
+/// Production text of every CLI source below `src`, keyed by its path
+/// relative to `src` (with `/`). Test-only files (`*_tests.*`) are skipped.
+fn cli_sources() -> BTreeMap<String, String> {
+    fn collect(root: &Path, directory: &Path, sources: &mut BTreeMap<String, String>) {
         for entry in fs::read_dir(directory).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
-                collect(&path, sources);
+                collect(root, &path, sources);
                 continue;
             }
             let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
@@ -776,43 +790,199 @@ fn cli_sources() -> Vec<(String, String)> {
             if !matches!(extension, "rs" | "ps1" | "js") || stem.ends_with("_tests") {
                 continue;
             }
-            let text = fs::read_to_string(&path).unwrap();
-            sources.push((
-                path.display().to_string(),
-                production_part(&text).to_string(),
-            ));
+            let relative = path
+                .strip_prefix(root)
+                .unwrap()
+                .components()
+                .map(|component| component.as_os_str().to_str().unwrap())
+                .collect::<Vec<_>>()
+                .join("/");
+            let text = fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
+            sources.insert(relative, production_text(&text, extension));
         }
     }
-    let mut sources = Vec::new();
-    collect(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-        &mut sources,
-    );
-    sources.sort();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut sources = BTreeMap::new();
+    collect(&root, &root, &mut sources);
     sources
 }
 
-/// Text before the first inline test module (`#[cfg(test)]` + `mod x {`).
-/// Relies on the repository convention that inline test modules sit at the
-/// end of a file; production code after one would not be scanned.
-fn production_part(text: &str) -> &str {
-    let mut offset = 0;
-    while let Some(found) = text[offset..].find("#[cfg(test)]\nmod ") {
-        let start = offset + found;
-        let line_end = text[start + "#[cfg(test)]\n".len()..]
-            .find('\n')
-            .map_or(text.len(), |end| start + "#[cfg(test)]\n".len() + end);
-        if text[start..line_end].trim_end().ends_with('{') {
-            return &text[..start];
-        }
-        offset = line_end;
+/// Source without comments and, for Rust, without `#[cfg(test)]` items.
+fn production_text(text: &str, extension: &str) -> String {
+    match extension {
+        "rs" => remove_rust_test_items(&strip_rust_comments(text)),
+        "ps1" => text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
-    text
 }
 
-/// `SAIAI_*` names referenced as environment variables: Rust/JS string
-/// literals, PowerShell `$env:`/`${env:}`, POSIX `${…}`/`$…`, and CMD `%…%`.
-fn saiai_environment_names(text: &str) -> BTreeSet<String> {
+/// Byte ranges of Rust string and char literals (including raw strings).
+fn rust_literal_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = text.as_bytes();
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            index = text[index + 2..]
+                .find("*/")
+                .map_or(bytes.len(), |end| index + 2 + end + 2);
+            continue;
+        }
+        let raw_start = byte == b'r'
+            && (index == 0
+                || !is_ident(bytes[index - 1])
+                || (bytes[index - 1] == b'b' && (index < 2 || !is_ident(bytes[index - 2]))));
+        if raw_start {
+            let hashes = bytes[index + 1..]
+                .iter()
+                .take_while(|byte| **byte == b'#')
+                .count();
+            if bytes.get(index + 1 + hashes) == Some(&b'"') {
+                let terminator = format!("\"{}", "#".repeat(hashes));
+                let body = index + 2 + hashes;
+                let end = text[body..]
+                    .find(&terminator)
+                    .map_or(bytes.len(), |end| body + end + terminator.len());
+                ranges.push(index..end);
+                index = end;
+                continue;
+            }
+        }
+        if byte == b'"' {
+            let mut end = index + 1;
+            while end < bytes.len() && bytes[end] != b'"' {
+                end += if bytes[end] == b'\\' { 2 } else { 1 };
+            }
+            ranges.push(index..(end + 1).min(bytes.len()));
+            index = end + 1;
+            continue;
+        }
+        if byte == b'\'' {
+            // Char literal ('x', '\n', '\u{..}') versus a lifetime ('a).
+            let rest = &text[index + 1..];
+            let length = if rest.starts_with('\\') {
+                rest.find('\'').map(|end| end + 1)
+            } else {
+                rest.chars()
+                    .next()
+                    .filter(|ch| rest[ch.len_utf8()..].starts_with('\''))
+                    .map(|ch| ch.len_utf8() + 1)
+            };
+            if let Some(length) = length {
+                ranges.push(index..index + 1 + length);
+                index += 1 + length;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    ranges
+}
+
+fn literal_mask(text: &str) -> Vec<bool> {
+    let mut mask = vec![false; text.len()];
+    for range in rust_literal_ranges(text) {
+        mask[range].fill(true);
+    }
+    mask
+}
+
+fn strip_rust_comments(text: &str) -> String {
+    let mask = literal_mask(text);
+    let in_literal = |index: usize| mask[index];
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < text.len() {
+        if !in_literal(index) && text[index..].starts_with("//") {
+            index = text[index..]
+                .find('\n')
+                .map_or(text.len(), |end| index + end);
+            continue;
+        }
+        if !in_literal(index) && text[index..].starts_with("/*") {
+            index = text[index..]
+                .find("*/")
+                .map_or(text.len(), |end| index + end + 2);
+            continue;
+        }
+        let ch = text[index..].chars().next().unwrap();
+        output.push(ch);
+        index += ch.len_utf8();
+    }
+    output
+}
+
+/// Removes every item annotated exactly `#[cfg(test)]` (module, fn, use, …),
+/// matching braces outside literals, and keeps everything after it.
+fn remove_rust_test_items(text: &str) -> String {
+    let mask = literal_mask(text);
+    let in_literal = |index: usize| mask[index];
+    let mut output = String::new();
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(found) = text[search..].find("#[cfg(test)]") {
+        let start = search + found;
+        if in_literal(start) {
+            search = start + 1;
+            continue;
+        }
+        let mut index = start + "#[cfg(test)]".len();
+        let mut depth = 0_usize;
+        let mut end = text.len();
+        while index < text.len() {
+            if !in_literal(index) {
+                match text.as_bytes()[index] {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            end = index + 1;
+                            break;
+                        }
+                    }
+                    b';' if depth == 0 => {
+                        end = index + 1;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            index += 1;
+        }
+        output.push_str(&text[copied..start]);
+        copied = end;
+        search = end;
+    }
+    output.push_str(&text[copied..]);
+    output
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Reference {
+    /// A string literal naming the variable (Rust `env::var`, `.env`, …).
+    Literal,
+    /// A script reading it (`$env:`, `${env:}`, `${…}`, `$…`, `%…%`).
+    Script,
+}
+
+/// `SAIAI_*` environment variable references in production text.
+fn saiai_environment_references(text: &str) -> BTreeSet<(String, Reference)> {
     let mut found = BTreeSet::new();
     for (index, _) in text.match_indices("SAIAI_") {
         let name = text[index..]
@@ -822,125 +992,312 @@ fn saiai_environment_names(text: &str) -> BTreeSet<String> {
         let before = &text[..index];
         let after = &text[index + name.len()..];
         // Names are all-uppercase; `SAIAI_Foo` is not a reference to `SAIAI_F`.
-        let complete = !after.starts_with(|ch: char| ch.is_ascii_alphanumeric());
-        let referenced = complete
-            && ((before.ends_with('"') && after.starts_with('"'))
-                || (before.ends_with('\'') && after.starts_with('\''))
-                || before.ends_with("$env:")
-                || (before.ends_with("${env:") && after.starts_with('}'))
-                || (before.ends_with("${") && (after.starts_with('}') || after.starts_with(':')))
-                || (before.ends_with('$') && !before.ends_with("\\$"))
-                || (before.ends_with('%') && after.starts_with('%')));
-        if referenced {
-            found.insert(name);
+        if after.starts_with(|ch: char| ch.is_ascii_alphanumeric()) {
+            continue;
         }
+        let reference = if (before.ends_with('"') && after.starts_with('"'))
+            || (before.ends_with('\'') && after.starts_with('\''))
+        {
+            Reference::Literal
+        } else if before.ends_with("$env:")
+            || (before.ends_with("${env:") && after.starts_with('}'))
+            || (before.ends_with("${") && (after.starts_with('}') || after.starts_with(':')))
+            || (before.ends_with('$') && !before.ends_with("\\$"))
+            || (before.ends_with('%') && after.starts_with('%'))
+        {
+            Reference::Script
+        } else {
+            continue;
+        };
+        found.insert((name, reference));
     }
     found
 }
 
+/// Variable name → production files referencing it.
+fn environment_inventory(sources: &BTreeMap<String, String>) -> BTreeMap<String, BTreeSet<String>> {
+    let mut inventory = BTreeMap::<String, BTreeSet<String>>::new();
+    for (file, text) in sources {
+        for (name, _) in saiai_environment_references(text) {
+            inventory.entry(name).or_default().insert(file.clone());
+        }
+    }
+    inventory
+}
+
 #[test]
-fn environment_scanner_recognizes_every_reference_style() {
+fn source_scanner_ignores_comments_and_tests_and_sees_every_consumer() {
     let sample = r#"env::var("SAIAI_A"); .env('SAIAI_B', x); $env:SAIAI_C; ${env:SAIAI_D};
 ${SAIAI_E:-x} "$SAIAI_F" %SAIAI_G% const SAIAI_NOT_ENV: &str = "x"; "__SAIAI_NULL__" $SAIAI_Foo"#;
     assert_eq!(
-        saiai_environment_names(sample),
+        saiai_environment_references(sample)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>(),
         [
             "SAIAI_A", "SAIAI_B", "SAIAI_C", "SAIAI_D", "SAIAI_E", "SAIAI_F", "SAIAI_G"
         ]
-        .into_iter()
-        .map(String::from)
-        .collect()
     );
-    let text = "a\n#[cfg(test)]\nmod brand_contract_tests;\nb\n#[cfg(test)]\nmod tests {\nc";
+
+    // A name kept only in a comment or a test item is not a production use,
+    // while production code after a test item is still scanned.
+    let rust = "fn a() { let _ = \"// not a comment SAIAI_KEEP\"; }
+// env::var(\"SAIAI_COMMENT\")
+/* env::var(\"SAIAI_BLOCK\") */
+#[cfg(test)]
+fn helper() { env::var(\"SAIAI_TEST_FN\"); }
+#[cfg(test)]
+mod tests { fn t() { let _ = \"}\"; let _ = '{'; env::var(\"SAIAI_TEST_MOD\"); } }
+#[cfg(test)]
+mod declared;
+fn after<'a>(_: &'a str) { env::var(\"SAIAI_AFTER\"); let _ = r#\"{\"SAIAI_RAW\"}\"#; }
+";
+    let names = saiai_environment_references(&production_text(rust, "rs"))
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["SAIAI_AFTER", "SAIAI_RAW"]);
+    let script = "# $env:SAIAI_COMMENT\n$x = $env:SAIAI_READ\n";
     assert_eq!(
-        production_part(text),
-        "a\n#[cfg(test)]\nmod brand_contract_tests;\nb\n"
+        saiai_environment_references(&production_text(script, "ps1")),
+        BTreeSet::from([("SAIAI_READ".to_string(), Reference::Script)])
+    );
+
+    // Renaming the variable in one consumer is visible even though another
+    // consumer still uses the old name.
+    let before = BTreeMap::from([
+        ("a.rs".to_string(), "env::var(\"SAIAI_HOME\")".to_string()),
+        ("b.rs".to_string(), "env::var(\"SAIAI_HOME\")".to_string()),
+    ]);
+    let mut after = before.clone();
+    after.insert("b.rs".into(), "env::var(\"AITP_HOME\")".into());
+    assert_ne!(
+        environment_inventory(&before),
+        environment_inventory(&after)
+    );
+    assert_eq!(
+        environment_inventory(&after)["SAIAI_HOME"],
+        BTreeSet::from(["a.rs".to_string()])
     );
 }
 
 /// Every `SAIAI_*` environment variable the client reads or hands to its own
-/// helper processes and scripts. Users, installers, services and older
-/// clients set these names; renaming or dropping one is a breaking change,
-/// and adding one should be a conscious decision recorded here.
+/// helper processes and scripts, with the production files that use it.
+/// Users, installers, services and older clients set these names; renaming
+/// or dropping one anywhere is a breaking change, and adding one should be a
+/// conscious decision recorded here.
 #[test]
 fn saiai_environment_variable_inventory_is_frozen() {
-    let expected = BTreeSet::from([
-        "SAIAI_BINARY_UPDATED",
+    let expected: &[(&str, &[&str])] = &[
+        ("SAIAI_BINARY_UPDATED", &["main.rs"]),
+        ("SAIAI_CA_FILES", &["uninstall.rs"]),
+        ("SAIAI_CA_THUMBPRINT", &["uninstall.rs"]),
+        ("SAIAI_CA_THUMBPRINTS", &["uninstall.rs"]),
+        ("SAIAI_CHATGPT_BIN", &["main.rs"]),
+        ("SAIAI_CHATGPT_CHAT_PASSTHROUGH", &["local_proxy.rs"]),
+        ("SAIAI_CHATGPT_TIMEZONE", &["main.rs"]),
+        ("SAIAI_CHECK_EXE", &["main.rs"]),
+        ("SAIAI_CHECK_PID", &["main.rs"]),
+        (
+            "SAIAI_CLAUDE_DESKTOP_ALLOW_UNTESTED",
+            &["claude_desktop.rs"],
+        ),
+        ("SAIAI_CLEANUP_DIR", &["uninstall.rs"]),
+        ("SAIAI_CLEANUP_DIRS", &["uninstall.rs"]),
+        ("SAIAI_CLEANUP_FILES", &["uninstall.rs"]),
+        ("SAIAI_DESKTOP_ACTIVATION_ARGS", &["main.rs"]),
+        ("SAIAI_DESKTOP_APP_ID", &["main.rs"]),
+        ("SAIAI_DESKTOP_BIN", &["main.rs"]),
+        ("SAIAI_DESKTOP_BROWSER_USE", &["local_proxy.rs"]),
+        (
+            "SAIAI_HOME",
+            &[
+                "environment_scope.rs",
+                "local_proxy.rs",
+                "main.rs",
+                "uninstall.rs",
+            ],
+        ),
+        ("SAIAI_INSTALL_DIR", &["uninstall.rs"]),
+        ("SAIAI_OPENAI_TRACE", &["local_proxy.rs"]),
+        ("SAIAI_OPENAI_TRACE_PATH", &["local_proxy.rs"]),
+        ("SAIAI_PATH_KIND", &["uninstall.rs"]),
+        ("SAIAI_PATH_NEW", &["uninstall.rs"]),
+        ("SAIAI_PATH_OLD", &["uninstall.rs"]),
+        ("SAIAI_PROXY_VERBOSE", &["local_proxy.rs"]),
+        (
+            "SAIAI_RUNTIME_APP_ID",
+            &["windows_desktop_inspect.ps1", "windows_desktop_runtime.rs"],
+        ),
+        ("SAIAI_RUNTIME_DIRECTORY", &["windows_desktop_runtime.rs"]),
+        (
+            "SAIAI_RUNTIME_PACKAGE_ROOT",
+            &["windows_desktop_inspect.ps1", "windows_desktop_runtime.rs"],
+        ),
+        (
+            "SAIAI_RUNTIME_REQUIRE_NO_ACTORS",
+            &["windows_desktop_inspect.ps1", "windows_desktop_runtime.rs"],
+        ),
+        ("SAIAI_SKIP_START", &["codex_daemon.rs", "main.rs"]),
+        ("SAIAI_UPSTREAM_PROXY", &["upstream_proxy.rs"]),
+        (
+            "SAIAI_VSCODE_CA_PATH",
+            &["vscode.rs", "vscode_trust_windows.ps1"],
+        ),
+        (
+            "SAIAI_VSCODE_CA_SHA256",
+            &["vscode.rs", "vscode_trust_windows.ps1"],
+        ),
+    ];
+    let found = environment_inventory(&cli_sources());
+    let found = found
+        .iter()
+        .map(|(name, files)| {
+            (
+                name.as_str(),
+                files.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let expected = expected
+        .iter()
+        .map(|(name, files)| (*name, files.to_vec()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(found, expected);
+}
+
+/// Variables the binary hands to its own PowerShell helpers: the Rust side
+/// must still pass each name and a script must still read it.
+#[test]
+fn helper_environment_variables_are_written_and_read() {
+    let sources = cli_sources();
+    let mut references = BTreeSet::new();
+    for (file, text) in &sources {
+        for (name, reference) in saiai_environment_references(text) {
+            references.insert((name, reference, file.ends_with(".rs")));
+        }
+    }
+    for name in [
         "SAIAI_CA_FILES",
         "SAIAI_CA_THUMBPRINT",
         "SAIAI_CA_THUMBPRINTS",
-        "SAIAI_CHATGPT_BIN",
-        "SAIAI_CHATGPT_CHAT_PASSTHROUGH",
-        "SAIAI_CHATGPT_TIMEZONE",
         "SAIAI_CHECK_EXE",
         "SAIAI_CHECK_PID",
-        "SAIAI_CLAUDE_DESKTOP_ALLOW_UNTESTED",
         "SAIAI_CLEANUP_DIR",
         "SAIAI_CLEANUP_DIRS",
         "SAIAI_CLEANUP_FILES",
         "SAIAI_DESKTOP_ACTIVATION_ARGS",
         "SAIAI_DESKTOP_APP_ID",
-        "SAIAI_DESKTOP_BIN",
-        "SAIAI_DESKTOP_BROWSER_USE",
-        "SAIAI_HOME",
-        "SAIAI_INSTALL_DIR",
-        "SAIAI_OPENAI_TRACE",
-        "SAIAI_OPENAI_TRACE_PATH",
         "SAIAI_PATH_KIND",
         "SAIAI_PATH_NEW",
         "SAIAI_PATH_OLD",
-        "SAIAI_PROXY_VERBOSE",
         "SAIAI_RUNTIME_APP_ID",
         "SAIAI_RUNTIME_DIRECTORY",
         "SAIAI_RUNTIME_PACKAGE_ROOT",
         "SAIAI_RUNTIME_REQUIRE_NO_ACTORS",
-        "SAIAI_SKIP_START",
-        "SAIAI_UPSTREAM_PROXY",
         "SAIAI_VSCODE_CA_PATH",
         "SAIAI_VSCODE_CA_SHA256",
-    ]);
-    let found = cli_sources()
-        .iter()
-        .flat_map(|(_, text)| saiai_environment_names(text))
-        .collect::<BTreeSet<_>>();
-    let found = found.iter().map(String::as_str).collect::<BTreeSet<_>>();
-    assert_eq!(found, expected);
+    ] {
+        assert!(
+            references.contains(&(name.to_string(), Reference::Literal, true)),
+            "the binary no longer passes {name} to its helper"
+        );
+        assert!(
+            references
+                .iter()
+                .any(|(found, reference, _)| found == name && *reference == Reference::Script),
+            "no helper script reads {name} any more"
+        );
+    }
 }
 
-/// Contract literals that are only reachable through inline code today
-/// (update URLs, uninstall service patterns, PowerShell filters). Each needle
-/// must stay present until a refactor replaces it with a behavioral test.
+/// Contract literals that are only reachable through inline code today,
+/// pinned to the production file that uses them. Each entry must stay until
+/// a refactor replaces it with a behavioral test of the same value.
 #[test]
 fn inline_contract_literals_are_present() {
     let sources = cli_sources();
-    for needle in [
-        // Self-update channel below the configured Gateway base URL.
-        "/saiai-cli/manifest.json",
-        "/saiai-cli/{asset}",
-        // Update candidates must identify themselves as SAIAI.
-        "starts_with(\"saiai \")",
-        // Uninstall discovers every environment's service by name pattern.
-        "\"saiai{}.service\"",
-        "is_service_file_name(&name, \"saiai\", \".service\")",
-        "\"top.saiai.local-proxy{}\"",
-        "is_service_file_name(&name, \"top.saiai.local-proxy\", \".plist\")",
-        // Windows: stale CAs are recognized by organization, uninstall
-        // locates the per-user install and Desktop runtime under SAIAI.
-        "O=SAIAI(,|$)",
-        ".join(\"SAIAI\").join(\"bin\")",
-        ".join(\"SAIAI\").join(\"desktop-runtime\")",
-        "AppData/Local/SAIAI/bin",
+    for (file, needle) in [
+        // Self-update channel below the configured Gateway base URL, and the
+        // version prefix an update candidate must print.
+        ("main.rs", "\"{base}/saiai-cli/manifest.json\""),
+        ("main.rs", "\"{}/saiai-cli/{asset}\""),
+        ("main.rs", "starts_with(\"saiai \")"),
+        // Service identities: the start side and the uninstall discovery.
+        ("environment_scope.rs", "\"saiai{}.service\""),
+        ("environment_scope.rs", "\"top.saiai.local-proxy{}\""),
+        ("uninstall.rs", "\"saiai{}.service\""),
+        (
+            "uninstall.rs",
+            "is_service_file_name(&name, \"saiai\", \".service\")",
+        ),
+        ("uninstall.rs", "\"top.saiai.local-proxy{}\""),
+        (
+            "uninstall.rs",
+            "is_service_file_name(&name, \"top.saiai.local-proxy\", \".plist\")",
+        ),
+        // Windows: stale CAs are recognized by organization.
+        ("main.rs", "O=SAIAI(,|$)"),
+        // Windows per-user install directory known to uninstall.
+        ("uninstall.rs", ".join(\"SAIAI\").join(\"bin\")"),
+        ("uninstall.rs", "AppData/Local/SAIAI/bin"),
+        // Windows Desktop runtime directory: produced by the observer script,
+        // consumed by the launcher, removed by uninstall.
+        (
+            "windows_desktop_inspect.ps1",
+            "runtime_directory=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'SAIAI\\desktop-runtime'",
+        ),
+        (
+            "windows_desktop_runtime.rs",
+            "pub runtime_directory: String,",
+        ),
+        ("main.rs", "PathBuf::from(&initial.runtime_directory)"),
+        ("uninstall.rs", ".join(\"SAIAI\").join(\"desktop-runtime\")"),
+        // The installer's "binary replaced" flag is read here.
+        (
+            "main.rs",
+            "binary_changed_during_initialization(env::var(\"SAIAI_BINARY_UPDATED\")",
+        ),
         // Desktop synthetic identity returned by the local sidecars.
-        "saiai-local-proxy@example.invalid",
-        "\"userID\":\"saiai-local-proxy-user\"",
-        "\"stableID\":\"saiai-local-proxy\"",
-        "x-saiai-chat-preference-restored",
+        ("local_proxy.rs", "\"saiai-local-proxy@example.invalid\""),
+        ("local_proxy.rs", "\"userID\":\"saiai-local-proxy-user\""),
+        ("local_proxy.rs", "\"stableID\":\"saiai-local-proxy\""),
+        ("local_proxy.rs", "\"x-saiai-chat-preference-restored\""),
         // Atomic temporary files that uninstall recognizes.
-        "\".{name}.saiai-tmp-{}-{}\"",
+        ("main.rs", "\".{name}.saiai-tmp-{}-{}\""),
     ] {
+        let text = sources
+            .get(file)
+            .unwrap_or_else(|| panic!("production source {file} disappeared"));
         assert!(
-            sources.iter().any(|(_, text)| text.contains(needle)),
-            "SAIAI contract literal disappeared from tools/saiai-cli/src: {needle}"
+            text.contains(needle),
+            "SAIAI contract literal disappeared from tools/saiai-cli/src/{file}: {needle}"
         );
     }
+}
+
+/// Executes the observer's production expression for the runtime directory.
+#[cfg(windows)]
+#[test]
+fn windows_desktop_runtime_directory_is_frozen() {
+    let line = include_str!("windows_desktop_inspect.ps1")
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("runtime_directory="))
+        .expect("observer reports runtime_directory");
+    let script = format!(
+        "$ErrorActionPreference='Stop'; $base=[Environment]::GetFolderPath('LocalApplicationData'); $value={line}; $base; $value"
+    );
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8(output.stdout).unwrap();
+    let mut lines = text.lines().map(str::trim);
+    let base = lines.next().unwrap().to_string();
+    assert_eq!(
+        lines.next().unwrap(),
+        format!(r"{base}\SAIAI\desktop-runtime")
+    );
 }

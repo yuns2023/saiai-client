@@ -1,12 +1,15 @@
 //! Black-box SAIAI contract: run the built `saiai` binary in a throwaway home
 //! and freeze what existing installations depend on (binary name, version
 //! output, `~/.saiai` layout, config JSON, CA identity, Codex files,
-//! environment isolation). Expected values are hand-written literals; see
+//! environment isolation). Expected values are hand-written literals, except
+//! the release version (read from Cargo.toml), the CA suffix (hash of the
+//! generated key) and environment digests of temporary paths; see
 //! `src/brand_contract_tests.rs` for the in-process half of the contract.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// Compile-time proof that Cargo still builds a binary target named `saiai`.
 const BINARY: &str = env!("CARGO_BIN_EXE_saiai");
@@ -69,14 +72,32 @@ impl Sandbox {
         command
     }
 
+    /// Runs to completion within a bounded time; output goes to files so a
+    /// chatty child can never block on a full pipe.
     fn run(&self, command: &mut Command) -> String {
-        let output = command.output().unwrap();
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(output.status.success(), "{command:?} failed:\n{text}");
+        let log = self
+            .home
+            .with_file_name(format!("run-{}.log", uuid::Uuid::new_v4().simple()));
+        let file = std::fs::File::create(&log).unwrap();
+        let mut child = command
+            .stdout(file.try_clone().unwrap())
+            .stderr(file)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{command:?} did not finish within 120 s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let text = String::from_utf8_lossy(&std::fs::read(&log).unwrap()).into_owned();
+        assert!(status.success(), "{command:?} failed:\n{text}");
         text
     }
 }
@@ -161,13 +182,18 @@ const CONFIG_KEYS: [&str; 9] = [
 #[test]
 fn claude_first_installation_layout_is_frozen() {
     let sandbox = Sandbox::new();
-    sandbox.run(&mut sandbox.command(&[
+    let output = sandbox.run(&mut sandbox.command(&[
         "init",
         "--base-url",
         "http://127.0.0.1:9",
         "--api-key",
         "TEST_ONLY_CONTRACT_CLAUDE",
     ]));
+    // Installers and CI rely on SAIAI_SKIP_START=1 to configure only.
+    assert!(
+        output.contains("SAIAI local proxy start skipped (SAIAI_SKIP_START=1)."),
+        "{output}"
+    );
     let root = sandbox.home.join(".saiai");
     let config = read_json(&root.join("config.json"));
     assert_eq!(sorted_keys(&config), CONFIG_KEYS);
@@ -283,4 +309,38 @@ fn saiai_home_override_and_environment_isolation_are_frozen() {
         project.to_str().unwrap()
     );
     assert!(!custom_root.join("config.json").exists());
+}
+
+/// `SAIAI_UPSTREAM_PROXY` overrides the configured egress for the process it
+/// is set on (only the child here; the test process environment is untouched).
+#[test]
+fn saiai_upstream_proxy_variable_is_honored() {
+    let sandbox = Sandbox::new();
+    sandbox.run(&mut sandbox.command(&[
+        "init-codex",
+        "--base-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "TEST_ONLY_CONTRACT_CODEX",
+    ]));
+    let direct = sandbox.run(
+        sandbox
+            .command(&["upstream-proxy"])
+            .env("SAIAI_UPSTREAM_PROXY", "direct"),
+    );
+    assert!(
+        direct.contains("this shell resolves it to: direct (configured)"),
+        "{direct}"
+    );
+    let invalid = sandbox.run(
+        sandbox
+            .command(&["upstream-proxy"])
+            .env("SAIAI_UPSTREAM_PROXY", "ftp://proxy.invalid"),
+    );
+    assert!(
+        invalid.contains(
+            "this shell resolves it to: SAIAI_UPSTREAM_PROXY is not an http:// proxy URL"
+        ),
+        "{invalid}"
+    );
 }

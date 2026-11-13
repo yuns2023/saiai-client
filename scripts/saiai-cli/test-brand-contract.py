@@ -9,8 +9,10 @@ tools/saiai-cli/src/brand_contract_tests.rs for the client half.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -100,7 +102,93 @@ class ManifestContractTests(unittest.TestCase):
         self.assertEqual(sorted(published), sorted(ASSETS))
 
 
+FAKE_ASSET = """#!/usr/bin/env bash
+printf 'UPDATED=%s\\n' "${SAIAI_BINARY_UPDATED:-}" >>"${SAIAI_CONTRACT_LOG:?}"
+printf 'ARGS=%s\\n' "$*" >>"${SAIAI_CONTRACT_LOG:?}"
+"""
+
+FAKE_UNAME = """#!/usr/bin/env bash
+case "${1:-}" in -s) echo Linux ;; -m) echo x86_64 ;; *) exit 1 ;; esac
+"""
+
+FAKE_CURL = """#!/usr/bin/env bash
+set -euo pipefail
+destination=""; url=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) destination="$2"; shift 2 ;;
+    --proto) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+printf '%s\\n' "${url}" >>"${SAIAI_CONTRACT_URLS:?}"
+case "${url}" in
+  */manifest.json) cp "${SAIAI_CONTRACT_FIXTURES:?}/manifest.json" "${destination}" ;;
+  */saiai-linux-x86_64) cp "${SAIAI_CONTRACT_FIXTURES:?}/saiai-linux-x86_64" "${destination}" ;;
+  *) echo "unexpected URL ${url}" >&2; exit 1 ;;
+esac
+"""
+
+
+class InstallerBehaviorTests(unittest.TestCase):
+    """Runs the real setup.sh with offline curl/uname stand-ins and no
+    location overrides, so the defaults themselves are exercised."""
+
+    @unittest.skipIf(sys.platform == "win32", "setup.sh is the Linux/macOS installer")
+    def test_unix_installer_defaults(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="saiai-brand-installer-") as temporary:
+            root = Path(temporary)
+            home, fixtures, fake = root / "home", root / "fixtures", root / "bin"
+            for directory in (home, fixtures, fake):
+                directory.mkdir()
+            asset = fixtures / "saiai-linux-x86_64"
+            asset.write_text(FAKE_ASSET)
+            digest = hashlib.sha256(asset.read_bytes()).hexdigest()
+            (fixtures / "manifest.json").write_text(json.dumps({
+                "manifest_schema": 1, "client_mode": "local-proxy",
+                "configuration_schema_version": 1, "version": "0.0.1",
+                "assets": {"saiai-linux-x86_64": {"sha256": digest, "size": asset.stat().st_size}},
+            }))
+            for name, body in (("curl", FAKE_CURL), ("uname", FAKE_UNAME)):
+                (fake / name).write_text(body)
+                (fake / name).chmod(0o755)
+            log, urls = root / "invoked", root / "urls"
+            environment = {
+                key: value for key, value in os.environ.items()
+                if not key.startswith("SAIAI_") and key not in ("CODEX_HOME", "CLAUDE_CONFIG_DIR")
+            }
+            environment.update({
+                "HOME": str(home),
+                "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}",
+                "SAIAI_CONTRACT_LOG": str(log),
+                "SAIAI_CONTRACT_URLS": str(urls),
+                "SAIAI_CONTRACT_FIXTURES": str(fixtures),
+            })
+            result = subprocess.run(
+                ["bash", str(SCRIPT_DIR / "setup.sh"), "https://gateway.example.test", "TEST_ONLY_INSTALLER_KEY"],
+                env=environment, stdin=subprocess.DEVNULL, capture_output=True, timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(
+                urls.read_text().splitlines(),
+                [f"{DOWNLOAD_BASE}/manifest.json", f"{DOWNLOAD_BASE}/saiai-linux-x86_64"],
+            )
+            installed = home / ".local" / "bin" / "saiai"
+            self.assertEqual(installed.read_bytes(), asset.read_bytes())
+            self.assertEqual(
+                log.read_text().splitlines(),
+                ["UPDATED=1", "ARGS=init https://gateway.example.test TEST_ONLY_INSTALLER_KEY"],
+            )
+
+
 class InstallerContractTests(unittest.TestCase):
+    """Source inventory, not a behavioral golden: these only prove the
+    literals are still written in the installers. A comment or dead branch
+    could satisfy them and an equivalent rewrite would trip them; the
+    behavioral check above covers the Unix defaults, the Windows wrappers are
+    exercised by the Windows CI smoke tests."""
+
     def test_unix_installer_locations_are_frozen(self) -> None:
         setup = text("scripts/saiai-cli/setup.sh")
         for required in (
