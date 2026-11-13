@@ -50,6 +50,173 @@ def load_generator():
     return module
 
 
+class UnreadableRustLiteral(ValueError):
+    pass
+
+
+def rust_trivia_end(source: str, index: int) -> int:
+    """Index after the whitespace and (nested) comments starting at `index`."""
+    while index < len(source):
+        if source[index].isspace():
+            index += 1
+        elif source.startswith("//", index):
+            newline = source.find("\n", index)
+            index = len(source) if newline < 0 else newline
+        elif source.startswith("/*", index):
+            depth = 0
+            while index < len(source):
+                if source.startswith("/*", index):
+                    depth += 1
+                    index += 2
+                elif source.startswith("*/", index):
+                    depth -= 1
+                    index += 2
+                    if depth == 0:
+                        break
+                else:
+                    index += 1
+        else:
+            break
+    return index
+
+
+def rust_string_literal(source: str, index: int) -> tuple[int, str] | None:
+    """(end, decoded text) of the Rust string literal starting at `index`;
+    raises UnreadableRustLiteral for an escape Rust would not accept."""
+    raw = re.match(r'[bc]?r(#*)"', source[index:])
+    if raw:
+        body = index + raw.end()
+        terminator = '"' + raw.group(1)
+        end = source.find(terminator, body)
+        if end < 0:
+            raise UnreadableRustLiteral("unterminated raw string")
+        return end + len(terminator), source[body:end]
+    plain = re.match(r'[bc]?"', source[index:])
+    if not plain:
+        return None
+    position = index + plain.end()
+    decoded = []
+    simple = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", "\\": "\\", '"': '"', "'": "'"}
+    while position < len(source) and source[position] != '"':
+        if source[position] != "\\":
+            decoded.append(source[position])
+            position += 1
+            continue
+        escape = source[position + 1 : position + 2]
+        hex_byte = re.match(r"x([0-9a-fA-F]{2})", source[position + 1 :])
+        unicode = re.match(r"u\{([0-9a-fA-F_]+)\}", source[position + 1 :])
+        if hex_byte:
+            decoded.append(chr(int(hex_byte.group(1), 16)))
+            position += 1 + hex_byte.end()
+        elif unicode:
+            digits = unicode.group(1).replace("_", "")
+            value = int(digits, 16) if 1 <= len(digits) <= 6 else -1
+            if not (0 <= value <= 0x10FFFF and not 0xD800 <= value <= 0xDFFF):
+                raise UnreadableRustLiteral(f"invalid unicode escape \\u{{{unicode.group(1)}}}")
+            decoded.append(chr(value))
+            position += 1 + unicode.end()
+        elif escape == "\n":
+            position += 2
+            while position < len(source) and source[position] in " \t\r\n":
+                position += 1
+        elif escape in simple:
+            decoded.append(simple[escape])
+            position += 2
+        else:
+            raise UnreadableRustLiteral(f"unsupported escape \\{escape}")
+    if position >= len(source):
+        raise UnreadableRustLiteral("unterminated string")
+    return position + 1, "".join(decoded)
+
+
+def rust_without_comments(source: str, blank_literals: bool = False) -> str:
+    """`source` with comments replaced by a space; string and char literals
+    are kept, or replaced by a space when `blank_literals`."""
+    output = []
+    index = 0
+    while index < len(source):
+        if source.startswith("//", index) or source.startswith("/*", index):
+            output.append(" ")
+            index = rust_trivia_end(source, index)
+            continue
+        previous = source[index - 1] if index else " "
+        end = None
+        if not (previous.isalnum() or previous == "_"):
+            literal = rust_string_literal(source, index)
+            char = re.match(
+                r"b?'(?:\\x[0-9a-fA-F]{2}|\\u\{[0-9a-fA-F_]+\}|\\.|[^\\'])'", source[index:]
+            )
+            end = literal[0] if literal else (index + char.end() if char else None)
+        if end is not None:
+            output.append(" " if blank_literals else source[index:end])
+            index = end
+            continue
+        output.append(source[index])
+        index += 1
+    return "".join(output)
+
+
+def rust_macro_invocations(source: str, names: str) -> list[tuple[str, str]]:
+    """(name, arguments) of every `name!(…)`, `name![…]` or `name!{…}` call in
+    code (not in comments or literals), with any path prefix and any
+    whitespace or comments between the name, `!` and the delimiter."""
+    name_pattern = re.compile(r"\b(" + names + r")\b")
+    closers = {"(": ")", "[": "]", "{": "}"}
+
+    def skip_literal(index: int) -> int | None:
+        previous = source[index - 1] if index else " "
+        if previous.isalnum() or previous == "_":
+            return None
+        literal = rust_string_literal(source, index)
+        if literal:
+            return literal[0]
+        char = re.match(
+            r"b?'(?:\\x[0-9a-fA-F]{2}|\\u\{[0-9a-fA-F_]+\}|\\.|[^\\'])'", source[index:]
+        )
+        return index + char.end() if char else None
+
+    found = []
+    position = 0
+    while position < len(source):
+        after_trivia = rust_trivia_end(source, position)
+        if after_trivia != position:
+            position = after_trivia
+            continue
+        skipped = skip_literal(position)
+        if skipped is not None:
+            position = skipped
+            continue
+        call = name_pattern.match(source, position)
+        previous = source[position - 1] if position else " "
+        if call and not (previous.isalnum() or previous == "_"):
+            bang = rust_trivia_end(source, call.end())
+            opening = rust_trivia_end(source, bang + 1) if source.startswith("!", bang) else -1
+            if opening >= 0 and opening < len(source) and source[opening] in closers:
+                stack = [closers[source[opening]]]
+                index = opening + 1
+                while index < len(source) and stack:
+                    after = rust_trivia_end(source, index)
+                    if after != index:
+                        index = after
+                        continue
+                    inner = skip_literal(index)
+                    if inner is not None:
+                        index = inner
+                        continue
+                    if source[index] in closers:
+                        stack.append(closers[source[index]])
+                    elif source[index] == stack[-1]:
+                        stack.pop()
+                    index += 1
+                found.append((call.group(1), source[opening + 1 : index - 1]))
+                position = index
+                continue
+            position = call.end()
+            continue
+        position += 1
+    return found
+
+
 def verify_claude_launcher(main: str) -> None:
     for required in (
         "mod claude_launcher;",
@@ -144,19 +311,38 @@ def verify_claude_launcher(main: str) -> None:
         require(f'.env_remove("{name}")' not in compact, f"Claude launcher must not remove {name}")
     # Diagnostics may name the program (each brand placeholder bound to its
     # Brand field by a named argument) but never interpolate anything else.
+    # Every delimiter form counts, and the format string is judged after its
+    # escapes are decoded (`"\x7btoken\x7d"` is the capture `{token}`).
     brand_argument = r"\s*,\s*(?:brand_product\s*=\s*BRAND\.product_name|brand_binary\s*=\s*BRAND\.binary_name)"
-    for invocation in re.findall(r"\b(?:e?print(?:ln)?|dbg)!\s*\((.*?)\)\s*;", production, re.DOTALL):
-        match = re.fullmatch(
-            r'\s*("(?:[^"\\{}]|\\.|\{brand_(?:product|binary)\})*")((?:' + brand_argument + r')*)\s*,?\s*',
-            invocation,
-        )
-        used = set(re.findall(r"\{(brand_product|brand_binary)\}", match.group(1))) if match else set()
-        bound = set(re.findall(r"\b(brand_product|brand_binary)\s*=", match.group(2))) if match else set()
+    try:
+        invocations = rust_macro_invocations(production, r"e?print(?:ln)?|dbg")
+    except UnreadableRustLiteral as error:
+        require(False, f"optional Claude launcher has an unreadable string literal: {error}")
+    # An alias (`use std::eprintln as notice;`) would escape the name-based
+    # checks below, so output macros may not be imported under another name.
+    for item in re.findall(r"(?<!r#)\buse\b[^;]*;", rust_without_comments(production, blank_literals=True)):
         require(
-            match is not None and used <= bound,
+            re.search(r"\b(?:e?print(?:ln)?|dbg)\s+as\b", item) is None,
+            "Claude diagnostics must not import output macros under another name",
+        )
+    for name, arguments in invocations:
+        require(not name.startswith("print"), "Claude diagnostics must not use stdout")
+        try:
+            literal = rust_string_literal(arguments, rust_trivia_end(arguments, 0))
+        except UnreadableRustLiteral as error:
+            require(False, f"optional Claude diagnostics have an unreadable format string: {error}")
+        rest = rust_without_comments(arguments[literal[0]:]) if literal else ""
+        bound_arguments = re.fullmatch(r"((?:" + brand_argument + r")*)\s*,?\s*", rest)
+        format_text = literal[1] if literal else ""
+        used = set(re.findall(r"\{(brand_product|brand_binary)\}", format_text))
+        bound = set(re.findall(r"\b(brand_product|brand_binary)\s*=", rest))
+        require(
+            literal is not None
+            and bound_arguments is not None
+            and not re.search(r"[{}]", re.sub(r"\{brand_(?:product|binary)\}", "", format_text))
+            and used <= bound,
             "optional Claude diagnostics must not interpolate credentials or configuration",
         )
-    require(re.search(r"\bprint(?:ln)?!\s*\(", production) is None, "Claude diagnostics must not use stdout")
     for required in (
         "claude_launcher_replaces_only_child_routing_environment",
         "claude_launcher_reuses_reachable_proxy_without_starting_service",

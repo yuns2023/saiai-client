@@ -183,9 +183,80 @@ class OptionalClaudeContractTests(unittest.TestCase):
                     self.verify(launcher=self.inject(behavior))
 
     def test_rejects_dynamic_secret_diagnostics(self) -> None:
-        for behavior in ('eprintln!("{token}");', 'eprint!("{}", token);', 'dbg!(config);'):
+        for behavior in (
+            'eprintln!("{token}");', 'eprint!("{}", token);', 'dbg!(config);',
+            # Other macro delimiters, paths and spacing.
+            'eprintln!["{}", token];', 'eprintln!{"{}", token}', 'std::eprintln!("{token}");',
+            'eprintln ! ("{token}");', 'eprint![r"{token}"];',
+            # Escapes that decode to a format capture.
+            'eprintln!("\\x7btoken\\x7d");', 'eprintln!("\\u{7b}token\\u{7d}");',
+            'eprintln!("{brand_product}\\x7btoken}", brand_product = BRAND.product_name);',
+            # Comments between tokens and nested block comments.
+            'eprintln /* note */ !("{token}");', 'eprintln! /* note */ ("{token}");',
+            '/* outer /* inner */ " */\neprintln!("{token}");',
+            'eprintln!(/* lead */ "{}", token);',
+            # A quote inside a (byte) char literal does not start a string.
+            'let quote = b\'"\';\neprintln!("{token}x");', 'let quote = \'"\';\neprintln!("{token}x");',
+            'let quote = \'\\x22\';\neprintln!("{token}x");',
+            # A format string that is not a literal.
+            'eprintln!(concat!("{tok", "en}"));', 'eprintln!(MESSAGE);',
+        ):
             with self.subTest(behavior=behavior):
                 with self.assertRaisesRegex(AssertionError, "interpolate credentials"):
+                    self.verify(launcher=self.inject(behavior))
+
+    def test_accepts_plain_diagnostics_in_any_delimiter(self) -> None:
+        self.verify(launcher=self.inject('eprintln!["plain notice; braces \\x41 decoded"];'))
+        self.verify(launcher=self.inject('// eprintln!("{token}") in a comment is not code\nconst NOTE: &str = "eprintln!(\\"{token}\\")";'))
+
+    def test_rejects_output_macro_aliases(self) -> None:
+        for behavior in (
+            'use std::eprintln as notice;\nnotice!("{token}");',
+            'use std::{eprintln as notice, env};\nnotice!("{token}");',
+            'use std::{\n    io,\n    eprint as note,\n};',
+            'pub(crate) use std::dbg as inspect;',
+            'use std::println as out;\nout!("plain");',
+        ):
+            with self.subTest(behavior=behavior):
+                with self.assertRaisesRegex(AssertionError, "under another name"):
+                    self.verify(launcher=self.inject(behavior))
+
+    def test_accepts_c_strings_and_argument_comments(self) -> None:
+        self.verify(launcher=self.inject('const NAME: &core::ffi::CStr = c"println!{}";\nconst RAW: &core::ffi::CStr = cr#"eprintln!("{token}")"#;'))
+        self.verify(launcher=self.inject('eprintln!("plain" /* note */);'))
+        self.verify(launcher=self.inject('eprintln!("{brand_product}" /* a */, /* b */ brand_product = BRAND.product_name);'))
+        self.verify(launcher=self.inject('// use std::eprintln as notice;\nconst TEXT: &str = "use std::println as out;";'))
+        self.verify(launcher=self.inject('fn r#use(eprintln: u8) -> u16 { eprintln as u16 }\nconst X: u8 = 0;'))
+
+    def test_c_strings_do_not_hide_the_next_diagnostic(self) -> None:
+        for behavior in (
+            'const RAW: &core::ffi::CStr = cr#"a"b"#;\neprintln!("{token}");',
+            'const TEXT: &core::ffi::CStr = c"a\\"b";\neprintln!("{token}");',
+        ):
+            with self.subTest(behavior=behavior):
+                with self.assertRaisesRegex(AssertionError, "interpolate credentials"):
+                    self.verify(launcher=self.inject(behavior))
+
+    def test_rejects_extra_arguments_hidden_behind_comments(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "interpolate credentials"):
+            self.verify(launcher=self.inject('eprintln!("plain" /* note */, "extra");'))
+
+    def test_accepts_underscored_unicode_escape(self) -> None:
+        self.verify(launcher=self.inject('eprintln!("notice \\u{4_1} \\u{4________1}");'))
+
+    def test_rejects_unreadable_literals_with_a_clear_message(self) -> None:
+        for behavior in ('eprintln!("\\xZZ");', 'eprintln!("\\u{12");', 'eprintln!("\\q");',
+                         'eprintln!("\\u{110000}");', 'eprintln!("\\u{D800}");', 'eprintln!("\\u{1234567}");'):
+            with self.subTest(behavior=behavior):
+                with self.assertRaisesRegex(AssertionError, "unreadable"):
+                    self.verify(launcher=self.inject(behavior))
+
+    def test_rejects_stdout_in_any_delimiter(self) -> None:
+        for behavior in ('println!["plain"];', 'print!{"plain"}', 'println /* x */ !("plain");',
+
+                         'let quote = b\'"\';\nprintln!("plain");'):
+            with self.subTest(behavior=behavior):
+                with self.assertRaisesRegex(AssertionError, "stdout"):
                     self.verify(launcher=self.inject(behavior))
 
     def test_rejects_stdout_pollution(self) -> None:
