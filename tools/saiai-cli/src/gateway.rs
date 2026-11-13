@@ -252,9 +252,22 @@ pub(crate) fn validate_extension(extension: &dyn GatewayExtension) -> Result<()>
     }
     for file in extension.owned_state_files() {
         let name = file.name;
+        // A plain basename that names the same file on every platform: no
+        // separators, no trailing dot (Windows drops it), no reserved
+        // Windows device name (with or without an extension).
+        let stem = name
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (stem.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && stem.as_bytes()[3].is_ascii_digit());
         let valid = !name.is_empty()
             && name.len() <= 255
-            && !matches!(name, "." | "..")
+            && !name.ends_with('.')
+            && !reserved
             && name
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'));
@@ -439,7 +452,13 @@ mod state_file_tests {
 
     #[test]
     fn state_file_names_are_plain_basenames() {
-        static GOOD: Files = Files(&[file("client-device.json"), file("a_b.c-d")]);
+        static GOOD: Files = Files(&[
+            file("client-device.json"),
+            file("a_b.c-d"),
+            file(".hidden"),
+            file("console.log"),
+            file("COM10"),
+        ]);
         validate_extension(&GOOD).unwrap();
         for name in [
             "",
@@ -453,6 +472,12 @@ mod state_file_tests {
             "a\0b",
             "\u{e9}",
             &"x".repeat(256),
+            "device.",
+            "CON",
+            "nul",
+            "aux.txt",
+            "COM1",
+            "lpt9.log",
         ] {
             let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
             let files: &'static [StateFile] = Box::leak(Box::new([file(leaked)]));

@@ -9014,12 +9014,18 @@ fn write_json_object(path: &Path, value: Value) -> Result<()> {
     write_bytes_atomic(path, &data, 0o600)
 }
 
-/// Replaces `path` with `data` atomically: the bytes go to a new temporary
-/// file `.<file name>.<brand temp infix>-<pid>-<random>` in the same
-/// directory (created with `unix_mode` on Unix, flushed to disk), which then
-/// replaces `path` in one step (`rename`; on Windows a replacing move). On
-/// failure the temporary file is removed and `path` is left as it was. The
-/// directory is created if missing. For Gateway extensions keeping state.
+/// Replaces `path` with `data` in one step, for Gateway extensions keeping
+/// state (the installed brand provides the temporary-name infix).
+///
+/// The bytes go to a new temporary file `.<file name>.<temp infix>-<pid>-
+/// <random>` in the same directory (created if missing; the file is created
+/// with `unix_mode` on Unix and flushed to disk), which then replaces `path`
+/// (`rename` on Unix, a replacing move on Windows), so readers see the old
+/// or the new contents, never a mix. If writing or replacing fails, `path`
+/// keeps its old contents and the temporary file is removed (best effort).
+/// On Unix `unix_mode` is applied to `path` again after the replacement; if
+/// that fails the error is returned although `path` already has the new
+/// contents. Syncing the directory afterwards is best effort.
 pub fn write_file_atomically(path: &Path, data: &[u8], unix_mode: u32) -> Result<()> {
     write_bytes_atomic(path, data, unix_mode)
 }

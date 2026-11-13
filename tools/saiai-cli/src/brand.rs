@@ -92,6 +92,17 @@ fn validate(brand: &Brand) -> Result<()> {
             bail!("brand {field} may only use plain name characters: {value:?}");
         }
     }
+    // A Rust identifier, as in the type names earlier releases printed.
+    if brand
+        .config
+        .type_name
+        .starts_with(|ch: char| ch.is_ascii_digit())
+    {
+        bail!(
+            "brand config.type_name must not start with a digit: {:?}",
+            brand.config.type_name
+        );
+    }
     let env = &brand.env;
     for (field, name) in [
         ("env.home", env.home),
@@ -447,6 +458,13 @@ mod tests {
             binary_name: "saiai start",
             ..SAIAI_VALUES
         };
+        static DIGIT_TYPE_NAME: Brand = Brand {
+            config: ConfigNames {
+                type_name: "1Config",
+                ..SAIAI_VALUES.config
+            },
+            ..SAIAI_VALUES
+        };
         static BAD_SYNTHETIC: Brand = Brand {
             placeholders: PlaceholderIdentities {
                 synthetic_id_prefix: "Saiai-local",
@@ -466,6 +484,7 @@ mod tests {
             &BAD_BINARY,
             &BAD_SYNTHETIC,
             &EMPTY_PRODUCT,
+            &DIGIT_TYPE_NAME,
         ] {
             let slot = OnceLock::new();
             assert!(install_into(&slot, brand).is_err());
