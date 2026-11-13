@@ -599,13 +599,29 @@ fn uninstall_recognition_rules_are_frozen() {
             "saiai.lock",
             "saiai.pid",
             "saiai.log",
-            "client-device-key",
-            "client-device.json",
-            "client-device.lock",
-            "client-device-key.corrupt",
             "windows-packaged-proxy-lease.json",
         ]
     );
+    // The client proof files, declared by the SAIAI extension, are still the
+    // program's own, with their backups and atomic-write leftovers.
+    for file in [
+        "client-device-key",
+        "client-device.json",
+        "client-device.lock",
+        "client-device-key.corrupt",
+    ] {
+        for name in [
+            file.to_string(),
+            format!("{file}.bak-20261030-010203"),
+            format!(".{file}.saiai-tmp-1-abc"),
+        ] {
+            assert!(uninstall::is_app_home_file(&name), "{name}");
+        }
+        assert!(!uninstall::is_app_home_file(&format!(
+            ".{file}.aitp-tmp-1-abc"
+        )));
+        assert!(!uninstall::is_app_home_file(&format!("{file}x")));
+    }
     assert_eq!(uninstall::APP_HOME_DIRS, &["log-followers", "desktop"]);
     for name in [
         "config.json.bak-20261030-010203",
@@ -1378,12 +1394,9 @@ fn inline_contract_literals_are_present() {
         ),
         (
             "gateway_saiai.rs",
-            "preference_restored_header: brand.gateway.chat_preference_restored_header,",
+            "preference_restored_header: CHAT_PREFERENCE_RESTORED_HEADER,",
         ),
-        (
-            "gateway_saiai.rs",
-            "updates_path: brand.gateway.chat_updates_path,",
-        ),
+        ("gateway_saiai.rs", "updates_path: CHAT_UPDATES_PATH,"),
         (
             "gateway_saiai.rs",
             "rejected_device_proofs: &[\"saiai-local-proxy\"],",
@@ -1825,6 +1838,7 @@ fn saiai_brand_values_are_frozen() {
     assert_eq!(brand.config.filename, "config.json");
     assert_eq!(brand.config.version, 2);
     assert_eq!(brand.config.temp_file_infix, "saiai-tmp");
+    assert_eq!(brand.config.type_name, "SaiaiConfig");
     let env = &brand.env;
     assert_eq!(
         [
@@ -1913,23 +1927,37 @@ fn saiai_brand_values_are_frozen() {
         "saiai-local-proxy@example.invalid"
     );
     assert_eq!(placeholders.synthetic_id_prefix, "saiai-local");
-    let proof = &brand.client_proof;
-    assert_eq!(proof.header, "x-saiai-client-proof");
-    assert_eq!(proof.message_domain, "saiai-client-proof-v1");
-    assert_eq!(proof.enroll_path, "/api/v1/client/devices/enroll");
-    assert_eq!(proof.key_filename, "client-device-key");
-    assert_eq!(proof.lock_filename, "client-device.lock");
-    assert_eq!(proof.device_filename, "client-device.json");
-    assert_eq!(proof.corrupt_key_filename, "client-device-key.corrupt");
+    // The client proof protocol: names of the SAIAI extension (no longer
+    // brand data), with the files it owns in each environment directory.
+    {
+        use crate::client_proof as proof;
+        assert_eq!(proof::HEADER_NAME, "x-saiai-client-proof");
+        assert_eq!(proof::MESSAGE_DOMAIN, "saiai-client-proof-v1");
+        assert_eq!(proof::ENROLL_PATH, "/api/v1/client/devices/enroll");
+        assert_eq!(proof::KEY_FILENAME, "client-device-key");
+        assert_eq!(proof::LOCK_FILENAME, "client-device.lock");
+        assert_eq!(proof::DEVICE_FILENAME, "client-device.json");
+        assert_eq!(proof::CORRUPT_KEY_FILENAME, "client-device-key.corrupt");
+        let family = |name| crate::StateFile {
+            name,
+            backups: true,
+            atomic_temporaries: true,
+        };
+        assert_eq!(
+            crate::GatewayExtension::owned_state_files(&crate::gateway_saiai::SAIAI_GATEWAY),
+            [
+                family("client-device-key"),
+                family("client-device.json"),
+                family("client-device.lock"),
+                family("client-device-key.corrupt"),
+            ]
+        );
+        assert_eq!(
+            crate::GatewayExtension::signature_headers(&crate::gateway_saiai::SAIAI_GATEWAY),
+            ["x-saiai-client-proof"]
+        );
+    }
     assert_eq!(certificates.ca_backup_prefix, "saiai-ca.");
-    assert_eq!(
-        brand.gateway.chat_updates_path,
-        "/backend-api/saiai/chat-updates"
-    );
-    assert_eq!(
-        brand.gateway.chat_preference_restored_header,
-        "x-saiai-chat-preference-restored"
-    );
     // SAIAI turns the Native Chat relay on with exactly its brand names and
     // the historical placeholder device proof it never forwards.
     assert_eq!(
@@ -1985,7 +2013,7 @@ fn protocol_reference_scanner_sees_paths_imports_and_types() {
         "use crate::client_proof::{self, ClientProof};",
         "let proof: Arc<ClientProof> = todo!();",
         "&proxy_cli::gateway_saiai::SAIAI_GATEWAY",
-        "client_proof::HEADER_NAME.get()",
+        "client_proof::HEADER_NAME",
     ] {
         assert!(protocol_reference(line).is_some(), "{line}");
     }
@@ -2153,15 +2181,10 @@ const SAIAI_NAMING_FILES: [&str; 4] = [
 /// the list to equal the code exactly; that it only ever shrinks is enforced
 /// by review of this file's diff, not by the test.
 ///
-/// Remaining entries, both in `lib.rs`:
-/// - `pub mod gateway_saiai;` — the SAIAI Gateway extension is compiled into
-///   the library (the program reaches it as
-///   `proxy_cli::gateway_saiai::SAIAI_GATEWAY`) until the client proof moves
-///   out of the library (C4) and the extension can move with it.
-/// - `#[serde(expecting = "struct SaiaiConfig")]` — the diagnostic printed
-///   when config.json is not an object keeps its earlier wording (serde
-///   derived it from the old type name); a behavior-changing release may
-///   make it neutral.
+/// Remaining entry: `lib.rs` `pub mod gateway_saiai;` — the SAIAI Gateway
+/// extension is compiled into the library (the program reaches it as
+/// `proxy_cli::gateway_saiai::SAIAI_GATEWAY`) until the client proof moves
+/// out of the library (C4c) and the extension can move with it.
 const SAIAI_RESIDUE: &str = include_str!("brand_residue.txt");
 
 fn saiai_residue_lines() -> Vec<String> {
@@ -2520,4 +2543,161 @@ fn call_arguments_finds_standalone_named_arguments() {
             "x = [1, 2].len()",
         ]
     );
+}
+
+/// Kernel modules the SAIAI side names through a module path, in `text`
+/// (comments and string contents ignored, spacing around `::` allowed):
+/// `crate::m`, `super::m`, `$crate::m`, and `m` at the start of an item in a
+/// `use crate::{…}` / `use super::{…}` group, for each private module `m`.
+fn kernel_module_paths(text: &str, private: &[String]) -> Vec<String> {
+    // Blank literals, drop comments, then remove spacing around `::`.
+    let mut code = strip_rust_comments(text);
+    for range in rust_literal_ranges(&code).into_iter().rev() {
+        code.replace_range(range, "\"\"");
+    }
+    let mut compact = String::new();
+    for part in code.split("::") {
+        if !compact.is_empty() {
+            compact = compact.trim_end().to_string() + "::";
+        }
+        compact.push_str(if compact.is_empty() {
+            part
+        } else {
+            part.trim_start()
+        });
+    }
+    let ident = |ch: char| ch.is_ascii_alphanumeric() || ch == '_';
+    let mut found = Vec::new();
+    for root in ["crate::", "super::"] {
+        for (index, _) in compact.match_indices(root) {
+            let rest = &compact[index + root.len()..];
+            let mut heads = Vec::new();
+            if let Some(group) = rest.strip_prefix('{') {
+                // Only items directly below the root; a nested item belongs
+                // to its parent, which is checked here.
+                let mut depth = 0;
+                let mut start = true;
+                for (offset, ch) in group.char_indices() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' if depth == 0 => break,
+                        '}' => depth -= 1,
+                        ',' if depth == 0 => start = true,
+                        ch if start && depth == 0 && ident(ch) => {
+                            heads.push(&group[offset..]);
+                            start = false;
+                        }
+                        ch if !ch.is_whitespace() => start = false,
+                        _ => {}
+                    }
+                }
+            } else {
+                heads.push(rest);
+            }
+            for head in heads {
+                let name: String = head.chars().take_while(|ch| ident(*ch)).collect();
+                if private.contains(&name) {
+                    found.push(format!("{root}{name}"));
+                }
+                // An alias of the root would hide later module paths.
+                let next: String = head[name.len()..]
+                    .trim_start()
+                    .chars()
+                    .take_while(|ch| ident(*ch))
+                    .collect();
+                if name == "self" && next == "as" {
+                    found.push(format!("{root}{{self as …}}"));
+                }
+            }
+        }
+    }
+    // Identifier and punctuation tokens, whatever the spacing.
+    let mut words = Vec::new();
+    let mut rest = compact.as_str();
+    while let Some(ch) = rest.chars().next() {
+        let length = if ident(ch) {
+            rest.find(|ch: char| !ident(ch)).unwrap_or(rest.len())
+        } else {
+            ch.len_utf8()
+        };
+        if !ch.is_whitespace() {
+            words.push(&rest[..length]);
+        }
+        rest = &rest[length..];
+    }
+    for window in words.windows(3) {
+        if matches!(window, ["use" | "crate", "crate" | "super" | "self", "as"]) {
+            found.push(format!("{} {} as", window[0], window[1]));
+        }
+    }
+    found
+}
+
+#[test]
+fn kernel_module_path_scanner_sees_aliases_groups_and_spacing() {
+    let private = vec!["gateway".to_string(), "brand".to_string()];
+    for text in [
+        "use crate::gateway as g;",
+        "use crate::gateway;",
+        "let x = crate :: gateway :: wire_target(url);",
+        "use crate::{gateway::GatewayHttp};",
+        "use crate::{ Brand, gateway::{GatewayHttp, StateFile} };",
+        "use crate::{\n    GatewayHttp,\n    brand,\n};",
+        "$crate::gateway::X",
+        "use super::brand::BRAND;",
+        "use crate as c;\nc::gateway::X",
+        "use crate::{self as c};\nc::gateway::X",
+        "use super as parent;",
+        "extern crate self as root;",
+        "use crate::{self as\n    c};\nc::gateway::X",
+        "fn f() {};use crate as c;",
+        "use\tcrate\tas\tc;",
+    ] {
+        assert!(!kernel_module_paths(text, &private).is_empty(), "{text}");
+    }
+    for text in [
+        "use crate::{GatewayHttp, StateFile, write_file_atomically};",
+        "crate::GatewayHttp::client_for(&**self, url)",
+        "use crate::client_proof::{self, ClientProof};",
+        "let text = \"crate::gateway::X\"; // crate::gateway::Y",
+        "use super::*;",
+        "fn gateway() {}",
+        "use crate::{client_proof::{brand}};",
+        "use crate::client_proof::{self, ClientProof};",
+    ] {
+        assert_eq!(
+            kernel_module_paths(text, &private),
+            Vec::<String>::new(),
+            "{text}"
+        );
+    }
+}
+
+/// The SAIAI side reaches the kernel only through the crate root's public
+/// items (`crate::X`), never a private kernel module (any spelling), so it
+/// can move out of the library unchanged. Tests in these files included.
+#[test]
+fn saiai_side_uses_only_the_public_kernel_root() {
+    const SAIAI_SIDE: [&str; 3] = ["client_proof", "gateway_saiai", "brand_saiai"];
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let lib = fs::read_to_string(root.join("lib.rs")).unwrap();
+    // Every module lib.rs declares, minus the public ones and the SAIAI side.
+    let private: Vec<String> = lib
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("mod "))
+        .filter_map(|rest| rest.strip_suffix(';'))
+        .map(str::to_string)
+        .filter(|name| !SAIAI_SIDE.contains(&name.as_str()))
+        .collect();
+    assert!(private.contains(&"gateway".to_string()), "{private:?}");
+    assert!(private.contains(&"local_proxy".to_string()), "{private:?}");
+    for module in SAIAI_SIDE {
+        let file = format!("{module}.rs");
+        let text = fs::read_to_string(root.join(&file)).unwrap();
+        let paths = kernel_module_paths(&text, &private);
+        assert!(
+            paths.is_empty(),
+            "{file} reaches into kernel modules: {paths:?}"
+        );
+    }
 }

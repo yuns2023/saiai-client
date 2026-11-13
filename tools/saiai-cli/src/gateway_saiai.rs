@@ -7,12 +7,17 @@
 //! on-demand enrollment, and every problem leaves requests unsigned.
 
 use crate::client_proof::{self, ClientProof};
-use crate::gateway::{
+use crate::{
     ConfiguredRoute, GatewayExtension, GatewayHttp, GatewaySession, GatewayStart,
-    NativeChatProtocol, SignInput,
+    NativeChatProtocol, SignInput, StateFile,
 };
 use std::sync::{Arc, OnceLock};
 use zeroize::Zeroizing;
+
+/// The SAIAI Gateway's Native Chat update channel and the response header
+/// marking a restored Chat preference.
+const CHAT_UPDATES_PATH: &str = "/backend-api/saiai/chat-updates";
+const CHAT_PREFERENCE_RESTORED_HEADER: &str = "x-saiai-chat-preference-restored";
 
 /// The SAIAI Gateway extension instance.
 pub static SAIAI_GATEWAY: SaiaiGateway = SaiaiGateway { _instance: () };
@@ -23,15 +28,33 @@ pub struct SaiaiGateway {
 
 impl GatewayExtension for SaiaiGateway {
     fn signature_headers(&self) -> &'static [&'static str] {
-        std::slice::from_ref(&crate::brand::brand().client_proof.header)
+        &[client_proof::HEADER_NAME]
+    }
+
+    /// The device key, its records, their lock and an unreadable key kept
+    /// aside, each with backups and atomic-write leftovers.
+    fn owned_state_files(&self) -> &'static [StateFile] {
+        const fn family(name: &'static str) -> StateFile {
+            StateFile {
+                name,
+                backups: true,
+                atomic_temporaries: true,
+            }
+        }
+        const FILES: &[StateFile] = &[
+            family(client_proof::KEY_FILENAME),
+            family(client_proof::DEVICE_FILENAME),
+            family(client_proof::LOCK_FILENAME),
+            family(client_proof::CORRUPT_KEY_FILENAME),
+        ];
+        FILES
     }
 
     /// The SAIAI Gateway relays ordinary Chat for the official Desktop.
     fn native_chat(&self) -> Option<NativeChatProtocol> {
-        let brand = crate::brand::brand();
         Some(NativeChatProtocol {
-            updates_path: brand.gateway.chat_updates_path,
-            preference_restored_header: brand.gateway.chat_preference_restored_header,
+            updates_path: CHAT_UPDATES_PATH,
+            preference_restored_header: CHAT_PREFERENCE_RESTORED_HEADER,
             // The historical local bootstrap placeholder is never a provider
             // proof; a real registration replaces it on startup.
             rejected_device_proofs: &["saiai-local-proxy"],
@@ -142,7 +165,7 @@ impl GatewaySession for SaiaiSession {
         self.enroll(proof, input.gateway, bearer, true);
         proof
             .sign_request(input.gateway, input.method, input.target, bearer)
-            .map(|value| vec![(client_proof::HEADER_NAME.get().to_string(), value)])
+            .map(|value| vec![(client_proof::HEADER_NAME.to_string(), value)])
             .unwrap_or_default()
     }
 

@@ -32,10 +32,6 @@ pub(crate) const APP_HOME_FILES: &[BrandValue<&'static str>] = &[
     BrandValue(|brand| brand.service.lock_filename),
     BrandValue(|brand| brand.service.pid_filename),
     BrandValue(|brand| brand.service.log_filename),
-    BrandValue(|brand| brand.client_proof.key_filename),
-    BrandValue(|brand| brand.client_proof.device_filename),
-    BrandValue(|brand| brand.client_proof.lock_filename),
-    BrandValue(|brand| brand.client_proof.corrupt_key_filename),
     BrandValue(|_| "windows-packaged-proxy-lease.json"),
 ];
 pub(crate) const APP_HOME_DIRS: &[&str] = &["log-followers", "desktop"];
@@ -1465,12 +1461,18 @@ fn plan_nss(files: &[PathBuf], plan: &mut Plan) {
 
 // ------------------------------------------------------------------ Data
 
+/// The program's own files in an environment directory: its own, and the
+/// state files the installed Gateway extension declares.
 pub(crate) fn is_app_home_file(name: &str) -> bool {
+    let infix = BRAND.config.temp_file_infix;
     APP_HOME_FILES.iter().map(BrandValue::get).any(|file| {
         name == file
             || name.starts_with(&format!("{file}.bak-"))
-            || name.starts_with(&format!(".{file}.{}-", BRAND.config.temp_file_infix))
-    })
+            || name.starts_with(&format!(".{file}.{infix}-"))
+    }) || crate::runtime::gateway()
+        .owned_state_files()
+        .iter()
+        .any(|file| file.owns(name, infix))
 }
 
 pub(crate) fn is_claude_ca_file(name: &str) -> bool {

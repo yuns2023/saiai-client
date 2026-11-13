@@ -79,6 +79,9 @@ fn validate(brand: &Brand) -> Result<()> {
         ("product_name", brand.product_name, |byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'.')
         }),
+        ("config.type_name", brand.config.type_name, |byte| {
+            byte.is_ascii_alphanumeric() || byte == b'_'
+        }),
         (
             "placeholders.synthetic_id_prefix",
             brand.placeholders.synthetic_id_prefix,
@@ -88,6 +91,17 @@ fn validate(brand: &Brand) -> Result<()> {
         if value.is_empty() || !value.bytes().all(valid) {
             bail!("brand {field} may only use plain name characters: {value:?}");
         }
+    }
+    // A Rust identifier, as in the type names earlier releases printed.
+    if brand
+        .config
+        .type_name
+        .starts_with(|ch: char| ch.is_ascii_digit())
+    {
+        bail!(
+            "brand config.type_name must not start with a digit: {:?}",
+            brand.config.type_name
+        );
     }
     let env = &brand.env;
     for (field, name) in [
@@ -254,8 +268,6 @@ pub struct Brand {
     pub update: UpdateNames,
     pub markers: OwnershipMarkers,
     pub placeholders: PlaceholderIdentities,
-    pub client_proof: ClientProofNames,
-    pub gateway: GatewayProtocolNames,
     pub scripts: ScriptNames,
     /// Inbound request headers only this program may produce; stripped from
     /// every request the proxy rebuilds (case-insensitive), in addition to
@@ -281,6 +293,10 @@ pub struct ConfigNames {
     pub version: u32,
     /// Infix of atomic-write temporary files (`.<file>.<infix>-<pid>-<id>`).
     pub temp_file_infix: &'static str,
+    /// Type name in the errors for a config file of the wrong shape
+    /// (`expected struct <name>`); earlier releases printed their Rust type
+    /// name there. A Rust identifier.
+    pub type_name: &'static str,
 }
 
 /// Environment variables read by the client or passed to its own children.
@@ -379,27 +395,6 @@ pub struct ScriptNames {
     pub identifier_prefix: &'static str,
 }
 
-/// Names of Gateway endpoints and headers specific to this distribution.
-pub struct GatewayProtocolNames {
-    /// Native Chat update channel: a complete path starting with
-    /// `/backend-api/` and without the `/chatgpt` prefix (the local proxy
-    /// forwards it as `/chatgpt` + this path).
-    pub chat_updates_path: &'static str,
-    /// Response header marking a restored native Chat preference.
-    pub chat_preference_restored_header: &'static str,
-}
-
-pub struct ClientProofNames {
-    pub header: &'static str,
-    pub message_domain: &'static str,
-    pub enroll_path: &'static str,
-    pub key_filename: &'static str,
-    pub lock_filename: &'static str,
-    pub device_filename: &'static str,
-    /// Unreadable key kept aside before a new device key is created.
-    pub corrupt_key_filename: &'static str,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,6 +458,13 @@ mod tests {
             binary_name: "saiai start",
             ..SAIAI_VALUES
         };
+        static DIGIT_TYPE_NAME: Brand = Brand {
+            config: ConfigNames {
+                type_name: "1Config",
+                ..SAIAI_VALUES.config
+            },
+            ..SAIAI_VALUES
+        };
         static BAD_SYNTHETIC: Brand = Brand {
             placeholders: PlaceholderIdentities {
                 synthetic_id_prefix: "Saiai-local",
@@ -482,6 +484,7 @@ mod tests {
             &BAD_BINARY,
             &BAD_SYNTHETIC,
             &EMPTY_PRODUCT,
+            &DIGIT_TYPE_NAME,
         ] {
             let slot = OnceLock::new();
             assert!(install_into(&slot, brand).is_err());

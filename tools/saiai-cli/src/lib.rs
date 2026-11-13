@@ -63,13 +63,13 @@ mod windows_desktop_runtime;
 
 use brand::{BRAND, BrandText, BrandValue};
 pub use brand::{
-    Brand, CertificateNames, ClientProofNames, ConfigNames, EnvironmentNames, GatewayProtocolNames,
-    OwnershipMarkers, PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
+    Brand, CertificateNames, ConfigNames, EnvironmentNames, OwnershipMarkers,
+    PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
 };
 use desktop_product::DesktopProduct;
 pub use gateway::{
     ConfiguredRoute, GatewayExtension, GatewayHttp, GatewaySession, GatewayStart,
-    NativeChatProtocol, NoGatewayExtension, SignInput, Transport,
+    NativeChatProtocol, NoGatewayExtension, SignInput, StateFile, Transport, wire_target,
 };
 pub use runtime::RuntimeContext;
 
@@ -3763,10 +3763,14 @@ fn local_proxy_chatgpt_spki(listen: &str) -> Result<String> {
     Ok(spki)
 }
 
+// The derived code below is used through `AppConfig::serialize` /
+// `AppConfig::deserialize` (`remote = "Self"`); the trait impls after the
+// struct name the brand's config type in shape errors, which derived code
+// would take from the Rust type name.
+// Fields: keep in sync with `APP_CONFIG_FIELDS` and the hand-written
+// `AppConfigVisitor::visit_seq`.
 #[derive(Clone, Serialize, Deserialize, Eq, PartialEq)]
-// Keeps the type name earlier releases printed when config.json is not an
-// object (serde derives `expected struct <type>` from the Rust name).
-#[serde(expecting = "struct SaiaiConfig")]
+#[serde(remote = "Self")]
 struct AppConfig {
     version: u32,
     base_url: String,
@@ -4041,6 +4045,106 @@ fn proxy_runtime_config_changed(previous: Option<&AppConfig>, current: &AppConfi
         || previous.providers != current.providers
         || (previous.providers.is_empty()
             && (previous.base_url != current.base_url || previous.api_key != current.api_key))
+}
+
+/// Field order of an array-form config.json (the struct's field order).
+/// Keep in sync with the `AppConfig` fields and `AppConfigVisitor::visit_seq`
+/// (`app_config_field_order_is_consistent` checks all three).
+const APP_CONFIG_FIELDS: &[&str] = &[
+    "version",
+    "base_url",
+    "api_key",
+    "listen",
+    "ca_cert_path",
+    "ca_key_path",
+    "chatgpt_chat_passthrough",
+    "desktop_browser_use",
+    "upstream_proxy",
+    "providers",
+];
+
+impl Serialize for AppConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        AppConfig::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AppConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct(
+            "AppConfig",
+            APP_CONFIG_FIELDS,
+            AppConfigVisitor(crate::brand::brand()),
+        )
+    }
+}
+
+/// `struct <brand type name> with <n> elements`: the expectation of an
+/// array-form config that is too short.
+struct AppConfigElements(&'static brand::Brand);
+
+impl serde::de::Expected for AppConfigElements {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "struct {} with {} elements",
+            self.0.config.type_name,
+            APP_CONFIG_FIELDS.len()
+        )
+    }
+}
+
+/// Reads a config for `brand`, whose config type name the shape errors use.
+struct AppConfigVisitor(&'static brand::Brand);
+
+impl<'de> serde::de::Visitor<'de> for AppConfigVisitor {
+    type Value = AppConfig;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "struct {}", self.0.config.type_name)
+    }
+
+    // Field errors (missing, duplicate, mistyped) name fields, not the type,
+    // so the derived code handles objects as before.
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<AppConfig, A::Error> {
+        AppConfig::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+    }
+
+    // As derived code reads an array: fields in order, a defaulted field may
+    // be missing at the end, a missing required one is a length error.
+    // Keep in sync with the `AppConfig` fields and `APP_CONFIG_FIELDS`.
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<AppConfig, A::Error> {
+        let brand = self.0;
+        let required_error =
+            |index| serde::de::Error::invalid_length(index, &AppConfigElements(brand));
+        fn required<'de, A: serde::de::SeqAccess<'de>, T: Deserialize<'de>>(
+            seq: &mut A,
+            index: &mut usize,
+            error: impl Fn(usize) -> A::Error,
+        ) -> Result<T, A::Error> {
+            let element = seq.next_element()?.ok_or_else(|| error(*index));
+            *index += 1;
+            element
+        }
+        let mut index = 0;
+        let version = required(&mut seq, &mut index, required_error)?;
+        let base_url = required(&mut seq, &mut index, required_error)?;
+        let api_key = required(&mut seq, &mut index, required_error)?;
+        let listen = required(&mut seq, &mut index, required_error)?;
+        let ca_cert_path = required(&mut seq, &mut index, required_error)?;
+        Ok(AppConfig {
+            version,
+            base_url,
+            api_key,
+            listen,
+            ca_cert_path,
+            ca_key_path: seq.next_element()?.unwrap_or_default(),
+            chatgpt_chat_passthrough: seq.next_element()?.unwrap_or_else(default_true),
+            desktop_browser_use: seq.next_element()?.unwrap_or_else(default_true),
+            upstream_proxy: seq.next_element()?.unwrap_or_default(),
+            providers: seq.next_element()?.unwrap_or_default(),
+        })
+    }
 }
 
 fn default_true() -> bool {
@@ -8915,6 +9019,22 @@ fn write_json_object(path: &Path, value: Value) -> Result<()> {
     write_bytes_atomic(path, &data, 0o600)
 }
 
+/// Replaces `path` with `data` in one step, for Gateway extensions keeping
+/// state (the installed brand provides the temporary-name infix).
+///
+/// The bytes go to a new temporary file `.<file name>.<temp infix>-<pid>-
+/// <random>` in the same directory (created if missing; the file is created
+/// with `unix_mode` on Unix and flushed to disk), which then replaces `path`
+/// (`rename` on Unix, a replacing move on Windows), so readers see the old
+/// or the new contents, never a mix. If writing or replacing fails, `path`
+/// keeps its old contents and the temporary file is removed (best effort).
+/// On Unix `unix_mode` is applied to `path` again after the replacement; if
+/// that fails the error is returned although `path` already has the new
+/// contents. Syncing the directory afterwards is best effort.
+pub fn write_file_atomically(path: &Path, data: &[u8], unix_mode: u32) -> Result<()> {
+    write_bytes_atomic(path, data, unix_mode)
+}
+
 fn write_bytes_atomic(path: &Path, data: &[u8], unix_mode: u32) -> Result<()> {
     #[cfg(not(unix))]
     let _ = unix_mode;
@@ -9975,6 +10095,360 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         ] {
             let error = validate_chatgpt_timezone(value).unwrap_err();
             assert_eq!(error.to_string(), message, "{value}");
+        }
+    }
+
+    /// config.json shapes and their exact results, frozen from the release
+    /// before the configuration type was renamed: every error names the type
+    /// as earlier releases did, including array-form length errors, with
+    /// serde_json's line and column.
+    #[test]
+    fn config_json_shapes_and_diagnostics_are_frozen() {
+        let cases: &[(&str, Result<&str, &str>)] = &[
+            (
+                r#"1"#,
+                Err(r#"invalid type: integer `1`, expected struct SaiaiConfig at line 1 column 1"#),
+            ),
+            (
+                r#""x""#,
+                Err(r#"invalid type: string "x", expected struct SaiaiConfig at line 1 column 3"#),
+            ),
+            (
+                r#"true"#,
+                Err(
+                    r#"invalid type: boolean `true`, expected struct SaiaiConfig at line 1 column 4"#,
+                ),
+            ),
+            (
+                r#"null"#,
+                Err(r#"invalid type: null, expected struct SaiaiConfig at line 1 column 4"#),
+            ),
+            (
+                r#"1.5"#,
+                Err(
+                    r#"invalid type: floating point `1.5`, expected struct SaiaiConfig at line 1 column 3"#,
+                ),
+            ),
+            (
+                r#"[]"#,
+                Err(
+                    r#"invalid length 0, expected struct SaiaiConfig with 10 elements at line 1 column 2"#,
+                ),
+            ),
+            (
+                r#"[2]"#,
+                Err(
+                    r#"invalid length 1, expected struct SaiaiConfig with 10 elements at line 1 column 3"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k"]"#,
+                Err(
+                    r#"invalid length 3, expected struct SaiaiConfig with 10 elements at line 1 column 11"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k","l"]"#,
+                Err(
+                    r#"invalid length 4, expected struct SaiaiConfig with 10 elements at line 1 column 15"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k","l","c"]"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k","l","c","kp",true,false,null,{}]"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"kp","chatgpt_chat_passthrough":true,"desktop_browser_use":false,"providers":{}}"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k","l","c","kp",true,false,null,{},1]"#,
+                Err(r#"trailing characters at line 1 column 44"#),
+            ),
+            (
+                r#"["2"]"#,
+                Err(r#"invalid type: string "2", expected u32 at line 1 column 4"#),
+            ),
+            (
+                r#"{}"#,
+                Err(r#"missing field `version` at line 1 column 2"#),
+            ),
+            (
+                r#"{"version":2}"#,
+                Err(r#"missing field `base_url` at line 1 column 13"#),
+            ),
+            (
+                r#"{"version":2,"version":3,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}"#,
+                Err(r#"duplicate field `version` at line 1 column 22"#),
+            ),
+            (
+                r#"{"version":"2","base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}"#,
+                Err(r#"invalid type: string "2", expected u32 at line 1 column 14"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","extra":1}"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
+                ),
+            ),
+            (
+                r#"
+
+   null"#,
+                Err(r#"invalid type: null, expected struct SaiaiConfig at line 3 column 7"#),
+            ),
+            (
+                r#"
+  [
+ 2,
+ "u"
+ ]"#,
+                Err(
+                    r#"invalid length 2, expected struct SaiaiConfig with 10 elements at line 5 column 2"#,
+                ),
+            ),
+            (
+                r#"{
+  "version": 2
+}"#,
+                Err(r#"missing field `base_url` at line 3 column 1"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
+                ),
+            ),
+            // Field-level edge cases, same source release.
+            (
+                r#"[2,"u","k","l","c","kp"]"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"kp","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k","l","c","kp",false]"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"kp","chatgpt_chat_passthrough":false,"desktop_browser_use":true,"providers":{}}"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k","l","c","kp",false,false]"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"kp","chatgpt_chat_passthrough":false,"desktop_browser_use":false,"providers":{}}"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k","l","c","kp",false,false,"direct"]"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"kp","chatgpt_chat_passthrough":false,"desktop_browser_use":false,"upstream_proxy":"direct","providers":{}}"#,
+                ),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","chatgpt_chat_passthrough":null}"#,
+                Err(r#"invalid type: null, expected a boolean at line 1 column 105"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","chatgpt_chat_passthrough":"yes"}"#,
+                Err(r#"invalid type: string "yes", expected a boolean at line 1 column 106"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","desktop_browser_use":null}"#,
+                Err(r#"invalid type: null, expected a boolean at line 1 column 100"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","desktop_browser_use":"no"}"#,
+                Err(r#"invalid type: string "no", expected a boolean at line 1 column 100"#),
+            ),
+            (
+                r#"[2,"u","k","l","c","kp",null]"#,
+                Err(r#"invalid type: null, expected a boolean at line 1 column 28"#),
+            ),
+            (
+                r#"[2,"u","k","l","c","kp",true,"x"]"#,
+                Err(r#"invalid type: string "x", expected a boolean at line 1 column 32"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":null}"#,
+                Err(r#"invalid type: null, expected a string at line 1 column 92"#),
+            ),
+            (
+                r#"[2,"u","k","l","c",null]"#,
+                Err(r#"invalid type: null, expected a string at line 1 column 23"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","providers":null}"#,
+                Err(
+                    r#"invalid type: null, expected struct ProviderCredentials at line 1 column 90"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k","l","c","kp",true,true,null,null]"#,
+                Err(
+                    r#"invalid type: null, expected struct ProviderCredentials at line 1 column 43"#,
+                ),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
+                ),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","upstream_proxy":null}"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
+                ),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","upstream_proxy":"direct"}"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"upstream_proxy":"direct","providers":{}}"#,
+                ),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","upstream_proxy":5}"#,
+                Err(r#"invalid type: integer `5`, expected a string at line 1 column 92"#),
+            ),
+            (
+                r#"[2,"u","k","l","c","kp",true,true,5]"#,
+                Err(r#"invalid type: integer `5`, expected a string at line 1 column 35"#),
+            ),
+            (
+                r#"{"version":null,"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}"#,
+                Err(r#"invalid type: null, expected u32 at line 1 column 15"#),
+            ),
+            (
+                r#"{"upstream_proxy":null,"upstream_proxy":"direct","version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}"#,
+                Err(r#"duplicate field `upstream_proxy` at line 1 column 39"#),
+            ),
+            (
+                r#"{"providers":{},"upstream_proxy":"direct","desktop_browser_use":false,"chatgpt_chat_passthrough":false,"ca_key_path":"kp","ca_cert_path":"c","listen":"l","api_key":"k","base_url":"u","version":2}"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"kp","chatgpt_chat_passthrough":false,"desktop_browser_use":false,"upstream_proxy":"direct","providers":{}}"#,
+                ),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","extra":{"a":[1,{"b":null}]},"more":[1,[2,{}]]}"#,
+                Ok(
+                    r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c","ca_key_path":"","chatgpt_chat_passthrough":true,"desktop_browser_use":true,"providers":{}}"#,
+                ),
+            ),
+            (
+                r#"[2,"u","k","l","c",]"#,
+                Err(r#"trailing comma at line 1 column 20"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c",}"#,
+                Err(r#"trailing comma at line 1 column 75"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"} {}"#,
+                Err(r#"trailing characters at line 1 column 76"#),
+            ),
+            (
+                r#"[2,"u","k","l","c"] 1"#,
+                Err(r#"trailing characters at line 1 column 21"#),
+            ),
+            (
+                r#"{"version":2,"base_url":"u","api_key":"k","listen":"l","ca_cert_path":"c"}
+
+  null"#,
+                Err(r#"trailing characters at line 3 column 3"#),
+            ),
+        ];
+        for (input, expected) in cases {
+            let actual = serde_json::from_str::<AppConfig>(input)
+                .map(|config| serde_json::to_string(&config).unwrap())
+                .map_err(|error| error.to_string());
+            assert_eq!(
+                actual.as_deref().map_err(String::as_str),
+                *expected,
+                "{input:?}"
+            );
+        }
+    }
+
+    /// The struct's field order, `APP_CONFIG_FIELDS` and the array reader
+    /// agree: an object serializes its keys in that order, and the same
+    /// values as an array read back the same config.
+    #[test]
+    fn app_config_field_order_is_consistent() {
+        let object = serde_json::json!({
+            "version": 7,
+            "base_url": "https://gateway.example.test",
+            "api_key": "TEST_ONLY_KEY",
+            "listen": "127.0.0.1:19908",
+            "ca_cert_path": "/tmp/ca.crt",
+            "ca_key_path": "/tmp/ca.key",
+            "chatgpt_chat_passthrough": false,
+            "desktop_browser_use": true,
+            "upstream_proxy": "direct",
+            "providers": {}
+        });
+        let config: AppConfig = serde_json::from_value(object).unwrap();
+        let serialized = serde_json::to_value(&config).unwrap();
+        let keys: Vec<&str> = serialized
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        // serde_json keeps insertion order only with preserve_order; compare
+        // the serialized text instead for the struct's field order.
+        let text = serde_json::to_string(&config).unwrap();
+        let mut positions: Vec<usize> = APP_CONFIG_FIELDS
+            .iter()
+            .map(|field| text.find(&format!("\"{field}\":")).unwrap())
+            .collect();
+        let sorted = {
+            let mut copy = positions.clone();
+            copy.sort_unstable();
+            copy
+        };
+        assert_eq!(positions, sorted, "{text}");
+        positions.dedup();
+        assert_eq!(positions.len(), APP_CONFIG_FIELDS.len());
+        assert_eq!(keys.len(), APP_CONFIG_FIELDS.len());
+        let array: Vec<Value> = APP_CONFIG_FIELDS
+            .iter()
+            .map(|field| serialized[*field].clone())
+            .collect();
+        let from_array: AppConfig = serde_json::from_value(Value::Array(array)).unwrap();
+        assert!(from_array == config);
+    }
+
+    /// The config type name in shape errors is the brand's.
+    #[test]
+    fn config_shape_errors_name_the_brand_config_type() {
+        use serde::Deserializer as _;
+        static ACME: brand::Brand = brand::Brand {
+            config: brand::ConfigNames {
+                type_name: "AcmeConfig",
+                ..crate::brand_saiai::SAIAI_VALUES.config
+            },
+            ..crate::brand_saiai::SAIAI_VALUES
+        };
+        for (input, message) in [
+            (
+                "null",
+                "invalid type: null, expected struct AcmeConfig at line 1 column 4",
+            ),
+            (
+                "[2]",
+                "invalid length 1, expected struct AcmeConfig with 10 elements at line 1 column 3",
+            ),
+        ] {
+            let mut deserializer = serde_json::Deserializer::from_str(input);
+            let error = (&mut deserializer)
+                .deserialize_struct("AppConfig", APP_CONFIG_FIELDS, AppConfigVisitor(&ACME))
+                .err()
+                .unwrap();
+            assert_eq!(error.to_string(), message, "{input}");
         }
     }
 
