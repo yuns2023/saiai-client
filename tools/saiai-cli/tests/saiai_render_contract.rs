@@ -6,7 +6,8 @@
 use base64::Engine as _;
 #[allow(unused_imports)]
 use proxy_cli::contract::{
-    certificates, codex, config, environment, scripts, service, uninstall, update, vscode,
+    certificates, claude_desktop, codex, config, desktop, environment, scripts, service, uninstall,
+    update, vscode,
 };
 use proxy_cli::{
     Brand, CertificateNames, ConfigNames, EnvironmentNames, OwnershipMarkers,
@@ -20,6 +21,9 @@ use std::path::{Path, PathBuf};
 
 #[path = "../src/brand_saiai.rs"]
 mod brand_saiai;
+#[allow(dead_code)]
+#[path = "support/source_scan.rs"]
+mod source_scan;
 
 /// The SAIAI brand and runtime, installed as the program installs them.
 fn saiai() -> &'static Brand {
@@ -879,4 +883,239 @@ fn uninstall_recognition_rules_are_frozen() {
     assert!(claude_ca_file("saiai-ca.crt"));
     assert!(claude_ca_file("saiai-ca.key.bak-1"));
     assert!(!claude_ca_file("aitp-ca.crt"));
+}
+
+/// A listener owned by a process whose name contains the binary name (any
+/// case) is treated as this client's own proxy.
+#[test]
+fn listen_port_owner_recognition_is_frozen() {
+    for (name, ours) in [
+        ("saiai", true),
+        ("SAIAI", true),
+        ("saiai.exe", true),
+        ("my-saiai-worker", true),
+        ("aitp", false),
+        ("node", false),
+    ] {
+        assert_eq!(
+            service::owns_listener(saiai(), name).unwrap(),
+            ours,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn desktop_synthetic_identity_is_frozen() {
+    // An identity persisted by an earlier client keeps loading from the same
+    // place with the same field names.
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("desktop/claude/state");
+    std::fs::create_dir_all(&state).unwrap();
+    let identity = serde_json::json!({
+        "account": "6f1c1f5e-8f1a-4d9e-9a51-0c2f5b7d1e01",
+        "organization": "0b9d6a7c-2e4f-4c1b-8d3a-5f6e7a8b9c02",
+        "access_token": "saiai-desktop-claude-0123456789abcdef0123456789abcdef",
+        "refresh_token": "saiai-desktop-claude-refresh-0123456789abcdef",
+        "session": "saiai-local-0123456789abcdef0123456789abcdef"
+    });
+    std::fs::write(state.join("identity.json"), identity.to_string()).unwrap();
+    let loaded = claude_desktop::load_identity(saiai(), root.path())
+        .unwrap()
+        .expect("persisted identity is found");
+    assert_eq!(serde_json::to_value(&loaded).unwrap(), identity);
+}
+
+/// Variables the binary hands to its own PowerShell helpers. Both ends are
+/// templates of the same brand prefix: Rust passes `script_brand::env("X")`
+/// and the script reads `$env:@@ENV@@X`, from the same production files as
+/// before the names became templates; under SAIAI the names are unchanged.
+#[test]
+fn helper_environment_variables_are_written_and_read() {
+    use source_scan::cli_sources;
+    use std::collections::BTreeSet;
+    let sources = cli_sources();
+    let expected: &[(&str, &[&str])] = &[
+        ("SAIAI_CA_FILES", &["uninstall.rs"]),
+        ("SAIAI_CA_THUMBPRINT", &["uninstall.rs"]),
+        ("SAIAI_CA_THUMBPRINTS", &["uninstall.rs"]),
+        ("SAIAI_CHECK_EXE", &["lib.rs"]),
+        ("SAIAI_CHECK_PID", &["lib.rs"]),
+        ("SAIAI_CLEANUP_DIR", &["uninstall.rs"]),
+        ("SAIAI_CLEANUP_DIRS", &["uninstall.rs"]),
+        ("SAIAI_CLEANUP_FILES", &["uninstall.rs"]),
+        ("SAIAI_DESKTOP_ACTIVATION_ARGS", &["lib.rs"]),
+        ("SAIAI_DESKTOP_APP_ID", &["lib.rs"]),
+        ("SAIAI_PATH_KIND", &["uninstall.rs"]),
+        ("SAIAI_PATH_NEW", &["uninstall.rs"]),
+        ("SAIAI_PATH_OLD", &["uninstall.rs"]),
+        (
+            "SAIAI_RUNTIME_APP_ID",
+            &["windows_desktop_inspect.ps1", "windows_desktop_runtime.rs"],
+        ),
+        ("SAIAI_RUNTIME_DIRECTORY", &["windows_desktop_runtime.rs"]),
+        (
+            "SAIAI_RUNTIME_PACKAGE_ROOT",
+            &["windows_desktop_inspect.ps1", "windows_desktop_runtime.rs"],
+        ),
+        (
+            "SAIAI_RUNTIME_REQUIRE_NO_ACTORS",
+            &["windows_desktop_inspect.ps1", "windows_desktop_runtime.rs"],
+        ),
+        (
+            "SAIAI_VSCODE_CA_PATH",
+            &["vscode.rs", "vscode_trust_windows.ps1"],
+        ),
+        (
+            "SAIAI_VSCODE_CA_SHA256",
+            &["vscode.rs", "vscode_trust_windows.ps1"],
+        ),
+    ];
+    let bounded = |text: &str, needle: &str| {
+        text.match_indices(needle).any(|(index, _)| {
+            !text[index + needle.len()..]
+                .starts_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+    };
+    // Exactly these helper variables exist: none may be added unregistered.
+    let mut found = BTreeSet::new();
+    for text in sources.values() {
+        for (marker, terminator) in [("script_brand::env(\"", '"'), ("$env:@@ENV@@", ' ')] {
+            for (index, _) in text.match_indices(marker) {
+                let rest = &text[index + marker.len()..];
+                let suffix = if terminator == '"' {
+                    rest.split('"').next().unwrap_or_default().to_string()
+                } else {
+                    rest.chars()
+                        .take_while(|ch| {
+                            ch.is_ascii_uppercase() || ch.is_ascii_digit() || *ch == '_'
+                        })
+                        .collect()
+                };
+                // The failure marker is a line prefix, not a variable.
+                if suffix != "DESKTOP_HELPER_FAILURE:" {
+                    found.insert(format!("SAIAI_{suffix}"));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        found,
+        expected
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect::<BTreeSet<_>>()
+    );
+    for (name, files) in expected {
+        let suffix = name.strip_prefix("SAIAI_").unwrap();
+        assert_eq!(scripts::env(saiai(), suffix).unwrap(), *name);
+        let writer = format!("script_brand::env(\"{suffix}\")");
+        let reader = format!("$env:@@ENV@@{suffix}");
+        assert!(
+            sources
+                .iter()
+                .any(|(file, text)| file.ends_with(".rs") && text.contains(&writer)),
+            "the binary no longer passes {name} to its helper"
+        );
+        assert!(
+            sources.values().any(|text| bounded(text, &reader)),
+            "no helper script reads {name} any more"
+        );
+        let users = sources
+            .iter()
+            .filter(|(_, text)| text.contains(&writer) || bounded(text, &reader))
+            .map(|(file, _)| file.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(&users, files, "files using {name}");
+    }
+}
+
+/// Native Chat update channel of the SAIAI Gateway, on both entry spellings.
+#[test]
+fn native_chat_update_route_is_frozen() {
+    assert_eq!(
+        desktop::chat_relay_target(saiai(), "/backend-api/saiai/chat-updates?since=1")
+            .unwrap()
+            .unwrap(),
+        "/chatgpt/backend-api/saiai/chat-updates?since=1"
+    );
+    assert!(
+        desktop::is_forwarded_chat_path(saiai(), "/chatgpt/backend-api/saiai/chat-updates")
+            .unwrap()
+    );
+    for rejected in [
+        "/backend-api/saiai/chat-updates/admin",
+        "/backend-api/aitp/chat-updates",
+    ] {
+        assert!(
+            desktop::chat_relay_target(saiai(), rejected)
+                .unwrap()
+                .is_err(),
+            "{rejected}"
+        );
+    }
+    for unforwarded in [
+        "/chatgpt/backend-api/saiai/chat-updates/admin",
+        "/backend-api/saiai/chat-updates",
+        "/chatgpt/backend-api/aitp/chat-updates",
+    ] {
+        assert!(
+            !desktop::is_forwarded_chat_path(saiai(), unforwarded).unwrap(),
+            "{unforwarded}"
+        );
+    }
+}
+
+/// Wire names inside helper scripts under SAIAI, written out by hand, in
+/// the production templates the program renders.
+#[test]
+fn helper_script_names_are_frozen() {
+    let render = |template: &str| scripts::render(saiai(), template).unwrap();
+    assert_eq!(scripts::env(saiai(), "CA_FILES").unwrap(), "SAIAI_CA_FILES");
+    assert_eq!(scripts::null_sentinel(saiai()).unwrap(), "__SAIAI_NULL__");
+    assert_eq!(scripts::identifier_prefix(saiai()).unwrap(), "Saiai");
+    #[cfg(windows)]
+    assert_eq!(
+        scripts::helper_failure_prefix(saiai()).unwrap(),
+        "SAIAI_DESKTOP_HELPER_FAILURE:"
+    );
+    assert!(
+        render(scripts::STALE_CA_LISTING)
+            .contains("Where-Object { $_.Subject -match '(^|, )O=SAIAI(,|$)' }")
+    );
+    let activation = render(scripts::PACKAGE_ACTIVATION);
+    assert!(activation.contains("public static class SaiaiPackageActivation {"));
+    assert!(activation.contains(
+        "[SaiaiPackageActivation]::Activate($env:SAIAI_DESKTOP_APP_ID,$env:SAIAI_DESKTOP_ACTIVATION_ARGS)"
+    ));
+    assert!(render(scripts::UNINSTALL_USER_PATH).contains("Add-Type -Namespace SaiaiUninstall"));
+    assert!(render(scripts::WINDOWS_DESKTOP_INSPECT).contains("'SAIAI\\desktop-runtime'"));
+}
+
+/// Executes the observer's production expression for the runtime directory.
+#[cfg(windows)]
+#[test]
+fn windows_desktop_runtime_directory_is_frozen() {
+    // The observer is a brand template; run what the program runs.
+    let observer = scripts::render(saiai(), scripts::WINDOWS_DESKTOP_INSPECT).unwrap();
+    let line = observer
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("runtime_directory="))
+        .expect("observer reports runtime_directory");
+    let script = format!(
+        "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.Encoding]::UTF8; $base=[Environment]::GetFolderPath('LocalApplicationData'); $value={line}; $base; $value"
+    );
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8(output.stdout).unwrap();
+    let mut lines = text.lines().map(str::trim);
+    let base = lines.next().unwrap().to_string();
+    assert_eq!(
+        lines.next().unwrap(),
+        format!(r"{base}\SAIAI\desktop-runtime")
+    );
 }

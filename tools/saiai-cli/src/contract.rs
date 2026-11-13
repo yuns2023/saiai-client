@@ -36,7 +36,6 @@ fn check_installed(installed: Option<&'static Brand>, brand: &'static Brand) -> 
 
 /// Service files the program installs for its background proxy.
 pub mod service {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use super::*;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::path::Path;
@@ -64,6 +63,17 @@ pub mod service {
     ) -> Result<String> {
         installed(brand)?;
         crate::render_launchd_plist(exe, app_home, working_dir, log)
+    }
+
+    /// Whether a listener owned by the process named `process_name` counts
+    /// as this program's own proxy.
+    pub fn owns_listener(brand: &'static Brand, process_name: &str) -> Result<bool> {
+        installed(brand)?;
+        Ok(crate::ListenPortOwner {
+            pid: 0,
+            name: process_name.to_string(),
+        }
+        .is_app())
     }
 }
 
@@ -94,10 +104,42 @@ pub mod scripts {
     /// The Windows Desktop inspection helper template.
     pub const WINDOWS_DESKTOP_INSPECT: &str = include_str!("windows_desktop_inspect.ps1");
 
+    /// Lists root CAs carrying the brand's CA organization (Windows).
+    pub const STALE_CA_LISTING: &str = crate::STALE_CA_LISTING_SCRIPT;
+    /// Activates a Store package by AppUserModelID (Windows).
+    pub const PACKAGE_ACTIVATION: &str = crate::PACKAGE_ACTIVATION_SCRIPT;
+    /// Replaces the user PATH during uninstall (Windows).
+    pub const UNINSTALL_USER_PATH: &str = crate::uninstall::USER_PATH_SCRIPT;
+
     /// A helper script template rendered for the installed brand.
     pub fn render(brand: &'static Brand, template: &str) -> Result<String> {
         installed(brand)?;
         Ok(crate::script_brand::render(template))
+    }
+
+    /// Name of the environment variable `name` handed to a helper.
+    pub fn env(brand: &'static Brand, name: &str) -> Result<String> {
+        installed(brand)?;
+        Ok(crate::script_brand::env(name))
+    }
+
+    /// The "no value" marker passed to the proxy settings helper.
+    pub fn null_sentinel(brand: &'static Brand) -> Result<String> {
+        installed(brand)?;
+        Ok(crate::script_brand::null_sentinel())
+    }
+
+    /// Prefix of .NET types and PowerShell functions in helpers.
+    pub fn identifier_prefix(brand: &'static Brand) -> Result<&'static str> {
+        installed(brand)?;
+        Ok(crate::script_brand::identifier_prefix())
+    }
+
+    /// Line prefix of a classified Windows Desktop helper failure.
+    #[cfg(windows)]
+    pub fn helper_failure_prefix(brand: &'static Brand) -> Result<String> {
+        installed(brand)?;
+        Ok(crate::windows_desktop_runtime::helper_failure_prefix())
     }
 
     /// The Windows self-update helper script.
@@ -412,6 +454,32 @@ pub mod desktop {
         )
     }
 
+    /// The Gateway target of an ordinary Chat request through the installed
+    /// extension's Chat relay, or why it is not relayed.
+    pub fn chat_relay_target(
+        brand: &'static Brand,
+        target: &str,
+    ) -> Result<std::result::Result<String, String>> {
+        installed(brand)?;
+        let Some(chat) = crate::runtime::gateway().native_chat() else {
+            return Ok(Err("the installed Gateway has no Chat relay".to_string()));
+        };
+        Ok(
+            crate::local_proxy::normalize_chatgpt_chat_target_with(target, &chat)
+                .map_err(|error| error.to_string()),
+        )
+    }
+
+    /// Whether `path` (below `/chatgpt`) is forwarded to the installed
+    /// extension's Chat relay.
+    pub fn is_forwarded_chat_path(brand: &'static Brand, path: &str) -> Result<bool> {
+        installed(brand)?;
+        Ok(crate::local_proxy::is_forwarded_chatgpt_path_with(
+            path,
+            crate::runtime::gateway().native_chat().as_ref(),
+        ))
+    }
+
     /// The local Statsig bootstrap for `brand`.
     pub fn statsig_local_payload(brand: &Brand) -> String {
         crate::local_proxy::desktop_statsig_local_payload(brand)
@@ -439,6 +507,15 @@ pub mod claude_desktop {
     use serde_json::Value;
 
     pub use crate::claude_desktop::Identity;
+
+    /// The synthetic identity persisted below the environment `root`, if any.
+    pub fn load_identity(
+        brand: &'static Brand,
+        root: &std::path::Path,
+    ) -> Result<Option<Identity>> {
+        installed(brand)?;
+        crate::claude_desktop::Identity::load(root)
+    }
 
     /// The local account, as JSON text.
     pub fn account(brand: &'static Brand, id: &Identity) -> Result<String> {

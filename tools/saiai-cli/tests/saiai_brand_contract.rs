@@ -4,8 +4,8 @@
 //! environment isolation). Expected values are hand-written literals, except
 //! the release version (read from Cargo.toml), the CA suffix (hash of the
 //! generated key) and environment digests of temporary paths; see
-//! `src/brand_contract_tests.rs` and `tests/saiai_render_contract.rs` for the
-//! in-process half of the contract.
+//! `tests/saiai_render_contract.rs`, `tests/saiai_source_contract.rs` and the
+//! client proof module's tests for the in-process half of the contract.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};

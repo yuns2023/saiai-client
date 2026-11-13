@@ -1,8 +1,8 @@
 //! SAIAI distribution values for [`Brand`]; compiled into the `saiai`
 //! program, which passes them to the client library.
 //!
-//! These are the names every installed SAIAI client already uses; see
-//! `brand_contract_tests` before changing any of them.
+//! These are the names every installed SAIAI client already uses; see the
+//! `tests/saiai_*.rs` contract tests before changing any of them.
 
 use super::{
     Brand, CertificateNames, ConfigNames, EnvironmentNames, OwnershipMarkers,

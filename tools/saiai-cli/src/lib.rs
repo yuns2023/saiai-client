@@ -30,8 +30,6 @@ use url::Url;
 use uuid::Uuid;
 
 mod brand;
-#[cfg(test)]
-mod brand_contract_tests;
 // The SAIAI values belong to the `saiai` program, not to the library; unit
 // tests include them only as the fallback brand.
 #[cfg(test)]
@@ -2715,7 +2713,7 @@ fn windows_quote_activation_arg(arg: &str) -> String {
 }
 
 /// Activates a Store package by AppUserModelID (brand template).
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", test, feature = "contract"))]
 const PACKAGE_ACTIVATION_SCRIPT: &str = r#"
 $ErrorActionPreference='Stop'
 $source=@'
@@ -6376,7 +6374,7 @@ fn check_codex_environment_context_time(report: &mut DoctorReport, codex_dir: &P
 // not, and clients that build chains by subject name then fail with a
 // signature error. Report it; removal stays a user decision.
 /// Lists root CAs whose subject carries this brand's CA organization.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", test, feature = "contract"))]
 const STALE_CA_LISTING_SCRIPT: &str = "$ErrorActionPreference='Stop'; foreach ($store in 'CurrentUser','LocalMachine') { Get-ChildItem \"Cert:\\$store\\Root\" | Where-Object { $_.Subject -match '(^|, )O=@@CA_ORG@@(,|$)' } | ForEach-Object { $_.Thumbprint + ' ' + $store + ' ' + [Convert]::ToBase64String($_.RawData) } }";
 
 #[cfg(target_os = "windows")]
@@ -9161,6 +9159,110 @@ mod tests {
 
     fn write_str(path: &Path, content: &str) {
         fs::write(path, content).unwrap();
+    }
+
+    // Brand-neutral contracts of the background proxy and its listener:
+    // installed services and earlier releases depend on these, whatever the
+    // brand. The brand's own file names are frozen by its program's tests.
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_background_command_and_state_are_stable() {
+        assert_eq!(LINUX_BACKGROUND_COMMAND, "__run-background-proxy");
+        assert_eq!(LINUX_BACKGROUND_STATE_VERSION, 1);
+        assert!(matches!(
+            parse_command(&["__run-background-proxy".to_string()]).unwrap(),
+            Command::RunLinuxBackgroundProxy
+        ));
+        let state = LinuxBackgroundState {
+            schema_version: 1,
+            pid: 42,
+            start_time_ticks: 7,
+            instance: Some("/home/u/.proxy-home".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&state).unwrap(),
+            serde_json::json!({
+                "schema_version": 1,
+                "pid": 42,
+                "start_time_ticks": 7,
+                "instance": "/home/u/.proxy-home"
+            })
+        );
+        // Upgrades read state files written before `instance` existed.
+        let legacy: LinuxBackgroundState =
+            serde_json::from_str(r#"{"schema_version":1,"pid":42,"start_time_ticks":7}"#).unwrap();
+        assert_eq!(legacy.instance, None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_background_command_and_state_are_stable() {
+        assert_eq!(WINDOWS_BACKGROUND_COMMAND, "__run-background-proxy");
+        assert_eq!(
+            WINDOWS_PACKAGED_PROXY_LEASE_FILENAME,
+            "windows-packaged-proxy-lease.json"
+        );
+        for args in [
+            vec!["__run-background-proxy".to_string()],
+            vec![
+                "__run-background-proxy".to_string(),
+                "--instance-v2".to_string(),
+            ],
+        ] {
+            assert!(matches!(
+                parse_command(&args).unwrap(),
+                Command::RunWindowsBackgroundProxy
+            ));
+        }
+        let state = WindowsBackgroundState {
+            version: 2,
+            pid: 42,
+            created: 7,
+            instance: r"C:\Users\u\.proxy-home".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&state).unwrap(),
+            serde_json::json!({
+                "version": 2,
+                "pid": 42,
+                "created": 7,
+                "instance": r"C:\Users\u\.proxy-home"
+            })
+        );
+        // The update status file sits next to the executable.
+        assert_eq!(
+            windows_update_status_path(Path::new(r"C:\Programs\tool\tool.exe")).unwrap(),
+            Path::new(r"C:\Programs\tool").join(BRAND.update.status_filename)
+        );
+    }
+
+    /// Brand-neutral defaults earlier releases already wrote to disk.
+    #[test]
+    fn default_listen_address_and_product_marker_are_stable() {
+        assert_eq!(DEFAULT_LOCAL_PROXY_LISTEN, "127.0.0.1:19908");
+        assert_eq!(environment_scope::PRODUCT_DIR_FILENAME, "product-dir");
+    }
+
+    /// A listener whose process name contains the binary name (any case) is
+    /// this program's own proxy.
+    #[test]
+    fn listen_port_owner_is_recognized_by_binary_name() {
+        let binary = BRAND.binary_name;
+        for (name, ours) in [
+            (binary.to_string(), true),
+            (binary.to_ascii_uppercase(), true),
+            (format!("{binary}.exe"), true),
+            (format!("my-{binary}-worker"), true),
+            ("node".to_string(), false),
+            (String::new(), false),
+        ] {
+            let owner = ListenPortOwner {
+                pid: 1,
+                name: name.clone(),
+            };
+            assert_eq!(owner.is_app(), ours, "{name}");
+        }
     }
 
     fn read_str(path: &Path) -> String {

@@ -10,7 +10,7 @@
 //!
 //! Changing a value strands existing installations of that distribution
 //! (orphaned directories, services, certificates, pins or markers), so the
-//! SAIAI values are frozen by `brand_contract_tests`.
+//! SAIAI values are frozen by the SAIAI program's contract tests.
 //!
 //! Value constraints (not checked at run time):
 //! - file and directory names are single path components without separators;

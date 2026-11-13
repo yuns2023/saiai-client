@@ -1346,3 +1346,115 @@ fn saiai_side_uses_only_the_public_kernel_root() {
         );
     }
 }
+
+/// Library constants that carry a brand value read exactly that brand
+/// field, on every platform (the SAIAI values of the fields are frozen in
+/// `saiai_brand_values_are_frozen`, and the behavior behind several of them
+/// by black-box tests that run on one platform only). Includes the client
+/// side of the certificate control request, which only the Linux black box
+/// reaches.
+#[test]
+fn brand_value_constants_read_their_brand_field() {
+    let sources = cli_sources();
+    let bindings: &[(&str, &str, &str, &str)] = &[
+        (
+            "lib.rs",
+            "CONFIG_FILENAME",
+            "&'static str",
+            "config.filename",
+        ),
+        ("lib.rs", "CONFIG_VERSION", "u32", "config.version"),
+        (
+            "lib.rs",
+            "CA_FILENAME",
+            "&'static str",
+            "certificates.ca_cert_filename",
+        ),
+        (
+            "lib.rs",
+            "CA_KEY_FILENAME",
+            "&'static str",
+            "certificates.ca_key_filename",
+        ),
+        (
+            "lib.rs",
+            "LOCAL_PROXY_NSS_CERT_NICKNAME",
+            "&'static str",
+            "certificates.nss_nickname",
+        ),
+        (
+            "lib.rs",
+            "CODEX_CERTIFICATE_CONTROL_HOST",
+            "&'static str",
+            "certificates.control_host",
+        ),
+        (
+            "lib.rs",
+            "CODEX_CERTIFICATE_SPKI_HEADER",
+            "&'static str",
+            "certificates.spki_header",
+        ),
+        (
+            "lib.rs",
+            "LINUX_PID_FILENAME",
+            "&'static str",
+            "service.pid_filename",
+        ),
+        (
+            "lib.rs",
+            "LINUX_LOCK_FILENAME",
+            "&'static str",
+            "service.lock_filename",
+        ),
+        (
+            "lib.rs",
+            "WINDOWS_PID_FILENAME",
+            "&'static str",
+            "service.pid_filename",
+        ),
+        (
+            "lib.rs",
+            "SERVICE_LOG_FILENAME",
+            "&'static str",
+            "service.log_filename",
+        ),
+        (
+            "local_proxy.rs",
+            "CERTIFICATE_CONTROL_HOST",
+            "&'static str",
+            "certificates.control_host",
+        ),
+        (
+            "local_proxy.rs",
+            "CERTIFICATE_SPKI_HEADER",
+            "&'static str",
+            "certificates.spki_header",
+        ),
+        (
+            "claude_desktop.rs",
+            "TOKEN_PREFIX",
+            "&'static str",
+            "placeholders.claude_desktop_token_prefix",
+        ),
+    ];
+    for (file, name, value_type, field) in bindings {
+        // Whitespace removed; `crate::brand::` paths and visibility dropped.
+        let code = production_text(&sources[*file], "rs")
+            .split_whitespace()
+            .collect::<String>()
+            .replace("crate::brand::", "")
+            .replace("pub(crate)const", "const");
+        let compact_type = value_type.split_whitespace().collect::<String>();
+        let expected =
+            format!("const{name}:BrandValue<{compact_type}>=BrandValue(|brand|brand.{field});");
+        assert_eq!(
+            code.matches(&format!("const{name}:")).count(),
+            1,
+            "{file} defines {name} once"
+        );
+        assert!(
+            code.contains(&expected),
+            "{file}: {name} must read brand.{field}"
+        );
+    }
+}

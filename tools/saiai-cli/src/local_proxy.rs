@@ -2687,7 +2687,10 @@ fn is_forwarded_openai_path(path: &str, chat: Option<&NativeChatProtocol>) -> bo
 }
 
 /// Gateway path of the ordinary Chat relay; nothing without a relay.
-fn is_forwarded_chatgpt_path_with(path: &str, chat: Option<&NativeChatProtocol>) -> bool {
+pub(crate) fn is_forwarded_chatgpt_path_with(
+    path: &str,
+    chat: Option<&NativeChatProtocol>,
+) -> bool {
     let Some(chat) = chat else {
         return false;
     };
@@ -2889,7 +2892,10 @@ fn normalize_chatgpt_gateway_target(
 }
 
 /// Gateway target of an ordinary Chat request for a relay with `chat`.
-fn normalize_chatgpt_chat_target_with(target: &str, chat: &NativeChatProtocol) -> Result<String> {
+pub(crate) fn normalize_chatgpt_chat_target_with(
+    target: &str,
+    chat: &NativeChatProtocol,
+) -> Result<String> {
     normalize_ordinary_chat_target(target, Some(chat.updates_path))
 }
 
@@ -3987,6 +3993,50 @@ mod tests {
     /// The SAIAI Gateway's Chat relay (the unit-test fallback extension).
     pub(super) fn saiai_chat() -> Option<NativeChatProtocol> {
         crate::runtime::gateway().native_chat()
+    }
+
+    /// A Gateway's Chat updates channel is relayed exactly, on both entry
+    /// spellings, and nothing below or beside it is (any Gateway; the
+    /// distribution's own channel is frozen by its program's tests).
+    #[test]
+    fn chat_updates_channel_is_relayed_exactly() {
+        let chat = NativeChatProtocol {
+            updates_path: "/backend-api/example/updates",
+            preference_restored_header: "x-example-preference-restored",
+            rejected_device_proofs: &[],
+        };
+        assert_eq!(
+            normalize_chatgpt_chat_target_with("/backend-api/example/updates?since=1", &chat)
+                .unwrap(),
+            "/chatgpt/backend-api/example/updates?since=1"
+        );
+        assert!(is_forwarded_chatgpt_path_with(
+            "/chatgpt/backend-api/example/updates",
+            Some(&chat)
+        ));
+        for rejected in [
+            "/backend-api/example/updates/admin",
+            "/backend-api/other/updates",
+        ] {
+            assert!(
+                normalize_chatgpt_chat_target_with(rejected, &chat).is_err(),
+                "{rejected}"
+            );
+        }
+        for unforwarded in [
+            "/chatgpt/backend-api/example/updates/admin",
+            "/backend-api/example/updates",
+            "/chatgpt/backend-api/other/updates",
+        ] {
+            assert!(
+                !is_forwarded_chatgpt_path_with(unforwarded, Some(&chat)),
+                "{unforwarded}"
+            );
+        }
+        assert!(!is_forwarded_chatgpt_path_with(
+            "/chatgpt/backend-api/example/updates",
+            None
+        ));
     }
     use crate::client_proof::{self, ClientProof};
     use crate::gateway_saiai::SaiaiSession;
