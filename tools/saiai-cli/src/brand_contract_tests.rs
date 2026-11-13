@@ -638,6 +638,26 @@ fn uninstall_recognition_rules_are_frozen() {
     assert!(!uninstall::is_claude_ca_file("aitp-ca.crt"));
 }
 
+/// A listener owned by a process whose name contains the binary name (any
+/// case) is treated as this client's own proxy.
+#[test]
+fn listen_port_owner_recognition_is_frozen() {
+    for (name, ours) in [
+        ("saiai", true),
+        ("SAIAI", true),
+        ("saiai.exe", true),
+        ("my-saiai-worker", true),
+        ("aitp", false),
+        ("node", false),
+    ] {
+        let owner = ListenPortOwner {
+            pid: 1,
+            name: name.to_string(),
+        };
+        assert_eq!(owner.is_saiai(), ours, "{name}");
+    }
+}
+
 // ------------------------------------------------------------ Client proof
 
 #[test]
@@ -1474,6 +1494,9 @@ fn saiai_brand_values_are_frozen() {
     assert_eq!(proof.key_filename, "client-device-key");
     assert_eq!(proof.lock_filename, "client-device.lock");
     assert_eq!(proof.device_filename, "client-device.json");
+    assert_eq!(proof.corrupt_key_filename, "client-device-key.corrupt");
+    assert_eq!(brand.winhttp_agent, "SAIAI");
+    assert_eq!(brand.codex_daemon_client_name, "saiai_daemon_check");
 }
 
 /// Executes the observer's production expression for the runtime directory.

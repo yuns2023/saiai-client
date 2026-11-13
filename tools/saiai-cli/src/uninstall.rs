@@ -27,10 +27,10 @@ pub(crate) const SAIAI_HOME_FILES: &[&str] = &[
     BRAND.service.lock_filename,
     BRAND.service.pid_filename,
     BRAND.service.log_filename,
-    "client-device-key",
-    "client-device.json",
-    "client-device.lock",
-    "client-device-key.corrupt",
+    BRAND.client_proof.key_filename,
+    BRAND.client_proof.device_filename,
+    BRAND.client_proof.lock_filename,
+    BRAND.client_proof.corrupt_key_filename,
     "windows-packaged-proxy-lease.json",
 ];
 pub(crate) const SAIAI_HOME_DIRS: &[&str] = &["log-followers", "desktop"];

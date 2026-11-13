@@ -80,5 +80,8 @@ pub(crate) const SAIAI_BRAND: Brand = Brand {
         key_filename: "client-device-key",
         lock_filename: "client-device.lock",
         device_filename: "client-device.json",
+        corrupt_key_filename: "client-device-key.corrupt",
     },
+    winhttp_agent: "SAIAI",
+    codex_daemon_client_name: "saiai_daemon_check",
 };

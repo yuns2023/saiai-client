@@ -571,7 +571,10 @@ fn probe_inner(socket: &Path, home: &Path) -> Result<Snapshot> {
         1,
         "initialize",
         json!({
-            "clientInfo": {"name": "saiai_daemon_check", "version": env!("CARGO_PKG_VERSION")},
+            "clientInfo": {
+                "name": crate::brand::BRAND.codex_daemon_client_name,
+                "version": env!("CARGO_PKG_VERSION")
+            },
             "capabilities": {"experimentalApi": true}
         }),
     )?;

@@ -305,7 +305,7 @@ fn load_or_create_key(path: &Path) -> Result<SigningKey> {
                     "client proof: device key {} is unreadable ({err:#}); generating a new device key",
                     path.display()
                 );
-                let aside = path.with_file_name(format!("{KEY_FILENAME}.corrupt"));
+                let aside = path.with_file_name(BRAND.client_proof.corrupt_key_filename);
                 fs::rename(path, &aside)
                     .with_context(|| format!("failed to set aside {}", path.display()))?;
             }

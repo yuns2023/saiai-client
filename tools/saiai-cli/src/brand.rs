@@ -33,6 +33,10 @@ pub(crate) struct Brand {
     pub markers: OwnershipMarkers,
     pub placeholders: PlaceholderIdentities,
     pub client_proof: ClientProofNames,
+    /// WinHTTP session agent used for proxy auto-configuration lookups.
+    pub winhttp_agent: &'static str,
+    /// `clientInfo.name` of the read-only Codex daemon initialization check.
+    pub codex_daemon_client_name: &'static str,
 }
 
 impl Brand {
@@ -130,4 +134,6 @@ pub(crate) struct ClientProofNames {
     pub key_filename: &'static str,
     pub lock_filename: &'static str,
     pub device_filename: &'static str,
+    /// Unreadable key kept aside before a new device key is created.
+    pub corrupt_key_filename: &'static str,
 }

@@ -1504,7 +1504,7 @@ mod windows {
         if !auto_detect && config_url.is_none() {
             return Err(0);
         }
-        let agent = wide("SAIAI");
+        let agent = wide(crate::brand::BRAND.winhttp_agent);
         // SAFETY: plain WinHTTP session; closed before returning.
         let session = unsafe {
             WinHttpOpen(

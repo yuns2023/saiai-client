@@ -6003,7 +6003,8 @@ struct ListenPortOwner {
 
 impl ListenPortOwner {
     fn is_saiai(&self) -> bool {
-        self.name.eq_ignore_ascii_case("saiai") || self.name.to_ascii_lowercase().contains("saiai")
+        let binary = BRAND.binary_name.to_ascii_lowercase();
+        self.name.eq_ignore_ascii_case(&binary) || self.name.to_ascii_lowercase().contains(&binary)
     }
 }
 
