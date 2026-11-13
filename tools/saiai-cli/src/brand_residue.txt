@@ -1,1 +1,2 @@
+lib.rs	#[serde(expecting = "struct SaiaiConfig")]
 lib.rs	pub mod gateway_saiai;

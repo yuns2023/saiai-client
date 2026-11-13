@@ -3764,6 +3764,9 @@ fn local_proxy_chatgpt_spki(listen: &str) -> Result<String> {
 }
 
 #[derive(Clone, Serialize, Deserialize, Eq, PartialEq)]
+// Keeps the type name earlier releases printed when config.json is not an
+// object (serde derives `expected struct <type>` from the Rust name).
+#[serde(expecting = "struct SaiaiConfig")]
 struct AppConfig {
     version: u32,
     base_url: String,
@@ -9941,6 +9944,41 @@ HTTPS_PROXY="http://127.0.0.1:1111"
 
         assert!(validate_chatgpt_timezone("../etc/passwd").is_err());
         assert!(validate_chatgpt_timezone("/etc/passwd").is_err());
+    }
+
+    /// The timezone diagnostics name the brand's environment variable
+    /// exactly as before (outer message; the I/O cause follows in the chain).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn chatgpt_timezone_errors_name_the_environment_variable() {
+        for (value, message) in [
+            (
+                "../etc/passwd",
+                "SAIAI_CHATGPT_TIMEZONE must be an IANA timezone such as America/Los_Angeles",
+            ),
+            (
+                "Mars/Olympus_Mons",
+                "SAIAI_CHATGPT_TIMEZONE does not exist in /usr/share/zoneinfo/Mars/Olympus_Mons",
+            ),
+            (
+                "America",
+                "SAIAI_CHATGPT_TIMEZONE is not a zoneinfo file: /usr/share/zoneinfo/America",
+            ),
+        ] {
+            let error = validate_chatgpt_timezone(value).unwrap_err();
+            assert_eq!(error.to_string(), message, "{value}");
+        }
+    }
+
+    /// A config.json whose root is not an object reports the same serde
+    /// diagnostic as before the configuration type was renamed.
+    #[test]
+    fn config_type_diagnostic_is_unchanged() {
+        let error = serde_json::from_str::<AppConfig>("null").err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "invalid type: null, expected struct SaiaiConfig at line 1 column 4"
+        );
     }
 
     #[test]

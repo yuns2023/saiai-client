@@ -1652,6 +1652,11 @@ fn brand_environment_call_sites_are_pinned() {
             "lib.rs",
             "const CHATGPT_TIMEZONE_ENV: BrandValue<&'static str> =\n    BrandValue(|brand| brand.env.chatgpt_timezone);",
         ),
+        // Raised only for a non-UTF-8 environment value; frozen by source.
+        (
+            "lib.rs",
+            ".with_context(|| format!(\"{CHATGPT_TIMEZONE_ENV} must be valid UTF-8\"))?",
+        ),
         (
             "local_proxy.rs",
             "const CHATGPT_CHAT_PASSTHROUGH_ENV: crate::brand::BrandValue<&'static str> =\n    crate::brand::BrandValue(|brand| brand.env.chatgpt_chat_passthrough);",
@@ -2148,10 +2153,15 @@ const SAIAI_NAMING_FILES: [&str; 4] = [
 /// the list to equal the code exactly; that it only ever shrinks is enforced
 /// by review of this file's diff, not by the test.
 ///
-/// Remaining entry: `lib.rs` `pub mod gateway_saiai;` — the SAIAI Gateway
-/// extension is compiled into the library (the program reaches it as
-/// `proxy_cli::gateway_saiai::SAIAI_GATEWAY`) until the client proof moves
-/// out of the library (C4) and the extension can move with it.
+/// Remaining entries, both in `lib.rs`:
+/// - `pub mod gateway_saiai;` — the SAIAI Gateway extension is compiled into
+///   the library (the program reaches it as
+///   `proxy_cli::gateway_saiai::SAIAI_GATEWAY`) until the client proof moves
+///   out of the library (C4) and the extension can move with it.
+/// - `#[serde(expecting = "struct SaiaiConfig")]` — the diagnostic printed
+///   when config.json is not an object keeps its earlier wording (serde
+///   derived it from the old type name); a behavior-changing release may
+///   make it neutral.
 const SAIAI_RESIDUE: &str = include_str!("brand_residue.txt");
 
 fn saiai_residue_lines() -> Vec<String> {
