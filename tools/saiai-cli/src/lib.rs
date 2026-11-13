@@ -10103,6 +10103,63 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         }
     }
 
+    /// Serialization omits an absent upstream proxy and absent provider
+    /// routes, and a config from an older client decodes to the defaults —
+    /// checked on the struct itself, not through a round trip that a
+    /// matching decode/encode mistake would hide.
+    #[test]
+    fn app_config_omits_absent_fields_and_defaults_missing_ones() {
+        let config = AppConfig {
+            version: 1,
+            base_url: "b".into(),
+            api_key: "k".into(),
+            listen: "l".into(),
+            ca_cert_path: "cc".into(),
+            ca_key_path: "ck".into(),
+            chatgpt_chat_passthrough: true,
+            desktop_browser_use: false,
+            upstream_proxy: None,
+            providers: ProviderCredentials {
+                claude: Some(ProviderCredential {
+                    base_url: "cb".into(),
+                    api_key: "ck2".into(),
+                }),
+                codex: None,
+            },
+        };
+        let value = serde_json::to_value(&config).unwrap();
+        let keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert!(!keys.contains(&"upstream_proxy"), "{keys:?}");
+        assert_eq!(
+            value["providers"],
+            serde_json::json!({"claude": {"base_url": "cb", "api_key": "ck2"}})
+        );
+        let empty = AppConfig {
+            providers: ProviderCredentials::default(),
+            ..config.clone()
+        };
+        assert_eq!(
+            serde_json::to_value(&empty).unwrap()["providers"],
+            serde_json::json!({})
+        );
+
+        let legacy: AppConfig = serde_json::from_str(
+            r#"{"version":1,"base_url":"b","api_key":"k","listen":"l","ca_cert_path":"cc"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.ca_key_path, "");
+        assert!(legacy.chatgpt_chat_passthrough);
+        assert!(legacy.desktop_browser_use);
+        assert_eq!(legacy.upstream_proxy, None);
+        assert!(legacy.providers.is_empty());
+        assert!(legacy.providers.claude.is_none() && legacy.providers.codex.is_none());
+    }
+
     /// Each config file key lands in its own struct field (a renamed or
     /// swapped key would still round-trip as JSON, so read the fields).
     #[test]
