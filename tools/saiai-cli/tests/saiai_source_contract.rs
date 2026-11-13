@@ -949,6 +949,15 @@ fn attribute_paths(
     }
 }
 
+/// Whether `stream` contains a `$` (a `macro_rules!` metavariable).
+fn has_metavariable(stream: proc_macro2::TokenStream) -> bool {
+    stream.into_iter().any(|token| match token {
+        proc_macro2::TokenTree::Punct(punct) => punct.as_char() == '$',
+        proc_macro2::TokenTree::Group(group) => has_metavariable(group.stream()),
+        _ => false,
+    })
+}
+
 fn token_references(tokens: &[proc_macro2::TokenTree], found: &mut Vec<Result<String, String>>) {
     use proc_macro2::Delimiter::Bracket;
     for (index, token) in tokens.iter().enumerate() {
@@ -958,9 +967,16 @@ fn token_references(tokens: &[proc_macro2::TokenTree], found: &mut Vec<Result<St
                 if is_punct(tokens.get(at), '!') {
                     at += 1;
                 }
-                if let Some(proc_macro2::TokenTree::Group(group)) = tokens.get(at)
+                // An attribute a macro assembles (`#[$attr]`, `# $tokens`)
+                // could carry a `path` this scan cannot see.
+                if is_punct(tokens.get(at), '$') {
+                    found.push(Err("# $... (macro-generated attribute)".to_string()));
+                } else if let Some(proc_macro2::TokenTree::Group(group)) = tokens.get(at)
                     && group.delimiter() == Bracket
                 {
+                    if has_metavariable(group.stream()) {
+                        found.push(Err(format!("#{group} (macro-generated attribute)")));
+                    }
                     let inline = is_inline_module(tokens, at + 1);
                     attribute_paths(group.stream(), inline, found);
                 }
@@ -1106,6 +1122,11 @@ mod documented;
         "#[r#path = \"../outside.rs\"]\nmod x;",
         "macro_rules! load { ($r:ident, $f:literal) => { $r!($f) }; }\nconst X: &str = load!(include_str, \"../../outside.txt\");",
         "use std::include_str as read;\nconst X: &str = read!(\"../x\");",
+        "macro_rules! m { ($a:meta) => { #[$a] mod outside; }; }\nm!(path = \"../../outside.rs\");",
+        "macro_rules! m { ($($a:tt)*) => { # $($a)* mod outside; }; }\nm!([path = \"../../outside.rs\"]);",
+        "macro_rules! m { ($p:literal) => { #[path = $p] mod outside; }; }\nm!(\"../../outside.rs\");",
+        "macro_rules! m { ($($t:tt)*) => { $($t)* }; }\nm!(#[path = \"../outside.rs\"] mod outside;);",
+        "const X: &[u8] = ::core::include_bytes!(\"../x\");",
         "const X: &str = \"unterminated;",
     ] {
         let references = file_references(refused);
