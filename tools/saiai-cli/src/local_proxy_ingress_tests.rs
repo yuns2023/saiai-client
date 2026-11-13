@@ -721,3 +721,224 @@ async fn signing_does_not_wait_for_enrollment_and_configured_routes_use_no_budge
     assert!(!proof.claim_enrollment(&url, "TEST_ONLY_EXTRA_16", true));
     server.abort();
 }
+
+/// A test extension that reserves a header outside the brand's sensitive
+/// set and records every signing request.
+struct TestProof;
+static TEST_PROOF: TestProof = TestProof;
+/// (transport, gateway, method, target, bearer) of each signing request.
+type SignedRequest = (
+    crate::gateway::Transport,
+    String,
+    String,
+    String,
+    Option<String>,
+);
+static SIGNED: std::sync::Mutex<Vec<SignedRequest>> = std::sync::Mutex::new(Vec::new());
+
+struct TestProofSession;
+
+impl crate::gateway::GatewayExtension for TestProof {
+    fn signature_headers(&self) -> &'static [&'static str] {
+        &["x-test-proof"]
+    }
+
+    fn start(
+        &self,
+        _start: crate::gateway::GatewayStart,
+    ) -> Arc<dyn crate::gateway::GatewaySession> {
+        Arc::new(TestProofSession)
+    }
+}
+
+impl crate::gateway::GatewaySession for TestProofSession {
+    fn sign(&self, input: &crate::gateway::SignInput<'_>) -> Vec<(String, String)> {
+        SIGNED.lock().unwrap().push((
+            input.transport,
+            input.gateway.to_string(),
+            input.method.to_string(),
+            input.target.to_string(),
+            input.bearer.map(str::to_string),
+        ));
+        vec![(
+            "x-test-proof".to_string(),
+            format!("signed {} {}", input.method, input.target),
+        )]
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+fn signed_for(gateway: &str) -> Vec<(crate::gateway::Transport, String, String, Option<String>)> {
+    SIGNED
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, url, ..)| url == gateway)
+        .map(|(transport, _, method, target, bearer)| {
+            (*transport, method.clone(), target.clone(), bearer.clone())
+        })
+        .collect()
+}
+
+/// Reserved inbound headers come from the extension the proxy runs with, not
+/// only from the brand: before the session starts nothing is signed and the
+/// spoofed header is dropped; afterwards the managed TLS exit signs.
+#[tokio::test]
+async fn extension_reserved_headers_are_stripped_and_signed_on_managed_tls() {
+    let (url, server) = capture_gateway_requests(2, 0).await;
+    let (mut state, _root) = proof_test_state(&url, &url, None);
+    state.gateway = &TEST_PROOF;
+    state.gateway_session = std::sync::OnceLock::new();
+    let state = Arc::new(state);
+    let request = b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nX-Test-Proof: spoofed\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}";
+    // First request: the session has not started.
+    let response = tls_request(
+        Arc::clone(&state),
+        EntryPoint::Main,
+        ANTHROPIC_HOST,
+        request,
+    )
+    .await;
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+    state.start_gateway_session();
+    let response = tls_request(
+        Arc::clone(&state),
+        EntryPoint::Main,
+        ANTHROPIC_HOST,
+        request,
+    )
+    .await;
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+    let (requests, _) = server.await.unwrap();
+    assert_eq!(header_value(&requests[0].headers, "x-test-proof"), None);
+    let proofs = requests[1]
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("x-test-proof"))
+        .map(|(_, value)| value.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(proofs, ["signed POST /v1/messages"]);
+    assert_eq!(
+        signed_for(&url),
+        [(
+            crate::gateway::Transport::Http,
+            "POST".to_string(),
+            "/v1/messages".to_string(),
+            Some("MOCK_ONLY_GATEWAY".to_string())
+        )]
+    );
+}
+
+#[tokio::test]
+async fn extension_reserved_headers_are_dropped_by_plain_http_proxy_and_claude_public_fetch() {
+    let request = super::tests::relay_plain_http_proxy_request_with(
+        vec![
+            ("X-Test-Proof".to_string(), "spoofed".to_string()),
+            ("X-Custom".to_string(), "kept".to_string()),
+        ],
+        &TEST_PROOF,
+    )
+    .await
+    .to_ascii_lowercase();
+    assert!(request.contains("\r\nx-custom: kept\r\n"), "{request}");
+    assert!(!request.contains("x-test-proof"), "{request}");
+    assert!(!claude_desktop::public_request_header(
+        "X-Test-Proof",
+        &TEST_PROOF
+    ));
+    assert!(claude_desktop::public_request_header("accept", &TEST_PROOF));
+}
+
+#[test]
+fn extension_reserved_headers_are_not_copied_into_the_websocket_handshake() {
+    let url = Url::parse("wss://gateway.ws-test.example/v1/responses?x=1").unwrap();
+    let incoming = vec![
+        ("X-Test-Proof".to_string(), "spoofed".to_string()),
+        (
+            "Sec-WebSocket-Key".to_string(),
+            "dGhlIHNhbXBsZSBub25jZQ==".to_string(),
+        ),
+    ];
+    let mut signed = None;
+    let request = build_openai_websocket_request(
+        &url,
+        &incoming,
+        "MOCK_ONLY_GATEWAY",
+        &TEST_PROOF,
+        |method, target| {
+            signed = Some((method.to_string(), target.to_string()));
+            vec![("x-test-proof", "signed handshake".to_string())]
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        signed,
+        Some(("GET".to_string(), "/v1/responses?x=1".to_string()))
+    );
+    let values = request
+        .headers()
+        .get_all("x-test-proof")
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(values, ["signed handshake"]);
+    // Unsigned (session not ready): the spoofed value is still not copied.
+    let request = build_openai_websocket_request(
+        &url,
+        &incoming,
+        "MOCK_ONLY_GATEWAY",
+        &TEST_PROOF,
+        |_, _| Vec::new(),
+    )
+    .unwrap();
+    assert!(request.headers().get("x-test-proof").is_none());
+}
+
+/// The model catalog exit hands the extension the finished request.
+#[tokio::test]
+async fn model_catalog_exit_passes_the_finished_request_to_the_extension() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let request = read_http_request(&mut reader).await.unwrap();
+        let body = r#"{"data":[{"id":"m-1"}],"has_more":false}"#;
+        reader
+            .get_mut()
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        request
+    });
+    let (mut state, root) = proof_test_state(&url, &url, None);
+    state.gateway = &TEST_PROOF;
+    state.gateway_session = std::sync::OnceLock::new();
+    let state = Arc::new(state);
+    state.start_gateway_session();
+    let identity = crate::claude_desktop::Identity::prepare(root.path()).unwrap();
+    claude_desktop::models(&state, &identity).await.unwrap();
+    let request = server.await.unwrap();
+    assert_eq!(
+        header_value(&request.headers, "x-test-proof"),
+        Some("signed GET /v1/models")
+    );
+    assert_eq!(
+        signed_for(&url),
+        [(
+            crate::gateway::Transport::Http,
+            "GET".to_string(),
+            "/v1/models".to_string(),
+            Some("MOCK_ONLY_GATEWAY".to_string())
+        )]
+    );
+}

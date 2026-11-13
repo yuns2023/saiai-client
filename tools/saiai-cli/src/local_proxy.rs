@@ -1057,7 +1057,7 @@ async fn serve_http_proxy_request(
         if nominated.contains(&name.to_ascii_lowercase()) {
             continue;
         }
-        if should_forward_http_proxy_header(name, managed_host) {
+        if should_forward_http_proxy_header(name, managed_host, state.gateway) {
             builder = builder.header(name.as_str(), value.as_str());
         }
     }
@@ -1413,6 +1413,7 @@ fn build_openai_websocket_request(
     upstream_url: &Url,
     incoming_headers: &[(String, String)],
     gateway_key: &str,
+    extension: &dyn GatewayExtension,
     sign: impl FnOnce(&str, &str) -> Vec<(&'static str, String)>,
 ) -> Result<tungstenite::http::Request<()>> {
     let mut upstream_request = upstream_url
@@ -1437,8 +1438,10 @@ fn build_openai_websocket_request(
             // upstream can send RSV1 frames that the relay cannot decode.
             continue;
         }
+        // Reserved names can never be handshake headers (refused when the
+        // brand and extension are installed), so this copy cannot relay one.
         if is_websocket_handshake_header(name)
-            || (should_forward_request_header_to_gateway(name, true))
+            || should_forward_request_header_to_gateway(name, true, extension)
         {
             let header_name = HeaderName::from_bytes(name.as_bytes())
                 .with_context(|| format!("invalid WebSocket header name {name:?}"))?;
@@ -1492,6 +1495,7 @@ async fn serve_openai_websocket(
         &upstream_url,
         &request.headers,
         &route.api_key,
+        state.gateway,
         |method, target| {
             state.gateway_signature(
                 Transport::WebSocket,
@@ -2000,7 +2004,7 @@ where
         if name.eq_ignore_ascii_case("authorization") {
             has_authorization = true;
         }
-        if should_forward_request_header_to_gateway(name, replace_authorization)
+        if should_forward_request_header_to_gateway(name, replace_authorization, state.gateway)
             && !(credentials == CredentialPolicy::DesktopPlaceholder
                 && name.eq_ignore_ascii_case("x-api-key"))
         {
@@ -3412,11 +3416,11 @@ fn is_websocket_handshake_header(name: &str) -> bool {
     )
 }
 
-fn should_forward_request_header(name: &str) -> bool {
+fn should_forward_request_header(name: &str, extension: &dyn GatewayExtension) -> bool {
     // Only the proxy itself may attach Gateway signatures or other reserved
-    // headers (brand policy and extension declarations); never relay one.
+    // headers (brand policy and the running extension's declarations).
     !is_hop_by_hop_header(name)
-        && !gateway::is_reserved_inbound_header(name)
+        && !gateway::is_reserved_inbound_header(extension, name)
         && !name.eq_ignore_ascii_case("host")
         && !name.eq_ignore_ascii_case("content-length")
         && !name.eq_ignore_ascii_case("transfer-encoding")
@@ -3433,8 +3437,12 @@ fn connection_nominated_headers(headers: &[(String, String)]) -> std::collection
         .collect()
 }
 
-fn should_forward_request_header_to_gateway(name: &str, replace_authorization: bool) -> bool {
-    should_forward_request_header(name)
+fn should_forward_request_header_to_gateway(
+    name: &str,
+    replace_authorization: bool,
+    extension: &dyn GatewayExtension,
+) -> bool {
+    should_forward_request_header(name, extension)
         && !(replace_authorization
             && (name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("cookie")))
 }
@@ -3444,8 +3452,12 @@ fn should_forward_request_header_to_gateway(name: &str, replace_authorization: b
 // proxy must not change requests that are not ours (including the caller's
 // own Authorization and Cookie).  Managed hosts must never receive OAuth
 // headers or cookies over cleartext, so those stay stripped there.
-fn should_forward_http_proxy_header(name: &str, managed_host: bool) -> bool {
-    should_forward_request_header(name)
+fn should_forward_http_proxy_header(
+    name: &str,
+    managed_host: bool,
+    extension: &dyn GatewayExtension,
+) -> bool {
+    should_forward_request_header(name, extension)
         && !name
             .get(..6)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("proxy-"))
@@ -4049,10 +4061,19 @@ mod tests {
         assert!(!is_forwarded_chatgpt_path("/backend-api/f/conversation"));
         assert!(!should_forward_request_header_to_gateway(
             "Authorization",
-            true
+            true,
+            crate::runtime::gateway()
         ));
-        assert!(!should_forward_request_header_to_gateway("Cookie", true));
-        assert!(should_forward_request_header_to_gateway("originator", true));
+        assert!(!should_forward_request_header_to_gateway(
+            "Cookie",
+            true,
+            crate::runtime::gateway()
+        ));
+        assert!(should_forward_request_header_to_gateway(
+            "originator",
+            true,
+            crate::runtime::gateway()
+        ));
     }
 
     #[test]
@@ -5470,6 +5491,7 @@ mod tests {
             &url,
             &incoming,
             "MOCK_ONLY_GATEWAY",
+            crate::runtime::gateway(),
             |method, target| {
                 signed = Some((method.to_string(), target.to_string()));
                 vec![("x-saiai-client-proof", "v1.MOCK_SIGNED".to_string())]
@@ -5550,9 +5572,14 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let request =
-            build_openai_websocket_request(&url, &[], "MOCK_ONLY_GATEWAY", |_, _| Vec::new())
-                .unwrap();
+        let request = build_openai_websocket_request(
+            &url,
+            &[],
+            "MOCK_ONLY_GATEWAY",
+            crate::runtime::gateway(),
+            |_, _| Vec::new(),
+        )
+        .unwrap();
         let Err(tungstenite::Error::Http(response)) = connect_async(request).await else {
             panic!("expected an HTTP handshake rejection");
         };
@@ -6678,6 +6705,13 @@ mod tests {
     /// Relays one absolute-form plain-HTTP proxy request to a local upstream
     /// and returns the raw request head the upstream received.
     async fn relay_plain_http_proxy_request(headers: Vec<(String, String)>) -> String {
+        relay_plain_http_proxy_request_with(headers, crate::runtime::gateway()).await
+    }
+
+    pub(super) async fn relay_plain_http_proxy_request_with(
+        headers: Vec<(String, String)>,
+        gateway: &'static dyn GatewayExtension,
+    ) -> String {
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_port = upstream.local_addr().unwrap().port();
         let upstream_task = tokio::spawn(async move {
@@ -6695,24 +6729,24 @@ mod tests {
         });
 
         let (ca_cert_pem, ca_key_pem) = test_ca();
-        let state = Arc::new(
-            State::new(Config {
-                listen: "127.0.0.1:0".to_string(),
-                base_url: "https://gateway.example.test".to_string(),
-                api_key: "test-key".to_string(),
-                claude: None,
-                codex: None,
-                ca_cert_pem,
-                ca_key_pem,
-                verbose: false,
-                chatgpt_chat_passthrough: false,
-                desktop_browser_use: true,
-                gateway_state_dir: None,
-                desktop_config_root: None,
-                upstream_proxy: None,
-            })
-            .unwrap(),
-        );
+        let mut state = State::new(Config {
+            listen: "127.0.0.1:0".to_string(),
+            base_url: "https://gateway.example.test".to_string(),
+            api_key: "test-key".to_string(),
+            claude: None,
+            codex: None,
+            ca_cert_pem,
+            ca_key_pem,
+            verbose: false,
+            chatgpt_chat_passthrough: false,
+            desktop_browser_use: true,
+            gateway_state_dir: None,
+            desktop_config_root: None,
+            upstream_proxy: None,
+        })
+        .unwrap();
+        state.gateway = gateway;
+        let state = Arc::new(state);
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         let client = TcpStream::connect(proxy_addr);
@@ -6784,18 +6818,37 @@ mod tests {
             assert!(is_managed_host(&canonical_host(host)));
         }
         for name in ["Authorization", "cookie", "x-saiai-client-proof"] {
-            assert!(!should_forward_http_proxy_header(name, true), "{name}");
+            assert!(
+                !should_forward_http_proxy_header(name, true, crate::runtime::gateway()),
+                "{name}"
+            );
         }
         for name in ["Authorization", "cookie"] {
-            assert!(should_forward_http_proxy_header(name, false), "{name}");
+            assert!(
+                should_forward_http_proxy_header(name, false, crate::runtime::gateway()),
+                "{name}"
+            );
         }
         assert!(!should_forward_http_proxy_header(
             "x-saiai-client-proof",
-            false
+            false,
+            crate::runtime::gateway()
         ));
-        assert!(should_forward_http_proxy_header("user-agent", true));
-        assert!(!should_forward_http_proxy_header("Proxy-Anything", false));
-        assert!(should_forward_http_proxy_header("x-proxy-note", false));
+        assert!(should_forward_http_proxy_header(
+            "user-agent",
+            true,
+            crate::runtime::gateway()
+        ));
+        assert!(!should_forward_http_proxy_header(
+            "Proxy-Anything",
+            false,
+            crate::runtime::gateway()
+        ));
+        assert!(should_forward_http_proxy_header(
+            "x-proxy-note",
+            false,
+            crate::runtime::gateway()
+        ));
         for target in [
             "http://API.Anthropic.COM./v1/messages",
             "http://chatgpt.com:80/",
@@ -7648,11 +7701,30 @@ mod tests {
     #[test]
     fn client_proof_is_never_relayed_on_any_outbound_path() {
         for name in ["X-Saiai-Client-Proof", "x-saiai-client-proof"] {
-            assert!(!should_forward_request_header(name));
-            assert!(!should_forward_request_header_to_gateway(name, true));
-            assert!(!should_forward_request_header_to_gateway(name, false));
-            assert!(!should_forward_http_proxy_header(name, true));
-            assert!(!should_forward_http_proxy_header(name, false));
+            assert!(!should_forward_request_header(
+                name,
+                crate::runtime::gateway()
+            ));
+            assert!(!should_forward_request_header_to_gateway(
+                name,
+                true,
+                crate::runtime::gateway()
+            ));
+            assert!(!should_forward_request_header_to_gateway(
+                name,
+                false,
+                crate::runtime::gateway()
+            ));
+            assert!(!should_forward_http_proxy_header(
+                name,
+                true,
+                crate::runtime::gateway()
+            ));
+            assert!(!should_forward_http_proxy_header(
+                name,
+                false,
+                crate::runtime::gateway()
+            ));
         }
         assert_eq!(bearer_token("Bearer abc"), Some("abc"));
         assert_eq!(bearer_token("bearer  abc "), Some("abc"));

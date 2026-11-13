@@ -64,6 +64,9 @@ impl GatewayExtension for SaiaiGateway {
     }
 }
 
+/// Belongs to one local proxy run: it spawns enrollment on the runtime that
+/// started it (the run's runtime) and must not outlive it or be used from
+/// another runtime.
 pub(crate) struct SaiaiSession {
     // Set by the background loader; until then requests are sent unsigned.
     proof: OnceLock<Arc<ClientProof>>,

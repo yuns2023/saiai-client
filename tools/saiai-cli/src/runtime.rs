@@ -28,13 +28,16 @@ impl PartialEq for RuntimeContext {
     fn eq(&self, other: &Self) -> bool {
         // The same extension instance: same type at the same address (vtable
         // pointers may differ between codegen units, so they are ignored).
-        self.version == other.version
-            && std::ptr::addr_eq(self.gateway, other.gateway)
-            && self.gateway.extension_type() == other.gateway.extension_type()
+        self.version == other.version && same_extension(self.gateway, other.gateway)
     }
 }
 
 impl Eq for RuntimeContext {}
+
+fn same_extension(left: &dyn GatewayExtension, right: &dyn GatewayExtension) -> bool {
+    std::ptr::addr_eq(left, right)
+        && crate::gateway::extension_type(left) == crate::gateway::extension_type(right)
+}
 
 impl std::fmt::Debug for RuntimeContext {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -54,12 +57,18 @@ pub(crate) fn install(context: RuntimeContext) -> Result<()> {
 }
 
 fn install_into(slot: &OnceLock<RuntimeContext>, context: RuntimeContext) -> Result<()> {
+    // An unusable extension never occupies the slot.
+    crate::gateway::validate_extension(context.gateway)?;
     let installed = slot.get_or_init(|| context);
-    if *installed != context {
+    if installed.version != context.version {
         bail!(
-            "this process already runs as version {} with another Gateway extension",
-            installed.version
+            "this process already runs as version {}, not {}",
+            installed.version,
+            context.version
         );
+    }
+    if !same_extension(installed.gateway, context.gateway) {
+        bail!("this process already runs with another Gateway extension");
     }
     Ok(())
 }
@@ -126,17 +135,50 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(error.to_string().contains("1.2.3"), "{error}");
         assert!(
-            install_into(
-                &slot,
-                RuntimeContext {
-                    gateway: &OTHER,
-                    ..first
-                }
-            )
-            .is_err()
+            error.to_string().contains("version 1.2.3, not 9.9.9"),
+            "{error}"
+        );
+        let error = install_into(
+            &slot,
+            RuntimeContext {
+                gateway: &OTHER,
+                ..first
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("another Gateway extension"),
+            "{error}"
         );
         assert_eq!(slot.get(), Some(&first));
+    }
+
+    #[test]
+    fn an_extension_reserving_protected_headers_is_refused_before_installing() {
+        struct Reserves(&'static [&'static str]);
+        impl GatewayExtension for Reserves {
+            fn signature_headers(&self) -> &'static [&'static str] {
+                self.0
+            }
+            fn start(
+                &self,
+                _start: crate::gateway::GatewayStart,
+            ) -> std::sync::Arc<dyn crate::gateway::GatewaySession> {
+                unreachable!()
+            }
+        }
+        static HANDSHAKE: Reserves = Reserves(&["sec-websocket-key"]);
+        static CREDENTIAL: Reserves = Reserves(&["authorization"]);
+        static UPPER: Reserves = Reserves(&["X-Proof"]);
+        for gateway in [&HANDSHAKE, &CREDENTIAL, &UPPER] {
+            let slot = OnceLock::new();
+            let context = RuntimeContext {
+                version: "1.2.3",
+                gateway,
+            };
+            assert!(install_into(&slot, context).is_err());
+            assert!(slot.get().is_none());
+        }
     }
 }

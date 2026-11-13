@@ -26,7 +26,7 @@ use std::sync::Arc;
 use zeroize::Zeroizing;
 
 /// Gateway behavior of a distribution.
-pub trait GatewayExtension: Send + Sync + 'static {
+pub trait GatewayExtension: std::any::Any + Send + Sync {
     /// Lowercase names of the request headers this extension adds. Only the
     /// proxy may produce them, so they are removed from inbound requests.
     fn signature_headers(&self) -> &'static [&'static str] {
@@ -35,12 +35,6 @@ pub trait GatewayExtension: Send + Sync + 'static {
 
     /// Starts the per-run session. Must return immediately.
     fn start(&self, start: GatewayStart) -> Arc<dyn GatewaySession>;
-    /// Concrete type, so two zero-sized extension statics that happen to
-    /// share an address are still told apart. Do not override.
-    #[doc(hidden)]
-    fn extension_type(&self) -> std::any::TypeId {
-        std::any::TypeId::of::<Self>()
-    }
 }
 
 /// What a session gets from the local proxy run that starts it.
@@ -150,12 +144,43 @@ const FORBIDDEN_SIGNATURE_HEADERS: &[&str] = &[
     "cookie",
 ];
 
-/// Inbound header that only this proxy may produce (case-insensitive).
-pub(crate) fn is_reserved_inbound_header(name: &str) -> bool {
+/// Concrete type of an extension, taken by the kernel (not overridable).
+pub(crate) fn extension_type(extension: &dyn GatewayExtension) -> std::any::TypeId {
+    let any: &dyn std::any::Any = extension;
+    any.type_id()
+}
+
+/// Header the proxy itself manages on Gateway requests: credentials,
+/// framing and the WebSocket handshake. Brand and extension reserved names
+/// may never be one of these, so reserving a name can never break the
+/// handshake copy or let a signature replace a credential.
+pub(crate) fn is_protected_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    FORBIDDEN_SIGNATURE_HEADERS.contains(&lower.as_str()) || lower.starts_with("sec-websocket-")
+}
+
+/// Checks the names an extension declares: valid lowercase header names
+/// that are not protected. Rejected at installation, before any request.
+pub(crate) fn validate_extension(extension: &dyn GatewayExtension) -> Result<()> {
+    for name in extension.signature_headers() {
+        let valid = !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+        if !valid || is_protected_header(name) {
+            anyhow::bail!("Gateway extension declares an unusable signature header {name:?}");
+        }
+    }
+    Ok(())
+}
+
+/// Inbound header that only this proxy may produce (case-insensitive): the
+/// brand's sensitive headers and the running extension's signature headers.
+pub(crate) fn is_reserved_inbound_header(extension: &dyn GatewayExtension, name: &str) -> bool {
     crate::brand::BRAND
         .sensitive_inbound_headers
         .iter()
-        .chain(crate::runtime::gateway().signature_headers())
+        .chain(extension.signature_headers())
         .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
@@ -178,9 +203,7 @@ pub(crate) fn signature(
             continue;
         };
         let lower = name.to_ascii_lowercase();
-        if FORBIDDEN_SIGNATURE_HEADERS.contains(&lower.as_str())
-            || lower.starts_with("sec-websocket-")
-        {
+        if is_protected_header(name) {
             eprintln!("gateway extension: skipped forbidden signature header {name}");
             continue;
         }

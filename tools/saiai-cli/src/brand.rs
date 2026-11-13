@@ -61,8 +61,8 @@ fn validate(brand: &Brand) -> Result<()> {
             && name
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
-        if !valid {
-            bail!("brand sensitive_inbound_headers entry is not a lowercase header name: {name:?}");
+        if !valid || crate::gateway::is_protected_header(name) {
+            bail!("brand sensitive_inbound_headers entry is not a usable header name: {name:?}");
         }
     }
     let env = &brand.env;
