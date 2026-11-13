@@ -276,6 +276,16 @@ mod tests {
         .expect("the key is loaded in the background")
     }
 
+    /// The exact `Authorization` value of a captured request (header name
+    /// in any case).
+    fn authorization(request: &str) -> Option<&str> {
+        request.split("\r\n\r\n").next()?.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("authorization")
+                .then(|| value.trim())
+        })
+    }
+
     async fn next_enrollment(requests: &mut mpsc::UnboundedReceiver<String>) -> String {
         let request = tokio::time::timeout(Duration::from_secs(5), requests.recv())
             .await
@@ -333,11 +343,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let session = start(Some(directory.path()), &[(&url, KEY)]);
         let enrollment = next_enrollment(&mut requests).await;
-        assert!(
-            enrollment.to_ascii_lowercase().contains(&format!(
-                "authorization: bearer {}",
-                KEY.to_ascii_lowercase()
-            )),
+        assert_eq!(
+            authorization(&enrollment),
+            Some(format!("Bearer {KEY}").as_str()),
             "{enrollment}"
         );
         loaded(&session).await;
@@ -404,11 +412,9 @@ mod tests {
             assert!(sign(&session, &url, "POST", "/v1/messages", bearer).is_empty());
             if enrolls {
                 let enrollment = next_enrollment(&mut requests).await;
-                let expected = format!("authorization: bearer {}", bearer.unwrap());
-                assert!(
-                    enrollment
-                        .to_ascii_lowercase()
-                        .contains(&expected.to_ascii_lowercase()),
+                assert_eq!(
+                    authorization(&enrollment),
+                    Some(format!("Bearer {}", bearer.unwrap()).as_str()),
                     "{enrollment}"
                 );
             } else {

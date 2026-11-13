@@ -52,16 +52,33 @@ jobs:
           cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test contract_entry --test saiai_render_contract --test kernel_consumer
 
       # The kernel package builds outside this workspace (production code,
-      # with and without the contract entries). Its unit tests still include
-      # the SAIAI brand values as their fallback brand until C4d, so they run
-      # in the workspace only.
+      # with and without the contract entries) on the workspace's locked
+      # dependencies. Its unit tests still include the SAIAI brand values as
+      # their fallback brand until C4d, so they run in the workspace only.
       - name: Build the kernel on its own
         run: |
           standalone="$(mktemp -d)"
           cp -R tools/saiai-cli/kernel "$standalone/kernel"
           cp tools/saiai-cli/Cargo.lock "$standalone/kernel/Cargo.lock"
-          cargo build --manifest-path "$standalone/kernel/Cargo.toml" --target-dir "$standalone/target"
-          cargo build --manifest-path "$standalone/kernel/Cargo.toml" --target-dir "$standalone/target" --features contract
+          # Drops the workspace-only entries from the copied lock file ...
+          cargo metadata --format-version 1 --manifest-path "$standalone/kernel/Cargo.toml" > /dev/null
+          # ... without changing any locked third-party package.
+          python3 - "$standalone/kernel/Cargo.lock" tools/saiai-cli/Cargo.lock <<'PY'
+          import re, sys
+          def packages(path):
+              found = {}
+              for block in open(path, encoding="utf-8").read().split("[[package]]")[1:]:
+                  field = lambda name: (re.search(rf'^{name} = "([^"]*)"', block, re.M) or [None, None])[1]
+                  if field("source"):
+                      found[(field("name"), field("version"))] = (field("source"), field("checksum"))
+              return found
+          standalone, workspace = packages(sys.argv[1]), packages(sys.argv[2])
+          changed = sorted(key for key, value in standalone.items() if workspace.get(key) != value)
+          assert not changed, f"standalone kernel resolves other packages: {changed}"
+          print(f"standalone kernel locks {len(standalone)} workspace packages unchanged")
+          PY
+          cargo build --locked --manifest-path "$standalone/kernel/Cargo.toml" --target-dir "$standalone/target"
+          cargo build --locked --manifest-path "$standalone/kernel/Cargo.toml" --target-dir "$standalone/target" --features contract
 
       - name: Verify official Codex daemon initialization without model turns
         env:
