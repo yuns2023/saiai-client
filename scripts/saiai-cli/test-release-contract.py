@@ -183,9 +183,29 @@ class OptionalClaudeContractTests(unittest.TestCase):
                     self.verify(launcher=self.inject(behavior))
 
     def test_rejects_dynamic_secret_diagnostics(self) -> None:
-        for behavior in ('eprintln!("{token}");', 'eprint!("{}", token);', 'dbg!(config);'):
+        for behavior in (
+            'eprintln!("{token}");', 'eprint!("{}", token);', 'dbg!(config);',
+            # Other macro delimiters, paths and spacing.
+            'eprintln!["{}", token];', 'eprintln!{"{}", token}', 'std::eprintln!("{token}");',
+            'eprintln ! ("{token}");', 'eprint![r"{token}"];',
+            # Escapes that decode to a format capture.
+            'eprintln!("\\x7btoken\\x7d");', 'eprintln!("\\u{7b}token\\u{7d}");',
+            'eprintln!("{brand_product}\\x7btoken}", brand_product = BRAND.product_name);',
+            # A format string that is not a literal.
+            'eprintln!(concat!("{tok", "en}"));', 'eprintln!(MESSAGE);',
+        ):
             with self.subTest(behavior=behavior):
                 with self.assertRaisesRegex(AssertionError, "interpolate credentials"):
+                    self.verify(launcher=self.inject(behavior))
+
+    def test_accepts_plain_diagnostics_in_any_delimiter(self) -> None:
+        self.verify(launcher=self.inject('eprintln!["plain notice; braces \\x41 decoded"];'))
+        self.verify(launcher=self.inject('// eprintln!("{token}") in a comment is not code\nconst NOTE: &str = "eprintln!(\\"{token}\\")";'))
+
+    def test_rejects_stdout_in_any_delimiter(self) -> None:
+        for behavior in ('println!["plain"];', 'print!{"plain"}'):
+            with self.subTest(behavior=behavior):
+                with self.assertRaisesRegex(AssertionError, "stdout"):
                     self.verify(launcher=self.inject(behavior))
 
     def test_rejects_stdout_pollution(self) -> None:

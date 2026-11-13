@@ -50,6 +50,89 @@ def load_generator():
     return module
 
 
+def rust_string_literal(source: str, index: int) -> tuple[int, str] | None:
+    """(end, decoded text) of the Rust string literal starting at `index`."""
+    raw = re.match(r'b?r(#*)"', source[index:])
+    if raw:
+        body = index + raw.end()
+        terminator = '"' + raw.group(1)
+        end = source.find(terminator, body)
+        end = len(source) if end < 0 else end
+        return end + len(terminator), source[body:end]
+    plain = re.match(r'b?"', source[index:])
+    if not plain:
+        return None
+    position = index + plain.end()
+    decoded = []
+    while position < len(source) and source[position] != '"':
+        if source[position] != "\\":
+            decoded.append(source[position])
+            position += 1
+            continue
+        escape = source[position + 1 : position + 2]
+        if escape == "x":
+            decoded.append(chr(int(source[position + 2 : position + 4], 16)))
+            position += 4
+        elif escape == "u":
+            close = source.index("}", position)
+            decoded.append(chr(int(source[position + 3 : close], 16)))
+            position = close + 1
+        elif escape == "\n":
+            position += 2
+            while position < len(source) and source[position] in " \t\r\n":
+                position += 1
+        else:
+            decoded.append({"n": "\n", "t": "\t", "r": "\r", "0": "\0"}.get(escape, escape))
+            position += 2
+    return position + 1, "".join(decoded)
+
+
+def rust_macro_invocations(source: str, names: str) -> list[tuple[str, str]]:
+    """(name, arguments) of every `name!(…)`, `name![…]` or `name!{…}` call in
+    code (not in comments or literals), with any path prefix or spacing."""
+    pattern = re.compile(r"\b(" + names + r")\s*!\s*([(\[{])")
+    closers = {"(": ")", "[": "]", "{": "}"}
+    found = []
+    position = 0
+    while position < len(source):
+        if source.startswith("//", position):
+            newline = source.find("\n", position)
+            position = len(source) if newline < 0 else newline
+            continue
+        if source.startswith("/*", position):
+            end = source.find("*/", position + 2)
+            position = len(source) if end < 0 else end + 2
+            continue
+        previous = source[position - 1] if position else " "
+        literal = None if previous.isalnum() or previous == "_" else rust_string_literal(source, position)
+        if literal:
+            position = literal[0]
+            continue
+        char = re.match(r"'(?:\\.|[^\\'])'", source[position:])
+        if char:
+            position += char.end()
+            continue
+        call = pattern.match(source, position)
+        if call and not (previous.isalnum() or previous == "_"):
+            stack = [closers[call.group(2)]]
+            index = call.end()
+            while index < len(source) and stack:
+                inner = rust_string_literal(source, index)
+                if inner and not (source[index - 1].isalnum() or source[index - 1] == "_"):
+                    index = inner[0]
+                    continue
+                if source[index] in closers:
+                    stack.append(closers[source[index]])
+                elif source[index] == stack[-1]:
+                    stack.pop()
+                index += 1
+            found.append((call.group(1), source[call.end() : index - 1]))
+            position = index
+            continue
+        position += 1
+    return found
+
+
 def verify_claude_launcher(main: str) -> None:
     for required in (
         "mod claude_launcher;",
@@ -144,19 +227,24 @@ def verify_claude_launcher(main: str) -> None:
         require(f'.env_remove("{name}")' not in compact, f"Claude launcher must not remove {name}")
     # Diagnostics may name the program (each brand placeholder bound to its
     # Brand field by a named argument) but never interpolate anything else.
+    # Every delimiter form counts, and the format string is judged after its
+    # escapes are decoded (`"\x7btoken\x7d"` is the capture `{token}`).
     brand_argument = r"\s*,\s*(?:brand_product\s*=\s*BRAND\.product_name|brand_binary\s*=\s*BRAND\.binary_name)"
-    for invocation in re.findall(r"\b(?:e?print(?:ln)?|dbg)!\s*\((.*?)\)\s*;", production, re.DOTALL):
-        match = re.fullmatch(
-            r'\s*("(?:[^"\\{}]|\\.|\{brand_(?:product|binary)\})*")((?:' + brand_argument + r')*)\s*,?\s*',
-            invocation,
-        )
-        used = set(re.findall(r"\{(brand_product|brand_binary)\}", match.group(1))) if match else set()
-        bound = set(re.findall(r"\b(brand_product|brand_binary)\s*=", match.group(2))) if match else set()
+    for name, arguments in rust_macro_invocations(production, r"e?print(?:ln)?|dbg"):
+        require(not name.startswith("print"), "Claude diagnostics must not use stdout")
+        literal = rust_string_literal(arguments, len(arguments) - len(arguments.lstrip()))
+        rest = arguments[literal[0]:] if literal else ""
+        bound_arguments = re.fullmatch(r"((?:" + brand_argument + r")*)\s*,?\s*", rest)
+        format_text = literal[1] if literal else ""
+        used = set(re.findall(r"\{(brand_product|brand_binary)\}", format_text))
+        bound = set(re.findall(r"\b(brand_product|brand_binary)\s*=", rest))
         require(
-            match is not None and used <= bound,
+            literal is not None
+            and bound_arguments is not None
+            and not re.search(r"[{}]", re.sub(r"\{brand_(?:product|binary)\}", "", format_text))
+            and used <= bound,
             "optional Claude diagnostics must not interpolate credentials or configuration",
         )
-    require(re.search(r"\bprint(?:ln)?!\s*\(", production) is None, "Claude diagnostics must not use stdout")
     for required in (
         "claude_launcher_replaces_only_child_routing_environment",
         "claude_launcher_reuses_reachable_proxy_without_starting_service",
