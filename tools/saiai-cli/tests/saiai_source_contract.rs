@@ -797,25 +797,34 @@ fn only_the_extension_side_uses_the_client_proof_protocol() {
     }
 }
 
-/// Every file below `kernel/`, recursively.
-fn kernel_tree() -> Vec<std::path::PathBuf> {
-    fn walk(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+/// Every file below `kernel/`, recursively, and every symbolic link found
+/// there (not followed). A local build directory `kernel/target` is skipped.
+fn kernel_tree() -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
+    fn walk(
+        dir: &Path,
+        top: bool,
+        files: &mut Vec<std::path::PathBuf>,
+        links: &mut Vec<std::path::PathBuf>,
+    ) {
         for entry in fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
-            if path.is_dir() {
-                walk(&path, files);
+            let kind = fs::symlink_metadata(&path).unwrap().file_type();
+            if kind.is_symlink() {
+                links.push(path);
+            } else if kind.is_dir() {
+                if !(top && path.file_name().is_some_and(|name| name == "target")) {
+                    walk(&path, false, files, links);
+                }
             } else {
                 files.push(path);
             }
         }
     }
-    let mut files = Vec::new();
-    walk(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("kernel"),
-        &mut files,
-    );
+    let (mut files, mut links) = (Vec::new(), Vec::new());
+    let kernel = Path::new(env!("CARGO_MANIFEST_DIR")).join("kernel");
+    walk(&kernel, true, &mut files, &mut links);
     files.sort();
-    files
+    (files, links)
 }
 
 /// Registered exceptions to the kernel's SAIAI-free rule:
@@ -830,7 +839,7 @@ const KERNEL_SAIAI_EXCEPTIONS: &[(&str, &str)] = &[];
 #[test]
 fn the_kernel_directory_never_names_saiai() {
     let kernel = Path::new(env!("CARGO_MANIFEST_DIR")).join("kernel");
-    let files = kernel_tree();
+    let (files, _) = kernel_tree();
     assert!(files.iter().any(|file| file.ends_with("Cargo.toml")));
     assert!(files.iter().any(|file| file.ends_with("lib.rs")));
     let mut found = Vec::new();
@@ -861,76 +870,149 @@ fn the_kernel_directory_never_names_saiai() {
     );
 }
 
-/// Arguments of `#[path = ...]`, `include_str!`, `include_bytes!` and
-/// `include!` in `text`, as written (`None` when not a plain string literal).
-fn file_references(text: &str) -> Vec<Option<String>> {
-    let mut found = Vec::new();
-    for (start, _) in text.match_indices("#[path") {
-        let rest = text[start + "#[path".len()..].trim_start();
-        let literal = rest
-            .strip_prefix('=')
-            .map(str::trim_start)
-            .and_then(|rest| rest.strip_prefix('"'))
-            .and_then(|rest| rest.split_once('"'))
-            .filter(|(_, after)| after.trim_start().starts_with(']'))
-            .map(|(path, _)| path.to_string());
-        found.push(literal);
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn skip_whitespace(text: &[u8], mut at: usize) -> usize {
+    while at < text.len() && text[at].is_ascii_whitespace() {
+        at += 1;
     }
-    for macro_name in ["include_str!", "include_bytes!", "include!"] {
-        for (start, _) in text.match_indices(macro_name) {
-            if text[..start].ends_with(|ch: char| ch.is_alphanumeric() || ch == '_') {
+    at
+}
+
+/// A plain string literal naming a sibling file (`"name.ext"`: letters,
+/// digits, `_`, `-`, `.`, not only dots) at `at`, and the index after it.
+fn sibling_name(text: &[u8], at: usize) -> Option<(String, usize)> {
+    let rest = text.get(at..)?.strip_prefix(b"\"")?;
+    let end = rest.iter().position(|&byte| byte == b'"')?;
+    let name = &rest[..end];
+    let plain = !name.is_empty()
+        && !name.iter().all(|&byte| byte == b'.')
+        && name
+            .iter()
+            .all(|&byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+    plain.then(|| (String::from_utf8(name.to_vec()).unwrap(), at + 1 + end + 1))
+}
+
+/// File references in Rust source `text`: every `include!`,
+/// `include_str!` and `include_bytes!` call and every `path = ...` inside an
+/// attribute (`#[path]`, `#[cfg_attr(..., path = ...)]`), whitespace between
+/// tokens allowed. `Ok(name)` is a sibling file name; `Err(form)` is anything
+/// else (another directory, escapes, raw strings, macros, `include!`, or a
+/// `#[path]` on an inline module), which the kernel does not use.
+fn file_references(text: &str) -> Vec<Result<String, String>> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    let excerpt = |at: usize| text[at..].chars().take(60).collect::<String>();
+    for (start, _) in text.match_indices("include") {
+        if start > 0 && is_ident_byte(bytes[start - 1]) {
+            continue;
+        }
+        let mut at = start + "include".len();
+        let mut plain_include = true;
+        for suffix in ["_str", "_bytes"] {
+            if bytes[at..].starts_with(suffix.as_bytes()) {
+                at += suffix.len();
+                plain_include = false;
+                break;
+            }
+        }
+        if bytes.get(at).is_some_and(|&byte| is_ident_byte(byte)) {
+            continue;
+        }
+        let at = skip_whitespace(bytes, at);
+        if bytes.get(at) != Some(&b'!') {
+            continue;
+        }
+        let at = skip_whitespace(bytes, at + 1);
+        let literal = (!plain_include && bytes.get(at) == Some(&b'('))
+            .then(|| sibling_name(bytes, skip_whitespace(bytes, at + 1)))
+            .flatten()
+            .filter(|(_, end)| bytes.get(skip_whitespace(bytes, *end)) == Some(&b')'));
+        found.push(literal.map(|(name, _)| name).ok_or_else(|| excerpt(start)));
+    }
+    for (start, _) in text.match_indices('#') {
+        let mut at = skip_whitespace(bytes, start + 1);
+        if bytes.get(at) == Some(&b'!') {
+            at = skip_whitespace(bytes, at + 1);
+        }
+        if bytes.get(at) != Some(&b'[') {
+            continue;
+        }
+        // The attribute body up to its closing bracket (string-aware).
+        let (mut depth, mut end, mut in_string) = (0usize, at, false);
+        while end < bytes.len() {
+            match bytes[end] {
+                b'\\' if in_string => end += 1,
+                b'"' => in_string = !in_string,
+                b'[' if !in_string => depth += 1,
+                b']' if !in_string => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            end += 1;
+        }
+        let body = &text[at..end.min(bytes.len())];
+        for (offset, _) in body.match_indices("path") {
+            let position = at + offset;
+            let after = position + "path".len();
+            if is_ident_byte(bytes[position - 1])
+                || bytes.get(after).is_some_and(|&byte| is_ident_byte(byte))
+            {
                 continue;
             }
-            let rest = text[start + macro_name.len()..].trim_start();
-            let literal = rest
-                .strip_prefix('(')
-                .map(str::trim_start)
-                .and_then(|rest| rest.strip_prefix('"'))
-                .and_then(|rest| rest.split_once('"'))
-                .filter(|(_, after)| after.trim_start().starts_with(')'))
-                .map(|(path, _)| path.to_string());
-            found.push(literal);
+            let equals = skip_whitespace(bytes, after);
+            if bytes.get(equals) != Some(&b'=') {
+                continue;
+            }
+            let literal = sibling_name(bytes, skip_whitespace(bytes, equals + 1))
+                .map(|(name, _)| name)
+                .filter(|_| !annotates_inline_module(bytes, end + 1));
+            found.push(literal.ok_or_else(|| excerpt(start)));
         }
     }
     found
 }
 
-/// Whether `reference`, written in `file` (below `root`), stays below `root`.
-/// `#[path]` and the include macros both resolve against the file's own
-/// directory here; `#[path]` inside an inline module of a non-`mod.rs` file
-/// would resolve deeper, so this is the stricter reading.
-fn stays_inside(root: &Path, file: &Path, reference: &str) -> bool {
-    if reference.starts_with('/') || reference.starts_with('\\') || reference.contains(':') {
-        return false;
-    }
-    let mut depth = file
-        .parent()
-        .unwrap()
-        .strip_prefix(root)
-        .unwrap()
-        .components()
-        .count() as isize;
-    for part in reference.split(['/', '\\']) {
-        match part {
-            "" | "." => {}
-            ".." => depth -= 1,
-            _ => depth += 1,
+/// Whether the item after the attribute ending at `at` (other attributes
+/// skipped) is an inline `mod name { ... }`.
+fn annotates_inline_module(text: &[u8], mut at: usize) -> bool {
+    loop {
+        at = skip_whitespace(text, at);
+        if text.get(at) != Some(&b'#') {
+            break;
         }
-        if depth < 0 {
+        let Some(close) = text[at..].iter().position(|&byte| byte == b']') else {
             return false;
+        };
+        at += close + 1;
+    }
+    for word in ["pub(crate)", "pub", "mod"] {
+        if text[at..].starts_with(word.as_bytes()) {
+            at = skip_whitespace(text, at + word.len());
         }
     }
-    true
+    while text.get(at).is_some_and(|&byte| is_ident_byte(byte)) {
+        at += 1;
+    }
+    text.get(skip_whitespace(text, at)) == Some(&b'{')
 }
 
-/// Kernel sources reference only files inside `kernel/`, by plain string
-/// literals (no `concat!`/`env!` paths), so the directory builds and tests on
+/// Kernel sources reference only sibling files inside `kernel/` (plain
+/// file-name literals, no directories, escapes or computed paths), and
+/// `kernel/` holds no symbolic links, so the directory builds and tests on
 /// its own.
 #[test]
 fn kernel_sources_reference_no_file_outside_the_kernel() {
-    let kernel = Path::new(env!("CARGO_MANIFEST_DIR")).join("kernel");
+    let (files, links) = kernel_tree();
+    assert!(links.is_empty(), "symbolic links in kernel/: {links:?}");
     let mut checked = 0;
-    for file in kernel_tree() {
+    for file in files {
         if file.extension().is_none_or(|extension| extension != "rs") {
             continue;
         }
@@ -938,37 +1020,52 @@ fn kernel_sources_reference_no_file_outside_the_kernel() {
         for reference in file_references(&text) {
             checked += 1;
             match reference {
-                Some(path) if stays_inside(&kernel, &file, &path) => {}
-                other => panic!("{} references {other:?} outside kernel/", file.display()),
+                Ok(name) if file.parent().unwrap().join(&name).is_file() => {}
+                Ok(name) => panic!("{} references missing file {name:?}", file.display()),
+                Err(form) => panic!(
+                    "{} uses a file reference the kernel does not allow (only sibling file-name literals): {form}",
+                    file.display()
+                ),
             }
         }
     }
-    // The kernel embeds its helper scripts and fixtures with include_str!.
+    // The kernel embeds its helper scripts with include_str! and its split
+    // modules with #[path].
     assert!(checked > 0);
 }
 
 #[test]
 fn kernel_file_reference_scanner_sees_every_form() {
-    let text = "#[path = \"../../src/x.rs\"]\nmod x;\n#[path=\"y.rs\"] mod y;\nconst A: &str = include_str!(\"a.ps1\");\nconst B: &[u8] = include_bytes! (\"../b\");\ninclude!(concat!(env!(\"OUT_DIR\"), \"/c.rs\"));\nmy_include_str!(\"ignored\");";
+    let allowed = "#[path = \"y.rs\"]\nmod y;\n#[cfg(test)]\n#[path=\"z_tests.rs\"] pub(crate) mod z;\nconst A: &str = include_str!(\"a.ps1\");\nconst B: &[u8] = include_bytes! ( \"b.js\" );\nmy_include_str!(\"ignored\");\nlet path = \"../ignored\";\n// include the x\n";
     assert_eq!(
-        file_references(text),
+        file_references(allowed),
         vec![
-            Some("../../src/x.rs".to_string()),
-            Some("y.rs".to_string()),
-            Some("a.ps1".to_string()),
-            Some("../b".to_string()),
-            None,
+            Ok("a.ps1".to_string()),
+            Ok("b.js".to_string()),
+            Ok("y.rs".to_string()),
+            Ok("z_tests.rs".to_string()),
         ]
     );
-    let root = Path::new("/k");
-    let file = Path::new("/k/src/lib.rs");
-    assert!(stays_inside(root, file, "brand_test.rs"));
-    assert!(stays_inside(root, file, "../Cargo.toml"));
-    assert!(stays_inside(root, file, "fixtures/./a/../b.json"));
-    assert!(!stays_inside(root, file, "../../src/brand_saiai.rs"));
-    assert!(!stays_inside(root, file, "../../kernel/src/x.rs"));
-    assert!(!stays_inside(root, file, "/etc/passwd"));
-    assert!(!stays_inside(root, file, "C:\\x.rs"));
+    for refused in [
+        "#[path = \"../../src/x.rs\"]\nmod x;",
+        "#[ path = \"../../outside.rs\"]\nmod x;",
+        "#[cfg_attr(unix, path = \"../outside.rs\")]\nmod x;",
+        "#[cfg_attr(unix, path = \"x.rs\")]\nmod x { }",
+        "#[path = \"..\"]\nmod inner {\n}",
+        "const X: &str = include_str ! (\"../../outside.txt\");",
+        "const X: &str = include_str!(\"..\\x2f..\\x2foutside.txt\");",
+        "const X: &str = include_str!(r\"outside.txt\");",
+        "const X: &[u8] = include_bytes!(concat!(env!(\"OUT_DIR\"), \"/c\"));",
+        "include!(\"fragment.inc\");",
+        "const X: &str = include_str!(\"sub/x.txt\");",
+        "const X: &str = include_str!(\"..\");",
+    ] {
+        let references = file_references(refused);
+        assert!(
+            references.iter().any(Result::is_err),
+            "{refused}: {references:?}"
+        );
+    }
 }
 
 #[test]

@@ -52,8 +52,8 @@ jobs:
           cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test contract_entry --test saiai_render_contract --test kernel_consumer
 
       # The kernel package (kernel/ alone, as a public repository would hold
-      # it) lints and passes its own tests outside this workspace, with and
-      # without the contract entries, on the workspace's locked dependencies.
+      # it) lints with and without the contract entries and passes its own
+      # tests outside this workspace, on the workspace's locked dependencies.
       - name: Test the kernel on its own
         run: |
           standalone="$(mktemp -d)"
