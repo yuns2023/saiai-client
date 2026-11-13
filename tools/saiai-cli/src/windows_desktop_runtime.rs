@@ -1,3 +1,4 @@
+use crate::brand::BRAND;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -161,7 +162,8 @@ fn parse_package(output: &str) -> Result<Option<Package>> {
 
 fn package_update_refused() -> anyhow::Error {
     anyhow::anyhow!(
-        "Official Codex package changed or is not ready. Wait for its update to finish, then retry `saiai desktop codex`; if Desktop is open, use normal File > Quit first. No Desktop process was stopped or adopted."
+        "Official Codex package changed or is not ready. Wait for its update to finish, then retry `{brand_binary} desktop codex`; if Desktop is open, use normal File > Quit first. No Desktop process was stopped or adopted.",
+        brand_binary = BRAND.binary_name
     )
 }
 
@@ -332,7 +334,8 @@ pub(crate) enum Decision {
 
 fn refuse() -> anyhow::Error {
     anyhow::anyhow!(
-        "Cannot safely reuse the running OpenAI Desktop. Use its normal File > Quit, then retry `saiai desktop codex`. No Desktop process was stopped."
+        "Cannot safely reuse the running OpenAI Desktop. Use its normal File > Quit, then retry `{brand_binary} desktop codex`. No Desktop process was stopped.",
+        brand_binary = BRAND.binary_name
     )
 }
 
@@ -509,8 +512,12 @@ pub(crate) fn lock(directory: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .open(path)?;
-    file.try_lock()
-        .context("Another SAIAI Desktop launch is in progress; retry after it finishes")?;
+    file.try_lock().with_context(|| {
+        format!(
+            "Another {brand_product} Desktop launch is in progress; retry after it finishes",
+            brand_product = BRAND.product_name
+        )
+    })?;
     Ok(file)
 }
 

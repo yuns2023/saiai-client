@@ -248,7 +248,8 @@ pub(crate) fn initialize(command: &Command, selector: Option<(String, String)>) 
                 let codex = product_directory(&root, &home, "codex")?;
                 match (claude.0 != root, codex.0 != root) {
                     (true, true) => bail!(
-                        "both Claude and Codex environments are selected; use saiai --environment claude|codex|default <command>"
+                        "both Claude and Codex environments are selected; use {brand_binary} --environment claude|codex|default <command>",
+                        brand_binary = BRAND.binary_name
                     ),
                     (true, false) => claude,
                     (false, true) => codex,
@@ -272,7 +273,11 @@ pub(crate) fn initialize(command: &Command, selector: Option<(String, String)>) 
         scope = Scope::new(scope.root.clone(), scope.root);
     }
     if scope.isolated {
-        eprintln!("SAIAI environment: {}", scope.directory.display());
+        eprintln!(
+            "{brand_product} environment: {}",
+            scope.directory.display(),
+            brand_product = BRAND.product_name
+        );
     }
     ACTIVE
         .set(scope)

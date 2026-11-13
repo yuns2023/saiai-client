@@ -139,7 +139,8 @@ pub(super) fn inspect_message(body: &[u8]) -> Result<()> {
     });
     if has_email {
         bail!(
-            "login_state_user_email_context_present; close Desktop and relaunch saiai desktop claude to clear isolated login identity"
+            "login_state_user_email_context_present; close Desktop and relaunch {brand_binary} desktop claude to clear isolated login identity",
+            brand_binary = BRAND.binary_name
         );
     }
     if let Some(user) = parsed.pointer("/metadata/user_id").and_then(Value::as_str) {

@@ -245,17 +245,30 @@ struct UpstreamRoute {
 
 fn validate_route(name: &str, route: RouteConfig) -> Result<UpstreamRoute> {
     let base = route.base_url.trim().trim_end_matches('/').to_string();
-    let parsed =
-        Url::parse(&base).with_context(|| format!("invalid {name} SAIAI base URL: {base}"))?;
+    let parsed = Url::parse(&base).with_context(|| {
+        format!(
+            "invalid {name} {brand_product} base URL: {base}",
+            brand_product = BRAND.product_name
+        )
+    })?;
     match parsed.scheme() {
         "http" | "https" => {}
-        scheme => bail!("{name} SAIAI base URL must use http or https, got {scheme}"),
+        scheme => bail!(
+            "{name} {brand_product} base URL must use http or https, got {scheme}",
+            brand_product = BRAND.product_name
+        ),
     }
     if parsed.host_str().is_none() {
-        bail!("{name} SAIAI base URL host is required");
+        bail!(
+            "{name} {brand_product} base URL host is required",
+            brand_product = BRAND.product_name
+        );
     }
     if route.api_key.trim().is_empty() {
-        bail!("{name} SAIAI API key is required");
+        bail!(
+            "{name} {brand_product} API key is required",
+            brand_product = BRAND.product_name
+        );
     }
     Ok(UpstreamRoute {
         base_url: base,
@@ -382,7 +395,11 @@ pub async fn run(cfg: Config) -> Result<()> {
             None
         }
     };
-    eprintln!("saiai local proxy listening on http://{}", state.listen);
+    eprintln!(
+        "{brand_binary} local proxy listening on http://{}",
+        state.listen,
+        brand_binary = BRAND.binary_name
+    );
     eprintln!(
         "forwarding managed Claude/OpenAI traffic to {}",
         state.default_route.base_url
@@ -426,7 +443,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             }
             signal = tokio::signal::ctrl_c() => {
                 signal.context("failed to listen for Ctrl-C")?;
-                eprintln!("saiai local proxy stopped");
+                eprintln!("{brand_binary} local proxy stopped", brand_binary = BRAND.binary_name);
                 return Ok(());
             }
         }
@@ -466,8 +483,14 @@ impl State {
             .map(|route| validate_route("Codex", route))
             .transpose()?;
 
-        build_leaf_server_config(ANTHROPIC_HOST, &cfg.ca_cert_pem, &cfg.ca_key_pem)
-            .context("failed to validate installation-specific SAIAI CA")?;
+        build_leaf_server_config(ANTHROPIC_HOST, &cfg.ca_cert_pem, &cfg.ca_key_pem).with_context(
+            || {
+                format!(
+                    "failed to validate installation-specific {brand_product} CA",
+                    brand_product = BRAND.product_name
+                )
+            },
+        )?;
 
         let gateways = [
             Some(&default_route),
@@ -3752,13 +3775,25 @@ pub(crate) fn sign_leaf_certificate(
     ca_cert_pem: &str,
     ca_key_pem: &str,
 ) -> Result<(Vec<u8>, KeyPair)> {
-    let ca_key = KeyPair::from_pem(ca_key_pem).context("failed to parse SAIAI CA key")?;
+    let ca_key = KeyPair::from_pem(ca_key_pem).with_context(|| {
+        format!(
+            "failed to parse {brand_product} CA key",
+            brand_product = BRAND.product_name
+        )
+    })?;
     ensure_ca_key_matches_certificate(ca_cert_pem, &ca_key)?;
-    let ca_params = CertificateParams::from_ca_cert_pem(ca_cert_pem)
-        .context("failed to parse SAIAI CA certificate")?;
-    let ca_cert = ca_params
-        .self_signed(&ca_key)
-        .context("failed to load SAIAI CA")?;
+    let ca_params = CertificateParams::from_ca_cert_pem(ca_cert_pem).with_context(|| {
+        format!(
+            "failed to parse {brand_product} CA certificate",
+            brand_product = BRAND.product_name
+        )
+    })?;
+    let ca_cert = ca_params.self_signed(&ca_key).with_context(|| {
+        format!(
+            "failed to load {brand_product} CA",
+            brand_product = BRAND.product_name
+        )
+    })?;
 
     let mut params = CertificateParams::new(vec![host.to_string()])?;
     let mut dn = DistinguishedName::new();
@@ -3779,13 +3814,23 @@ pub(crate) fn sign_leaf_certificate(
 // certificate paired with the wrong key would still sign leaves (now naming
 // the certificate's key identifier) that no client can verify.
 fn ensure_ca_key_matches_certificate(ca_cert_pem: &str, ca_key: &KeyPair) -> Result<()> {
-    let (_, pem) = x509_parser::pem::parse_x509_pem(ca_cert_pem.as_bytes())
-        .map_err(|_| anyhow::anyhow!("failed to parse SAIAI CA certificate PEM"))?;
-    let certificate = pem
-        .parse_x509()
-        .map_err(|_| anyhow::anyhow!("failed to parse SAIAI CA certificate"))?;
+    let (_, pem) = x509_parser::pem::parse_x509_pem(ca_cert_pem.as_bytes()).map_err(|_| {
+        anyhow::anyhow!(
+            "failed to parse {brand_product} CA certificate PEM",
+            brand_product = BRAND.product_name
+        )
+    })?;
+    let certificate = pem.parse_x509().map_err(|_| {
+        anyhow::anyhow!(
+            "failed to parse {brand_product} CA certificate",
+            brand_product = BRAND.product_name
+        )
+    })?;
     if certificate.public_key().raw != ca_key.public_key_der().as_slice() {
-        bail!("SAIAI CA key does not match the CA certificate");
+        bail!(
+            "{brand_product} CA key does not match the CA certificate",
+            brand_product = BRAND.product_name
+        );
     }
     Ok(())
 }

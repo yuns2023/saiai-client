@@ -1,3 +1,4 @@
+use crate::brand::BRAND;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -34,7 +35,8 @@ pub fn trust_windows_current_user_ca(ca_cert: &Path) -> Result<()> {
         PathBuf::from(env::var_os("SystemRoot").context("Windows SystemRoot is missing")?)
             .join("System32/WindowsPowerShell/v1.0/powershell.exe");
     eprintln!(
-        "Windows may show a Security Warning for the existing SAIAI CA (SHA-256: {hash}). Confirm that certificate within 90 seconds to finish VSCode setup."
+        "Windows may show a Security Warning for the existing {brand_product} CA (SHA-256: {hash}). Confirm that certificate within 90 seconds to finish VSCode setup.",
+        brand_product = BRAND.product_name
     );
     let script = crate::script_brand::render(include_str!("vscode_trust_windows.ps1"));
     let mut child = Command::new(program)
@@ -134,7 +136,10 @@ fn inspect_certificate_trust(program: &Path, app: &Path, ca_cert: &Path) -> Resu
         anyhow::anyhow!("VSCode's certificate inspection returned an invalid result")
     })?;
     if !output.status.success() {
-        bail!("VSCode's certificate loader could not verify the SAIAI CA");
+        bail!(
+            "VSCode's certificate loader could not verify the {brand_product} CA",
+            brand_product = BRAND.product_name
+        );
     }
     value
         .get("trusted")
@@ -383,7 +388,10 @@ pub fn validate_settings(raw: &str, listen: &str) -> Result<()> {
     let proxy = proxy_url(listen)?;
     for (key, expected) in managed_settings(&proxy) {
         if document.parsed.get(key) != Some(&expected) {
-            bail!("VSCode's {key} is not configured for the current SAIAI proxy");
+            bail!(
+                "VSCode's {key} is not configured for the current {brand_product} proxy",
+                brand_product = BRAND.product_name
+            );
         }
     }
     if document
@@ -461,7 +469,10 @@ pub fn merge_settings(raw: &str, listen: &str) -> Result<String> {
         .filter(|span| raw[(*span).clone()].starts_with(MARKER.get()))
         .collect();
     if markers.len() > 1 {
-        bail!("VSCode settings contain multiple SAIAI ownership markers");
+        bail!(
+            "VSCode settings contain multiple {brand_product} ownership markers",
+            brand_product = BRAND.product_name
+        );
     }
     if document.parsed.get("http.proxyStrictSSL") == Some(&json!(false)) {
         bail!("VSCode's http.proxyStrictSSL must remain enabled; existing settings were preserved");
@@ -693,7 +704,10 @@ pub fn remove_managed_proxy(raw: &str, proxies: &[String]) -> Result<ManagedRemo
         return Ok(ManagedRemoval::NotManaged);
     };
     if markers.len() > 1 {
-        bail!("VSCode settings contain multiple SAIAI ownership markers");
+        bail!(
+            "VSCode settings contain multiple {brand_product} ownership markers",
+            brand_product = BRAND.product_name
+        );
     }
     let proxy = raw[(marker.start + MARKER.get().len())..marker.end].trim();
     if !proxies.iter().any(|candidate| candidate == proxy) {
@@ -724,7 +738,12 @@ pub fn remove_managed_proxy(raw: &str, proxies: &[String]) -> Result<ManagedRemo
         .iter()
         .find(|span| content[(*span).clone()].starts_with(MARKER.get()))
         .cloned()
-        .context("SAIAI ownership marker disappeared during removal")?;
+        .with_context(|| {
+            format!(
+                "{brand_product} ownership marker disappeared during removal",
+                brand_product = BRAND.product_name
+            )
+        })?;
     // `merge_settings` inserts "\n  <marker>\n" directly after the brace.
     let span =
         if content[..marker.start].ends_with("{\n  ") && content[marker.end..].starts_with('\n') {

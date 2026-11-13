@@ -142,9 +142,18 @@ def verify_claude_launcher(main: str) -> None:
     ):
         require(name not in conflicts, f"Claude launcher must not remove {name}")
         require(f'.env_remove("{name}")' not in compact, f"Claude launcher must not remove {name}")
+    # Diagnostics may name the program (each brand placeholder bound to its
+    # Brand field by a named argument) but never interpolate anything else.
+    brand_argument = r"\s*,\s*(?:brand_product\s*=\s*BRAND\.product_name|brand_binary\s*=\s*BRAND\.binary_name)"
     for invocation in re.findall(r"\b(?:e?print(?:ln)?|dbg)!\s*\((.*?)\)\s*;", production, re.DOTALL):
+        match = re.fullmatch(
+            r'\s*("(?:[^"\\{}]|\\.|\{brand_(?:product|binary)\})*")((?:' + brand_argument + r')*)\s*,?\s*',
+            invocation,
+        )
+        used = set(re.findall(r"\{(brand_product|brand_binary)\}", match.group(1))) if match else set()
+        bound = set(re.findall(r"\b(brand_product|brand_binary)\s*=", match.group(2))) if match else set()
         require(
-            re.fullmatch(r'\s*"(?:[^"\\{}]|\\.)*"\s*,?\s*', invocation) is not None,
+            match is not None and used <= bound,
             "optional Claude diagnostics must not interpolate credentials or configuration",
         )
     require(re.search(r"\bprint(?:ln)?!\s*\(", production) is None, "Claude diagnostics must not use stdout")
@@ -184,6 +193,12 @@ def verify_cli() -> None:
         require(withdrawn not in entry, f"CLI entry point exposes withdrawn V2 behavior: {withdrawn}")
 
     main = text("tools/saiai-cli/src/lib.rs")
+    # User-visible text names the program through Brand placeholders (see
+    # brand_contract_tests::BRAND_TEXT_TOKENS, which also proves each one is
+    # bound); check the text as the SAIAI build renders it.
+    for binding in ("brand_binary = BRAND.binary_name", "brand_product = BRAND.product_name"):
+        require(binding in main, f"CLI text is missing the brand binding {binding!r}")
+    main = main.replace("{brand_binary}", "saiai").replace("{brand_product}", "SAIAI")
     for required in (
         "saiai start",
         "saiai stop",

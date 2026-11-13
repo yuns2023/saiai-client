@@ -4,6 +4,7 @@
 //! Model requests carry the daemon's own version, so an idle daemon older than
 //! the CLI is replaced with the CLI package instead of being restarted as-is.
 
+use crate::brand::{BRAND, BrandText};
 use crate::{DoctorReport, codex_config_dir, codex_process_command};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -27,10 +28,24 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 // off after the old daemon stops but before the new one starts.
 const RESTART_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_COMMAND_OUTPUT: u64 = 16 * 1024;
-const MANUAL_RESTART: &str =
-    "finish Codex tasks, then run `codex app-server daemon restart`; meanwhile use `saiai codex`";
-const MANUAL_UPDATE: &str = "finish Codex tasks, then run `codex app-server daemon update --from-cli -y`; meanwhile use `saiai codex`";
-const PINNED_NOTE: &str = "the daemon now follows this CLI package instead of its own updater; re-run `saiai init-codex` after upgrading Codex, or run `codex app-server daemon update` to return to official daemon updates";
+const MANUAL_RESTART: BrandText = BrandText(|| {
+    format!(
+        "finish Codex tasks, then run `codex app-server daemon restart`; meanwhile use `{brand_binary} codex`",
+        brand_binary = BRAND.binary_name
+    )
+});
+const MANUAL_UPDATE: BrandText = BrandText(|| {
+    format!(
+        "finish Codex tasks, then run `codex app-server daemon update --from-cli -y`; meanwhile use `{brand_binary} codex`",
+        brand_binary = BRAND.binary_name
+    )
+});
+const PINNED_NOTE: BrandText = BrandText(|| {
+    format!(
+        "the daemon now follows this CLI package instead of its own updater; re-run `{brand_binary} init-codex` after upgrading Codex, or run `codex app-server daemon update` to return to official daemon updates",
+        brand_binary = BRAND.binary_name
+    )
+});
 // The official update copies the package, then stops the daemon with up to a
 // 300s shutdown grace and waits up to 30s for readiness. Killing the helper
 // mid-replacement is worse than waiting, so cover at least those two phases;
@@ -43,7 +58,10 @@ pub(crate) fn after_initialization(home: &Path) {
             .ok()
             .as_deref(),
     ) {
-        println!("Codex daemon refresh skipped (SAIAI_SKIP_START=1).");
+        println!(
+            "Codex daemon refresh skipped ({brand_skip_start_env}=1).",
+            brand_skip_start_env = BRAND.env.skip_start
+        );
         return;
     }
     match refresh(&OfficialDaemon { home }) {
@@ -53,7 +71,9 @@ pub(crate) fn after_initialization(home: &Path) {
             if stale { MANUAL_UPDATE } else { MANUAL_RESTART }
         ),
         Ok(Refresh::NewerRunning { running }) => println!(
-            "WARNING: Codex daemon runs app-server {running}, newer than this CLI and the package a restart would launch; left running to avoid a downgrade. To reload SAIAI settings, upgrade Codex, then run `saiai init-codex` again."
+            "WARNING: Codex daemon runs app-server {running}, newer than this CLI and the package a restart would launch; left running to avoid a downgrade. To reload {brand_product} settings, upgrade Codex, then run `{brand_binary} init-codex` again.",
+            brand_binary = BRAND.binary_name,
+            brand_product = BRAND.product_name
         ),
         Ok(Refresh::Restarted) => println!(
             "Codex daemon restarted and recognizes ChatGPT authentication; direct `codex` startup is ready."
@@ -153,7 +173,7 @@ fn report_versions(report: &mut DoctorReport, versions: &Versions) {
         let minimum = crate::codex_diagnostics::MIN_TIME_TOGGLE_VERSION_TEXT;
         report.warn(
             "Codex daemon time reporting support",
-            format!("running app-server {app_server} ignores include_environment_context_time; upgrade Codex to {minimum}+, then run `saiai init-codex`"),
+            format!("running app-server {app_server} ignores include_environment_context_time; upgrade Codex to {minimum}+, then run `{brand_binary} init-codex`", brand_binary = BRAND.binary_name),
         );
     }
 }
@@ -436,8 +456,12 @@ impl OfficialDaemon<'_> {
         if args[0] != "version" {
             // Match the working launcher environment. A daemon started before
             // initialization also retains its old proxy/CA environment.
-            let cfg = crate::read_saiai_config()
-                .map_err(|_| anyhow!("SAIAI proxy configuration is unavailable"))?;
+            let cfg = crate::read_saiai_config().map_err(|_| {
+                anyhow!(
+                    "{brand_product} proxy configuration is unavailable",
+                    brand_product = BRAND.product_name
+                )
+            })?;
             let proxy = format!("http://{}", cfg.listen);
             for name in crate::CODEX_MANAGED_ENV {
                 command.env_remove(name);

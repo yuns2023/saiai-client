@@ -969,10 +969,16 @@ fn strip_rust_comments(text: &str) -> String {
 }
 
 /// Removes every item annotated exactly `#[cfg(test)]` (module, fn, use, …)
-/// and every standalone `#[test]` / `#[tokio::test]` function, matching
-/// braces outside literals, and keeps everything after it.
+/// and every standalone `#[test]` / `#[tokio::test]` / `#[tokio::test(…)]`
+/// function, matching braces outside literals, and keeps everything after it.
+/// Other test attributes (`#[test_case]`, `#[rstest]`) are not recognized.
 fn remove_rust_test_items(text: &str) -> String {
-    const MARKERS: [&str; 3] = ["#[cfg(test)]", "#[test]", "#[tokio::test]"];
+    const MARKERS: [&str; 4] = [
+        "#[cfg(test)]",
+        "#[test]",
+        "#[tokio::test]",
+        "#[tokio::test(",
+    ];
     let mask = literal_mask(text);
     let in_literal = |index: usize| mask[index];
     let mut output = String::new();
@@ -1875,6 +1881,10 @@ fn saiai_brand_values_are_frozen() {
     assert_eq!(update.candidate_prefix, ".saiai-update-");
     assert_eq!(update.backup_prefix, "saiai.bak-");
     assert_eq!(update.status_filename, ".saiai-update-status.txt");
+    assert_eq!(
+        update.windows_setup_command,
+        "irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai"
+    );
     let markers = &brand.markers;
     assert_eq!(
         markers.codex_ide_env_begin,
@@ -2136,8 +2146,9 @@ const SAIAI_NAMING_FILES: [&str; 4] = [
 ];
 
 /// Production lines elsewhere that still contain `saiai` (any case), one
-/// `file<TAB>line` per occurrence, whitespace collapsed. The list may only
-/// shrink: names move to `Brand`, they never come back.
+/// `file<TAB>line` per occurrence, whitespace collapsed. The test requires
+/// the list to equal the code exactly; that it only ever shrinks is enforced
+/// by review of this file's diff, not by the test.
 const SAIAI_RESIDUE: &str = include_str!("brand_residue.txt");
 
 fn saiai_residue_lines() -> Vec<String> {
@@ -2198,6 +2209,8 @@ fn standalone() { let _ = "SAIAI fixture { }"; }
 #[tokio::test]
 #[ignore]
 async fn standalone_async() { if true { } }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flavored_async() { let _ = ("SAIAI flavored", [1]); }
 const MARKER_IN_TEXT: &str = "#[test] fn not_an_item() {}";
 #[test_case(1)]
 fn parameterized_kept(value: u8) {}
@@ -2210,6 +2223,8 @@ fn kept_after() {}
         "standalone",
         "SAIAI fixture",
         "standalone_async",
+        "flavored_async",
+        "SAIAI flavored",
         "mod tests",
     ] {
         assert!(!kept.contains(gone), "{gone} survived:\n{kept}");
@@ -2222,4 +2237,271 @@ fn kept_after() {}
     ] {
         assert!(kept.contains(present), "{present} lost:\n{kept}");
     }
+}
+
+// ------------------------------------------------------- brand-neutral text
+
+/// Brand placeholders in production format strings, the SAIAI text each one
+/// stands for, and the named argument that must bind it in the same call.
+const BRAND_TEXT_TOKENS: [(&str, &str, &str); 6] = [
+    (
+        "{brand_product}",
+        "SAIAI",
+        "brand_product = BRAND.product_name",
+    ),
+    (
+        "{brand_binary}",
+        "saiai",
+        "brand_binary = BRAND.binary_name",
+    ),
+    (
+        "{brand_skip_start_env}",
+        "SAIAI_SKIP_START",
+        "brand_skip_start_env = BRAND.env.skip_start",
+    ),
+    (
+        "{brand_desktop_bin_env}",
+        "SAIAI_DESKTOP_BIN",
+        "brand_desktop_bin_env = BRAND.env.desktop_bin",
+    ),
+    (
+        "{brand_windows_setup}",
+        "irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai",
+        "brand_windows_setup = BRAND.update.windows_setup_command",
+    ),
+    (
+        "{brand_allow_untested_env}",
+        "SAIAI_CLAUDE_DESKTOP_ALLOW_UNTESTED",
+        "brand_allow_untested_env = BRAND.env.claude_desktop_allow_untested",
+    ),
+];
+
+/// Every production string literal that renders SAIAI text, as
+/// `["file", "literal source"]` JSON lines, frozen before the text moved to
+/// `Brand`. A literal whose brand placeholders are put back to the SAIAI
+/// values must reproduce one of these exactly; with the SAIAI brand the
+/// program therefore prints the same bytes.
+const BRAND_TEXT_GOLDEN: &str = include_str!("brand_text_golden.txt");
+
+/// Text that scripts, tests or tools outside this crate parse; each must stay
+/// in the frozen set (the consumer is named for the reviewer).
+const BRAND_TEXT_CONTRACTS: [(&str, &str, &str); 11] = [
+    (
+        "lib.rs",
+        "\"SAIAI LaunchAgent started.\"",
+        "scripts/saiai-cli/test-macos-service.py",
+    ),
+    (
+        "lib.rs",
+        "\"SAIAI background proxy started or refreshed.\"",
+        "scripts/saiai-cli/test-linux-service.py",
+    ),
+    (
+        "lib.rs",
+        "\"SAIAI background proxy stopped.\"",
+        "scripts/saiai-cli/test-linux-service.py",
+    ),
+    (
+        "lib.rs",
+        "\"SAIAI configured Codex for local-proxy OAuth mode.\"",
+        "scripts/saiai-cli/verify-release.py",
+    ),
+    (
+        "lib.rs",
+        "\"SAIAI local proxy start skipped (SAIAI_SKIP_START=1).\"",
+        "tools/saiai-cli/tests/saiai_brand_contract.rs",
+    ),
+    (
+        "lib.rs",
+        "\"Starting ChatGPT Desktop through the SAIAI local proxy.\"",
+        "scripts/saiai-cli/test-macos-service.py",
+    ),
+    (
+        "lib.rs",
+        "\"Starting OpenAI Desktop through the SAIAI local proxy.\"",
+        "scripts/saiai-cli/test-windows-runtime.ps1",
+    ),
+    (
+        "uninstall.rs",
+        "\"SAIAI home: {}\"",
+        "scripts/saiai-cli/test-setup-wrappers.sh",
+    ),
+    (
+        "uninstall.rs",
+        "\"SAIAI uninstall plan\"",
+        "scripts/saiai-cli/setup.sh, setup.ps1",
+    ),
+    (
+        "lib.rs",
+        "\"SAIAI Desktop scope: Codex only; the official ChatGPT sidebar, ordinary Chat history, and settings are not supported.\"",
+        "scripts/saiai-cli/test-macos-service.py",
+    ),
+    (
+        "lib.rs",
+        "\"Trusted the SAIAI CA in the current user's NSS database for direct Linux Desktop (no system trust store or dialog).\"",
+        "scripts/saiai-cli/test-initialization-scope.py (must not appear)",
+    ),
+];
+
+/// Top-level arguments of a call between `from` and `end` (the text after
+/// its format literal), each with whitespace collapsed. Not a Rust parser:
+/// commas inside generics or closure parameters also split; that is enough
+/// to find a standalone `name = BRAND.field` argument, the only use.
+fn call_arguments(
+    text: &str,
+    literals: &[std::ops::Range<usize>],
+    from: usize,
+    end: usize,
+) -> Vec<String> {
+    let mut arguments = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0_usize;
+    let mut index = from;
+    while index < end {
+        if let Some(range) = literals.iter().find(|range| range.start == index) {
+            current.push_str(&text[range.clone()]);
+            index = range.end;
+            continue;
+        }
+        let ch = text[index..].chars().next().unwrap();
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                arguments.push(std::mem::take(&mut current));
+                index += 1;
+                continue;
+            }
+            _ => {}
+        }
+        current.push(ch);
+        index += ch.len_utf8();
+    }
+    arguments.push(current);
+    arguments
+        .iter()
+        .map(|argument| argument.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|argument| !argument.is_empty())
+        .collect()
+}
+
+/// End of the call whose arguments start at `from`: the `)` that closes it.
+fn enclosing_call_end(text: &str, literals: &[std::ops::Range<usize>], from: usize) -> usize {
+    let mut depth = 0_usize;
+    let mut index = from;
+    while index < text.len() {
+        if let Some(range) = literals.iter().find(|range| range.start == index) {
+            index = range.end;
+            continue;
+        }
+        match text.as_bytes()[index] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' if depth == 0 => return index,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    text.len()
+}
+
+/// Production literals that render SAIAI text, with brand placeholders put
+/// back to the SAIAI values; panics if a placeholder is not bound to its
+/// `Brand` field in the same call.
+fn rendered_brand_text() -> Vec<(String, String)> {
+    let mut rendered = Vec::new();
+    for (file, text) in cli_sources() {
+        if SAIAI_NAMING_FILES.contains(&file.as_str()) || !file.ends_with(".rs") {
+            continue;
+        }
+        let literals = rust_literal_ranges(&text);
+        for range in &literals {
+            let literal = &text[range.clone()];
+            let mut restored = literal.to_string();
+            let mut bound = None;
+            for (token, saiai, binding) in BRAND_TEXT_TOKENS {
+                if !literal.contains(token) {
+                    continue;
+                }
+                // A top-level argument exactly `name = BRAND.field`: the
+                // value printed is the field itself, nothing derived from it.
+                let arguments = bound.get_or_insert_with(|| {
+                    let end = enclosing_call_end(&text, &literals, range.end);
+                    call_arguments(&text, &literals, range.end, end)
+                });
+                assert!(
+                    arguments.iter().any(|argument| argument == binding),
+                    "{file}: {token} in {literal} is not bound by exactly `{binding}`"
+                );
+                restored = restored.replace(token, saiai);
+            }
+            if restored.to_ascii_lowercase().contains("saiai") {
+                rendered.push((file.clone(), restored));
+            }
+        }
+    }
+    rendered.sort();
+    rendered
+}
+
+#[test]
+fn brand_text_renders_the_frozen_saiai_bytes() {
+    // The placeholders stand for these SAIAI values only if the brand has them.
+    let brand = crate::brand::brand();
+    for (token, saiai, _) in BRAND_TEXT_TOKENS {
+        let value = match token {
+            "{brand_product}" => brand.product_name,
+            "{brand_binary}" => brand.binary_name,
+            "{brand_skip_start_env}" => brand.env.skip_start,
+            "{brand_desktop_bin_env}" => brand.env.desktop_bin,
+            "{brand_windows_setup}" => brand.update.windows_setup_command,
+            "{brand_allow_untested_env}" => brand.env.claude_desktop_allow_untested,
+            other => panic!("unknown brand placeholder {other}"),
+        };
+        assert_eq!(value, saiai, "{token}");
+    }
+    let mut golden: Vec<(String, String)> = BRAND_TEXT_GOLDEN
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    golden.sort();
+    let rendered = rendered_brand_text();
+    if rendered != golden {
+        let lines: Vec<String> = rendered
+            .iter()
+            .map(|entry| serde_json::to_string(entry).unwrap())
+            .collect();
+        panic!(
+            "SAIAI text differs from brand_text_golden.txt; rendered now:\n{}",
+            lines.join("\n")
+        );
+    }
+    for (file, literal, consumer) in BRAND_TEXT_CONTRACTS {
+        assert!(
+            golden.contains(&(file.to_string(), literal.to_string())),
+            "{file}: {literal} (parsed by {consumer}) is not frozen"
+        );
+    }
+}
+
+#[test]
+fn call_arguments_finds_standalone_named_arguments() {
+    let text = r#"format!(
+        "{brand_product} at {}, {x}",
+        f(a, "b, c"),
+        brand_product = BRAND.product_name.to_ascii_lowercase(),
+        x = [1, 2].len()
+    ) + g(brand_binary = BRAND.binary_name)"#;
+    let literals = rust_literal_ranges(text);
+    let format_literal = literals[0].clone();
+    let end = enclosing_call_end(text, &literals, format_literal.end);
+    assert_eq!(
+        call_arguments(text, &literals, format_literal.end, end),
+        [
+            r#"f(a, "b, c")"#,
+            "brand_product = BRAND.product_name.to_ascii_lowercase()",
+            "x = [1, 2].len()",
+        ]
+    );
 }

@@ -18,6 +18,7 @@
 //! pooled connections never outlive a route change, while established tunnels
 //! and WebSockets keep their route until they close.
 
+use crate::brand::BRAND;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use std::collections::HashMap;
@@ -513,7 +514,11 @@ fn policy_from_inputs(inputs: &Inputs, listen: Option<SocketAddr>) -> (Policy, S
     match mode {
         Mode::Direct => (Policy::Direct, "direct (configured)".to_string()),
         Mode::Fixed(endpoint) if endpoint.is_listener(listen) => {
-            let message = "the configured upstream proxy is this SAIAI proxy itself".to_string();
+            let message = format!(
+                "the configured upstream proxy is this {brand_product} proxy itself",
+                brand_product = BRAND.product_name
+            )
+            .to_string();
             (Policy::Unavailable(message.clone()), message)
         }
         Mode::Fixed(endpoint) => (
@@ -535,8 +540,12 @@ fn system_policy(env: &EnvProxies, os: &OsProxy, listen: Option<SocketAddr>) -> 
         let Some((name, value)) = entry else {
             return Ok(None);
         };
-        let endpoint =
-            Endpoint::parse(value).with_context(|| format!("{name} in the SAIAI environment"))?;
+        let endpoint = Endpoint::parse(value).with_context(|| {
+            format!(
+                "{name} in the {brand_product} environment",
+                brand_product = BRAND.product_name
+            )
+        })?;
         if endpoint.is_listener(listen) {
             ignored.push(*name);
             return Ok(None);
@@ -563,8 +572,9 @@ fn system_policy(env: &EnvProxies, os: &OsProxy, listen: Option<SocketAddr>) -> 
         String::new()
     } else {
         format!(
-            " (ignored {} pointing at this SAIAI proxy)",
-            ignored.join(", ")
+            " (ignored {} pointing at this {brand_product} proxy)",
+            ignored.join(", "),
+            brand_product = BRAND.product_name
         )
     };
     if !matches!((&https, &http), (Ok(None), Ok(None))) {
@@ -1231,7 +1241,8 @@ async fn open_tunnel(endpoint: &Endpoint, host: &str, port: u16) -> Result<TcpSt
     match status {
         200..=299 => Ok(stream),
         407 => bail!(
-            "upstream proxy {endpoint} requires authentication (407); SAIAI supports Basic credentials in the proxy URL"
+            "upstream proxy {endpoint} requires authentication (407); {brand_product} supports Basic credentials in the proxy URL",
+            brand_product = BRAND.product_name
         ),
         status => bail!("upstream proxy {endpoint} refused the tunnel to {target} (HTTP {status})"),
     }
@@ -1299,9 +1310,11 @@ fn pac_decision(
         Ok(None) => (Ok(Route::Direct), false),
         Ok(Some(list)) => (
             match first_proxy(&list) {
-                Some(endpoint) if endpoint.is_listener(listen) => {
-                    Err("proxy auto-configuration returned this SAIAI proxy itself".to_string())
-                }
+                Some(endpoint) if endpoint.is_listener(listen) => Err(format!(
+                    "proxy auto-configuration returned this {brand_product} proxy itself",
+                    brand_product = BRAND.product_name
+                )
+                .to_string()),
                 Some(endpoint) => Ok(Route::Proxy(endpoint)),
                 None => Err("proxy auto-configuration returned no usable HTTP proxy".to_string()),
             },

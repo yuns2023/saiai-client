@@ -1,3 +1,4 @@
+use crate::brand::BRAND;
 use anyhow::{Context, Result, bail};
 use std::env;
 use std::net::SocketAddr;
@@ -56,17 +57,25 @@ pub(crate) const CONFLICTING_ENV: &[&str] = &[
 pub(crate) fn run(args: &[String]) -> Result<()> {
     let mut command = process_command()?;
     let config = read_saiai_config()
-        .context("SAIAI local proxy is not configured; run the SAIAI Claude setup first")?;
+        .with_context(|| format!("{brand_product} local proxy is not configured; run the {brand_product} Claude setup first", brand_product = BRAND.product_name))?;
     let token = claude_token(&config)?;
     validate_listen(&config.listen)?;
-    let _runtime_ca = read_runtime_ca(&config)
-        .context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
+    let _runtime_ca = read_runtime_ca(&config).with_context(|| {
+        format!(
+            "{brand_product} local proxy CA is unavailable; rerun the {brand_product} setup",
+            brand_product = BRAND.product_name
+        )
+    })?;
     // Shared proxy startup is product-neutral; check Claude's own settings on
     // every Claude launch, whether or not the proxy is already listening.
     warn_claude_settings_overrides();
     ensure_local_proxy_running_with_start(&config.listen, || {
-        let mut start =
-            Command::new(env::current_exe().context("failed to resolve SAIAI executable")?);
+        let mut start = Command::new(env::current_exe().with_context(|| {
+            format!(
+                "failed to resolve {brand_product} executable",
+                brand_product = BRAND.product_name
+            )
+        })?);
         apply_environment(&mut start, &config, token);
         // The service follows the user's own proxy for its egress; only the
         // Claude child is pointed at SAIAI.
@@ -77,16 +86,25 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .status()
-            .context("failed to start the SAIAI local proxy service")?;
+            .with_context(|| {
+                format!(
+                    "failed to start the {brand_product} local proxy service",
+                    brand_product = BRAND.product_name
+                )
+            })?;
         if !status.success() {
-            bail!("SAIAI local proxy service failed to start ({status})");
+            bail!(
+                "{brand_product} local proxy service failed to start ({status})",
+                brand_product = BRAND.product_name
+            );
         }
         Ok(())
     })?;
     apply_environment(&mut command, &config, token);
     command.args(args);
     eprintln!(
-        "Starting Claude with SAIAI child environment; explicit Claude settings still apply."
+        "Starting Claude with {brand_product} child environment; explicit Claude settings still apply.",
+        brand_product = BRAND.product_name
     );
 
     #[cfg(unix)]
@@ -107,20 +125,32 @@ fn claude_token(config: &SaiaiConfig) -> Result<&str> {
     } else if config.providers.is_empty() {
         &config.api_key
     } else {
-        bail!("SAIAI Claude route is not configured; run the SAIAI Claude setup first");
+        bail!(
+            "{brand_product} Claude route is not configured; run the {brand_product} Claude setup first",
+            brand_product = BRAND.product_name
+        );
     };
     if token.trim().is_empty() {
-        bail!("SAIAI Claude Key is missing; rerun the SAIAI Claude setup");
+        bail!(
+            "{brand_product} Claude Key is missing; rerun the {brand_product} Claude setup",
+            brand_product = BRAND.product_name
+        );
     }
     Ok(token)
 }
 
 fn validate_listen(listen: &str) -> Result<()> {
-    let address = listen
-        .parse::<SocketAddr>()
-        .context("invalid SAIAI local proxy listen address")?;
+    let address = listen.parse::<SocketAddr>().with_context(|| {
+        format!(
+            "invalid {brand_product} local proxy listen address",
+            brand_product = BRAND.product_name
+        )
+    })?;
     if !address.ip().is_loopback() || address.port() == 0 {
-        bail!("SAIAI local proxy must listen on a nonzero loopback port");
+        bail!(
+            "{brand_product} local proxy must listen on a nonzero loopback port",
+            brand_product = BRAND.product_name
+        );
     }
     Ok(())
 }

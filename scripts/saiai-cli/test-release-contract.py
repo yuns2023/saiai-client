@@ -170,6 +170,18 @@ class OptionalClaudeContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, "forbidden behavior"):
                     self.verify(launcher=self.inject(behavior))
 
+    def test_accepts_only_brand_names_in_diagnostics(self) -> None:
+        self.verify(launcher=self.inject('eprintln!("{brand_product} via {brand_binary}", brand_product = BRAND.product_name, brand_binary = BRAND.binary_name);'))
+        for behavior in (
+            'eprintln!("{brand_product}", brand_product = config.api_key);',
+            'eprintln!("{brand_product} {token}", brand_product = BRAND.product_name);',
+            'eprintln!("{brand_product}");',
+            'eprintln!("{brand_product} {brand_binary}", brand_product = BRAND.product_name);',
+        ):
+            with self.subTest(behavior=behavior):
+                with self.assertRaisesRegex(AssertionError, "interpolate credentials"):
+                    self.verify(launcher=self.inject(behavior))
+
     def test_rejects_dynamic_secret_diagnostics(self) -> None:
         for behavior in ('eprintln!("{token}");', 'eprint!("{}", token);', 'dbg!(config);'):
             with self.subTest(behavior=behavior):

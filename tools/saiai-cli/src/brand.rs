@@ -65,7 +65,10 @@ fn validate(brand: &Brand) -> Result<()> {
             bail!("brand sensitive_inbound_headers entry is not a usable header name: {name:?}");
         }
     }
-    // Embedded verbatim in JSON answers and messages.
+    // Embedded verbatim in JSON answers and messages. A conservative limit
+    // because those answers are assembled by hand (`format!`) rather than
+    // serialized; a display name could be JSON-escaped instead if a brand
+    // ever needs other characters.
     for (field, value, valid) in [
         (
             "binary_name",
@@ -150,6 +153,24 @@ impl Deref for ActiveBrand {
 
     fn deref(&self) -> &Brand {
         brand()
+    }
+}
+
+/// Program text that names the brand, rendered from the installed brand
+/// each time it is printed. A constant of this type works where a `&str`
+/// constant did in format arguments (`{USAGE}`) and as an error message.
+#[derive(Clone, Copy)]
+pub(crate) struct BrandText(pub fn() -> String);
+
+impl fmt::Display for BrandText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&(self.0)(), formatter)
+    }
+}
+
+impl fmt::Debug for BrandText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&(self.0)(), formatter)
     }
 }
 
@@ -318,6 +339,9 @@ pub struct UpdateNames {
     pub backup_prefix: &'static str,
     /// Windows update helper result next to the executable.
     pub status_filename: &'static str,
+    /// PowerShell command that downloads and loads the public setup script,
+    /// shown in messages; append a subcommand (`… uninstall`) to run it.
+    pub windows_setup_command: &'static str,
 }
 
 pub struct OwnershipMarkers {
@@ -379,6 +403,19 @@ pub struct ClientProofNames {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `BrandText` constant prints exactly like the `&str` constant it
+    /// replaced: plain, padded, debug-quoted and as an error message.
+    #[test]
+    fn brand_text_prints_like_the_string_it_renders() {
+        const TEXT: BrandText = BrandText(|| "SAIAI \"local\" proxy".to_string());
+        let text = "SAIAI \"local\" proxy";
+        assert_eq!(format!("{TEXT}"), format!("{text}"));
+        assert_eq!(format!("[{TEXT:>30}]"), format!("[{text:>30}]"));
+        assert_eq!(format!("{TEXT:?}"), format!("{text:?}"));
+        assert_eq!(anyhow::anyhow!(TEXT).to_string(), text);
+        assert_eq!(format!("{:#}", anyhow::anyhow!(TEXT)), text);
+    }
 
     // A local slot: the process-wide brand is never installed by tests.
     #[test]
