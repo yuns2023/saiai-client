@@ -1223,6 +1223,35 @@ fn helper_environment_variables_are_written_and_read() {
                 .starts_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_')
         })
     };
+    // Exactly these helper variables exist: none may be added unregistered.
+    let mut found = BTreeSet::new();
+    for text in sources.values() {
+        for (marker, terminator) in [("script_brand::env(\"", '"'), ("$env:@@ENV@@", ' ')] {
+            for (index, _) in text.match_indices(marker) {
+                let rest = &text[index + marker.len()..];
+                let suffix = if terminator == '"' {
+                    rest.split('"').next().unwrap_or_default().to_string()
+                } else {
+                    rest.chars()
+                        .take_while(|ch| {
+                            ch.is_ascii_uppercase() || ch.is_ascii_digit() || *ch == '_'
+                        })
+                        .collect()
+                };
+                // The failure marker is a line prefix, not a variable.
+                if suffix != "DESKTOP_HELPER_FAILURE:" {
+                    found.insert(format!("SAIAI_{suffix}"));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        found,
+        expected
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect::<BTreeSet<_>>()
+    );
     for (name, files) in expected {
         let suffix = name.strip_prefix("SAIAI_").unwrap();
         assert_eq!(crate::script_brand::env(suffix), *name);
