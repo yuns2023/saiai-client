@@ -968,21 +968,27 @@ fn strip_rust_comments(text: &str) -> String {
     output
 }
 
-/// Removes every item annotated exactly `#[cfg(test)]` (module, fn, use, …),
-/// matching braces outside literals, and keeps everything after it.
+/// Removes every item annotated exactly `#[cfg(test)]` (module, fn, use, …)
+/// and every standalone `#[test]` / `#[tokio::test]` function, matching
+/// braces outside literals, and keeps everything after it.
 fn remove_rust_test_items(text: &str) -> String {
+    const MARKERS: [&str; 3] = ["#[cfg(test)]", "#[test]", "#[tokio::test]"];
     let mask = literal_mask(text);
     let in_literal = |index: usize| mask[index];
     let mut output = String::new();
     let mut copied = 0;
     let mut search = 0;
-    while let Some(found) = text[search..].find("#[cfg(test)]") {
+    while let Some((found, marker)) = MARKERS
+        .iter()
+        .filter_map(|marker| text[search..].find(marker).map(|found| (found, marker)))
+        .min()
+    {
         let start = search + found;
         if in_literal(start) {
             search = start + 1;
             continue;
         }
-        let mut index = start + "#[cfg(test)]".len();
+        let mut index = start + marker.len();
         // Braces end an item body; `;` ends an item only outside any
         // bracket, so `fn f(x: [u8; 1])` is not cut at the array length.
         let (mut braces, mut nested) = (0_usize, 0_usize);
@@ -1348,13 +1354,18 @@ fn inline_contract_literals_are_present() {
             "lib.rs",
             "binary_changed_during_initialization(env::var(BRAND.env.binary_updated)",
         ),
-        // Desktop synthetic identity returned by the local sidecars.
+        // Desktop synthetic identity returned by the local sidecars: the email
+        // and the synthetic ids derived from the brand's prefix.
         (
             "local_proxy.rs",
-            "const SAIAI_DESKTOP_EMAIL: crate::brand::BrandValue<&'static str> =\n    crate::brand::BrandValue(|brand| brand.placeholders.desktop_email);",
+            "const DESKTOP_EMAIL: crate::brand::BrandValue<&'static str> =\n    crate::brand::BrandValue(|brand| brand.placeholders.desktop_email);",
         ),
-        ("local_proxy.rs", "\"userID\":\"saiai-local-proxy-user\""),
-        ("local_proxy.rs", "\"stableID\":\"saiai-local-proxy\""),
+        ("local_proxy.rs", "\"userID\":\"@@ID@@-proxy-user\""),
+        ("local_proxy.rs", "\"stableID\":\"@@ID@@-proxy\""),
+        (
+            "local_proxy.rs",
+            "DESKTOP_STATSIG_LOCAL_TEMPLATE.replace(\"@@ID@@\", brand.placeholders.synthetic_id_prefix)",
+        ),
         // The restored-preference marker: the forwarder writes the header the
         // Native Chat capability names, and SAIAI names its brand header.
         (
@@ -1799,6 +1810,7 @@ fn only_the_program_names_the_saiai_brand() {
 fn saiai_brand_values_are_frozen() {
     let brand = crate::brand::BRAND;
     assert_eq!(brand.binary_name, "saiai");
+    assert_eq!(brand.product_name, "SAIAI");
     assert_eq!(brand.home_dir_name, ".saiai");
     assert_eq!(brand.windows_app_dir_name, "SAIAI");
     assert_eq!(brand.config.filename, "config.json");
@@ -1887,6 +1899,7 @@ fn saiai_brand_values_are_frozen() {
         placeholders.desktop_email,
         "saiai-local-proxy@example.invalid"
     );
+    assert_eq!(placeholders.synthetic_id_prefix, "saiai-local");
     let proof = &brand.client_proof;
     assert_eq!(proof.header, "x-saiai-client-proof");
     assert_eq!(proof.message_domain, "saiai-client-proof-v1");
@@ -2111,4 +2124,102 @@ fn windows_desktop_runtime_directory_is_frozen() {
         lines.next().unwrap(),
         format!(r"{base}\SAIAI\desktop-runtime")
     );
+}
+
+/// Files that may name SAIAI: its brand values, its Gateway extension, the
+/// client proof (moves out in C4), and the SAIAI program entry point.
+const SAIAI_NAMING_FILES: [&str; 4] = [
+    "brand_saiai.rs",
+    "gateway_saiai.rs",
+    "client_proof.rs",
+    "main.rs",
+];
+
+/// Production lines elsewhere that still contain `saiai` (any case), one
+/// `file<TAB>line` per occurrence, whitespace collapsed. The list may only
+/// shrink: names move to `Brand`, they never come back.
+const SAIAI_RESIDUE: &str = include_str!("brand_residue.txt");
+
+fn saiai_residue_lines() -> Vec<String> {
+    let mut lines = Vec::new();
+    for (file, text) in cli_sources() {
+        if SAIAI_NAMING_FILES.contains(&file.as_str()) {
+            continue;
+        }
+        for line in text.lines() {
+            if line.to_ascii_lowercase().contains("saiai") {
+                let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+                lines.push(format!("{file}\t{line}"));
+            }
+        }
+    }
+    lines.sort();
+    lines
+}
+
+#[test]
+fn saiai_names_outside_the_brand_only_shrink() {
+    let mut expected: Vec<String> = SAIAI_RESIDUE
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    expected.sort();
+    let actual = saiai_residue_lines();
+    let added: Vec<_> = actual
+        .iter()
+        .filter(|line| !expected.contains(line))
+        .collect();
+    let removed: Vec<_> = expected
+        .iter()
+        .filter(|line| !actual.contains(line))
+        .collect();
+    assert!(
+        added.is_empty() && removed.is_empty() && actual == expected,
+        "SAIAI name residue changed.\nNew (read the value from Brand instead):\n{}\nGone (delete from brand_residue.txt):\n{}",
+        added
+            .iter()
+            .map(|line| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        removed
+            .iter()
+            .map(|line| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+}
+
+#[test]
+fn production_text_drops_test_items_and_keeps_production_code() {
+    let source = r##"fn kept_before() {}
+#[test]
+fn standalone() { let _ = "SAIAI fixture { }"; }
+#[tokio::test]
+#[ignore]
+async fn standalone_async() { if true { } }
+const MARKER_IN_TEXT: &str = "#[test] fn not_an_item() {}";
+#[test_case(1)]
+fn parameterized_kept(value: u8) {}
+#[cfg(test)]
+mod tests { fn inner() {} }
+fn kept_after() {}
+"##;
+    let kept = remove_rust_test_items(source);
+    for gone in [
+        "standalone",
+        "SAIAI fixture",
+        "standalone_async",
+        "mod tests",
+    ] {
+        assert!(!kept.contains(gone), "{gone} survived:\n{kept}");
+    }
+    for present in [
+        "fn kept_before() {}",
+        r##"const MARKER_IN_TEXT: &str = "#[test] fn not_an_item() {}";"##,
+        "#[test_case(1)]\nfn parameterized_kept(value: u8) {}",
+        "fn kept_after() {}",
+    ] {
+        assert!(kept.contains(present), "{present} lost:\n{kept}");
+    }
 }

@@ -37,8 +37,11 @@ mod claude_desktop;
 #[cfg(test)]
 #[path = "local_proxy_ingress_tests.rs"]
 mod ingress_tests;
+#[cfg(test)]
+#[path = "local_proxy_synthetic_tests.rs"]
+mod synthetic_tests;
 
-use crate::brand::BRAND;
+use crate::brand::{BRAND, Brand};
 use crate::gateway::{
     self, ConfiguredRoute, GatewayExtension, GatewayHttp, GatewaySession, GatewayStart,
     NativeChatProtocol, SignInput, Transport,
@@ -82,7 +85,7 @@ pub(crate) const CERTIFICATE_SPKI_HEADER: crate::brand::BrandValue<&'static str>
     crate::brand::BrandValue(|brand| brand.certificates.spki_header);
 const CHATGPT_CHAT_PASSTHROUGH_ENV: crate::brand::BrandValue<&'static str> =
     crate::brand::BrandValue(|brand| brand.env.chatgpt_chat_passthrough);
-const SAIAI_DESKTOP_EMAIL: crate::brand::BrandValue<&'static str> =
+const DESKTOP_EMAIL: crate::brand::BrandValue<&'static str> =
     crate::brand::BrandValue(|brand| brand.placeholders.desktop_email);
 const DESKTOP_STATSIG_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 // Codex Desktop 26.908.4834.0 / Statsig JS 3.33.4 gates bundled locale
@@ -90,7 +93,10 @@ const DESKTOP_STATSIG_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 // narrow: it enables i18n and, unless disabled, Desktop browser and Computer
 // Use control. It does not opt the synthetic SAIAI identity into unrelated
 // hosted experiments or send it to the Statsig control plane.
-const DESKTOP_STATSIG_LOCAL_PAYLOAD: &str = r#"{"feature_gates":{},"dynamic_configs":{},"layer_configs":{"72216192":{"name":"72216192","value":{"enable_i18n":true},"rule_id":"saiai-local-i18n","secondary_exposures":[],"is_user_in_experiment":false,"is_experiment_active":false,"allocated_experiment_name":"","explicit_parameters":["enable_i18n"],"undelegated_secondary_exposures":[]}},"has_updates":true,"time":0,"user":{"userID":"saiai-local-proxy-user","customIDs":{"stableID":"saiai-local-proxy"}}}"#;
+const DESKTOP_STATSIG_LOCAL_TEMPLATE: &str = r#"{"feature_gates":{},"dynamic_configs":{},"layer_configs":{"72216192":{"name":"72216192","value":{"enable_i18n":true},"rule_id":"@@ID@@-i18n","secondary_exposures":[],"is_user_in_experiment":false,"is_experiment_active":false,"allocated_experiment_name":"","explicit_parameters":["enable_i18n"],"undelegated_secondary_exposures":[]}},"has_updates":true,"time":0,"user":{"userID":"@@ID@@-proxy-user","customIDs":{"stableID":"@@ID@@-proxy"}}}"#;
+/// The local Statsig bootstrap with the brand's synthetic identifiers.
+static DESKTOP_STATSIG_LOCAL_PAYLOAD: LazyLock<String> =
+    LazyLock::new(|| desktop_statsig_local_payload(crate::brand::brand()));
 // Desktop only offers its node_repl control tools to a thread when one of
 // these Statsig gates is on; with none of them the model sees no browser or
 // Computer Use tool at all. 410262010 = in-app browser, 410065390 = Chrome/Edge
@@ -111,8 +117,9 @@ const DESKTOP_CONTROL_GATES: [&str; 5] = [
 ];
 const DESKTOP_BROWSER_USE_ENV: crate::brand::BrandValue<&'static str> =
     crate::brand::BrandValue(|brand| brand.env.desktop_browser_use);
-static DESKTOP_STATSIG_BROWSER_PAYLOAD: LazyLock<String> =
-    LazyLock::new(|| desktop_statsig_base(DesktopFeatures { browser_use: true }).to_string());
+static DESKTOP_STATSIG_BROWSER_PAYLOAD: LazyLock<String> = LazyLock::new(|| {
+    desktop_statsig_base(crate::brand::brand(), DesktopFeatures { browser_use: true }).to_string()
+});
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(600);
 // Match the Gateway's default ingress ceiling. Buffer only bytes received,
@@ -3045,7 +3052,7 @@ fn chatgpt_sidecar_response_with(
         "/backend-api/notifications/settings" | "/notifications/settings" => Some(StaticResponse {
                 status: StatusCode::NOT_IMPLEMENTED,
                 content_type: "application/json",
-                body: br#"{"error":{"type":"desktop_notification_settings_unsupported","message":"Notification settings are unavailable through SAIAI Desktop."}}"#,
+                body: DESKTOP_NOTIFICATION_SETTINGS_UNSUPPORTED.as_bytes(),
                 reason: "desktop_notification_settings_unsupported",
             }),
         _ if path.starts_with("/backend-api/wham/")
@@ -3064,11 +3071,43 @@ fn chatgpt_sidecar_response_with(
     }
 }
 
+/// `{"error":{"type":…,"message":…}}` in this field order. Both values are
+/// fixed text or brand names restricted to plain characters (`brand::validate`).
+fn desktop_error_body(error_type: &str, message: &str) -> String {
+    format!(r#"{{"error":{{"type":"{error_type}","message":"{message}"}}}}"#)
+}
+
+static DESKTOP_NOTIFICATION_SETTINGS_UNSUPPORTED: LazyLock<String> = LazyLock::new(|| {
+    desktop_error_body(
+        "desktop_notification_settings_unsupported",
+        &format!(
+            "Notification settings are unavailable through {} Desktop.",
+            BRAND.product_name
+        ),
+    )
+});
+
+static DESKTOP_CONTROL_UNSUPPORTED: LazyLock<String> = LazyLock::new(|| {
+    desktop_error_body(
+        "desktop_control_unsupported",
+        &desktop_control_unsupported_message(&BRAND),
+    )
+});
+
+/// Message for a Desktop control endpoint the local proxy does not offer
+/// (Codex and Claude Desktop alike).
+pub(crate) fn desktop_control_unsupported_message(brand: &Brand) -> String {
+    format!(
+        "This Desktop control endpoint is unavailable through {}.",
+        brand.product_name
+    )
+}
+
 fn desktop_control_unsupported_response() -> StaticResponse {
     StaticResponse {
         status: StatusCode::NOT_IMPLEMENTED,
         content_type: "application/json",
-        body: br#"{"error":{"type":"desktop_control_unsupported","message":"This Desktop control endpoint is unavailable through SAIAI."}}"#,
+        body: DESKTOP_CONTROL_UNSUPPORTED.as_bytes(),
         reason: "desktop_control_unsupported",
     }
 }
@@ -3110,7 +3149,14 @@ fn chatgpt_account_sidecar_response_with(
     if is_desktop_identity_read_path(&path) && !request.method.eq_ignore_ascii_case("GET") {
         return Some((
             StatusCode::NOT_IMPLEMENTED,
-            br#"{"error":{"type":"desktop_identity_write_unsupported","message":"Hosted account changes are unavailable through SAIAI Desktop."}}"#.to_vec(),
+            desktop_error_body(
+                "desktop_identity_write_unsupported",
+                &format!(
+                    "Hosted account changes are unavailable through {} Desktop.",
+                    BRAND.product_name
+                ),
+            )
+            .into_bytes(),
             "desktop_identity_write_unsupported",
             &[],
         ));
@@ -3120,8 +3166,8 @@ fn chatgpt_account_sidecar_response_with(
         .or_else(|| oauth_claim_account_id(&request.headers))
         .or_else(desktop_account_id_fallback)
         .unwrap_or_else(|| "fixture-chatgpt-account".to_string());
-    let user_id = oauth_claim_user_id(&request.headers)
-        .unwrap_or_else(|| "saiai-local-proxy-user".to_string());
+    let user_id =
+        oauth_claim_user_id(&request.headers).unwrap_or_else(|| synthetic_user_id(&BRAND));
     if path == "/v1/initialize"
         && request.method.eq_ignore_ascii_case("POST")
         && request.body.len() <= DESKTOP_STATSIG_MAX_REQUEST_BYTES
@@ -3173,7 +3219,7 @@ fn chatgpt_account_sidecar_response_with(
             Some("initialize") => json!({"jsonrpc": "2.0", "id": id, "result": {
                 "protocolVersion": "2025-03-26",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "saiai-local", "version": "1"}
+                "serverInfo": {"name": BRAND.placeholders.synthetic_id_prefix, "version": "1"}
             }}),
             Some("tools/list") => json!({"jsonrpc": "2.0", "id": id, "result": {"tools": []}}),
             Some("ping") => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
@@ -3312,7 +3358,14 @@ fn chatgpt_account_sidecar_response_with(
         "/profiles/me" => {
             return Some((
                 StatusCode::NOT_IMPLEMENTED,
-                br#"{"error":{"type":"desktop_profile_update_unsupported","message":"Profile updates are unavailable through SAIAI Desktop."}}"#.to_vec(),
+                desktop_error_body(
+                    "desktop_profile_update_unsupported",
+                    &format!(
+                        "Profile updates are unavailable through {} Desktop.",
+                        BRAND.product_name
+                    ),
+                )
+                .into_bytes(),
                 "desktop_profile_update_unsupported",
                 &[],
             ));
@@ -3320,7 +3373,7 @@ fn chatgpt_account_sidecar_response_with(
         "/me" => json!({
             "id": account_id,
             "account_id": account_id,
-            "email": SAIAI_DESKTOP_EMAIL.get()
+            "email": DESKTOP_EMAIL.get()
         }),
         // The Desktop rate-limit/sidebar code dereferences this array even
         // when no checkout flow is enabled. Returning an empty collection is
@@ -3486,15 +3539,24 @@ fn desktop_statsig_user(input: &Value) -> Option<Value> {
     Some(user)
 }
 
-fn desktop_statsig_base(features: DesktopFeatures) -> Value {
-    let mut payload: Value =
-        serde_json::from_str(DESKTOP_STATSIG_LOCAL_PAYLOAD).expect("valid local Statsig payload");
+fn desktop_statsig_local_payload(brand: &Brand) -> String {
+    DESKTOP_STATSIG_LOCAL_TEMPLATE.replace("@@ID@@", brand.placeholders.synthetic_id_prefix)
+}
+
+/// User id of the synthetic Desktop identity when a request carries none.
+fn synthetic_user_id(brand: &Brand) -> String {
+    format!("{}-proxy-user", brand.placeholders.synthetic_id_prefix)
+}
+
+fn desktop_statsig_base(brand: &Brand, features: DesktopFeatures) -> Value {
+    let mut payload: Value = serde_json::from_str(&desktop_statsig_local_payload(brand))
+        .expect("valid local Statsig payload");
     if features.browser_use {
         for gate in DESKTOP_CONTROL_GATES {
             payload["feature_gates"][gate] = json!({
                 "name": gate,
                 "value": true,
-                "rule_id": "saiai-local-browser-use",
+                "rule_id": format!("{}-browser-use", brand.placeholders.synthetic_id_prefix),
                 "id_type": "userID",
                 "secondary_exposures": []
             });
@@ -3504,7 +3566,7 @@ fn desktop_statsig_base(features: DesktopFeatures) -> Value {
 }
 
 fn desktop_statsig_payload(user: Value, features: DesktopFeatures) -> Option<Value> {
-    let mut payload = desktop_statsig_base(features);
+    let mut payload = desktop_statsig_base(crate::brand::brand(), features);
     payload["user"] = user;
     Some(payload)
 }
@@ -4945,7 +5007,7 @@ mod tests {
         };
         let (_, body, _, _) = chatgpt_account_sidecar_response(&me).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["email"], SAIAI_DESKTOP_EMAIL.get());
+        assert_eq!(body["email"], DESKTOP_EMAIL.get());
 
         let accounts = IncomingRequest {
             method: "GET".to_string(),

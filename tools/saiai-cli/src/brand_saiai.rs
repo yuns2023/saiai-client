@@ -15,6 +15,7 @@ pub(crate) static SAIAI_BRAND: Brand = SAIAI_VALUES;
 
 pub(crate) const SAIAI_VALUES: Brand = Brand {
     binary_name: "saiai",
+    product_name: "SAIAI",
     home_dir_name: ".saiai",
     windows_app_dir_name: "SAIAI",
     config: ConfigNames {
@@ -78,6 +79,7 @@ pub(crate) const SAIAI_VALUES: Brand = Brand {
         claude_desktop_token_prefix: "saiai-desktop-claude-",
         claude_desktop_session_prefix: "saiai-local-",
         desktop_email: "saiai-local-proxy@example.invalid",
+        synthetic_id_prefix: "saiai-local",
     },
     client_proof: ClientProofNames {
         header: "x-saiai-client-proof",

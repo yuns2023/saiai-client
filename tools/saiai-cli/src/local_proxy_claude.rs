@@ -36,9 +36,26 @@ fn identity(state: &State) -> Result<Option<Identity>> {
         .map_err(|_| IdentityUnavailable.into())
 }
 
+static DESKTOP_IDENTITY_INVALID: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{{"error":"desktop_identity_invalid","message":"Repair the isolated Desktop identity file and relaunch {}"}}"#,
+        fixtures::desktop_claude_command(&BRAND)
+    )
+});
+
+static DESKTOP_IDENTITY_MISSING: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{{"error":"desktop_identity_missing","message":"Run {} to initialize this environment"}}"#,
+        fixtures::desktop_claude_command(&BRAND)
+    )
+});
+
 pub(super) fn auth_error(error: &anyhow::Error) -> (StatusCode, &'static [u8]) {
     if error.is::<IdentityUnavailable>() {
-        (StatusCode::SERVICE_UNAVAILABLE, br#"{"error":"desktop_identity_invalid","message":"Repair the isolated Desktop identity file and relaunch saiai desktop claude"}"#)
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            DESKTOP_IDENTITY_INVALID.as_bytes(),
+        )
     } else {
         (
             StatusCode::UNAUTHORIZED,
@@ -174,7 +191,7 @@ fn oauth(request: &IncomingRequest, path: &str, id: &Identity, now: Instant) -> 
         return if access_valid(request, id) {
             (
                 200,
-                json!({"account":{"email_address":"","display_name":"SAIAI Local Code"},"organization":fixtures::organization(id)}),
+                json!({"account":{"email_address":"","display_name":fixtures::local_code_name(&BRAND)},"organization":fixtures::organization(id)}),
             )
         } else {
             (401, json!({"error":"invalid_local_token"}))
@@ -506,7 +523,14 @@ pub(super) async fn handle<W: AsyncWrite + Unpin>(
     let id = match identity(state) {
         Ok(Some(id)) => id,
         Ok(None) => {
-            write_static_response(writer, StatusCode::SERVICE_UNAVAILABLE, "application/json", br#"{"error":"desktop_identity_missing","message":"Run saiai desktop claude to initialize this environment"}"#, close).await?;
+            write_static_response(
+                writer,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "application/json",
+                DESKTOP_IDENTITY_MISSING.as_bytes(),
+                close,
+            )
+            .await?;
             return Ok(true);
         }
         Err(error) => {
@@ -641,7 +665,7 @@ pub(super) async fn handle<W: AsyncWrite + Unpin>(
                     } else {
                         reply(
                             501,
-                            json!({"error":{"type":"desktop_control_unsupported","message":"This Desktop control endpoint is unavailable through SAIAI."}}),
+                            json!({"error":{"type":"desktop_control_unsupported","message":desktop_control_unsupported_message(&BRAND)}}),
                         )
                     }
                 }

@@ -1,4 +1,5 @@
 //! Versioned local control-plane patches for Desktop 4.23118.0.
+use crate::brand::{BRAND, Brand};
 use crate::claude_desktop::Identity;
 use serde_json::{Value, json};
 
@@ -37,14 +38,25 @@ pub(crate) fn classify(method: &str, path: &str, org: &str) -> Route {
     Route::Local
 }
 
+/// Display name of the local Claude account and organization.
+pub(crate) fn local_code_name(brand: &Brand) -> String {
+    format!("{} Local Code", brand.product_name)
+}
+
+/// The command that (re)launches the isolated Claude Desktop.
+pub(crate) fn desktop_claude_command(brand: &Brand) -> String {
+    format!("{} desktop claude", brand.binary_name)
+}
+
 pub(crate) fn account(id: &Identity) -> Value {
-    json!({"uuid":id.account,"email_address":"","full_name":"SAIAI Local Code","display_name":"SAIAI Local Code",
+    let name = local_code_name(&BRAND);
+    json!({"uuid":id.account,"email_address":"","full_name":name,"display_name":name,
         "created_at":"2026-01-01T00:00:00Z","has_consented_to_terms":true,"has_completed_onboarding":true,
         "is_verified":true,"settings":{"has_finished_claudeai_onboarding":true},
         "memberships":[{"role":"owner","organization":organization(id)}],"invites":[],"age_is_verified":true})
 }
 pub(crate) fn organization(id: &Identity) -> Value {
-    json!({"uuid":id.organization,"name":"SAIAI Local Code","capabilities":["chat","claude_pro","claude_code"],
+    json!({"uuid":id.organization,"name":local_code_name(&BRAND),"capabilities":["chat","claude_pro","claude_code"],
         "settings":{},"active_flags":[],"created_at":"2026-01-01T00:00:00Z","rate_limit_tier":"default_claude_ai"})
 }
 fn access() -> Value {
@@ -72,8 +84,9 @@ pub(crate) fn patch(
     Ok(())
 }
 pub(crate) fn selectors(models: &[Value], selection: &Value) -> Value {
-    json!([{"id":"code","revision":"saiai-local-1","models":models,"default_model":selection["model"]},
-        {"id":"chat","revision":"saiai-local-1","models":[],"default_model":null}])
+    let revision = format!("{}-1", BRAND.placeholders.synthetic_id_prefix);
+    json!([{"id":"code","revision":revision,"models":models,"default_model":selection["model"]},
+        {"id":"chat","revision":revision,"models":[],"default_model":null}])
 }
 
 pub(crate) fn local(method: &str, path: &str, id: &Identity) -> Option<(u16, Value)> {
@@ -86,7 +99,7 @@ pub(crate) fn local(method: &str, path: &str, id: &Identity) -> Option<(u16, Val
     if path == "/logout" || path == "/api/auth/logout" {
         return Some((
             200,
-            json!({"logged_out":true,"message":"Local session ended. Relaunch saiai desktop claude to reconnect."}),
+            json!({"logged_out":true,"message":format!("Local session ended. Relaunch {} to reconnect.", desktop_claude_command(&BRAND))}),
         ));
     }
     if path.contains("/completion")
@@ -98,7 +111,7 @@ pub(crate) fn local(method: &str, path: &str, id: &Identity) -> Option<(u16, Val
     {
         return Some((
             409,
-            json!({"error":{"type":"desktop_surface_unsupported","message":"SAIAI supports Code only. Open the Code tab; Chat and Cowork are not supported."}}),
+            json!({"error":{"type":"desktop_surface_unsupported","message":format!("{} supports Code only. Open the Code tab; Chat and Cowork are not supported.", BRAND.product_name)}}),
         ));
     }
     if method == "PUT" && path == "/v1/privacy-consents" {

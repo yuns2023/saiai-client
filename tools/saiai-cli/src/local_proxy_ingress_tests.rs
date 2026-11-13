@@ -1506,3 +1506,86 @@ async fn no_chat_relay_never_parses_the_device_cookie_nor_reads_preferences() {
         task.abort();
     }
 }
+
+/// Byte goldens of the Claude Desktop listener's own answers (frozen from
+/// the SAIAI build before their names moved to `Brand`). The organization
+/// id is a random UUID (`Identity::prepare`): only its format is frozen.
+#[tokio::test]
+async fn claude_desktop_local_answers_are_byte_identical() {
+    let root = tempfile::tempdir().unwrap();
+    let response = tls_request(
+        state(Some(root.path()), None),
+        EntryPoint::ClaudeDesktop,
+        "claude.ai",
+        b"GET /api/account HTTP/1.1\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(
+        String::from_utf8(response).unwrap(),
+        "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 104\r\nContent-Type: application/json\r\n\r\n{\"error\":\"desktop_identity_missing\",\"message\":\"Run saiai desktop claude to initialize this environment\"}"
+    );
+
+    let id = crate::claude_desktop::Identity::prepare(root.path()).unwrap();
+    let org = &id.organization;
+    assert!(
+        org.len() == 36
+            && org
+                .char_indices()
+                .all(|(index, ch)| if matches!(index, 8 | 13 | 18 | 23) {
+                    ch == '-'
+                } else {
+                    ch.is_ascii_hexdigit()
+                }),
+        "{org}"
+    );
+    let response = tls_request(
+        state(Some(root.path()), None),
+        EntryPoint::ClaudeDesktop,
+        ANTHROPIC_HOST,
+        format!(
+            "GET /api/oauth/profile HTTP/1.1\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            id.access_token
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        String::from_utf8(response)
+            .unwrap()
+            .replace(org.as_str(), "<ORG-UUID>"),
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 312\r\nContent-Type: application/json\r\n\r\n{\"account\":{\"display_name\":\"SAIAI Local Code\",\"email_address\":\"\"},\"organization\":{\"active_flags\":[],\"capabilities\":[\"chat\",\"claude_pro\",\"claude_code\"],\"created_at\":\"2026-01-01T00:00:00Z\",\"name\":\"SAIAI Local Code\",\"rate_limit_tier\":\"default_claude_ai\",\"settings\":{},\"uuid\":\"<ORG-UUID>\"}}"
+    );
+
+    let response = tls_request(
+        state(Some(root.path()), None),
+        EntryPoint::ClaudeDesktop,
+        "claude.ai",
+        format!(
+            "GET /api/zzz_unknown HTTP/1.1\r\nCookie: sessionKey={}\r\nConnection: close\r\n\r\n",
+            id.session
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        String::from_utf8(response).unwrap(),
+        "HTTP/1.1 501 Not Implemented\r\nConnection: close\r\nContent-Length: 120\r\nContent-Type: application/json\r\n\r\n{\"error\":{\"message\":\"This Desktop control endpoint is unavailable through SAIAI.\",\"type\":\"desktop_control_unsupported\"}}"
+    );
+
+    fs::write(
+        root.path().join("desktop/claude/state/identity.json"),
+        b"{MOCK_ONLY_BROKEN",
+    )
+    .unwrap();
+    let response = tls_request(
+        state(Some(root.path()), None),
+        EntryPoint::ClaudeDesktop,
+        "claude.ai",
+        b"GET /api/account HTTP/1.1\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(
+        String::from_utf8(response).unwrap(),
+        "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 124\r\nContent-Type: application/json\r\n\r\n{\"error\":\"desktop_identity_invalid\",\"message\":\"Repair the isolated Desktop identity file and relaunch saiai desktop claude\"}"
+    );
+}

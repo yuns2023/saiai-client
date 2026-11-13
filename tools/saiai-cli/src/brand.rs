@@ -65,6 +65,27 @@ fn validate(brand: &Brand) -> Result<()> {
             bail!("brand sensitive_inbound_headers entry is not a usable header name: {name:?}");
         }
     }
+    // Embedded verbatim in JSON answers and messages.
+    for (field, value, valid) in [
+        (
+            "binary_name",
+            brand.binary_name,
+            (|byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                as fn(u8) -> bool,
+        ),
+        ("product_name", brand.product_name, |byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'.')
+        }),
+        (
+            "placeholders.synthetic_id_prefix",
+            brand.placeholders.synthetic_id_prefix,
+            |byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-',
+        ),
+    ] {
+        if value.is_empty() || !value.bytes().all(valid) {
+            bail!("brand {field} may only use plain name characters: {value:?}");
+        }
+    }
     let env = &brand.env;
     for (field, name) in [
         ("env.home", env.home),
@@ -198,6 +219,9 @@ pub struct Brand {
     /// Executable name (without `.exe`); also the prefix printed by `--version`,
     /// followed by one space and the version.
     pub binary_name: &'static str,
+    /// Product name in messages and in the local proxy's synthetic Desktop
+    /// answers. Letters, digits, spaces, `-` and `.` only.
+    pub product_name: &'static str,
     /// Per-user data directory below the home directory.
     pub home_dir_name: &'static str,
     /// Windows per-user directory below `%LOCALAPPDATA%` (program, Desktop runtime).
@@ -315,6 +339,10 @@ pub struct PlaceholderIdentities {
     pub claude_desktop_token_prefix: &'static str,
     pub claude_desktop_session_prefix: &'static str,
     pub desktop_email: &'static str,
+    /// Prefix of the synthetic local identifiers in Desktop answers: the
+    /// MCP server name, Statsig rule ids, user and stable ids, and the
+    /// Claude model catalog revision. Lowercase letters, digits and `-`.
+    pub synthetic_id_prefix: &'static str,
 }
 
 /// Names the program's own helper scripts use (see `script_brand`).
@@ -389,7 +417,35 @@ mod tests {
             },
             ..SAIAI_VALUES
         };
-        for brand in [&BAD_DIRECTORY, &BAD_PREFIX, &BAD_ENV] {
+        // Names embedded verbatim in JSON answers and messages.
+        static BAD_PRODUCT: Brand = Brand {
+            product_name: "SAIAI\"}",
+            ..SAIAI_VALUES
+        };
+        static BAD_BINARY: Brand = Brand {
+            binary_name: "saiai start",
+            ..SAIAI_VALUES
+        };
+        static BAD_SYNTHETIC: Brand = Brand {
+            placeholders: PlaceholderIdentities {
+                synthetic_id_prefix: "Saiai-local",
+                ..SAIAI_VALUES.placeholders
+            },
+            ..SAIAI_VALUES
+        };
+        static EMPTY_PRODUCT: Brand = Brand {
+            product_name: "",
+            ..SAIAI_VALUES
+        };
+        for brand in [
+            &BAD_DIRECTORY,
+            &BAD_PREFIX,
+            &BAD_ENV,
+            &BAD_PRODUCT,
+            &BAD_BINARY,
+            &BAD_SYNTHETIC,
+            &EMPTY_PRODUCT,
+        ] {
             let slot = OnceLock::new();
             assert!(install_into(&slot, brand).is_err());
             assert!(slot.get().is_none());
