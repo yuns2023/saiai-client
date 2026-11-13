@@ -2013,7 +2013,7 @@ fn plan_windows_certificates(
     const SCRIPT: &str = r#"
 $ErrorActionPreference='Stop'
 $found=New-Object System.Collections.Generic.List[string]
-foreach($file in ($env:SAIAI_CA_FILES -split "`n")){
+foreach($file in ($env:@@ENV@@CA_FILES -split "`n")){
   if([string]::IsNullOrWhiteSpace($file)){continue}
   try{
     $pem=[IO.File]::ReadAllText($file)
@@ -2023,7 +2023,7 @@ foreach($file in ($env:SAIAI_CA_FILES -split "`n")){
     }
   }catch{}
 }
-foreach($t in ($env:SAIAI_CA_THUMBPRINTS -split "`n")){ $t=$t.Trim(); if($t -match '^[0-9A-Fa-f]{40}$'){ $found.Add($t.ToUpperInvariant()) } }
+foreach($t in ($env:@@ENV@@CA_THUMBPRINTS -split "`n")){ $t=$t.Trim(); if($t -match '^[0-9A-Fa-f]{40}$'){ $found.Add($t.ToUpperInvariant()) } }
 $present=@($found | Sort-Object -Unique | Where-Object { Test-Path -LiteralPath ('Cert:\CurrentUser\Root\'+$_) })
 ConvertTo-Json -Compress -InputObject $present
 "#;
@@ -2034,10 +2034,16 @@ ConvertTo-Json -Compress -InputObject $present
         .join("\n");
     let thumbprints = thumbprints.join("\n");
     let output = match powershell(
-        SCRIPT,
+        &crate::script_brand::render(SCRIPT),
         &[
-            ("SAIAI_CA_FILES", std::ffi::OsStr::new(&files)),
-            ("SAIAI_CA_THUMBPRINTS", std::ffi::OsStr::new(&thumbprints)),
+            (
+                crate::script_brand::env("CA_FILES").as_str(),
+                std::ffi::OsStr::new(&files),
+            ),
+            (
+                crate::script_brand::env("CA_THUMBPRINTS").as_str(),
+                std::ffi::OsStr::new(&thumbprints),
+            ),
         ],
         Duration::from_secs(60),
     ) {
@@ -2143,21 +2149,30 @@ $ErrorActionPreference='Stop'
 $k=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment',$true)
 try{
   $current=[string]$k.GetValue('Path',$null,'DoNotExpandEnvironmentNames')
-  if($current -cne $env:SAIAI_PATH_OLD -or [string]$k.GetValueKind('Path') -cne $env:SAIAI_PATH_KIND){throw 'the user PATH changed since the plan was shown'}
-  if([string]::IsNullOrEmpty($env:SAIAI_PATH_NEW)){$k.DeleteValue('Path',$false)}
-  else{$k.SetValue('Path',$env:SAIAI_PATH_NEW,[Microsoft.Win32.RegistryValueKind]$env:SAIAI_PATH_KIND)}
+  if($current -cne $env:@@ENV@@PATH_OLD -or [string]$k.GetValueKind('Path') -cne $env:@@ENV@@PATH_KIND){throw 'the user PATH changed since the plan was shown'}
+  if([string]::IsNullOrEmpty($env:@@ENV@@PATH_NEW)){$k.DeleteValue('Path',$false)}
+  else{$k.SetValue('Path',$env:@@ENV@@PATH_NEW,[Microsoft.Win32.RegistryValueKind]$env:@@ENV@@PATH_KIND)}
 }finally{$k.Close()}
-Add-Type -Namespace SaiaiUninstall -Name Native -MemberDefinition '[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'
+Add-Type -Namespace @@ID@@Uninstall -Name Native -MemberDefinition '[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'
 $result=[UIntPtr]::Zero
-[void][SaiaiUninstall.Native]::SendMessageTimeout([IntPtr]0xffff,0x1A,[UIntPtr]::Zero,'Environment',2,5000,[ref]$result)
+[void][@@ID@@Uninstall.Native]::SendMessageTimeout([IntPtr]0xffff,0x1A,[UIntPtr]::Zero,'Environment',2,5000,[ref]$result)
 'updated'
 "#;
     powershell(
-        SCRIPT,
+        &crate::script_brand::render(SCRIPT),
         &[
-            ("SAIAI_PATH_OLD", std::ffi::OsStr::new(value)),
-            ("SAIAI_PATH_NEW", std::ffi::OsStr::new(replacement)),
-            ("SAIAI_PATH_KIND", std::ffi::OsStr::new(kind)),
+            (
+                crate::script_brand::env("PATH_OLD").as_str(),
+                std::ffi::OsStr::new(value),
+            ),
+            (
+                crate::script_brand::env("PATH_NEW").as_str(),
+                std::ffi::OsStr::new(replacement),
+            ),
+            (
+                crate::script_brand::env("PATH_KIND").as_str(),
+                std::ffi::OsStr::new(kind),
+            ),
         ],
         Duration::from_secs(30),
     )?;
@@ -2171,14 +2186,17 @@ fn execute_root_ca(thumbprint: &str) -> Result<()> {
     }
     const SCRIPT: &str = r#"
 $ErrorActionPreference='Stop'
-$p='Cert:\CurrentUser\Root\'+$env:SAIAI_CA_THUMBPRINT
+$p='Cert:\CurrentUser\Root\'+$env:@@ENV@@CA_THUMBPRINT
 if(Test-Path -LiteralPath $p){ Remove-Item -LiteralPath $p }
 if(Test-Path -LiteralPath $p){ throw 'the certificate is still trusted' }
 'removed'
 "#;
     powershell(
-        SCRIPT,
-        &[("SAIAI_CA_THUMBPRINT", std::ffi::OsStr::new(thumbprint))],
+        &crate::script_brand::render(SCRIPT),
+        &[(
+            crate::script_brand::env("CA_THUMBPRINT").as_str(),
+            std::ffi::OsStr::new(thumbprint),
+        )],
         Duration::from_secs(120),
     )?;
     Ok(())
@@ -2243,15 +2261,15 @@ fn schedule_temporary_copy_removal() {
     // Paths travel in the environment, never through command text.
     const SCRIPT: &str = r#"
 Start-Sleep -Seconds 3
-foreach($file in ($env:SAIAI_CLEANUP_FILES -split "`n")){
+foreach($file in ($env:@@ENV@@CLEANUP_FILES -split "`n")){
   if([string]::IsNullOrWhiteSpace($file)){continue}
   Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
 }
-foreach($directory in ($env:SAIAI_CLEANUP_DIRS -split "`n")){
+foreach($directory in ($env:@@ENV@@CLEANUP_DIRS -split "`n")){
   if([string]::IsNullOrWhiteSpace($directory)){continue}
   try{[IO.Directory]::Delete($directory)}catch{}
 }
-Remove-Item -LiteralPath $env:SAIAI_CLEANUP_DIR -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $env:@@ENV@@CLEANUP_DIR -Recurse -Force -ErrorAction SilentlyContinue
 "#;
     let parked = PARKED.lock().unwrap();
     let files = parked
@@ -2271,11 +2289,14 @@ Remove-Item -LiteralPath $env:SAIAI_CLEANUP_DIR -Recurse -Force -ErrorAction Sil
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            SCRIPT,
+            crate::script_brand::render(SCRIPT).as_str(),
         ])
-        .env("SAIAI_CLEANUP_FILES", files)
-        .env("SAIAI_CLEANUP_DIRS", directories)
-        .env("SAIAI_CLEANUP_DIR", &directory)
+        .env(crate::script_brand::env("CLEANUP_FILES").as_str(), files)
+        .env(
+            crate::script_brand::env("CLEANUP_DIRS").as_str(),
+            directories,
+        )
+        .env(crate::script_brand::env("CLEANUP_DIR").as_str(), &directory)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

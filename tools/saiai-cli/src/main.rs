@@ -5,7 +5,7 @@ mod brand_saiai;
 
 use proxy_cli::{
     Brand, CertificateNames, ClientProofNames, ConfigNames, EnvironmentNames, GatewayProtocolNames,
-    OwnershipMarkers, PlaceholderIdentities, ServiceNames, UpdateNames,
+    OwnershipMarkers, PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
 };
 
 fn main() -> anyhow::Result<()> {

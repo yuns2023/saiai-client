@@ -39,12 +39,52 @@ pub(crate) fn install(brand: &'static Brand) -> Result<()> {
 }
 
 fn install_into(slot: &OnceLock<&'static Brand>, brand: &'static Brand) -> Result<()> {
+    // Reject an unusable brand before it occupies the slot or the program
+    // writes anything (a later failure could leave half-finished work).
+    validate(brand)?;
     let installed = *slot.get_or_init(|| brand);
     if !std::ptr::eq(installed, brand) {
         bail!(
             "this process already runs as {}; a different brand cannot be installed",
             installed.binary_name
         );
+    }
+    Ok(())
+}
+
+/// Values that are embedded in scripts, service files or environment
+/// variable positions must stay inert there.
+fn validate(brand: &Brand) -> Result<()> {
+    crate::script_brand::validate(brand)?;
+    let env = &brand.env;
+    for (field, name) in [
+        ("env.home", env.home),
+        ("env.install_dir", env.install_dir),
+        ("env.skip_start", env.skip_start),
+        ("env.binary_updated", env.binary_updated),
+        ("env.upstream_proxy", env.upstream_proxy),
+        ("env.chatgpt_timezone", env.chatgpt_timezone),
+        ("env.chatgpt_bin", env.chatgpt_bin),
+        ("env.desktop_bin", env.desktop_bin),
+        ("env.chatgpt_chat_passthrough", env.chatgpt_chat_passthrough),
+        ("env.desktop_browser_use", env.desktop_browser_use),
+        ("env.openai_trace", env.openai_trace),
+        ("env.openai_trace_path", env.openai_trace_path),
+        ("env.proxy_verbose", env.proxy_verbose),
+        (
+            "env.claude_desktop_allow_untested",
+            env.claude_desktop_allow_untested,
+        ),
+    ] {
+        // `[A-Z][A-Z0-9_]*`: also written as a LaunchAgent `<key>` and a
+        // systemd `Environment=` name.
+        let valid = name.starts_with(|ch: char| ch.is_ascii_uppercase())
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
+        if !valid {
+            bail!("brand {field} is not a portable environment variable name: {name:?}");
+        }
     }
     Ok(())
 }
@@ -128,7 +168,8 @@ impl AsRef<OsStr> for BrandValue<&'static str> {
 
 impl fmt::Display for BrandValue<&'static str> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.get())
+        // Delegate so width, precision and alignment behave like the string's.
+        fmt::Display::fmt(self.get(), formatter)
     }
 }
 
@@ -161,6 +202,7 @@ pub struct Brand {
     pub placeholders: PlaceholderIdentities,
     pub client_proof: ClientProofNames,
     pub gateway: GatewayProtocolNames,
+    pub scripts: ScriptNames,
     /// WinHTTP session agent used for proxy auto-configuration lookups.
     pub winhttp_agent: &'static str,
     /// `clientInfo.name` of the read-only Codex daemon initialization check.
@@ -262,6 +304,16 @@ pub struct PlaceholderIdentities {
     pub desktop_email: &'static str,
 }
 
+/// Names the program's own helper scripts use (see `script_brand`).
+pub struct ScriptNames {
+    /// Prefix of environment variables passed to helper scripts and of
+    /// internal helper markers; `[A-Z][A-Z0-9_]*_`.
+    pub env_prefix: &'static str,
+    /// Prefix of .NET types and PowerShell functions the helpers define;
+    /// `[A-Z][A-Za-z0-9]*`.
+    pub identifier_prefix: &'static str,
+}
+
 /// Names of Gateway endpoints and headers specific to this distribution.
 pub struct GatewayProtocolNames {
     /// Native Chat update channel: a complete path starting with
@@ -301,5 +353,35 @@ mod tests {
         let error = install_into(&slot, &OTHER).unwrap_err();
         assert!(error.to_string().contains("saiai"), "{error}");
         assert!(std::ptr::eq(*slot.get().unwrap(), saiai));
+    }
+
+    #[test]
+    fn an_unsafe_brand_is_rejected_before_it_occupies_the_slot() {
+        use crate::brand_saiai::SAIAI_VALUES;
+        static BAD_DIRECTORY: Brand = Brand {
+            windows_app_dir_name: "SAIAI'; Remove-Item",
+            ..SAIAI_VALUES
+        };
+        static BAD_PREFIX: Brand = Brand {
+            scripts: ScriptNames {
+                env_prefix: "SA$AI_",
+                identifier_prefix: "Saiai",
+            },
+            ..SAIAI_VALUES
+        };
+        static BAD_ENV: Brand = Brand {
+            env: EnvironmentNames {
+                home: "SAIAI HOME",
+                ..SAIAI_VALUES.env
+            },
+            ..SAIAI_VALUES
+        };
+        for brand in [&BAD_DIRECTORY, &BAD_PREFIX, &BAD_ENV] {
+            let slot = OnceLock::new();
+            assert!(install_into(&slot, brand).is_err());
+            assert!(slot.get().is_none());
+        }
+        let slot = OnceLock::new();
+        install_into(&slot, &crate::brand_saiai::SAIAI_BRAND).unwrap();
     }
 }

@@ -5,14 +5,14 @@ $store = $null
 $certificate = $null
 $failure = 'trust_not_established'
 try {
-    $pem = [IO.File]::ReadAllText($env:SAIAI_VSCODE_CA_PATH)
+    $pem = [IO.File]::ReadAllText($env:@@ENV@@VSCODE_CA_PATH)
     $match = [regex]::Match($pem, '\A\s*-----BEGIN CERTIFICATE-----\s*(?<der>[A-Za-z0-9+/=\s]+)-----END CERTIFICATE-----\s*\z')
     if (-not $match.Success) { throw 'Expected one public installation CA' }
     $der = [Convert]::FromBase64String($match.Groups['der'].Value)
     $algorithm = [Security.Cryptography.SHA256]::Create()
     try { $hash = ([BitConverter]::ToString($algorithm.ComputeHash($der))).Replace('-', '').ToLowerInvariant() }
     finally { $algorithm.Dispose() }
-    if ($hash -cne $env:SAIAI_VSCODE_CA_SHA256) { throw 'Installation CA changed during trust setup' }
+    if ($hash -cne $env:@@ENV@@VSCODE_CA_SHA256) { throw 'Installation CA changed during trust setup' }
     $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new($der)
     $constraint = @($certificate.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.19' })
     if ($constraint.Count -ne 1) { throw 'Installation CA constraints are missing' }

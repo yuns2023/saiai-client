@@ -6,7 +6,7 @@
 
 use super::{
     Brand, CertificateNames, ClientProofNames, ConfigNames, EnvironmentNames, GatewayProtocolNames,
-    OwnershipMarkers, PlaceholderIdentities, ServiceNames, UpdateNames,
+    OwnershipMarkers, PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
 };
 
 /// The single SAIAI brand instance (a `static`, so every reference has the
@@ -91,6 +91,10 @@ pub(crate) const SAIAI_VALUES: Brand = Brand {
     gateway: GatewayProtocolNames {
         chat_updates_path: "/backend-api/saiai/chat-updates",
         chat_preference_restored_header: "x-saiai-chat-preference-restored",
+    },
+    scripts: ScriptNames {
+        env_prefix: "SAIAI_",
+        identifier_prefix: "Saiai",
     },
     winhttp_agent: "SAIAI",
     codex_daemon_client_name: "saiai_daemon_check",
