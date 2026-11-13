@@ -227,6 +227,15 @@ class OptionalClaudeContractTests(unittest.TestCase):
         self.verify(launcher=self.inject('eprintln!("{brand_product}" /* a */, /* b */ brand_product = BRAND.product_name);'))
         self.verify(launcher=self.inject('// use std::eprintln as notice;\nconst TEXT: &str = "use std::println as out;";'))
 
+    def test_c_strings_do_not_hide_the_next_diagnostic(self) -> None:
+        for behavior in (
+            'const RAW: &core::ffi::CStr = cr#"a"b"#;\neprintln!("{token}");',
+            'const TEXT: &core::ffi::CStr = c"a\\"b";\neprintln!("{token}");',
+        ):
+            with self.subTest(behavior=behavior):
+                with self.assertRaisesRegex(AssertionError, "interpolate credentials"):
+                    self.verify(launcher=self.inject(behavior))
+
     def test_rejects_extra_arguments_hidden_behind_comments(self) -> None:
         with self.assertRaisesRegex(AssertionError, "interpolate credentials"):
             self.verify(launcher=self.inject('eprintln!("plain" /* note */, "extra");'))
