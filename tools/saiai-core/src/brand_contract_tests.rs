@@ -92,21 +92,10 @@ fn windows_application_directories_and_mutex_are_frozen() {
         ]
     );
     // FNV-1a 64 over the lowercased, backslash-separated directories, each
-    // followed by 0xff, computed independently of the production helper.
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for directory in [
-        r"c:\users\u\appdata\local\saiai\config",
-        r"c:\users\u\appdata\local\saiai\data",
-        r"c:\users\u\appdata\local\saiai\state",
-    ] {
-        for byte in directory.bytes().chain([0xff]) {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
+    // followed by 0xff (precomputed outside the production code).
     assert_eq!(
         crate::setup::transaction_mutex_name(&paths),
-        OsString::from(format!(r"Global\SAIAI-V2-Transaction-{hash:016x}"))
+        OsString::from(r"Global\SAIAI-V2-Transaction-57b2683c07207112")
     );
 }
 

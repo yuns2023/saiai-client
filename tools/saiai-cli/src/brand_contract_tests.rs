@@ -107,6 +107,36 @@ fn saiai_config_json_shape_is_frozen() {
         })
     );
 
+    let full = serde_json::json!({
+        "version": 2,
+        "base_url": "https://gateway.example",
+        "api_key": "TEST_ONLY_CONTRACT",
+        "listen": "127.0.0.1:41035",
+        "ca_cert_path": "/h/.claude/saiai-ca.crt",
+        "ca_key_path": "/h/.claude/saiai-ca.key",
+        "chatgpt_chat_passthrough": false,
+        "desktop_browser_use": true,
+        "upstream_proxy": "http://127.0.0.1:7890",
+        "providers": {
+            "claude": {"base_url": "https://claude.gateway.example", "api_key": "TEST_ONLY_CLAUDE"},
+            "codex": {"base_url": "https://codex.gateway.example", "api_key": "TEST_ONLY_CODEX"}
+        }
+    });
+    let parsed: SaiaiConfig = serde_json::from_value(full.clone()).unwrap();
+    assert_eq!(
+        parsed.upstream_proxy.as_deref(),
+        Some("http://127.0.0.1:7890")
+    );
+    assert_eq!(
+        parsed
+            .providers
+            .codex
+            .as_ref()
+            .map(|codex| codex.base_url.as_str()),
+        Some("https://codex.gateway.example")
+    );
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), full);
+
     // Configurations written by older clients keep loading with defaults.
     let legacy: SaiaiConfig = serde_json::from_value(serde_json::json!({
         "version": 2,
@@ -602,10 +632,8 @@ fn client_proof_wire_names_are_frozen() {
     assert_eq!(client_proof::HEADER_NAME, "x-saiai-client-proof");
     assert_eq!(
         client_proof::proof_message("post", "/v1/messages", 1, "n", "k"),
-        format!(
-            "saiai-client-proof-v1\nPOST\n/v1/messages\n1\nn\n{}",
-            hex(&Sha256::digest(b"k"))
-        )
+        "saiai-client-proof-v1\nPOST\n/v1/messages\n1\nn\n\
+         8254c329a92850f6d539dd376f4816ee2764517da5e0235514af433164480d7a"
     );
     let directory = tempfile::tempdir().unwrap();
     let state = directory.path().join("proof");
@@ -658,17 +686,24 @@ async fn client_proof_enrollment_request_is_frozen() {
     });
     let directory = tempfile::tempdir().unwrap();
     let proof = Arc::new(client_proof::ClientProof::load(directory.path()).unwrap());
-    const NO_RETRY: [Duration; 1] = [Duration::from_secs(3600)];
-    Arc::clone(&proof)
-        .enroll(
-            reqwest::Client::new(),
+    // No retries and no inherited proxy: a broken contract fails fast.
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        Arc::clone(&proof).enroll(
+            client,
             gateway,
             zeroize::Zeroizing::new("TEST_ONLY_PROOF".into()),
-            &NO_RETRY,
-        )
+            &[],
+        ),
+    )
+    .await
+    .expect("enrollment finished in time")
+    .expect("enrollment recorded a device");
+    let request = tokio::time::timeout(Duration::from_secs(20), server)
         .await
-        .expect("enrollment recorded a device");
-    let request = server.await.unwrap();
+        .expect("mock gateway finished in time")
+        .unwrap();
     assert!(
         request.starts_with("POST /api/v1/client/devices/enroll HTTP/1.1\r\n"),
         "{request}"
@@ -699,29 +734,121 @@ async fn client_proof_enrollment_request_is_frozen() {
 #[test]
 fn desktop_synthetic_identity_is_frozen() {
     assert_eq!(claude_desktop::TOKEN_PREFIX, "saiai-desktop-claude-");
+    // An identity persisted by an earlier client keeps loading from the same
+    // place with the same field names.
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("desktop/claude/state");
+    fs::create_dir_all(&state).unwrap();
+    let identity = serde_json::json!({
+        "account": "6f1c1f5e-8f1a-4d9e-9a51-0c2f5b7d1e01",
+        "organization": "0b9d6a7c-2e4f-4c1b-8d3a-5f6e7a8b9c02",
+        "access_token": "saiai-desktop-claude-0123456789abcdef0123456789abcdef",
+        "refresh_token": "saiai-desktop-claude-refresh-0123456789abcdef",
+        "session": "saiai-local-0123456789abcdef0123456789abcdef"
+    });
+    fs::write(state.join("identity.json"), identity.to_string()).unwrap();
+    let loaded = claude_desktop::Identity::load(root.path())
+        .unwrap()
+        .expect("persisted identity is found");
+    assert_eq!(serde_json::to_value(&loaded).unwrap(), identity);
 }
 
 // ------------------------------------------------------- Source inventories
 
+/// Production sources of the CLI (Rust plus bundled PowerShell/JavaScript),
+/// recursively. Test-only files (`*_tests.*`) and inline `#[cfg(test)] mod
+/// … {` blocks are dropped so that a name kept alive only by an old test
+/// cannot hide a removed production use.
 fn cli_sources() -> Vec<(String, String)> {
-    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut sources = fs::read_dir(&directory)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| {
-            path.extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| matches!(extension, "rs" | "ps1" | "js"))
-        })
-        // This file names every value on purpose; never count it as a user.
-        .filter(|path| path.file_name() != Some(std::ffi::OsStr::new("brand_contract_tests.rs")))
-        .map(|path| {
+    fn collect(directory: &Path, sources: &mut Vec<(String, String)>) {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect(&path, sources);
+                continue;
+            }
+            let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let stem = path.file_stem().and_then(|value| value.to_str()).unwrap();
+            if !matches!(extension, "rs" | "ps1" | "js") || stem.ends_with("_tests") {
+                continue;
+            }
             let text = fs::read_to_string(&path).unwrap();
-            (path.display().to_string(), text)
-        })
-        .collect::<Vec<_>>();
+            sources.push((
+                path.display().to_string(),
+                production_part(&text).to_string(),
+            ));
+        }
+    }
+    let mut sources = Vec::new();
+    collect(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut sources,
+    );
     sources.sort();
     sources
+}
+
+/// Text before the first inline test module (`#[cfg(test)]` + `mod x {`).
+fn production_part(text: &str) -> &str {
+    let mut offset = 0;
+    while let Some(found) = text[offset..].find("#[cfg(test)]\nmod ") {
+        let start = offset + found;
+        let line_end = text[start + "#[cfg(test)]\n".len()..]
+            .find('\n')
+            .map_or(text.len(), |end| start + "#[cfg(test)]\n".len() + end);
+        if text[start..line_end].trim_end().ends_with('{') {
+            return &text[..start];
+        }
+        offset = line_end;
+    }
+    text
+}
+
+/// `SAIAI_*` names referenced as environment variables: Rust/JS string
+/// literals, PowerShell `$env:`/`${env:}`, POSIX `${…}`/`$…`, and CMD `%…%`.
+fn saiai_environment_names(text: &str) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    for (index, _) in text.match_indices("SAIAI_") {
+        let name = text[index..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || *ch == '_')
+            .collect::<String>();
+        let before = &text[..index];
+        let after = &text[index + name.len()..];
+        let referenced = (before.ends_with('"') && after.starts_with('"'))
+            || (before.ends_with('\'') && after.starts_with('\''))
+            || before.ends_with("$env:")
+            || (before.ends_with("${env:") && after.starts_with('}'))
+            || (before.ends_with("${") && (after.starts_with('}') || after.starts_with(':')))
+            || (before.ends_with('$') && !before.ends_with("\\$"))
+            || (before.ends_with('%') && after.starts_with('%'));
+        if referenced {
+            found.insert(name);
+        }
+    }
+    found
+}
+
+#[test]
+fn environment_scanner_recognizes_every_reference_style() {
+    let sample = r#"env::var("SAIAI_A"); .env('SAIAI_B', x); $env:SAIAI_C; ${env:SAIAI_D};
+${SAIAI_E:-x} "$SAIAI_F" %SAIAI_G% const SAIAI_NOT_ENV: &str = "x"; "__SAIAI_NULL__""#;
+    assert_eq!(
+        saiai_environment_names(sample),
+        [
+            "SAIAI_A", "SAIAI_B", "SAIAI_C", "SAIAI_D", "SAIAI_E", "SAIAI_F", "SAIAI_G"
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    );
+    let text = "a\n#[cfg(test)]\nmod brand_contract_tests;\nb\n#[cfg(test)]\nmod tests {\nc";
+    assert_eq!(
+        production_part(text),
+        "a\n#[cfg(test)]\nmod brand_contract_tests;\nb\n"
+    );
 }
 
 /// Every `SAIAI_*` environment variable the client reads or hands to its own
@@ -765,24 +892,10 @@ fn saiai_environment_variable_inventory_is_frozen() {
         "SAIAI_VSCODE_CA_PATH",
         "SAIAI_VSCODE_CA_SHA256",
     ]);
-    let mut found = BTreeSet::new();
-    for (_, text) in cli_sources() {
-        // Quoted names (Rust `env::var("…")`, `.env("…", …)`) and PowerShell
-        // `$env:…` references in embedded or bundled scripts.
-        for (marker, quoted) in [("\"SAIAI_", true), ("$env:SAIAI_", false)] {
-            for (index, _) in text.match_indices(marker) {
-                let start = index + marker.len() - "SAIAI_".len();
-                let name = text[start..]
-                    .chars()
-                    .take_while(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || *ch == '_')
-                    .collect::<String>();
-                if quoted && !text[start + name.len()..].starts_with('"') {
-                    continue;
-                }
-                found.insert(name);
-            }
-        }
-    }
+    let found = cli_sources()
+        .iter()
+        .flat_map(|(_, text)| saiai_environment_names(text))
+        .collect::<BTreeSet<_>>();
     let found = found.iter().map(String::as_str).collect::<BTreeSet<_>>();
     assert_eq!(found, expected);
 }
