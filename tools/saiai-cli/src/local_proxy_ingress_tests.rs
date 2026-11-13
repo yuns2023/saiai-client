@@ -921,6 +921,8 @@ async fn model_catalog_exit_passes_the_finished_request_to_the_extension() {
         request
     });
     let (mut state, root) = proof_test_state(&url, &url, None);
+    // A configured key with surrounding spaces is used verbatim.
+    state.default_route.api_key = Zeroizing::new(" MOCK_SPACED_KEY ".to_string());
     state.gateway = &TEST_PROOF;
     state.gateway_session = std::sync::OnceLock::new();
     let state = Arc::new(state);
@@ -938,7 +940,7 @@ async fn model_catalog_exit_passes_the_finished_request_to_the_extension() {
             crate::gateway::Transport::Http,
             "GET".to_string(),
             "/v1/models".to_string(),
-            Some("MOCK_ONLY_GATEWAY".to_string())
+            Some(" MOCK_SPACED_KEY ".to_string())
         )]
     );
 }

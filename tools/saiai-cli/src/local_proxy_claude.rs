@@ -354,7 +354,8 @@ pub(super) async fn models(state: &State, id: &Identity) -> Result<Vec<Value>> {
             .headers()
             .get(reqwest::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            .and_then(bearer_token)
+            // Exactly what `bearer_auth` wrote: the route key, untrimmed.
+            .and_then(|value| value.strip_prefix("Bearer "))
             .map(str::to_string);
         for (name, value) in state.gateway_signature(
             crate::gateway::Transport::Http,
