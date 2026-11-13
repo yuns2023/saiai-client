@@ -36,26 +36,38 @@ jobs:
           workspaces: tools/saiai-cli -> target
 
       - name: Format
-        run: cargo fmt --manifest-path tools/saiai-cli/Cargo.toml --check
+        run: cargo fmt --manifest-path tools/saiai-cli/Cargo.toml --all --check
 
       - name: Lint
-        run: cargo clippy --locked --manifest-path tools/saiai-cli/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml
+        run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace
 
       # The contract entries as an outside crate uses them (feature on, the
       # library built without cfg(test)); the steps above build without it.
       - name: Lint and test contract entries
         run: |
-          cargo clippy --locked --manifest-path tools/saiai-cli/Cargo.toml --features contract --all-targets -- -D warnings
-          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --features contract --test contract_entry --test saiai_render_contract --test kernel_consumer
+          cargo clippy --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace --features contract --all-targets -- -D warnings
+          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test contract_entry --test saiai_render_contract --test kernel_consumer
+
+      # The kernel package builds outside this workspace (production code,
+      # with and without the contract entries). Its unit tests still include
+      # the SAIAI brand values as their fallback brand until C4d, so they run
+      # in the workspace only.
+      - name: Build the kernel on its own
+        run: |
+          standalone="$(mktemp -d)"
+          cp -R tools/saiai-cli/kernel "$standalone/kernel"
+          cp tools/saiai-cli/Cargo.lock "$standalone/kernel/Cargo.lock"
+          cargo build --manifest-path "$standalone/kernel/Cargo.toml" --target-dir "$standalone/target"
+          cargo build --manifest-path "$standalone/kernel/Cargo.toml" --target-dir "$standalone/target" --features contract
 
       - name: Verify official Codex daemon initialization without model turns
         env:
           CARGO_BUILD_JOBS: 2
         run: |
-          cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml
+          cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --bin saiai
           python3 - <<'PY'
           import hashlib, pathlib, tarfile, urllib.request
           root = pathlib.Path("dist/codex-daemon-regression")
@@ -172,17 +184,17 @@ jobs:
 
       - name: Verify native Windows Desktop runtime
         shell: bash
-        run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml windows_desktop_runtime::tests -- --test-threads=1
+        run: bash scripts/saiai-cli/cargo-test-filtered.sh proxy-cli windows_desktop_runtime::tests -- --test-threads=1
 
       - name: Test and build native Windows client
         shell: bash
         run: |
           node --test scripts/saiai-cli/test-vscode-certificates.js
-          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml
+          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace
           # Platform-specific SAIAI goldens (LaunchAgent plist, Windows update
           # helper) run through the contract entries on this platform.
-          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --features contract --test saiai_render_contract --test kernel_consumer
-          cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml
+          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test saiai_render_contract --test kernel_consumer
+          cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --bin saiai
 
       - name: Smoke-test Windows configuration
         shell: pwsh
@@ -269,11 +281,11 @@ jobs:
       - name: Test and build native macOS client
         run: |
           node --test scripts/saiai-cli/test-vscode-certificates.js
-          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml
+          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace
           # Platform-specific SAIAI goldens (LaunchAgent plist, Windows update
           # helper) run through the contract entries on this platform.
-          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --features contract --test saiai_render_contract --test kernel_consumer
-          cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml
+          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test saiai_render_contract --test kernel_consumer
+          cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --bin saiai
 
       - name: Verify provider and project configuration isolation
         run: >-

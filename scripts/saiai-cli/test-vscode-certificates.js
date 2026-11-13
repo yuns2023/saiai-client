@@ -6,7 +6,7 @@ const {spawnSync} = require('node:child_process');
 const {rootCertificates} = require('node:tls');
 const {test} = require('node:test');
 
-const helper = fs.readFileSync(path.resolve(__dirname, '../../tools/saiai-cli/src/vscode_certificates.js'), 'utf8');
+const helper = fs.readFileSync(path.resolve(__dirname, '../../tools/saiai-cli/kernel/src/vscode_certificates.js'), 'utf8');
 
 function fixture(context, options = {}) {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'saiai-vscode-certificates-'));

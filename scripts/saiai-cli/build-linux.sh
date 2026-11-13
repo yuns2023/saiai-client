@@ -34,4 +34,4 @@ printf '#include <linux/random.h>\n#include <stdlib.h>\nint main(void) { return 
 
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 cargo build --locked --manifest-path "$repo_root/tools/saiai-cli/Cargo.toml" \
-  --release --target "$target"
+  -p saiai --bin saiai --release --target "$target"

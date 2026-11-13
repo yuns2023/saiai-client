@@ -133,9 +133,7 @@ fn saiai_brand_values_are_frozen() {
             atomic_temporaries: true,
         };
         assert_eq!(
-            proxy_cli::GatewayExtension::owned_state_files(
-                &proxy_cli::gateway_saiai::SAIAI_GATEWAY
-            ),
+            proxy_cli::GatewayExtension::owned_state_files(&saiai::gateway_saiai::SAIAI_GATEWAY),
             [
                 family("client-device-key"),
                 family("client-device.json"),
@@ -144,9 +142,7 @@ fn saiai_brand_values_are_frozen() {
             ]
         );
         assert_eq!(
-            proxy_cli::GatewayExtension::signature_headers(
-                &proxy_cli::gateway_saiai::SAIAI_GATEWAY
-            ),
+            proxy_cli::GatewayExtension::signature_headers(&saiai::gateway_saiai::SAIAI_GATEWAY),
             ["x-saiai-client-proof"]
         );
     }
@@ -154,7 +150,7 @@ fn saiai_brand_values_are_frozen() {
     // SAIAI turns the Native Chat relay on with exactly its brand names and
     // the historical placeholder device proof it never forwards.
     assert_eq!(
-        proxy_cli::GatewayExtension::native_chat(&proxy_cli::gateway_saiai::SAIAI_GATEWAY),
+        proxy_cli::GatewayExtension::native_chat(&saiai::gateway_saiai::SAIAI_GATEWAY),
         Some(proxy_cli::NativeChatProtocol {
             updates_path: "/backend-api/saiai/chat-updates",
             preference_restored_header: "x-saiai-chat-preference-restored",
@@ -710,21 +706,23 @@ fn library_takes_release_facts_from_the_entry_point() {
     );
 }
 
-/// Blocks naming the SAIAI brand directly from library sources: only the
-/// program side (`main.rs`) and the SAIAI values themselves spell these
-/// names. A textual check, not a proof of the dependency boundary.
+/// Blocks naming the SAIAI brand directly from kernel sources: only the
+/// SAIAI program's own sources spell these names. A textual check; the
+/// package boundary itself is enforced by the compiler.
 #[test]
 fn only_the_program_names_the_saiai_brand() {
     let sources = cli_sources();
+    let kernel = kernel_files();
     for (file, text) in &sources {
-        if file == "main.rs" || file == "brand_saiai.rs" {
+        if !kernel.contains(file) {
             continue;
         }
         for name in ["brand_saiai", "SAIAI_BRAND"] {
             assert!(!text.contains(name), "{file} names {name}");
         }
     }
-    assert!(sources["main.rs"].contains("mod brand_saiai;"));
+    assert!(sources["main.rs"].contains("use saiai::{brand_saiai, gateway_saiai};"));
+    assert!(sources["distribution.rs"].contains("pub mod brand_saiai;"));
 }
 
 /// Identifier (not a field access or field declaration) of the client proof
@@ -782,23 +780,16 @@ fn protocol_reference_scanner_sees_paths_imports_and_types() {
 fn only_the_extension_side_uses_the_client_proof_protocol() {
     let sources = cli_sources();
     assert!(
-        sources["main.rs"].contains("gateway: &proxy_cli::gateway_saiai::SAIAI_GATEWAY,"),
+        sources["main.rs"].contains("gateway: &gateway_saiai::SAIAI_GATEWAY,"),
         "the saiai program must inject the SAIAI Gateway extension"
     );
+    let kernel = kernel_files();
     for (file, text) in &sources {
-        if matches!(
-            file.as_str(),
-            "main.rs" | "gateway_saiai.rs" | "client_proof.rs"
-        ) {
+        if !kernel.contains(file) {
             continue;
         }
         for line in text.lines() {
             let trimmed = line.trim();
-            // lib.rs declares the modules (and nothing else may name them).
-            if file == "lib.rs" && matches!(trimmed, "mod client_proof;" | "pub mod gateway_saiai;")
-            {
-                continue;
-            }
             if let Some(name) = protocol_reference(trimmed) {
                 panic!("{file} uses {name}: {trimmed}");
             }
@@ -806,30 +797,19 @@ fn only_the_extension_side_uses_the_client_proof_protocol() {
     }
 }
 
-/// Files that may name SAIAI: its brand values, its Gateway extension, the
-/// client proof (moves out in C4), and the SAIAI program entry point.
-const SAIAI_NAMING_FILES: [&str; 4] = [
-    "brand_saiai.rs",
-    "gateway_saiai.rs",
-    "client_proof.rs",
-    "main.rs",
-];
-
-/// Production lines elsewhere that still contain `saiai` (any case), one
-/// `file<TAB>line` per occurrence, whitespace collapsed. The test requires
-/// the list to equal the code exactly; that it only ever shrinks is enforced
-/// by review of this file's diff, not by the test.
-///
-/// Remaining entry: `lib.rs` `pub mod gateway_saiai;` — the SAIAI Gateway
-/// extension is compiled into the library (the program reaches it as
-/// `proxy_cli::gateway_saiai::SAIAI_GATEWAY`) until the client proof moves
-/// out of the library (C4c) and the extension can move with it.
+/// Kernel production lines that still contain `saiai` (any case), one
+/// `file<TAB>line` per occurrence, whitespace collapsed (the SAIAI program's
+/// own sources may name SAIAI). The test requires the list to equal the code
+/// exactly; that it only ever shrinks is enforced by review of this file's
+/// diff, not by the test. Empty since the SAIAI extension left the kernel
+/// (C4c).
 const SAIAI_RESIDUE: &str = include_str!("data/brand_residue.txt");
 
 fn saiai_residue_lines() -> Vec<String> {
     let mut lines = Vec::new();
+    let kernel = kernel_files();
     for (file, text) in cli_sources() {
-        if SAIAI_NAMING_FILES.contains(&file.as_str()) {
+        if !kernel.contains(&file) {
             continue;
         }
         for line in text.lines() {
@@ -891,6 +871,10 @@ const MARKER_IN_TEXT: &str = "#[test] fn not_an_item() {}";
 fn parameterized_kept(value: u8) {}
 #[cfg(test)]
 mod tests { fn inner() {} }
+#[cfg(all(test, feature = "contract"))]
+mod contract_tests { fn with_entries() {} }
+#[cfg(feature = "contract")]
+fn feature_kept() {}
 fn kept_after() {}
 "##;
     let kept = remove_rust_test_items(source);
@@ -901,6 +885,7 @@ fn kept_after() {}
         "flavored_async",
         "SAIAI flavored",
         "mod tests",
+        "contract_tests",
     ] {
         assert!(!kept.contains(gone), "{gone} survived:\n{kept}");
     }
@@ -908,6 +893,7 @@ fn kept_after() {}
         "fn kept_before() {}",
         r##"const MARKER_IN_TEXT: &str = "#[test] fn not_an_item() {}";"##,
         "#[test_case(1)]\nfn parameterized_kept(value: u8) {}",
+        "#[cfg(feature = \"contract\")]\nfn feature_kept() {}",
         "fn kept_after() {}",
     ] {
         assert!(kept.contains(present), "{present} lost:\n{kept}");
@@ -1088,8 +1074,9 @@ fn enclosing_call_end(text: &str, literals: &[std::ops::Range<usize>], from: usi
 /// if a placeholder is not bound to its `Brand` field in the same call.
 fn rendered_brand_text() -> Vec<(String, String)> {
     let mut rendered = Vec::new();
+    let kernel = kernel_files();
     for (file, text) in cli_sources() {
-        if SAIAI_NAMING_FILES.contains(&file.as_str()) || !file.ends_with(".rs") {
+        if !kernel.contains(&file) || !file.ends_with(".rs") {
             continue;
         }
         let literals = rust_literal_ranges(&text);
@@ -1325,8 +1312,9 @@ fn saiai_side_uses_only_the_public_kernel_root() {
         "brand_saiai",
         "contract_desktop_tests",
     ];
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let lib = fs::read_to_string(root.join("lib.rs")).unwrap();
+    let package = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = package.join("src");
+    let lib = fs::read_to_string(package.join("kernel/src/lib.rs")).unwrap();
     // Every module lib.rs declares, minus the public ones and the SAIAI side.
     let private: Vec<String> = lib
         .lines()

@@ -1,0 +1,62 @@
+[package]
+name = "proxy-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Managed local proxy client for Claude Code and Codex: the distribution-neutral kernel"
+license = "MIT"
+publish = false
+
+# A plain package without a workspace section, so the kernel builds on its own or as
+# a member of a distribution's workspace. The release version is supplied by
+# the distribution's entry point (`RuntimeContext`), not by this manifest.
+[lib]
+name = "proxy_cli"
+path = "src/lib.rs"
+
+[features]
+# Test entry points for a distribution's contract tests (see `contract`);
+# never enabled for a release build.
+contract = []
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", default-features = true, features = ["clock"] }
+futures-util = "0.3"
+hkdf = "0.12"
+p256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa", "pkcs8", "std"] }
+rand = "0.10"
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+rustls = "0.23"
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+toml_edit = "0.22"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+webpki-roots = "1"
+x509-parser = "0.16"
+zeroize = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+dunce = "1"
+schannel = "0.1"
+uds_windows = "1.1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinHttp"] }
+
+[dev-dependencies]
+tempfile = "3"

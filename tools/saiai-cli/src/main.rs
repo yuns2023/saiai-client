@@ -1,19 +1,15 @@
-//! The `saiai` program: the shared client library plus this distribution's
-//! identity (`brand_saiai.rs`) and release facts.
+//! The `saiai` program: the kernel (`proxy_cli`) run with this
+//! distribution's identity and Gateway extension (`saiai`) and its release
+//! facts.
 
-mod brand_saiai;
-
-use proxy_cli::{
-    Brand, CertificateNames, ConfigNames, EnvironmentNames, OwnershipMarkers,
-    PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
-};
+use saiai::{brand_saiai, gateway_saiai};
 
 fn main() -> anyhow::Result<()> {
     proxy_cli::run(
         &brand_saiai::SAIAI_BRAND,
         proxy_cli::RuntimeContext {
             version: env!("CARGO_PKG_VERSION"),
-            gateway: &proxy_cli::gateway_saiai::SAIAI_GATEWAY,
+            gateway: &gateway_saiai::SAIAI_GATEWAY,
         },
     )
 }

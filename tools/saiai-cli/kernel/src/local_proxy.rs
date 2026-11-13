@@ -4395,7 +4395,7 @@ mod tests {
             "/chatgpt/backend-api/models",
             "/chatgpt/backend-api/devicecheck",
             "/chatgpt/backend-api/f/conversation",
-            "/chatgpt/backend-api/saiai/chat-updates",
+            "/chatgpt/backend-api/test-gateway/chat-updates",
         ] {
             assert!(is_forwarded_chatgpt_path_with(path, on), "{path}");
             assert!(!is_forwarded_chatgpt_path_with(path, None), "{path}");
@@ -4729,7 +4729,10 @@ mod tests {
         }
         assert!(
             chatgpt_device_cookie(
-                &[("Cookie".into(), "_devicecheck=saiai-local-proxy".into())],
+                &[(
+                    "Cookie".into(),
+                    "_devicecheck=test-gateway-placeholder".into()
+                )],
                 saiai_chat().unwrap().rejected_device_proofs
             )
             .unwrap()
@@ -4784,7 +4787,7 @@ mod tests {
                 "POST",
                 "/backend-api/devicecheck?x=a%2Fb&x=a+b",
                 "{ \"device_token\":\"MOCK_ONLY_APPLE\",\"bundle_id\":\"com.openai.codex\",\"future\":null }",
-                "session=MOCK_ONLY_AUTH; _devicecheck=saiai-local-proxy",
+                "session=MOCK_ONLY_AUTH; _devicecheck=test-gateway-placeholder",
                 None,
             ),
             (
@@ -4812,7 +4815,7 @@ mod tests {
                 "POST",
                 "/backend-api/f/conversation/prepare",
                 "{ \"model\":\"auto\",\"future\":null }",
-                "session=MOCK_ONLY_AUTH; _devicecheck=saiai-local-proxy",
+                "session=MOCK_ONLY_AUTH; _devicecheck=test-gateway-placeholder",
                 None,
             ),
             (
@@ -4924,7 +4927,7 @@ mod tests {
             "/backend-api/conversation/TEST_ONLY_ID?history_off=true&x=a%2Bb",
             "/backend-api/conversations/TEST_ONLY_ID?num_turns=10",
             "/backend-api/conversations/TEST_ONLY_ID/messages?cursor=TEST_ONLY",
-            "/backend-api/saiai/chat-updates",
+            "/backend-api/test-gateway/chat-updates",
         ] {
             let forwarded = normalize_chatgpt_chat_target(target).unwrap();
             assert_eq!(forwarded, format!("/chatgpt{target}"));
@@ -4938,7 +4941,7 @@ mod tests {
             "/backend-api/conversation/%2Faccounts",
             "/backend-api/conversation/id/unknown",
             "/backend-api/celsius/ws/admin",
-            "/backend-api/saiai/chat-updates/admin",
+            "/backend-api/test-gateway/chat-updates/admin",
         ] {
             assert!(normalize_chatgpt_chat_target(target).is_err());
         }
@@ -6347,7 +6350,7 @@ mod tests {
             .unwrap()
             .remove("intended_default_model_slug");
         assert_eq!(serde_json::from_slice::<Value>(&actual).unwrap(), expected);
-        assert!(headers.contains("x-saiai-chat-preference-restored: 1"));
+        assert!(headers.contains("x-test-gateway-chat-preference-restored: 1"));
         assert!(headers.contains("x-mock-upstream: keep"));
         assert!(!headers.contains("etag:"));
     }
@@ -6362,7 +6365,7 @@ mod tests {
             (StatusCode::OK,"application/json",None,vec![b' ';MAX_CHAT_INIT_RESPONSE_BYTES+1]),
         ] {
             let (headers,actual)=chat_init_wire(status,kind,encoding,body.clone()).await;
-            assert_eq!(actual,body);assert!(!headers.contains("x-saiai-chat-preference-restored"));
+            assert_eq!(actual,body);assert!(!headers.contains("x-test-gateway-chat-preference-restored"));
             assert!(headers.contains("etag: MOCK_ORIGINAL"));
         }
     }
@@ -6454,7 +6457,7 @@ mod tests {
         let split = response.windows(4).position(|s| s == b"\r\n\r\n").unwrap();
         assert!(
             String::from_utf8_lossy(&response[..split])
-                .contains("x-saiai-chat-preference-restored: 1")
+                .contains("x-test-gateway-chat-preference-restored: 1")
         );
         let mut reader = BufReader::new(&response[split + 4..]);
         assert_eq!(

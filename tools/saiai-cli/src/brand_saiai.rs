@@ -1,5 +1,5 @@
-//! SAIAI distribution values for [`Brand`]; compiled into the `saiai`
-//! program, which passes them to the client library.
+//! SAIAI distribution values for [`Brand`]; the `saiai` program passes them
+//! to the kernel.
 //!
 //! These are the names every installed SAIAI client already uses; see the
 //! `tests/saiai_*.rs` contract tests before changing any of them.
@@ -11,9 +11,9 @@ use super::{
 
 /// The single SAIAI brand instance (a `static`, so every reference has the
 /// same address and repeated installation is recognized as the same brand).
-pub(crate) static SAIAI_BRAND: Brand = SAIAI_VALUES;
+pub static SAIAI_BRAND: Brand = SAIAI_VALUES;
 
-pub(crate) const SAIAI_VALUES: Brand = Brand {
+pub const SAIAI_VALUES: Brand = Brand {
     binary_name: "saiai",
     product_name: "SAIAI",
     home_dir_name: ".saiai",

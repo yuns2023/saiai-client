@@ -155,7 +155,7 @@ impl GatewaySession for SaiaiSession {
 /// The SAIAI session lifecycle, driven through the extension interface the
 /// kernel calls (moved from the kernel's proxy tests, which now use the
 /// kernel's own test extension).
-#[cfg(test)]
+#[cfg(all(test, feature = "contract"))]
 mod tests {
     use super::*;
     use crate::{SignInput, Transport};

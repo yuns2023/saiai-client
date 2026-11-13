@@ -6,8 +6,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-/// Production text of every CLI source below `src`, keyed by its path
-/// relative to `src` (with `/`). Test-only files (`*_tests.*`) are skipped.
+/// Production text of every CLI source below the kernel's `kernel/src` and
+/// the SAIAI program's `src`, keyed by its path relative to that directory
+/// (with `/`; a name in both is an error). Test-only files (`*_tests.*`) are
+/// skipped.
 pub(crate) fn cli_sources() -> BTreeMap<String, String> {
     fn collect(root: &Path, directory: &Path, sources: &mut BTreeMap<String, String>) {
         for entry in fs::read_dir(directory).unwrap() {
@@ -34,9 +36,23 @@ pub(crate) fn cli_sources() -> BTreeMap<String, String> {
             sources.insert(relative, production_text(&text, extension));
         }
     }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let package = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut sources = BTreeMap::new();
-    collect(&root, &root, &mut sources);
+    let kernel = kernel_files();
+    for root in [package.join("kernel/src"), package.join("src")] {
+        let mut found = BTreeMap::new();
+        collect(&root, &root, &mut found);
+        for (name, text) in found {
+            assert!(
+                root.ends_with("kernel/src") == kernel.contains(&name),
+                "{name} is not where kernel_files() says"
+            );
+            assert!(
+                sources.insert(name.clone(), text).is_none(),
+                "{name} exists in both the kernel and the program"
+            );
+        }
+    }
     sources
 }
 
@@ -186,8 +202,9 @@ pub(crate) fn strip_rust_comments(text: &str) -> String {
 /// function, matching braces outside literals, and keeps everything after it.
 /// Other test attributes (`#[test_case]`, `#[rstest]`) are not recognized.
 pub(crate) fn remove_rust_test_items(text: &str) -> String {
-    const MARKERS: [&str; 4] = [
+    const MARKERS: [&str; 5] = [
         "#[cfg(test)]",
+        "#[cfg(all(test, feature = \"contract\"))]",
         "#[test]",
         "#[tokio::test]",
         "#[tokio::test(",
@@ -275,4 +292,30 @@ pub(crate) fn function_texts<'a>(text: &'a str, name: &str) -> Vec<&'a str> {
         found.push(&text[start..end]);
     }
     found
+}
+
+/// Names (as in [`cli_sources`]) of the kernel's sources, below
+/// `kernel/src`; every other source belongs to the SAIAI program.
+pub(crate) fn kernel_files() -> std::collections::BTreeSet<String> {
+    fn collect(root: &Path, directory: &Path, names: &mut std::collections::BTreeSet<String>) {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect(root, &path, names);
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .unwrap()
+                .components()
+                .map(|component| component.as_os_str().to_str().unwrap())
+                .collect::<Vec<_>>()
+                .join("/");
+            names.insert(relative);
+        }
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("kernel/src");
+    let mut names = std::collections::BTreeSet::new();
+    collect(&root, &root, &mut names);
+    names
 }

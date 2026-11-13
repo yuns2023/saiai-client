@@ -30,34 +30,26 @@ use url::Url;
 use uuid::Uuid;
 
 mod brand;
-// The SAIAI values belong to the `saiai` program, not to the library; unit
-// tests include them only as the fallback brand.
+// TRANSITIONAL — MUST BE REMOVED BEFORE THE KERNEL LEAVES THIS REPOSITORY
+// (C4d switches unit tests to a neutral test brand): unit tests include the
+// SAIAI program's brand values, outside this package, as the fallback brand.
 #[cfg(test)]
-#[path = "brand_saiai.rs"]
+#[path = "../../src/brand_saiai.rs"]
 mod brand_saiai;
 mod claude_desktop;
 mod claude_desktop_fixtures;
 mod claude_launcher;
-mod client_proof;
-// SAIAI client proof goldens; they move with the client proof.
-#[cfg(test)]
-mod client_proof_saiai_tests;
 mod codex_daemon;
 mod codex_diagnostics;
 #[cfg(any(test, feature = "contract"))]
 #[doc(hidden)]
 pub mod contract;
-#[cfg(test)]
-mod contract_desktop_tests;
 mod desktop_product;
 mod environment_scope;
 mod gateway;
 // The kernel's test Gateway extension (unit-test runtime fallback).
 #[cfg(test)]
 mod gateway_test;
-// SAIAI Gateway extension; only the program entry point names it.
-#[doc(hidden)]
-pub mod gateway_saiai;
 mod local_proxy;
 mod runtime;
 mod script_brand;

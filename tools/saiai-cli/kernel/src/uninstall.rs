@@ -3075,7 +3075,8 @@ mod tests {
             "config.json",
             "config.json.bak-20261030-010203",
             "saiai-ca.key.bak-1",
-            "client-device-key.corrupt",
+            "test-gateway-state.json.bak-1",
+            ".test-gateway-state.json.saiai-tmp-1-abc",
             ".config.json.saiai-tmp-1-abc",
             "saiai.log",
         ] {
