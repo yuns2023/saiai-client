@@ -793,3 +793,138 @@ fn uninstall_dry_run_plan_is_frozen() {
         "{output}"
     );
 }
+
+/// Byte goldens of the running program's Claude Desktop listener (Linux):
+/// status line, header order, Content-Length, CRLF and body of its own
+/// answers with the SAIAI names, written by the production HTTP path. The
+/// organization id is random, so it is compared as `<ORG-UUID>`.
+#[cfg(target_os = "linux")]
+#[test]
+fn claude_desktop_listener_answers_are_byte_identical() {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    let sandbox = Sandbox::new();
+    sandbox.run(&mut sandbox.command(&[
+        "init",
+        "--base-url",
+        "http://127.0.0.1:1",
+        "--api-key",
+        "TEST_ONLY_CONTRACT_DESKTOP",
+    ]));
+    let root = sandbox.home.join(".saiai");
+    let config = read_json(&root.join("config.json"));
+    let ca = std::fs::read(config["ca_cert_path"].as_str().unwrap()).unwrap();
+    let state = root.join("desktop/claude/state");
+    std::fs::create_dir_all(&state).unwrap();
+    let hex = || uuid::Uuid::new_v4().simple().to_string();
+    let org = uuid::Uuid::new_v4().to_string();
+    let access = format!("saiai-desktop-claude-{}{}", hex(), hex());
+    let session = format!("saiai-local-{}{}", hex(), hex());
+    let identity = serde_json::json!({
+        "account": uuid::Uuid::new_v4().to_string(),
+        "organization": org,
+        "access_token": access,
+        "refresh_token": format!("saiai-desktop-claude-refresh-{}", hex()),
+        "session": session,
+    });
+    std::fs::write(
+        state.join("identity.json"),
+        serde_json::to_vec(&identity).unwrap(),
+    )
+    .unwrap();
+
+    let log = sandbox.home.with_file_name("desktop-proxy.log");
+    let file = std::fs::File::create(&log).unwrap();
+    let _proxy = KillOnDrop(
+        sandbox
+            .command(&[])
+            .env("SAIAI_UPSTREAM_PROXY", "direct")
+            .stdout(file.try_clone().unwrap())
+            .stderr(file)
+            .spawn()
+            .unwrap(),
+    );
+    // The listener writes its receipt after binding.
+    let receipt = state.join("proxy.json");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !receipt.is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let listen = read_json(&receipt)["listen"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "no Claude Desktop listener; proxy log:\n{}",
+                String::from_utf8_lossy(&std::fs::read(&log).unwrap_or_default())
+            )
+        })
+        .to_string();
+
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in rustls_pemfile::certs(&mut std::io::Cursor::new(&ca)) {
+        roots.add(certificate.unwrap()).unwrap();
+    }
+    let tls = Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let request = |host: &str, request: &str| -> String {
+        let mut tcp = std::net::TcpStream::connect(&listen).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        tcp.write_all(format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+            .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            tcp.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        assert_eq!(head, b"HTTP/1.1 200 Connection Established\r\n\r\n");
+        let connection =
+            rustls::ClientConnection::new(Arc::clone(&tls), host.to_string().try_into().unwrap())
+                .unwrap();
+        let mut stream = rustls::StreamOwned::new(connection, tcp);
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+        String::from_utf8(response).unwrap()
+    };
+
+    assert_eq!(
+        request(
+            "api.anthropic.com",
+            &format!(
+                "GET /api/oauth/profile HTTP/1.1\r\nAuthorization: Bearer {access}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .replace(org.as_str(), "<ORG-UUID>"),
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 312\r\nContent-Type: application/json\r\n\r\n{\"account\":{\"display_name\":\"SAIAI Local Code\",\"email_address\":\"\"},\"organization\":{\"active_flags\":[],\"capabilities\":[\"chat\",\"claude_pro\",\"claude_code\"],\"created_at\":\"2026-01-01T00:00:00Z\",\"name\":\"SAIAI Local Code\",\"rate_limit_tier\":\"default_claude_ai\",\"settings\":{},\"uuid\":\"<ORG-UUID>\"}}"
+    );
+    assert_eq!(
+        request(
+            "claude.ai",
+            &format!(
+                "GET /api/zzz_unknown HTTP/1.1\r\nCookie: sessionKey={session}\r\nConnection: close\r\n\r\n"
+            ),
+        ),
+        "HTTP/1.1 501 Not Implemented\r\nConnection: close\r\nContent-Length: 120\r\nContent-Type: application/json\r\n\r\n{\"error\":{\"message\":\"This Desktop control endpoint is unavailable through SAIAI.\",\"type\":\"desktop_control_unsupported\"}}"
+    );
+    std::fs::write(state.join("identity.json"), b"{MOCK_ONLY_BROKEN").unwrap();
+    assert_eq!(
+        request(
+            "claude.ai",
+            "GET /api/account HTTP/1.1\r\nConnection: close\r\n\r\n"
+        ),
+        "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 124\r\nContent-Type: application/json\r\n\r\n{\"error\":\"desktop_identity_invalid\",\"message\":\"Repair the isolated Desktop identity file and relaunch saiai desktop claude\"}"
+    );
+    std::fs::remove_file(state.join("identity.json")).unwrap();
+    assert_eq!(
+        request(
+            "claude.ai",
+            "GET /api/account HTTP/1.1\r\nConnection: close\r\n\r\n"
+        ),
+        "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 104\r\nContent-Type: application/json\r\n\r\n{\"error\":\"desktop_identity_missing\",\"message\":\"Run saiai desktop claude to initialize this environment\"}"
+    );
+}

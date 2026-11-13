@@ -34,6 +34,20 @@ cargo test --manifest-path $M -p saiai --features contract --lib \
 也不得引用内核目录以外的文件（由 `saiai_source_contract` 检查）；SAIAI 的取值
 只放在 `tools/saiai-cli/src/brand_saiai.rs`，由薄壳测试冻结。
 
+内核文件引用扫描是保守的（按 token 检查，宁可误拒）：
+
+- `include_str!` / `include_bytes!` 只接受同目录文件名的普通字符串字面量；
+  子目录、`..`、转义、raw string（`r"..."`）、`concat!`/`env!` 等计算路径都会被拒。
+- `#[path = ...]`（含 `cfg_attr` 内）只接受同目录的 `.rs` 文件，且不能挂在内联
+  `mod x { }` 上；不允许 `include!`。
+- `include`、`include_str`、`include_bytes` 这三个名字只能以直接调用的形式出现：
+  作为参数传给其他宏、`use ... as` 别名等写法会被拒，即使与内置宏同名的标识符
+  并非用于读取文件。
+- 内核中新增或修改 `macro_rules!` 需要在 `tests/saiai_source_contract.rs` 的
+  `KERNEL_MACROS` 中登记名字和完整规则，并经过评审。
+- 宏拼装的属性（`#[$attr]`、不跟方括号的 `#`）和含 `$` 的方括号也会被拒；
+  `kernel/` 中不得有符号链接。
+
 Desktop 需要 Node.js 20.19+、pnpm 10、仓库固定的 Rust 工具链和对应平台的 Tauri 2 系统依赖：
 
 ```bash

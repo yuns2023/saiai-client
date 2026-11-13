@@ -836,6 +836,10 @@ const KERNEL_SAIAI_EXCEPTIONS: &[(&str, &str)] = &[];
 /// `saiai` in any case: the directory can stand alone as a public
 /// repository, and every SAIAI value reaches the kernel through the brand
 /// and Gateway extension the program passes in.
+///
+/// Hidden files are scanned like any other: they ship with the directory.
+/// If `kernel/` later becomes a git submodule, skip only its git metadata
+/// (the `.git` file or directory), never hidden files in general.
 #[test]
 fn the_kernel_directory_never_names_saiai() {
     let kernel = Path::new(env!("CARGO_MANIFEST_DIR")).join("kernel");
