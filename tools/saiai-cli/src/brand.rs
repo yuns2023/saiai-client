@@ -136,6 +136,12 @@ fn validate(brand: &Brand) -> Result<()> {
     Ok(())
 }
 
+/// The installed brand, without the unit-test fallback.
+#[cfg(any(test, feature = "contract"))]
+pub(crate) fn installed() -> Option<&'static Brand> {
+    INSTALLED.get().copied()
+}
+
 /// The brand of the program running this library.
 pub(crate) fn brand() -> &'static Brand {
     match INSTALLED.get() {
@@ -412,7 +418,8 @@ mod tests {
         assert_eq!(format!("{:#}", anyhow::anyhow!(TEXT)), text);
     }
 
-    // A local slot: the process-wide brand is never installed by tests.
+    // A local slot: these tests never touch the process-wide brand (contract
+    // tests install the SAIAI brand there).
     #[test]
     fn install_accepts_the_same_brand_and_rejects_another_without_overwriting() {
         static OTHER: Brand = Brand {

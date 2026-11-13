@@ -44,6 +44,13 @@ jobs:
       - name: Test
         run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml
 
+      # The contract entries as an outside crate uses them (feature on, the
+      # library built without cfg(test)); the steps above build without it.
+      - name: Lint and test contract entries
+        run: |
+          cargo clippy --locked --manifest-path tools/saiai-cli/Cargo.toml --features contract --all-targets -- -D warnings
+          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --features contract --test contract_entry
+
       - name: Verify official Codex daemon initialization without model turns
         env:
           CARGO_BUILD_JOBS: 2

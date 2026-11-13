@@ -37,9 +37,6 @@ mod claude_desktop;
 #[cfg(test)]
 #[path = "local_proxy_ingress_tests.rs"]
 mod ingress_tests;
-#[cfg(test)]
-#[path = "local_proxy_synthetic_tests.rs"]
-mod synthetic_tests;
 
 use crate::brand::{BRAND, Brand};
 use crate::gateway::{
@@ -293,12 +290,12 @@ enum InitialProxyRequest {
 }
 
 #[derive(Debug, Clone)]
-struct IncomingRequest {
-    method: String,
-    target: String,
-    http_version: String,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
+pub(crate) struct IncomingRequest {
+    pub(crate) method: String,
+    pub(crate) target: String,
+    pub(crate) http_version: String,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Vec<u8>,
 }
 
 struct OpenAITrace {
@@ -357,14 +354,14 @@ struct UpstreamResponseOutcome {
     chunks: u64,
 }
 
-struct StaticResponse {
-    status: StatusCode,
-    content_type: &'static str,
-    body: &'static [u8],
-    reason: &'static str,
+pub(crate) struct StaticResponse {
+    pub(crate) status: StatusCode,
+    pub(crate) content_type: &'static str,
+    pub(crate) body: &'static [u8],
+    pub(crate) reason: &'static str,
 }
 
-type AccountSidecarResponse = (
+pub(crate) type AccountSidecarResponse = (
     StatusCode,
     Vec<u8>,
     &'static str,
@@ -2951,8 +2948,8 @@ fn desktop_browser_use_setting(env_value: Option<&str>, configured: bool) -> boo
 
 /// Local Desktop capabilities that change the synthetic identity's responses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DesktopFeatures {
-    browser_use: bool,
+pub(crate) struct DesktopFeatures {
+    pub(crate) browser_use: bool,
 }
 
 #[cfg(test)]
@@ -2960,7 +2957,7 @@ fn chatgpt_sidecar_response(request: &IncomingRequest) -> Option<StaticResponse>
     chatgpt_sidecar_response_with(request, DesktopFeatures { browser_use: true })
 }
 
-fn chatgpt_sidecar_response_with(
+pub(crate) fn chatgpt_sidecar_response_with(
     request: &IncomingRequest,
     features: DesktopFeatures,
 ) -> Option<StaticResponse> {
@@ -3162,7 +3159,7 @@ fn chatgpt_account_sidecar_response(request: &IncomingRequest) -> Option<Account
     chatgpt_account_sidecar_response_with(request, DesktopFeatures { browser_use: true })
 }
 
-fn chatgpt_account_sidecar_response_with(
+pub(crate) fn chatgpt_account_sidecar_response_with(
     request: &IncomingRequest,
     features: DesktopFeatures,
 ) -> Option<AccountSidecarResponse> {
@@ -3562,16 +3559,16 @@ fn desktop_statsig_user(input: &Value) -> Option<Value> {
     Some(user)
 }
 
-fn desktop_statsig_local_payload(brand: &Brand) -> String {
+pub(crate) fn desktop_statsig_local_payload(brand: &Brand) -> String {
     DESKTOP_STATSIG_LOCAL_TEMPLATE.replace("@@ID@@", brand.placeholders.synthetic_id_prefix)
 }
 
 /// User id of the synthetic Desktop identity when a request carries none.
-fn synthetic_user_id(brand: &Brand) -> String {
+pub(crate) fn synthetic_user_id(brand: &Brand) -> String {
     format!("{}-proxy-user", brand.placeholders.synthetic_id_prefix)
 }
 
-fn desktop_statsig_base(brand: &Brand, features: DesktopFeatures) -> Value {
+pub(crate) fn desktop_statsig_base(brand: &Brand, features: DesktopFeatures) -> Value {
     let mut payload: Value = serde_json::from_str(&desktop_statsig_local_payload(brand))
         .expect("valid local Statsig payload");
     if features.browser_use {
