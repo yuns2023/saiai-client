@@ -349,7 +349,7 @@ async fn models(state: &State, id: &Identity) -> Result<Vec<Value>> {
             &client_proof::wire_target(&parsed),
             Some(&route.api_key),
         ) {
-            request = request.header(client_proof::HEADER_NAME, proof);
+            request = request.header(client_proof::HEADER_NAME.get(), proof);
         }
         let response = request.send().await?.error_for_status()?;
         let body: Value = serde_json::from_slice(&bounded_body(response).await?)?;

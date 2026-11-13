@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const MARKER: &str = crate::brand::BRAND.markers.vscode_proxy;
+const MARKER: crate::brand::BrandValue<&'static str> =
+    crate::brand::BrandValue(|brand| brand.markers.vscode_proxy);
 
 pub fn certificate_trust(home: &Path, ca_cert: &Path) -> Result<bool> {
     let (program, app) = certificate_loader_program(home).context(
@@ -400,11 +401,11 @@ pub fn has_managed_proxy(raw: &str) -> bool {
         Ok(document) => document
             .comments
             .iter()
-            .any(|span| raw[span.clone()].starts_with(MARKER)),
+            .any(|span| raw[span.clone()].starts_with(MARKER.get())),
         // Keep diagnosing broken settings previously written by this tool.
         Err(_) => raw
             .lines()
-            .any(|line| line.trim_start().starts_with(MARKER)),
+            .any(|line| line.trim_start().starts_with(MARKER.get())),
     }
 }
 
@@ -456,7 +457,7 @@ pub fn merge_settings(raw: &str, listen: &str) -> Result<String> {
     let markers: Vec<_> = document
         .comments
         .iter()
-        .filter(|span| raw[(*span).clone()].starts_with(MARKER))
+        .filter(|span| raw[(*span).clone()].starts_with(MARKER.get()))
         .collect();
     if markers.len() > 1 {
         bail!("VSCode settings contain multiple SAIAI ownership markers");
@@ -470,7 +471,7 @@ pub fn merge_settings(raw: &str, listen: &str) -> Result<String> {
             .as_str()
             .context("VSCode's http.proxy must be a string; existing settings were preserved")?;
         let owned = markers.first().is_some_and(|span| {
-            raw[(span.start + MARKER.len())..span.end].trim() == current
+            raw[(span.start + MARKER.get().len())..span.end].trim() == current
                 && current
                     .strip_prefix("http://")
                     .and_then(|address| address.parse::<SocketAddr>().ok())
@@ -685,7 +686,7 @@ pub fn remove_managed_proxy(raw: &str, proxies: &[String]) -> Result<ManagedRemo
     let markers: Vec<_> = document
         .comments
         .iter()
-        .filter(|span| raw[(*span).clone()].starts_with(MARKER))
+        .filter(|span| raw[(*span).clone()].starts_with(MARKER.get()))
         .collect();
     let Some(marker) = markers.first() else {
         return Ok(ManagedRemoval::NotManaged);
@@ -693,7 +694,7 @@ pub fn remove_managed_proxy(raw: &str, proxies: &[String]) -> Result<ManagedRemo
     if markers.len() > 1 {
         bail!("VSCode settings contain multiple SAIAI ownership markers");
     }
-    let proxy = raw[(marker.start + MARKER.len())..marker.end].trim();
+    let proxy = raw[(marker.start + MARKER.get().len())..marker.end].trim();
     if !proxies.iter().any(|candidate| candidate == proxy) {
         return Ok(ManagedRemoval::OtherProxy(proxy.to_string()));
     }
@@ -720,7 +721,7 @@ pub fn remove_managed_proxy(raw: &str, proxies: &[String]) -> Result<ManagedRemo
     let marker = updated
         .comments
         .iter()
-        .find(|span| content[(*span).clone()].starts_with(MARKER))
+        .find(|span| content[(*span).clone()].starts_with(MARKER.get()))
         .cloned()
         .context("SAIAI ownership marker disappeared during removal")?;
     // `merge_settings` inserts "\n  <marker>\n" directly after the brace.
@@ -1068,7 +1069,7 @@ mod tests {
         assert_eq!(parsed["http.proxyStrictSSL"], json!("user"));
         assert_eq!(parsed["http.noProxy"], json!(["example.test"]));
         assert!(parsed.get("http.proxy").is_none());
-        assert!(!content.contains(MARKER));
+        assert!(!content.contains(MARKER.get()));
     }
 
     #[test]

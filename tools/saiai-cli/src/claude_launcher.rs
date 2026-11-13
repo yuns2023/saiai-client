@@ -264,7 +264,7 @@ mod tests {
 
     fn config() -> SaiaiConfig {
         SaiaiConfig {
-            version: SAIAI_CONFIG_VERSION,
+            version: SAIAI_CONFIG_VERSION.get(),
             base_url: "https://gateway.invalid".to_string(),
             api_key: "synthetic-legacy-key".to_string(),
             listen: "127.0.0.1:19908".to_string(),

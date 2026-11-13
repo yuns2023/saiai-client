@@ -3,7 +3,7 @@
 //! These are the names every installed SAIAI client already uses; see
 //! `brand_contract_tests` before changing any of them.
 
-use crate::brand::{
+use super::{
     Brand, CertificateNames, ClientProofNames, ConfigNames, EnvironmentNames, GatewayProtocolNames,
     OwnershipMarkers, PlaceholderIdentities, ServiceNames, UpdateNames,
 };

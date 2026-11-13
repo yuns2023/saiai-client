@@ -28,7 +28,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, lookup_host};
 
-pub(crate) const UPSTREAM_PROXY_ENV: &str = crate::brand::BRAND.env.upstream_proxy;
+pub(crate) const UPSTREAM_PROXY_ENV: crate::brand::BrandValue<&'static str> =
+    crate::brand::BrandValue(|brand| brand.env.upstream_proxy);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PROXY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1035,7 +1036,7 @@ impl UpstreamProxy {
         listen: Option<SocketAddr>,
         prewarm: Vec<(String, u16)>,
     ) -> Self {
-        let env_setting = std::env::var(UPSTREAM_PROXY_ENV)
+        let env_setting = std::env::var(UPSTREAM_PROXY_ENV.get())
             .ok()
             .filter(|value| !value.trim().is_empty());
         let mode = match (&env_setting, setting) {

@@ -170,10 +170,12 @@ def verify_cli() -> None:
         and '[[bin]]\nname = "saiai"\npath = "src/main.rs"' in cargo,
         "CLI must build the saiai binary from the shared client library",
     )
-    # The binary only supplies release facts; the client lives in lib.rs.
+    # The binary only supplies the SAIAI brand and release facts; the client
+    # lives in lib.rs.
     entry = text("tools/saiai-cli/src/main.rs")
     for required in (
-        "proxy_cli::run(proxy_cli::RuntimeContext {",
+        "mod brand_saiai;",
+        "proxy_cli::run(\n        &brand_saiai::SAIAI_BRAND,\n        proxy_cli::RuntimeContext {",
         'version: env!("CARGO_PKG_VERSION"),',
     ):
         require(required in entry, f"CLI entry point is missing {required!r}")

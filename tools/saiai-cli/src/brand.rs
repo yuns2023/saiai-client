@@ -4,8 +4,9 @@
 //! the Gateway as a *name* lives in one read-only [`Brand`] value: binary and
 //! directory names, environment variables, certificate and service identities,
 //! update coordinates, ownership markers, placeholder identities and client
-//! proof wire names. Core code reads these values only through [`BRAND`]; the
-//! concrete values of a distribution live in a separate module.
+//! proof wire names. Core code reads these values only through [`BRAND`] /
+//! [`brand`], i.e. the brand the program's entry point passed to `run`; the
+//! concrete values of a distribution live outside the library.
 //!
 //! Changing a value strands existing installations of that distribution
 //! (orphaned directories, services, certificates, pins or markers), so the
@@ -22,10 +23,128 @@
 // the fields that apply to it.
 #![allow(dead_code)]
 
-/// The brand compiled into this binary.
-pub(crate) const BRAND: &Brand = &crate::brand_saiai::SAIAI_BRAND;
+use anyhow::{Result, bail};
+use std::ffi::OsStr;
+use std::fmt;
+use std::ops::Deref;
+use std::path::Path;
+use std::sync::OnceLock;
 
-pub(crate) struct Brand {
+static INSTALLED: OnceLock<&'static Brand> = OnceLock::new();
+
+/// Installs the distribution's brand once per process; `run` does this
+/// before parsing. A later `run` in the same process must pass the same brand.
+pub(crate) fn install(brand: &'static Brand) -> Result<()> {
+    install_into(&INSTALLED, brand)
+}
+
+fn install_into(slot: &OnceLock<&'static Brand>, brand: &'static Brand) -> Result<()> {
+    let installed = *slot.get_or_init(|| brand);
+    if !std::ptr::eq(installed, brand) {
+        bail!(
+            "this process already runs as {}; a different brand cannot be installed",
+            installed.binary_name
+        );
+    }
+    Ok(())
+}
+
+/// The brand of the program running this library.
+pub(crate) fn brand() -> &'static Brand {
+    match INSTALLED.get() {
+        Some(brand) => brand,
+        None => uninstalled_brand(),
+    }
+}
+
+#[cfg(not(test))]
+fn uninstalled_brand() -> &'static Brand {
+    panic!("the brand is installed by run() before any command executes")
+}
+
+// Unit tests call library functions without going through `run`; they see
+// the SAIAI values, which the golden contract tests expect.
+#[cfg(test)]
+fn uninstalled_brand() -> &'static Brand {
+    &crate::brand_saiai::SAIAI_BRAND
+}
+
+/// `BRAND.field` reads the installed brand (see [`brand`]).
+pub(crate) const BRAND: ActiveBrand = ActiveBrand;
+
+#[derive(Clone, Copy)]
+pub struct ActiveBrand;
+
+impl Deref for ActiveBrand {
+    type Target = Brand;
+
+    fn deref(&self) -> &Brand {
+        brand()
+    }
+}
+
+/// A brand field read when used, for names that used to be constants.
+pub struct BrandValue<T: 'static>(pub fn(&'static Brand) -> T);
+
+impl<T> Clone for BrandValue<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for BrandValue<T> {}
+
+impl<T> BrandValue<T> {
+    pub fn get(&self) -> T {
+        (self.0)(brand())
+    }
+}
+
+impl Deref for BrandValue<&'static str> {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.get()
+    }
+}
+
+impl AsRef<str> for BrandValue<&'static str> {
+    fn as_ref(&self) -> &str {
+        self.get()
+    }
+}
+
+impl AsRef<Path> for BrandValue<&'static str> {
+    fn as_ref(&self) -> &Path {
+        Path::new(self.get())
+    }
+}
+
+impl AsRef<OsStr> for BrandValue<&'static str> {
+    fn as_ref(&self) -> &OsStr {
+        OsStr::new(self.get())
+    }
+}
+
+impl fmt::Display for BrandValue<&'static str> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.get())
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for BrandValue<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(formatter)
+    }
+}
+
+impl<T: PartialEq<U>, U> PartialEq<U> for BrandValue<T> {
+    fn eq(&self, other: &U) -> bool {
+        self.get() == *other
+    }
+}
+
+pub struct Brand {
     /// Executable name (without `.exe`); also the prefix printed by `--version`,
     /// followed by one space and the version.
     pub binary_name: &'static str,
@@ -55,7 +174,7 @@ impl Brand {
     }
 }
 
-pub(crate) struct ConfigNames {
+pub struct ConfigNames {
     pub filename: &'static str,
     /// Configuration *format* version, not a brand identity; it only lives
     /// here because the format is shared by this distribution's installs.
@@ -65,7 +184,7 @@ pub(crate) struct ConfigNames {
 }
 
 /// Environment variables read by the client or passed to its own children.
-pub(crate) struct EnvironmentNames {
+pub struct EnvironmentNames {
     pub home: &'static str,
     pub install_dir: &'static str,
     pub skip_start: &'static str,
@@ -82,7 +201,7 @@ pub(crate) struct EnvironmentNames {
     pub claude_desktop_allow_untested: &'static str,
 }
 
-pub(crate) struct CertificateNames {
+pub struct CertificateNames {
     pub ca_cert_filename: &'static str,
     pub ca_key_filename: &'static str,
     /// Backups starting with this prefix belong to the CA pair and are not
@@ -99,7 +218,7 @@ pub(crate) struct CertificateNames {
     pub spki_header: &'static str,
 }
 
-pub(crate) struct ServiceNames {
+pub struct ServiceNames {
     /// systemd user unit `<prefix><environment suffix>.service`.
     pub systemd_unit_prefix: &'static str,
     /// launchd label `<label><environment suffix>`.
@@ -109,7 +228,7 @@ pub(crate) struct ServiceNames {
     pub log_filename: &'static str,
 }
 
-pub(crate) struct UpdateNames {
+pub struct UpdateNames {
     /// Path segment below the Gateway base URL serving manifest and assets.
     pub channel_path: &'static str,
     /// Release asset prefix (`<prefix>linux-x86_64`, …).
@@ -122,13 +241,13 @@ pub(crate) struct UpdateNames {
     pub status_filename: &'static str,
 }
 
-pub(crate) struct OwnershipMarkers {
+pub struct OwnershipMarkers {
     pub codex_ide_env_begin: &'static str,
     pub codex_ide_env_end: &'static str,
     pub vscode_proxy: &'static str,
 }
 
-pub(crate) struct PlaceholderIdentities {
+pub struct PlaceholderIdentities {
     pub codex_account_id: &'static str,
     /// Unsigned local-only JWT used as Codex id and access token.
     pub codex_token: &'static str,
@@ -144,7 +263,7 @@ pub(crate) struct PlaceholderIdentities {
 }
 
 /// Names of Gateway endpoints and headers specific to this distribution.
-pub(crate) struct GatewayProtocolNames {
+pub struct GatewayProtocolNames {
     /// Native Chat update channel: a complete path starting with
     /// `/backend-api/` and without the `/chatgpt` prefix (the local proxy
     /// forwards it as `/chatgpt` + this path).
@@ -153,7 +272,7 @@ pub(crate) struct GatewayProtocolNames {
     pub chat_preference_restored_header: &'static str,
 }
 
-pub(crate) struct ClientProofNames {
+pub struct ClientProofNames {
     pub header: &'static str,
     pub message_domain: &'static str,
     pub enroll_path: &'static str,
@@ -162,4 +281,25 @@ pub(crate) struct ClientProofNames {
     pub device_filename: &'static str,
     /// Unreadable key kept aside before a new device key is created.
     pub corrupt_key_filename: &'static str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A local slot: the process-wide brand is never installed by tests.
+    #[test]
+    fn install_accepts_the_same_brand_and_rejects_another_without_overwriting() {
+        static OTHER: Brand = Brand {
+            binary_name: "other",
+            ..crate::brand_saiai::SAIAI_BRAND
+        };
+        let saiai = &crate::brand_saiai::SAIAI_BRAND;
+        let slot = OnceLock::new();
+        install_into(&slot, saiai).unwrap();
+        install_into(&slot, saiai).unwrap();
+        let error = install_into(&slot, &OTHER).unwrap_err();
+        assert!(error.to_string().contains("saiai"), "{error}");
+        assert!(std::ptr::eq(*slot.get().unwrap(), saiai));
+    }
 }

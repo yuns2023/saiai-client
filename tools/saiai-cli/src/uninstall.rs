@@ -1,6 +1,6 @@
 //! `saiai uninstall`: a read-only discovery builds the plan; execution removes
 //! only SAIAI-created files and values exactly equal to what SAIAI wrote.
-use crate::brand::BRAND;
+use crate::brand::{BRAND, BrandValue};
 use crate::{environment_scope, vscode};
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value};
@@ -19,19 +19,19 @@ const PLAN_MARKER: &str = "SAIAI uninstall plan";
 #[cfg(windows)]
 const RELAUNCH_FLAG: &str = "--relaunched-from";
 const ENVIRONMENTS_DIR: &str = "environments";
-pub(crate) const SAIAI_HOME_FILES: &[&str] = &[
+pub(crate) const SAIAI_HOME_FILES: &[BrandValue<&'static str>] = &[
     crate::SAIAI_CONFIG_FILENAME,
     crate::SAIAI_CA_FILENAME,
     crate::SAIAI_CA_KEY_FILENAME,
-    "initialization.lock",
-    BRAND.service.lock_filename,
-    BRAND.service.pid_filename,
-    BRAND.service.log_filename,
-    BRAND.client_proof.key_filename,
-    BRAND.client_proof.device_filename,
-    BRAND.client_proof.lock_filename,
-    BRAND.client_proof.corrupt_key_filename,
-    "windows-packaged-proxy-lease.json",
+    BrandValue(|_| "initialization.lock"),
+    BrandValue(|brand| brand.service.lock_filename),
+    BrandValue(|brand| brand.service.pid_filename),
+    BrandValue(|brand| brand.service.log_filename),
+    BrandValue(|brand| brand.client_proof.key_filename),
+    BrandValue(|brand| brand.client_proof.device_filename),
+    BrandValue(|brand| brand.client_proof.lock_filename),
+    BrandValue(|brand| brand.client_proof.corrupt_key_filename),
+    BrandValue(|_| "windows-packaged-proxy-lease.json"),
 ];
 pub(crate) const SAIAI_HOME_DIRS: &[&str] = &["log-followers", "desktop"];
 const CLAUDE_GENERIC_ENV: &[&str] = &[
@@ -537,7 +537,7 @@ fn read_instance(
             instance.product_dir = Some(dir);
         }
     }
-    let raw = match fs::read(instance.dir.join(crate::SAIAI_CONFIG_FILENAME)) {
+    let raw = match fs::read(instance.dir.join(crate::SAIAI_CONFIG_FILENAME.get())) {
         Ok(raw) => raw,
         Err(error) => {
             instance.config_present = error.kind() != ErrorKind::NotFound;
@@ -575,7 +575,7 @@ fn is_saiai_config(config: &Value) -> bool {
         && text("ca_cert_path")
         && match config.get("version") {
             Some(version) => {
-                version.as_u64() == Some(u64::from(crate::SAIAI_CONFIG_VERSION))
+                version.as_u64() == Some(u64::from(crate::SAIAI_CONFIG_VERSION.get()))
                     || version.as_u64() == Some(1)
             }
             None => text("base_url") && text("api_key"),
@@ -609,7 +609,7 @@ fn owned_environment(instance: &Instance) -> bool {
                 return false;
             }
             record = true;
-        } else if name == crate::SAIAI_CONFIG_FILENAME
+        } else if name == crate::SAIAI_CONFIG_FILENAME.get()
             || !is_saiai_home_file(name)
             || !entry.file_type().is_ok_and(|kind| kind.is_file())
         {
@@ -977,10 +977,10 @@ fn is_codex_placeholder_tokens(tokens: &Value) -> bool {
         return false;
     };
     let expected = [
-        ("id_token", crate::CODEX_PLACEHOLDER_ID_TOKEN),
-        ("access_token", crate::CODEX_PLACEHOLDER_ACCESS_TOKEN),
+        ("id_token", crate::CODEX_PLACEHOLDER_ID_TOKEN.get()),
+        ("access_token", crate::CODEX_PLACEHOLDER_ACCESS_TOKEN.get()),
         ("refresh_token", ""),
-        ("account_id", crate::CODEX_PLACEHOLDER_ACCOUNT_ID),
+        ("account_id", crate::CODEX_PLACEHOLDER_ACCOUNT_ID.get()),
     ];
     tokens.len() == expected.len()
         && expected
@@ -1272,8 +1272,8 @@ fn ca_backup_paths(dir: &Path) -> Vec<PathBuf> {
         return Vec::new();
     };
     let prefixes = [
-        format!("{}.bak-", crate::SAIAI_CA_FILENAME),
-        format!("{}.bak-", crate::SAIAI_CA_KEY_FILENAME),
+        format!("{}.bak-", crate::SAIAI_CA_FILENAME.get()),
+        format!("{}.bak-", crate::SAIAI_CA_KEY_FILENAME.get()),
     ];
     let mut paths = entries
         .flatten()
@@ -1312,12 +1312,12 @@ fn known_ca_files(discovery: &Discovery) -> Vec<PathBuf> {
         }
     }
     for directory in directories {
-        files.insert(directory.join(crate::SAIAI_CA_FILENAME));
+        files.insert(directory.join(crate::SAIAI_CA_FILENAME.get()));
         for path in ca_backup_paths(directory) {
             if path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(crate::SAIAI_CA_FILENAME))
+                .is_some_and(|name| name.starts_with(crate::SAIAI_CA_FILENAME.get()))
             {
                 files.insert(path);
             }
@@ -1371,7 +1371,7 @@ fn certutil_export(db: &str) -> Result<Option<Vec<u8>>> {
             "-d",
             db,
             "-n",
-            crate::SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME,
+            crate::SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME.get(),
             "-a",
         ])
         .stdin(std::process::Stdio::null())
@@ -1410,7 +1410,7 @@ fn plan_nss(files: &[PathBuf], plan: &mut Plan) {
         .collect::<BTreeSet<_>>();
     let label = format!(
         "NSS certificate {} in {}",
-        crate::SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME,
+        crate::SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME.get(),
         db_dir.display()
     );
     match nss_decision(&exported, &known) {
@@ -1430,17 +1430,20 @@ fn plan_nss(files: &[PathBuf], plan: &mut Plan) {
 // ------------------------------------------------------------------ Data
 
 pub(crate) fn is_saiai_home_file(name: &str) -> bool {
-    SAIAI_HOME_FILES.iter().any(|file| {
-        name == *file
+    SAIAI_HOME_FILES.iter().map(BrandValue::get).any(|file| {
+        name == file
             || name.starts_with(&format!("{file}.bak-"))
             || name.starts_with(&format!(".{file}.{}-", BRAND.config.temp_file_infix))
     })
 }
 
 pub(crate) fn is_claude_ca_file(name: &str) -> bool {
-    [crate::SAIAI_CA_FILENAME, crate::SAIAI_CA_KEY_FILENAME]
-        .iter()
-        .any(|file| name == *file || name.starts_with(&format!("{file}.bak-")))
+    [
+        crate::SAIAI_CA_FILENAME.get(),
+        crate::SAIAI_CA_KEY_FILENAME.get(),
+    ]
+    .iter()
+    .any(|file| name == *file || name.starts_with(&format!("{file}.bak-")))
 }
 
 fn matching_files(dir: &Path, filter: fn(&str) -> bool) -> Result<Vec<PathBuf>> {
@@ -1483,7 +1486,7 @@ fn plan_data(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
         for path in matching_files(root, is_saiai_home_file)? {
             if path
                 .file_name()
-                .is_some_and(|name| name == crate::SAIAI_CONFIG_FILENAME)
+                .is_some_and(|name| name == crate::SAIAI_CONFIG_FILENAME.get())
                 && !saiai_config
             {
                 plan.note(
@@ -2386,7 +2389,7 @@ fn execute_nss(db: &str, known: &BTreeSet<String>) -> Result<Outcome> {
                 "-d",
                 db,
                 "-n",
-                crate::SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME,
+                crate::SAIAI_LOCAL_PROXY_NSS_CERT_NICKNAME.get(),
             ])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -2822,10 +2825,10 @@ mod tests {
 
     fn placeholder() -> Value {
         json!({
-            "id_token": crate::CODEX_PLACEHOLDER_ID_TOKEN,
-            "access_token": crate::CODEX_PLACEHOLDER_ACCESS_TOKEN,
+            "id_token": crate::CODEX_PLACEHOLDER_ID_TOKEN.get(),
+            "access_token": crate::CODEX_PLACEHOLDER_ACCESS_TOKEN.get(),
             "refresh_token": "",
-            "account_id": crate::CODEX_PLACEHOLDER_ACCOUNT_ID
+            "account_id": crate::CODEX_PLACEHOLDER_ACCOUNT_ID.get()
         })
     }
 
@@ -2900,7 +2903,7 @@ mod tests {
         assert!(stripped.complete);
         assert_eq!(stripped.content, "A=1\n\nB=2\r\n");
         assert_eq!(crate::strip_codex_ide_env_block(&block).content, "");
-        let unterminated = format!("A=1\n{}\nB=2\n", crate::CODEX_IDE_ENV_BEGIN);
+        let unterminated = format!("A=1\n{}\nB=2\n", crate::CODEX_IDE_ENV_BEGIN.get());
         assert!(!crate::strip_codex_ide_env_block(&unterminated).complete);
         assert_eq!(
             crate::strip_codex_ide_env_block("A=1\r\nB=2").content,

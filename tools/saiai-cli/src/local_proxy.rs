@@ -56,7 +56,8 @@ const CHAT_OPENAI_HOST: &str = "chat.openai.com";
 // as chatgpt.com; otherwise CONNECT falls through to the real provider with
 // the SAIAI placeholder and the app appears logged out.
 const CHATGPT_AUX_HOST: &str = "ab.chatgpt.com";
-pub(crate) const CERTIFICATE_CONTROL_HOST: &str = BRAND.certificates.control_host;
+pub(crate) const CERTIFICATE_CONTROL_HOST: crate::brand::BrandValue<&'static str> =
+    crate::brand::BrandValue(|brand| brand.certificates.control_host);
 // Third-party telemetry and error-reporting intake hosts that the local proxy
 // refuses with 403 before any upstream connect.  Exact hosts must be measured
 // from the clients SAIAI launches; the Sentry suffixes generalise measured
@@ -74,9 +75,12 @@ const TELEMETRY_DENY_EXACT_HOSTS: &[&str] = &[
 // that varies, so these are matched as label-boundary suffixes.  sentry.io
 // itself, docs, and `mcp.sentry.dev` stay reachable.
 const TELEMETRY_DENY_HOST_SUFFIXES: &[&str] = &[".ingest.sentry.io", ".ingest.us.sentry.io"];
-pub(crate) const CERTIFICATE_SPKI_HEADER: &str = BRAND.certificates.spki_header;
-const CHATGPT_CHAT_PASSTHROUGH_ENV: &str = BRAND.env.chatgpt_chat_passthrough;
-const SAIAI_DESKTOP_EMAIL: &str = BRAND.placeholders.desktop_email;
+pub(crate) const CERTIFICATE_SPKI_HEADER: crate::brand::BrandValue<&'static str> =
+    crate::brand::BrandValue(|brand| brand.certificates.spki_header);
+const CHATGPT_CHAT_PASSTHROUGH_ENV: crate::brand::BrandValue<&'static str> =
+    crate::brand::BrandValue(|brand| brand.env.chatgpt_chat_passthrough);
+const SAIAI_DESKTOP_EMAIL: crate::brand::BrandValue<&'static str> =
+    crate::brand::BrandValue(|brand| brand.placeholders.desktop_email);
 const DESKTOP_STATSIG_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 // Codex Desktop 26.908.4834.0 / Statsig JS 3.33.4 gates bundled locale
 // messages behind layer 72216192. Keep this local bootstrap deliberately
@@ -102,7 +106,8 @@ const DESKTOP_CONTROL_GATES: [&str; 5] = [
     "1892382740",
     "1146407612",
 ];
-const DESKTOP_BROWSER_USE_ENV: &str = BRAND.env.desktop_browser_use;
+const DESKTOP_BROWSER_USE_ENV: crate::brand::BrandValue<&'static str> =
+    crate::brand::BrandValue(|brand| brand.env.desktop_browser_use);
 static DESKTOP_STATSIG_BROWSER_PAYLOAD: LazyLock<String> =
     LazyLock::new(|| desktop_statsig_base(DesktopFeatures { browser_use: true }).to_string());
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
@@ -468,18 +473,18 @@ impl State {
         }));
         let websocket_tls = upstream_tls::upstream_websocket_tls_config(&cfg.ca_cert_pem);
         let openai_trace = OpenAITrace::from_env()?;
-        let chatgpt_chat_passthrough = match env::var(CHATGPT_CHAT_PASSTHROUGH_ENV).ok().as_deref()
-        {
-            Some("0") => false,
-            Some("1") => true,
-            _ => cfg.chatgpt_chat_passthrough,
-        };
+        let chatgpt_chat_passthrough =
+            match env::var(CHATGPT_CHAT_PASSTHROUGH_ENV.get()).ok().as_deref() {
+                Some("0") => false,
+                Some("1") => true,
+                _ => cfg.chatgpt_chat_passthrough,
+            };
         // This is an opt-in operator diagnostic for a single inherited service
         // process. It never enables body tracing; verbose records remain
         // limited to request metadata and response outcomes.
         let verbose = cfg.verbose || env::var(BRAND.env.proxy_verbose).ok().as_deref() == Some("1");
         let browser_use = desktop_browser_use_setting(
-            env::var(DESKTOP_BROWSER_USE_ENV).ok().as_deref(),
+            env::var(DESKTOP_BROWSER_USE_ENV.get()).ok().as_deref(),
             cfg.desktop_browser_use,
         );
 
@@ -880,7 +885,7 @@ async fn handle_client_on(
         )
         .await;
     }
-    if connect.host == CERTIFICATE_CONTROL_HOST && connect.port == 443 {
+    if connect.host == CERTIFICATE_CONTROL_HOST.get() && connect.port == 443 {
         let spki = if entry == EntryPoint::ClaudeDesktop {
             ["claude.ai", ANTHROPIC_HOST]
                 .into_iter()
@@ -1469,9 +1474,10 @@ fn build_openai_websocket_request(
     if let Some(proof) = sign(upstream_request.method().as_str(), &target)
         && let Ok(value) = HeaderValue::from_str(&proof)
     {
-        upstream_request
-            .headers_mut()
-            .insert(HeaderName::from_static(client_proof::HEADER_NAME), value);
+        upstream_request.headers_mut().insert(
+            HeaderName::from_static(client_proof::HEADER_NAME.get()),
+            value,
+        );
     }
 
     Ok(upstream_request)
@@ -2066,7 +2072,7 @@ where
         ) && let Ok(value) = reqwest::header::HeaderValue::from_str(&proof)
         {
             upstream_request.headers_mut().insert(
-                reqwest::header::HeaderName::from_static(client_proof::HEADER_NAME),
+                reqwest::header::HeaderName::from_static(client_proof::HEADER_NAME.get()),
                 value,
             );
         }
@@ -3141,7 +3147,7 @@ fn chatgpt_account_sidecar_response_with(
         "/me" => json!({
             "id": account_id,
             "account_id": account_id,
-            "email": SAIAI_DESKTOP_EMAIL
+            "email": SAIAI_DESKTOP_EMAIL.get()
         }),
         // The Desktop rate-limit/sidebar code dereferences this array even
         // when no checkout flow is enabled. Returning an empty collection is
@@ -3404,7 +3410,7 @@ fn is_websocket_handshake_header(name: &str) -> bool {
 fn should_forward_request_header(name: &str) -> bool {
     // Only the proxy itself may attach a client proof; never relay one.
     !is_hop_by_hop_header(name)
-        && !name.eq_ignore_ascii_case(client_proof::HEADER_NAME)
+        && !name.eq_ignore_ascii_case(client_proof::HEADER_NAME.get())
         && !name.eq_ignore_ascii_case("host")
         && !name.eq_ignore_ascii_case("content-length")
         && !name.eq_ignore_ascii_case("transfer-encoding")
@@ -4537,7 +4543,7 @@ mod tests {
         };
         let (_, body, _, _) = chatgpt_account_sidecar_response(&me).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["email"], SAIAI_DESKTOP_EMAIL);
+        assert_eq!(body["email"], SAIAI_DESKTOP_EMAIL.get());
 
         let accounts = IncomingRequest {
             method: "GET".to_string(),
@@ -7340,7 +7346,7 @@ mod tests {
         request
             .headers
             .iter()
-            .filter(|(name, _)| name.eq_ignore_ascii_case(client_proof::HEADER_NAME))
+            .filter(|(name, _)| name.eq_ignore_ascii_case(client_proof::HEADER_NAME.get()))
             .map(|(_, value)| value.as_str())
             .collect()
     }

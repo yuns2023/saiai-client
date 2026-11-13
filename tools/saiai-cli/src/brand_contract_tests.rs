@@ -1325,7 +1325,7 @@ fn inline_contract_literals_are_present() {
         // Desktop synthetic identity returned by the local sidecars.
         (
             "local_proxy.rs",
-            "const SAIAI_DESKTOP_EMAIL: &str = BRAND.placeholders.desktop_email;",
+            "const SAIAI_DESKTOP_EMAIL: crate::brand::BrandValue<&'static str> =\n    crate::brand::BrandValue(|brand| brand.placeholders.desktop_email);",
         ),
         ("local_proxy.rs", "\"userID\":\"saiai-local-proxy-user\""),
         ("local_proxy.rs", "\"stableID\":\"saiai-local-proxy\""),
@@ -1384,13 +1384,18 @@ fn brand_environment_fields_are_used_by_the_same_files() {
         ),
     ];
     for (field, files) in expected {
+        // A field is read as `BRAND.env.x` or, in a lazily resolved
+        // constant, as `BrandValue(|brand| brand.env.x)`.
+        let lazy = field.replacen("BRAND.", "|brand| brand.", 1);
         // `BRAND.env.openai_trace` is a prefix of `…_trace_path`.
         let users = sources
             .iter()
             .filter(|(_, text)| {
-                text.match_indices(field).any(|(index, _)| {
-                    !text[index + field.len()..]
-                        .starts_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_')
+                [field, lazy.as_str()].into_iter().any(|needle| {
+                    text.match_indices(needle).any(|(index, _)| {
+                        !text[index + needle.len()..]
+                            .starts_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_')
+                    })
                 })
             })
             .map(|(file, _)| file.as_str())
@@ -1502,27 +1507,27 @@ fn brand_environment_call_sites_are_pinned() {
         (
             "lib.rs",
             "resolve_chatgpt_timezone",
-            "env::var_os(SAIAI_CHATGPT_TIMEZONE_ENV)",
+            "env::var_os(SAIAI_CHATGPT_TIMEZONE_ENV.get())",
         ),
         (
             "lib.rs",
             "run_windows_packaged_desktop",
-            "env::var_os(SAIAI_CHATGPT_TIMEZONE_ENV).is_some()",
+            "env::var_os(SAIAI_CHATGPT_TIMEZONE_ENV.get()).is_some()",
         ),
         (
             "lib.rs",
             "run_linux_desktop",
-            "command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV);",
+            "command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV.get());",
         ),
         (
             "lib.rs",
             "run_macos_desktop",
-            "command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV);",
+            "command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV.get());",
         ),
         (
             "lib.rs",
             "run_windows_desktop",
-            "command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV);",
+            "command.env_remove(SAIAI_CHATGPT_TIMEZONE_ENV.get());",
         ),
         // Installer hand-off and configure-only switch.
         (
@@ -1544,9 +1549,13 @@ fn brand_environment_call_sites_are_pinned() {
         (
             "local_proxy.rs",
             "new",
-            "env::var(CHATGPT_CHAT_PASSTHROUGH_ENV)",
+            "env::var(CHATGPT_CHAT_PASSTHROUGH_ENV.get())",
         ),
-        ("local_proxy.rs", "new", "env::var(DESKTOP_BROWSER_USE_ENV)"),
+        (
+            "local_proxy.rs",
+            "new",
+            "env::var(DESKTOP_BROWSER_USE_ENV.get())",
+        ),
         ("local_proxy.rs", "new", "env::var(BRAND.env.proxy_verbose)"),
         (
             "local_proxy.rs",
@@ -1561,7 +1570,7 @@ fn brand_environment_call_sites_are_pinned() {
         (
             "upstream_proxy.rs",
             "new",
-            "std::env::var(UPSTREAM_PROXY_ENV)",
+            "std::env::var(UPSTREAM_PROXY_ENV.get())",
         ),
         (
             "claude_desktop.rs",
@@ -1586,19 +1595,19 @@ fn brand_environment_call_sites_are_pinned() {
     for (file, needle) in [
         (
             "lib.rs",
-            "const SAIAI_CHATGPT_TIMEZONE_ENV: &str = BRAND.env.chatgpt_timezone;",
+            "const SAIAI_CHATGPT_TIMEZONE_ENV: BrandValue<&'static str> =\n    BrandValue(|brand| brand.env.chatgpt_timezone);",
         ),
         (
             "local_proxy.rs",
-            "const CHATGPT_CHAT_PASSTHROUGH_ENV: &str = BRAND.env.chatgpt_chat_passthrough;",
+            "const CHATGPT_CHAT_PASSTHROUGH_ENV: crate::brand::BrandValue<&'static str> =\n    crate::brand::BrandValue(|brand| brand.env.chatgpt_chat_passthrough);",
         ),
         (
             "local_proxy.rs",
-            "const DESKTOP_BROWSER_USE_ENV: &str = BRAND.env.desktop_browser_use;",
+            "const DESKTOP_BROWSER_USE_ENV: crate::brand::BrandValue<&'static str> =\n    crate::brand::BrandValue(|brand| brand.env.desktop_browser_use);",
         ),
         (
             "upstream_proxy.rs",
-            "pub(crate) const UPSTREAM_PROXY_ENV: &str = crate::brand::BRAND.env.upstream_proxy;",
+            "pub(crate) const UPSTREAM_PROXY_ENV: crate::brand::BrandValue<&'static str> =\n    crate::brand::BrandValue(|brand| brand.env.upstream_proxy);",
         ),
     ] {
         assert!(sources[file].contains(needle), "{file}: {needle}");
@@ -1716,13 +1725,31 @@ fn library_takes_release_facts_from_the_entry_point() {
     }
     let entry = &sources["main.rs"];
     assert!(
-        entry.contains("proxy_cli::run(proxy_cli::RuntimeContext {"),
+        entry.contains(
+            "proxy_cli::run(\n        &brand_saiai::SAIAI_BRAND,\n        proxy_cli::RuntimeContext {"
+        ),
         "{entry}"
     );
     assert!(
         entry.contains("version: env!(\"CARGO_PKG_VERSION\"),"),
         "{entry}"
     );
+}
+
+/// The library core reads the brand the program installed; only the
+/// program side (`main.rs`) and the SAIAI values themselves name them.
+#[test]
+fn only_the_program_names_the_saiai_brand() {
+    let sources = cli_sources();
+    for (file, text) in &sources {
+        if file == "main.rs" || file == "brand_saiai.rs" {
+            continue;
+        }
+        for name in ["brand_saiai", "SAIAI_BRAND"] {
+            assert!(!text.contains(name), "{file} names {name}");
+        }
+    }
+    assert!(sources["main.rs"].contains("mod brand_saiai;"));
 }
 
 /// The SAIAI values of every brand field, written out by hand. A refactor
