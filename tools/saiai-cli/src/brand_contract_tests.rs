@@ -2573,19 +2573,17 @@ fn kernel_module_paths(text: &str, private: &[String]) -> Vec<String> {
             let rest = &compact[index + root.len()..];
             let mut heads = Vec::new();
             if let Some(group) = rest.strip_prefix('{') {
-                // Items at any nesting depth start after `{` or `,`.
+                // Only items directly below the root; a nested item belongs
+                // to its parent, which is checked here.
                 let mut depth = 0;
                 let mut start = true;
                 for (offset, ch) in group.char_indices() {
                     match ch {
-                        '{' => {
-                            depth += 1;
-                            start = true;
-                        }
+                        '{' => depth += 1,
                         '}' if depth == 0 => break,
                         '}' => depth -= 1,
-                        ',' => start = true,
-                        ch if start && ident(ch) => {
+                        ',' if depth == 0 => start = true,
+                        ch if start && depth == 0 && ident(ch) => {
                             heads.push(&group[offset..]);
                             start = false;
                         }
@@ -2601,7 +2599,17 @@ fn kernel_module_paths(text: &str, private: &[String]) -> Vec<String> {
                 if private.contains(&name) {
                     found.push(format!("{root}{name}"));
                 }
+                // An alias of the root would hide later module paths.
+                if name == "self" && head[name.len()..].trim_start().starts_with("as ") {
+                    found.push(format!("{root}{{self as …}}"));
+                }
             }
+        }
+    }
+    let words: Vec<&str> = compact.split_whitespace().collect();
+    for window in words.windows(3) {
+        if matches!(window, ["use" | "crate", "crate" | "super" | "self", "as"]) {
+            found.push(format!("{} {} as", window[0], window[1]));
         }
     }
     found
@@ -2619,6 +2627,10 @@ fn kernel_module_path_scanner_sees_aliases_groups_and_spacing() {
         "use crate::{\n    GatewayHttp,\n    brand,\n};",
         "$crate::gateway::X",
         "use super::brand::BRAND;",
+        "use crate as c;\nc::gateway::X",
+        "use crate::{self as c};\nc::gateway::X",
+        "use super as parent;",
+        "extern crate self as root;",
     ] {
         assert!(!kernel_module_paths(text, &private).is_empty(), "{text}");
     }
@@ -2629,6 +2641,8 @@ fn kernel_module_path_scanner_sees_aliases_groups_and_spacing() {
         "let text = \"crate::gateway::X\"; // crate::gateway::Y",
         "use super::*;",
         "fn gateway() {}",
+        "use crate::{client_proof::{brand}};",
+        "use crate::client_proof::{self, ClientProof};",
     ] {
         assert_eq!(
             kernel_module_paths(text, &private),
