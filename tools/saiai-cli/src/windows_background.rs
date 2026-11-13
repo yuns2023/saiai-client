@@ -198,10 +198,7 @@ mod tests {
         let error =
             finish_stop(Some(os_error(ERROR_ACCESS_DENIED)), |_| Wait::TimedOut).unwrap_err();
         assert_eq!(os_code(&error), Some(ERROR_ACCESS_DENIED));
-        assert!(
-            error.to_string().starts_with("cannot terminate selected"),
-            "{error:#}"
-        );
+        assert_eq!(error.to_string(), "cannot terminate selected SAIAI process");
     }
 
     #[test]
@@ -223,13 +220,16 @@ mod tests {
         for terminate_error in [None, Some(os_error(ERROR_ACCESS_DENIED))] {
             let error = finish_stop(terminate_error, |_| Wait::Failed(os_error(6))).unwrap_err();
             assert_eq!(os_code(&error), Some(6));
-            assert!(
-                error.to_string().starts_with("cannot wait for selected"),
-                "{error:#}"
+            assert_eq!(
+                error.to_string(),
+                "cannot wait for selected SAIAI process to exit"
             );
         }
         let error = finish_stop(None, |_| Wait::TimedOut).unwrap_err();
-        assert!(error.to_string().contains("did not exit"), "{error:#}");
+        assert_eq!(
+            error.to_string(),
+            "selected SAIAI process did not exit after termination"
+        );
     }
 
     /// The real path on a child process: one that is running (no
