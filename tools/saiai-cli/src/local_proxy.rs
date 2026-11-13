@@ -1295,7 +1295,7 @@ async fn serve_managed_tls_on(
                         }
                         continue;
                     }
-                    forward_to_saiai(
+                    forward_to_gateway(
                         &state,
                         reader.get_mut(),
                         request,
@@ -1441,7 +1441,7 @@ async fn serve_managed_tls_on(
             if is_forwarded_openai_path(&path, chat.as_ref()) {
                 // Codex's OAuth request shape is preserved; only the Gateway
                 // credential is substituted at this upstream boundary.
-                forward_to_saiai(
+                forward_to_gateway(
                     &state,
                     reader.get_mut(),
                     request,
@@ -2010,7 +2010,7 @@ enum CredentialPolicy {
     DesktopPlaceholder,
 }
 
-async fn forward_to_saiai<W>(
+async fn forward_to_gateway<W>(
     state: &State,
     writer: &mut W,
     request: IncomingRequest,
@@ -2024,7 +2024,7 @@ where
     let preferences_path = super::codex_config_dir()
         .ok()
         .map(|home| home.join(".codex-global-state.json"));
-    forward_to_saiai_with_preferences_path(
+    forward_to_gateway_with_preferences_path(
         state,
         writer,
         request,
@@ -2036,7 +2036,7 @@ where
     .await
 }
 
-async fn forward_to_saiai_with_preferences_path<W>(
+async fn forward_to_gateway_with_preferences_path<W>(
     state: &State,
     writer: &mut W,
     request: IncomingRequest,
@@ -6369,7 +6369,7 @@ mod tests {
             ],
         };
         let (mut writer, mut output) = tokio::io::duplex(16384);
-        forward_to_saiai_with_preferences_path(
+        forward_to_gateway_with_preferences_path(
             &state,
             &mut writer,
             request,
@@ -6468,7 +6468,7 @@ mod tests {
             ],
         };
         let (mut writer, mut output) = tokio::io::duplex(16_384);
-        forward_to_saiai(
+        forward_to_gateway(
             &state,
             &mut writer,
             request,
@@ -6587,7 +6587,7 @@ mod tests {
             };
             state.trace_openai_request("request", "to_gateway", &request);
             let (mut writer, mut output) = tokio::io::duplex(16384);
-            forward_to_saiai(
+            forward_to_gateway(
                 &state,
                 &mut writer,
                 request,
@@ -6700,7 +6700,7 @@ mod tests {
                 body: Vec::new(),
             };
             let (mut writer, mut output) = tokio::io::duplex(16_384);
-            forward_to_saiai(
+            forward_to_gateway(
                 &state,
                 &mut writer,
                 request,
@@ -7937,7 +7937,7 @@ mod tests {
         let targets = ["/v1/responses?future=a%2Fb&x=", "/v1/responses?"];
         for target in targets {
             let (mut writer, mut output) = tokio::io::duplex(16_384);
-            forward_to_saiai(
+            forward_to_gateway(
                 &state,
                 &mut writer,
                 proof_request(target, "Bearer MOCK_ONLY_CLIENT"),
@@ -8004,7 +8004,7 @@ mod tests {
         let original = request.body.clone();
         let policy = claude_desktop::credential_policy(&state, &request).unwrap();
         let (mut writer, mut output) = tokio::io::duplex(16_384);
-        forward_to_saiai(
+        forward_to_gateway(
             &state,
             &mut writer,
             request,
@@ -8069,7 +8069,7 @@ mod tests {
         let (state, _directory) =
             proof_test_state(&base_url, &base_url, Some("MOCK_ONLY_CLAUDE_KEY"));
         let (mut writer, mut output) = tokio::io::duplex(16_384);
-        forward_to_saiai(
+        forward_to_gateway(
             &state,
             &mut writer,
             proof_request("/v1/messages?beta=true", "Bearer MOCK_ONLY_CLAUDE_KEY"),
@@ -8110,7 +8110,7 @@ mod tests {
             let (base_url, server) = capture_gateway_requests(1, enrolls).await;
             let (state, _directory) = proof_test_state(&base_url, &base_url, enrolled);
             let (mut writer, mut output) = tokio::io::duplex(16_384);
-            forward_to_saiai(
+            forward_to_gateway(
                 &state,
                 &mut writer,
                 proof_request("/v1/messages", authorization),

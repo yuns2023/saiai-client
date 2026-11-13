@@ -81,7 +81,7 @@ def verify_claude_launcher(main: str) -> None:
     for required in (
         "pub(crate) fn run(args: &[String])",
         "let mut command = process_command()?",
-        "read_saiai_config()",
+        "read_app_config()",
         "let token = claude_token(&config)?",
         "validate_listen(&config.listen)?",
         "read_runtime_ca(&config)",
@@ -193,9 +193,11 @@ def verify_cli() -> None:
         require(withdrawn not in entry, f"CLI entry point exposes withdrawn V2 behavior: {withdrawn}")
 
     main = text("tools/saiai-cli/src/lib.rs")
-    # User-visible text names the program through Brand placeholders (see
-    # brand_contract_tests::BRAND_TEXT_TOKENS, which also proves each one is
-    # bound); check the text as the SAIAI build renders it.
+    # User-visible text names the program through Brand placeholders; check
+    # the text as the SAIAI build renders it. The binding check here is only
+    # file-level (the bindings exist somewhere in lib.rs); that every
+    # placeholder is bound in its own call is proven by the Rust test
+    # brand_contract_tests::brand_text_renders_the_frozen_saiai_bytes.
     for binding in ("brand_binary = BRAND.binary_name", "brand_product = BRAND.product_name"):
         require(binding in main, f"CLI text is missing the brand binding {binding!r}")
     main = main.replace("{brand_binary}", "saiai").replace("{brand_product}", "SAIAI")
@@ -237,7 +239,7 @@ def verify_cli() -> None:
         'state.remove("oauthAccount")',
         "remove_if_exists_with_backup(credentials_path",
         "generate_installation_ca",
-        "SAIAI_CA_KEY_FILENAME",
+        "CA_KEY_FILENAME",
         "is_managed_claude_env",
         '"VERTEX_REGION_CLAUDE_"',
         '"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"',
@@ -247,11 +249,11 @@ def verify_cli() -> None:
         "create_new(true)",
         "MOVEFILE_REPLACE_EXISTING",
         "file.sync_all()",
-        "SAIAI_LINUX_BACKGROUND_COMMAND",
+        "LINUX_BACKGROUND_COMMAND",
         "start_linux_background_proxy",
         "start_time_ticks",
         "apply_systemd_user_environment",
-        "SAIAI_WINDOWS_BACKGROUND_COMMAND",
+        "WINDOWS_BACKGROUND_COMMAND",
         "run_windows_background_proxy_worker",
     ):
         require(required in main, f"CLI contract is missing {required!r}")

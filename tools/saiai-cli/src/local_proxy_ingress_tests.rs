@@ -1230,7 +1230,7 @@ async fn no_chat_relay_means_no_device_cookie_and_no_preference_rewrite() {
         )],
     };
     let (mut writer, mut output) = tokio::io::duplex(16384);
-    forward_to_saiai_with_preferences_path(
+    forward_to_gateway_with_preferences_path(
         &state,
         &mut writer,
         request,
@@ -1455,7 +1455,7 @@ async fn no_chat_relay_never_parses_the_device_cookie_nor_reads_preferences() {
                 "_devicecheck=MOCK_ONLY_FIRST; _devicecheck=MOCK_ONLY_SECOND".into(),
             )],
         };
-        let result = forward_to_saiai_with_preferences_path(
+        let result = forward_to_gateway_with_preferences_path(
             &state,
             &mut tokio::io::sink(),
             duplicated,
@@ -1486,7 +1486,7 @@ async fn no_chat_relay_never_parses_the_device_cookie_nor_reads_preferences() {
             headers: Vec::new(),
         };
         let before = super::preference_reads();
-        forward_to_saiai_with_preferences_path(
+        forward_to_gateway_with_preferences_path(
             &state,
             &mut tokio::io::sink(),
             init,
