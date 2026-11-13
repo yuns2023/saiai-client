@@ -216,3 +216,49 @@ fn claude_desktop_fixtures_are_byte_identical() {
         assert_eq!(value.to_string(), body, "{method} {path}");
     }
 }
+
+/// The synthetic names come from the brand: another brand's answers carry
+/// its own names and none of SAIAI's.
+#[test]
+fn synthetic_names_follow_the_brand() {
+    use crate::brand::{Brand, PlaceholderIdentities};
+    use crate::brand_saiai::SAIAI_VALUES;
+    static ACME: Brand = Brand {
+        binary_name: "acme",
+        product_name: "Acme",
+        placeholders: PlaceholderIdentities {
+            synthetic_id_prefix: "acme-local",
+            ..SAIAI_VALUES.placeholders
+        },
+        ..SAIAI_VALUES
+    };
+    let payload = desktop_statsig_local_payload(&ACME);
+    for name in [
+        r#""rule_id":"acme-local-i18n""#,
+        r#""userID":"acme-local-proxy-user""#,
+        r#""stableID":"acme-local-proxy""#,
+    ] {
+        assert!(payload.contains(name), "{payload}");
+    }
+    let browser = desktop_statsig_base(&ACME, DesktopFeatures { browser_use: true }).to_string();
+    assert!(
+        browser.contains(r#""rule_id":"acme-local-browser-use""#),
+        "{browser}"
+    );
+    assert_eq!(synthetic_user_id(&ACME), "acme-local-proxy-user");
+    assert_eq!(
+        desktop_control_unsupported_message(&ACME),
+        "This Desktop control endpoint is unavailable through Acme."
+    );
+    assert_eq!(
+        crate::claude_desktop_fixtures::local_code_name(&ACME),
+        "Acme Local Code"
+    );
+    assert_eq!(
+        crate::claude_desktop_fixtures::desktop_claude_command(&ACME),
+        "acme desktop claude"
+    );
+    for text in [payload, browser] {
+        assert!(!text.to_ascii_lowercase().contains("saiai"), "{text}");
+    }
+}

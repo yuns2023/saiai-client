@@ -1348,13 +1348,18 @@ fn inline_contract_literals_are_present() {
             "lib.rs",
             "binary_changed_during_initialization(env::var(BRAND.env.binary_updated)",
         ),
-        // Desktop synthetic identity returned by the local sidecars.
+        // Desktop synthetic identity returned by the local sidecars: the email
+        // and the synthetic ids derived from the brand's prefix.
         (
             "local_proxy.rs",
-            "const SAIAI_DESKTOP_EMAIL: crate::brand::BrandValue<&'static str> =\n    crate::brand::BrandValue(|brand| brand.placeholders.desktop_email);",
+            "const DESKTOP_EMAIL: crate::brand::BrandValue<&'static str> =\n    crate::brand::BrandValue(|brand| brand.placeholders.desktop_email);",
         ),
-        ("local_proxy.rs", "\"userID\":\"saiai-local-proxy-user\""),
-        ("local_proxy.rs", "\"stableID\":\"saiai-local-proxy\""),
+        ("local_proxy.rs", "\"userID\":\"@@ID@@-proxy-user\""),
+        ("local_proxy.rs", "\"stableID\":\"@@ID@@-proxy\""),
+        (
+            "local_proxy.rs",
+            "DESKTOP_STATSIG_LOCAL_TEMPLATE.replace(\"@@ID@@\", brand.placeholders.synthetic_id_prefix)",
+        ),
         // The restored-preference marker: the forwarder writes the header the
         // Native Chat capability names, and SAIAI names its brand header.
         (
@@ -1799,6 +1804,7 @@ fn only_the_program_names_the_saiai_brand() {
 fn saiai_brand_values_are_frozen() {
     let brand = crate::brand::BRAND;
     assert_eq!(brand.binary_name, "saiai");
+    assert_eq!(brand.product_name, "SAIAI");
     assert_eq!(brand.home_dir_name, ".saiai");
     assert_eq!(brand.windows_app_dir_name, "SAIAI");
     assert_eq!(brand.config.filename, "config.json");
@@ -1887,6 +1893,7 @@ fn saiai_brand_values_are_frozen() {
         placeholders.desktop_email,
         "saiai-local-proxy@example.invalid"
     );
+    assert_eq!(placeholders.synthetic_id_prefix, "saiai-local");
     let proof = &brand.client_proof;
     assert_eq!(proof.header, "x-saiai-client-proof");
     assert_eq!(proof.message_domain, "saiai-client-proof-v1");

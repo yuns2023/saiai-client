@@ -10,12 +10,6 @@ claude_desktop.rs	let cfg = crate::read_saiai_config()?;
 claude_desktop.rs	let cfg = crate::read_saiai_config()?;
 claude_desktop.rs	let config_root = crate::saiai_config_dir()?;
 claude_desktop.rs	let root = crate::saiai_config_dir()?;
-claude_desktop_fixtures.rs	json!([{"id":"code","revision":"saiai-local-1","models":models,"default_model":selection["model"]},
-claude_desktop_fixtures.rs	json!({"error":{"type":"desktop_surface_unsupported","message":"SAIAI supports Code only. Open the Code tab; Chat and Cowork are not supported."}}),
-claude_desktop_fixtures.rs	json!({"logged_out":true,"message":"Local session ended. Relaunch saiai desktop claude to reconnect."}),
-claude_desktop_fixtures.rs	json!({"uuid":id.account,"email_address":"","full_name":"SAIAI Local Code","display_name":"SAIAI Local Code",
-claude_desktop_fixtures.rs	json!({"uuid":id.organization,"name":"SAIAI Local Code","capabilities":["chat","claude_pro","claude_code"],
-claude_desktop_fixtures.rs	{"id":"chat","revision":"saiai-local-1","models":[],"default_model":null}])
 claude_launcher.rs	"Starting Claude with SAIAI child environment; explicit Claude settings still apply."
 claude_launcher.rs	.context("SAIAI local proxy CA is unavailable; rerun the SAIAI setup")?;
 claude_launcher.rs	.context("SAIAI local proxy is not configured; run the SAIAI Claude setup first")?;
@@ -449,27 +443,17 @@ lib.rs	write_saiai_config_at(&config_path, &migrated)?;
 lib.rs	write_saiai_config_at(&saiai_config_path()?, &cfg)?;
 lib.rs	write_saiai_config_at(path, &config)?;
 lib.rs	} else if linux_configured_listen_has_saiai_owner()? {
-local_proxy.rs	"email": SAIAI_DESKTOP_EMAIL.get()
-local_proxy.rs	"rule_id": "saiai-local-browser-use",
-local_proxy.rs	"serverInfo": {"name": "saiai-local", "version": "1"}
 local_proxy.rs	.context("failed to load SAIAI CA")?;
 local_proxy.rs	.context("failed to parse SAIAI CA certificate")?;
 local_proxy.rs	.context("failed to validate installation-specific SAIAI CA")?;
 local_proxy.rs	.map_err(|_| anyhow::anyhow!("failed to parse SAIAI CA certificate PEM"))?;
 local_proxy.rs	.map_err(|_| anyhow::anyhow!("failed to parse SAIAI CA certificate"))?;
-local_proxy.rs	.unwrap_or_else(|| "saiai-local-proxy-user".to_string());
 local_proxy.rs	Url::parse(&base).with_context(|| format!("invalid {name} SAIAI base URL: {base}"))?;
 local_proxy.rs	async fn forward_to_saiai<W>(
 local_proxy.rs	async fn forward_to_saiai_with_preferences_path<W>(
 local_proxy.rs	bail!("SAIAI CA key does not match the CA certificate");
 local_proxy.rs	bail!("{name} SAIAI API key is required");
 local_proxy.rs	bail!("{name} SAIAI base URL host is required");
-local_proxy.rs	body: br#"{"error":{"type":"desktop_control_unsupported","message":"This Desktop control endpoint is unavailable through SAIAI."}}"#,
-local_proxy.rs	body: br#"{"error":{"type":"desktop_notification_settings_unsupported","message":"Notification settings are unavailable through SAIAI Desktop."}}"#,
-local_proxy.rs	br#"{"error":{"type":"desktop_identity_write_unsupported","message":"Hosted account changes are unavailable through SAIAI Desktop."}}"#.to_vec(),
-local_proxy.rs	br#"{"error":{"type":"desktop_profile_update_unsupported","message":"Profile updates are unavailable through SAIAI Desktop."}}"#.to_vec(),
-local_proxy.rs	const DESKTOP_STATSIG_LOCAL_PAYLOAD: &str = r#"{"feature_gates":{},"dynamic_configs":{},"layer_configs":{"72216192":{"name":"72216192","value":{"enable_i18n":true},"rule_id":"saiai-local-i18n","secondary_exposures":[],"is_user_in_experiment":false,"is_experiment_active":false,"allocated_experiment_name":"","explicit_parameters":["enable_i18n"],"undelegated_secondary_exposures":[]}},"has_updates":true,"time":0,"user":{"userID":"saiai-local-proxy-user","customIDs":{"stableID":"saiai-local-proxy"}}}"#;
-local_proxy.rs	const SAIAI_DESKTOP_EMAIL: crate::brand::BrandValue<&'static str> =
 local_proxy.rs	eprintln!("saiai local proxy listening on http://{}", state.listen);
 local_proxy.rs	eprintln!("saiai local proxy stopped");
 local_proxy.rs	forward_to_saiai(
@@ -478,10 +462,6 @@ local_proxy.rs	forward_to_saiai_with_preferences_path(
 local_proxy.rs	let ca_key = KeyPair::from_pem(ca_key_pem).context("failed to parse SAIAI CA key")?;
 local_proxy.rs	scheme => bail!("{name} SAIAI base URL must use http or https, got {scheme}"),
 local_proxy_claude.rs	"login_state_user_email_context_present; close Desktop and relaunch saiai desktop claude to clear isolated login identity"
-local_proxy_claude.rs	(StatusCode::SERVICE_UNAVAILABLE, br#"{"error":"desktop_identity_invalid","message":"Repair the isolated Desktop identity file and relaunch saiai desktop claude"}"#)
-local_proxy_claude.rs	json!({"account":{"email_address":"","display_name":"SAIAI Local Code"},"organization":fixtures::organization(id)}),
-local_proxy_claude.rs	json!({"error":{"type":"desktop_control_unsupported","message":"This Desktop control endpoint is unavailable through SAIAI."}}),
-local_proxy_claude.rs	write_static_response(writer, StatusCode::SERVICE_UNAVAILABLE, "application/json", br#"{"error":"desktop_identity_missing","message":"Run saiai desktop claude to initialize this environment"}"#, close).await?;
 uninstall.rs	" - Claude Code: log in again (`claude`, then /login). SAIAI did not change ~/.claude.json, .credentials.json or oauthAccount."
 uninstall.rs	" - If you use the Codex app-server daemon, run `codex app-server daemon update`; it may still be pinned to the SAIAI setup."
 uninstall.rs	"SAIAI home is reached through a symbolic link; no SAIAI data inside it is deleted (its services are still stopped), delete it yourself"
