@@ -66,6 +66,11 @@ pub struct GatewayStart {
 /// preference restore, trace redaction) is ChatGPT client protocol handled
 /// by the kernel; a Gateway contributes that it serves the relay plus the
 /// names that are its own.
+///
+/// Codex images (`/v1/codex/images/*`) belong to this capability too: a
+/// generic Gateway does not promise that endpoint, so without the relay the
+/// explicit refusal beats forwarding to an endpoint that may not exist. A
+/// separate capability can split them out if a Gateway ever needs it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeChatProtocol {
     /// Gateway's Chat updates channel: a complete path starting with

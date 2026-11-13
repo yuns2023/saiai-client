@@ -1033,6 +1033,15 @@ async fn serve_http_proxy_request(
     };
     let host = canonical_host(target.host_str().unwrap_or_default());
     let port = target.port_or_known_default().unwrap_or(80);
+    // The Chat relay gate holds on the plain HTTP proxy too, on the path
+    // the absolute-form URL resolved to (the one that would be sent).
+    if state.gateway.native_chat().is_none()
+        && refused_without_chat_relay(&host, &target[url::Position::BeforePath..])
+    {
+        let resp = chat_relay_disabled_response();
+        return write_static_response(&mut stream, resp.status, resp.content_type, resp.body, true)
+            .await;
+    }
     if state.verbose {
         eprintln!(
             "http proxy accepted method={} scheme=http host={}:{} remote={} bytes={}",
@@ -2185,7 +2194,20 @@ fn is_fresh_chat_init(request: &IncomingRequest) -> bool {
     .all(|key| body.get(*key).is_none_or(Value::is_null))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Times this thread looked at a saved Chat preference file.
+    static PREFERENCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn preference_reads() -> usize {
+    PREFERENCE_READS.with(std::cell::Cell::get)
+}
+
 fn saved_chat_model_at(path: &std::path::Path) -> Option<String> {
+    #[cfg(test)]
+    PREFERENCE_READS.with(|reads| reads.set(reads.get() + 1));
     let file = fs::File::open(path).ok()?;
     if !file.metadata().ok()?.is_file() {
         return None;
@@ -2669,36 +2691,67 @@ pub(crate) fn is_forwarded_chatgpt_path(path: &str) -> bool {
 }
 
 /// Codex image endpoints, a part of the Gateway's ChatGPT relay.
-/// Whether `target` may reach the Chat relay (`/chatgpt`, Codex images).
-/// The outgoing URL is the Gateway base URL followed by the target, so a
-/// path with dot segments (`..`, `%2e%2e`, backslashes) could resolve into
+/// Whether `target` may reach the Chat relay (`/chatgpt`, Codex images),
+/// compared on `relay_gate_path`. The outgoing URL is the Gateway base URL
+/// followed by the target, so a path with dot segments could resolve into
 /// the relay below any base path; such a path counts as reaching it.
 fn may_reach_chat_relay(target: &str) -> bool {
-    request_path(target).is_ok_and(|path| {
-        path == "/chatgpt"
-            || path.starts_with("/chatgpt/")
-            || is_codex_images_path(&path)
-            || has_dot_segments(&path)
-    })
+    let Ok(path) = request_path(target) else {
+        return false;
+    };
+    let Some(path) = relay_gate_path(&path) else {
+        return true;
+    };
+    let under = |root: &str| {
+        path == root
+            || path
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    under("/chatgpt") || under("/v1/codex/images") || under("/backend-api/codex/images")
 }
 
-/// Whether URL parsing would rewrite `path` by resolving dot segments.
-fn has_dot_segments(path: &str) -> bool {
-    path.contains('\\')
-        || path.split('/').any(|segment| {
-            let segment = segment.to_ascii_lowercase().replace("%2e", ".");
-            segment == "." || segment == ".."
-        })
+/// Whether a request to `host` is refused because the Gateway has no Chat
+/// relay: relay paths on any OpenAI host, and ordinary Chat paths on the
+/// ChatGPT hosts — however spelled. Codex and other traffic is not.
+fn refused_without_chat_relay(host: &str, target: &str) -> bool {
+    let chatgpt = matches!(host, CHATGPT_HOST | CHAT_OPENAI_HOST | CHATGPT_AUX_HOST);
+    if !chatgpt && host != OPENAI_HOST {
+        return false;
+    }
+    may_reach_chat_relay(target)
+        || chatgpt
+            && request_path(target)
+                .ok()
+                .and_then(|path| relay_gate_path(&path))
+                .is_some_and(|path| normalize_ordinary_chat_target(&path, None).is_ok())
 }
 
-fn is_codex_images_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/v1/codex/images/generations"
-            | "/v1/codex/images/edits"
-            | "/backend-api/codex/images/generations"
-            | "/backend-api/codex/images/edits"
-    )
+/// `path` as the Chat relay gate compares it: lowercase, `%2f` and `%2e`
+/// decoded, `;` parameters and empty segments dropped. `None` when it holds
+/// dot segments or backslashes, whose resolution depends on the Gateway
+/// base path.
+fn relay_gate_path(path: &str) -> Option<String> {
+    if path.contains('\\') {
+        return None;
+    }
+    let decoded = path
+        .to_ascii_lowercase()
+        .replace("%2f", "/")
+        .replace("%2e", ".");
+    let mut gate = String::new();
+    for segment in decoded.split('/') {
+        let segment = segment.split(';').next().unwrap_or_default();
+        match segment {
+            "" => {}
+            "." | ".." => return None,
+            segment => {
+                gate.push('/');
+                gate.push_str(segment);
+            }
+        }
+    }
+    Some(if gate.is_empty() { "/".into() } else { gate })
 }
 
 fn is_chatgpt_upload_target(target: &str) -> bool {
@@ -3029,10 +3082,7 @@ fn chatgpt_chat_disabled_response(
 ) -> Option<StaticResponse> {
     let covered = match chat {
         Some(chat) => normalize_chatgpt_chat_target_with(&request.target, chat).is_ok(),
-        None => {
-            normalize_ordinary_chat_target(&request.target, None).is_ok()
-                || may_reach_chat_relay(&request.target)
-        }
+        None => refused_without_chat_relay(CHATGPT_HOST, &request.target),
     };
     covered.then(chat_relay_disabled_response)
 }
@@ -4214,16 +4264,53 @@ mod tests {
             assert_eq!(response.status, StatusCode::NOT_IMPLEMENTED);
             assert_eq!(response.reason, "chat_mode_temporarily_disabled");
         }
-        assert!(has_dot_segments("/v1/responses/%2E%2e/x"));
-        assert!(has_dot_segments("/v1/responses/./x"));
-        assert!(has_dot_segments("/v1/responses\\x"));
         for path in [
-            "/v1/responses",
-            "/v1/responses/..x",
-            "/v1/models/gpt-5.3-codex",
-            "/v1/.well",
+            "/v1/responses/%2E%2e/x",
+            "/v1/responses/./x",
+            "/v1/responses\\x",
+            "/a/.%2E;p/b",
         ] {
-            assert!(!has_dot_segments(path), "{path}");
+            assert_eq!(relay_gate_path(path), None, "{path}");
+        }
+        for (path, gate) in [
+            ("/v1/responses", "/v1/responses"),
+            ("/v1/responses/..x", "/v1/responses/..x"),
+            ("/v1/.well", "/v1/.well"),
+            ("/ChatGPT//Backend-API/", "/chatgpt/backend-api"),
+            ("/chatgpt%2Fbackend-api;x=1/f", "/chatgpt/backend-api/f"),
+        ] {
+            assert_eq!(relay_gate_path(path).as_deref(), Some(gate), "{path}");
+        }
+        // Every spelling of a relay path, on the hosts it belongs to.
+        for (host, target) in [
+            (OPENAI_HOST, "/ChatGPT/backend-api/celsius/ws/user"),
+            (OPENAI_HOST, "/chatgpt/"),
+            (OPENAI_HOST, "//chatgpt/backend-api/models"),
+            (OPENAI_HOST, "/chatgpt;x/backend-api/models"),
+            (OPENAI_HOST, "/v1/codex/images/generations/"),
+            (OPENAI_HOST, "/V1/Codex/Images/edits"),
+            (OPENAI_HOST, "/v1/codex/images"),
+            (CHATGPT_HOST, "/Backend-API/f/conversation"),
+            (CHAT_OPENAI_HOST, "/backend-api/devicecheck/"),
+            (CHATGPT_AUX_HOST, "/backend-api/codex/images/generations/"),
+            (CHATGPT_HOST, "/celsius/ws/user"),
+        ] {
+            assert!(refused_without_chat_relay(host, target), "{host}{target}");
+        }
+        // Codex, the Desktop sidecars and other hosts are not.
+        for (host, target) in [
+            (OPENAI_HOST, "/v1/responses"),
+            (OPENAI_HOST, "/v1/responses/compact"),
+            (OPENAI_HOST, "/v1/models/gpt-5.3-codex"),
+            (OPENAI_HOST, "/v1/codex/imagesx"),
+            (OPENAI_HOST, "/chatgptx"),
+            (CHATGPT_HOST, "/backend-api/codex/responses"),
+            (CHATGPT_HOST, "/backend-api/codex/models?client_version=1"),
+            (CHATGPT_HOST, "/backend-api/me"),
+            (ANTHROPIC_HOST, "/chatgpt/backend-api/models"),
+            ("example.com", "/backend-api/f/conversation"),
+        ] {
+            assert!(!refused_without_chat_relay(host, target), "{host}{target}");
         }
         // Ordinary Codex traffic stays open, including relay-looking queries.
         for target in [

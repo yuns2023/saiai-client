@@ -1268,6 +1268,13 @@ async fn no_chat_relay_refuses_every_spelling_of_a_relay_path() {
     state.chatgpt_chat_passthrough = true;
     let state = Arc::new(state);
     let targets = [
+        // Case, trailing slash and alias-host spellings.
+        (OPENAI_HOST, "/ChatGPT/backend-api/celsius/ws/user"),
+        (OPENAI_HOST, "/v1/codex/images/generations/"),
+        (OPENAI_HOST, "//chatgpt/backend-api/models"),
+        (CHAT_OPENAI_HOST, "/Backend-API/f/conversation"),
+        (CHATGPT_AUX_HOST, "/backend-api/codex/images/generations/"),
+        (CHATGPT_HOST, "/backend-api/devicecheck/"),
         (
             OPENAI_HOST,
             "/v1/responses/../../chatgpt/backend-api/models",
@@ -1330,4 +1337,168 @@ async fn no_chat_relay_refuses_every_spelling_of_a_relay_path() {
         }
     }
     task.abort();
+}
+
+/// The plain HTTP proxy holds the same Chat relay gate: without the
+/// capability, absolute-form requests to relay paths on the OpenAI hosts
+/// (any method, any alias host, any spelling) get the explicit 501 and
+/// never leave; Codex and other traffic is forwarded as before. With the
+/// capability nothing changes.
+#[tokio::test]
+async fn plain_http_proxy_holds_the_chat_relay_gate() {
+    static NONE: crate::gateway::NoGatewayExtension = crate::gateway::NoGatewayExtension;
+    let relay = [
+        ("POST", "http://chatgpt.com/backend-api/f/conversation"),
+        ("POST", "http://CHATGPT.COM./Backend-API/f/conversation"),
+        ("GET", "http://chat.openai.com/backend-api/devicecheck/"),
+        ("GET", "http://ab.chatgpt.com/celsius/ws/user"),
+        (
+            "POST",
+            "http://api.openai.com/chatgpt/backend-api/f/conversation",
+        ),
+        ("GET", "http://api.openai.com/ChatGPT/backend-api/models"),
+        ("GET", "http://api.openai.com/chatgpt"),
+        ("POST", "http://api.openai.com/v1/codex/images/generations/"),
+        (
+            "POST",
+            "http://api.openai.com/v1/responses/../../chatgpt/backend-api/models",
+        ),
+        ("POST", "http://chatgpt.com/backend-api/codex/images/edits"),
+        ("HEAD", "http://api.openai.com/chatgpt/backend-api/models"),
+        ("OPTIONS", "http://chatgpt.com/backend-api/f/conversation"),
+    ];
+    let open = [
+        ("POST", "http://api.openai.com/v1/responses"),
+        ("GET", "http://api.openai.com/v1/models"),
+        ("POST", "http://chatgpt.com/backend-api/codex/responses"),
+        ("GET", "http://example.com/chatgpt/backend-api/models"),
+    ];
+    for capability in [true, false] {
+        let (proxy, mut forwarded, task) = recording_gateway().await;
+        // Every forwarded request reaches the recorder as the upstream proxy.
+        let mut state = state(None, Some(proxy));
+        if !capability {
+            Arc::get_mut(&mut state).unwrap().gateway = &NONE;
+        }
+        for (method, url) in relay.iter().chain(open.iter()) {
+            let refused = !capability && relay.contains(&(method, url));
+            let (mut stream, client) = connection(Arc::clone(&state), EntryPoint::Main).await;
+            let length = if *method == "POST" {
+                "Content-Length: 2\r\n\r\n{}"
+            } else {
+                "\r\n"
+            };
+            stream
+                .write_all(format!("{method} {url} HTTP/1.1\r\nHost: x\r\n{length}").as_bytes())
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            let _ = client.await.unwrap();
+            let text = String::from_utf8_lossy(&response);
+            let label = format!("capability={capability} {method} {url}");
+            if refused {
+                assert!(text.starts_with("HTTP/1.1 501"), "{label}: {text}");
+                assert!(
+                    text.contains("chat_mode_temporarily_disabled"),
+                    "{label}: {text}"
+                );
+                assert!(forwarded.try_recv().is_err(), "forwarded anyway: {label}");
+            } else {
+                assert!(text.starts_with("HTTP/1.1 200"), "{label}: {text}");
+                let seen = timeout(Duration::from_secs(5), forwarded.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("not forwarded: {label}"))
+                    .unwrap();
+                assert_eq!(seen.method, *method, "{label}");
+            }
+        }
+        task.abort();
+    }
+}
+
+/// Without a Chat relay the forwarder never parses the device-proof cookie
+/// (a malformed one raises no error) nor looks at the saved preference file;
+/// with the relay both happen, which proves the probes observe them.
+#[tokio::test]
+async fn no_chat_relay_never_parses_the_device_cookie_nor_reads_preferences() {
+    static NONE: crate::gateway::NoGatewayExtension = crate::gateway::NoGatewayExtension;
+    for capability in [true, false] {
+        let (url, mut forwarded, task) = recording_gateway().await;
+        let (mut state, root) = proof_test_state(&url, &url, None);
+        state.gateway_session = std::sync::OnceLock::new();
+        state.chatgpt_chat_passthrough = true;
+        if !capability {
+            state.gateway = &NONE;
+        }
+        let preferences = root.path().join(".codex-global-state.json");
+        fs::write(
+            &preferences,
+            br#"{"electron-persisted-atom-state":{"chatgpt-last-selected-model-v1":{"slug":"gpt-5-6-thinking"}}}"#,
+        )
+        .unwrap();
+
+        let duplicated = IncomingRequest {
+            method: "GET".into(),
+            target: "/chatgpt/backend-api/devicecheck".into(),
+            http_version: "HTTP/1.1".into(),
+            body: Vec::new(),
+            headers: vec![(
+                "Cookie".into(),
+                "_devicecheck=MOCK_ONLY_FIRST; _devicecheck=MOCK_ONLY_SECOND".into(),
+            )],
+        };
+        let result = forward_to_saiai_with_preferences_path(
+            &state,
+            &mut tokio::io::sink(),
+            duplicated,
+            true,
+            GatewayRoute::OpenAI,
+            CredentialPolicy::Replace,
+            None,
+        )
+        .await;
+        if capability {
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(
+                error.contains("invalid native Chat device proof"),
+                "{error}"
+            );
+            assert!(forwarded.try_recv().is_err());
+        } else {
+            result.unwrap();
+            let seen = forwarded.recv().await.unwrap();
+            assert_eq!(header_value(&seen.headers, "cookie"), None);
+        }
+
+        let init = IncomingRequest {
+            method: "POST".into(),
+            target: "/chatgpt/backend-api/conversation/init".into(),
+            http_version: "HTTP/1.1".into(),
+            body: br#"{"conversation_origin":null,"requested_default_model":null}"#.to_vec(),
+            headers: Vec::new(),
+        };
+        let before = super::preference_reads();
+        forward_to_saiai_with_preferences_path(
+            &state,
+            &mut tokio::io::sink(),
+            init,
+            true,
+            GatewayRoute::OpenAI,
+            CredentialPolicy::Replace,
+            Some(&preferences),
+        )
+        .await
+        .unwrap();
+        let reads = super::preference_reads() - before;
+        assert_eq!(
+            reads > 0,
+            capability,
+            "capability={capability} reads={reads}"
+        );
+        task.abort();
+    }
 }
