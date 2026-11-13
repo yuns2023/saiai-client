@@ -1400,7 +1400,9 @@ fn brand_environment_fields_are_used_by_the_same_files() {
 }
 
 /// Text of every function named `name` in production text (all `cfg`
-/// variants), matched by braces outside literals.
+/// variants), matched by braces outside literals. Supports the plain
+/// `fn name(` signatures pinned here: no generics, no braces inside the
+/// signature. Callers accept a needle found in any variant.
 fn function_texts<'a>(text: &'a str, name: &str) -> Vec<&'a str> {
     let mask = literal_mask(text);
     let signature = format!("fn {name}(");
