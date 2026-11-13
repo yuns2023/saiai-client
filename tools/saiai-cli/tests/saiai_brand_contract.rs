@@ -355,9 +355,21 @@ fn client_proof_enrollment_reports_the_release_version() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let gateway = format!("http://{}", listener.local_addr().unwrap());
     let (sender, receiver) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
+    // Bounded mock Gateway: answers until it has seen one enrollment or the
+    // deadline passes, so the thread always ends and can be joined.
+    listener.set_nonblocking(true).unwrap();
+    let gateway_thread = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while Instant::now() < deadline {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            let _ = stream.set_nonblocking(false);
             let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
             let mut request = Vec::new();
             let mut buffer = [0_u8; 4096];
@@ -382,8 +394,8 @@ fn client_proof_enrollment_reports_the_release_version() {
                 }
             }
             let text = String::from_utf8_lossy(&request).to_string();
-            let (status, body) = if text.starts_with("POST /api/v1/client/devices/enroll ") {
-                let _ = sender.send(text);
+            let enrollment = text.starts_with("POST /api/v1/client/devices/enroll ");
+            let (status, body) = if enrollment {
                 (
                     "200 OK",
                     r#"{"device_id":"cd_DDDDDDDDDDDDDDDDDDDDDD","status":"active"}"#,
@@ -398,6 +410,10 @@ fn client_proof_enrollment_reports_the_release_version() {
                 )
                 .as_bytes(),
             );
+            if enrollment {
+                let _ = sender.send(text);
+                return;
+            }
         }
     });
     sandbox.run(&mut sandbox.command(&[
@@ -419,6 +435,7 @@ fn client_proof_enrollment_reports_the_release_version() {
     let request = receiver.recv_timeout(Duration::from_secs(60));
     let _ = proxy.kill();
     let _ = proxy.wait();
+    let _ = gateway_thread.join();
     let request = request.unwrap_or_else(|_| {
         panic!(
             "no enrollment within 60 s; proxy log:\n{}",

@@ -1702,10 +1702,13 @@ fn native_chat_update_route_is_frozen() {
 fn library_takes_release_facts_from_the_entry_point() {
     let sources = cli_sources();
     for (file, text) in &sources {
+        // Any `env!`/`option_env!` spelling, with or without whitespace,
+        // of Cargo-provided package, crate or binary metadata.
+        let compact = text.split_whitespace().collect::<String>();
         if file != "main.rs" {
             assert!(
-                !text.contains("env!(\"CARGO_PKG_"),
-                "{file} reads compile-time package metadata"
+                !compact.contains("env!(\"CARGO_"),
+                "{file} reads compile-time Cargo metadata"
             );
         }
     }

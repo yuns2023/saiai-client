@@ -265,7 +265,7 @@ fn is_managed_claude_env(key: &str) -> bool {
 /// program (its release version) that the library must not take from its
 /// own package metadata.
 pub fn run(context: RuntimeContext) -> Result<()> {
-    runtime::install(context);
+    runtime::install(context)?;
     let mut args = env::args().skip(1).collect::<Vec<_>>();
     let selector = environment_scope::parse_selector(&mut args)?;
     let command = parse_command(&args)?;

@@ -5,6 +5,7 @@
 //! user installed. Everything that reports the program's identity to users,
 //! the update channel or a Gateway reads it from here.
 
+use anyhow::{Result, bail};
 use std::sync::OnceLock;
 
 /// Release facts of the program running this library.
@@ -18,8 +19,13 @@ pub struct RuntimeContext {
 static CONTEXT: OnceLock<RuntimeContext> = OnceLock::new();
 
 /// Installs the context once per process; `run` does this before parsing.
-pub(crate) fn install(context: RuntimeContext) {
-    let _ = CONTEXT.set(context);
+/// A later `run` in the same process must describe the same program.
+pub(crate) fn install(context: RuntimeContext) -> Result<()> {
+    let installed = CONTEXT.get_or_init(|| context);
+    if *installed != context {
+        bail!("this process already runs as version {}", installed.version);
+    }
+    Ok(())
 }
 
 /// The released program version.
