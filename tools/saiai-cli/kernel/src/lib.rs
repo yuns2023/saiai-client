@@ -7695,11 +7695,15 @@ fn probe_candidate_version(path: &Path, timeout: Duration, limit: usize) -> Resu
         Ok(output)
     });
     let result = watch_candidate(path, &mut child, reader, deadline, timeout, limit);
-    // Every way out leaves the direct child exited and reaped.
-    if result.is_err() {
-        stop_candidate(&mut child)?;
+    // Every way out leaves the direct child exited and reaped (an extra
+    // bounded wait after the budget); a failed cleanup keeps both errors.
+    match result {
+        Err(error) => match stop_candidate(&mut child) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error.context(format!("{cleanup:#}"))),
+        },
+        ok => ok,
     }
-    result
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]

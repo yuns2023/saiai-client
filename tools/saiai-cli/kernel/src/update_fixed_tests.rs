@@ -824,7 +824,7 @@ fn candidate_probes_are_bounded() {
         ),
         (
             "orphans",
-            "echo 'ktest 1.2.3'; sleep 30 & exit 0",
+            "echo 'ktest 1.2.3'; sleep 30 & echo $! > \"$0.pid\"; exit 0",
             "left its output open",
         ),
     ] {
@@ -837,6 +837,9 @@ fn candidate_probes_are_bounded() {
             started.elapsed()
         );
     }
+    // The orphan outlives the probe by design; end it here.
+    let orphan = fs::read_to_string(directory.path().join("orphans.pid")).unwrap();
+    let _ = ProcessCommand::new("kill").arg(orphan.trim()).status();
 }
 
 #[tokio::test]
