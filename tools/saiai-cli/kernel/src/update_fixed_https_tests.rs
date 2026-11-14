@@ -67,6 +67,8 @@ struct Reply {
     body: Vec<u8>,
     /// Send no Content-Length (the body ends when the connection closes).
     no_length: bool,
+    /// Pause before the head.
+    head_delay: Duration,
     /// Pause after the head, before the body.
     delay: Duration,
 }
@@ -140,6 +142,7 @@ async fn serve(pki: &Pki, routes: impl FnOnce(u16) -> Routes) -> Server {
                     response.extend(format!("{name}: {value}\r\n").bytes());
                 }
                 response.extend(b"\r\n");
+                tokio::time::sleep(reply.head_delay).await;
                 if stream.write_all(&response).await.is_err() {
                     return;
                 }
@@ -475,6 +478,47 @@ async fn https_bodies_are_limited_in_size_and_time() {
     assert_eq!(exact.len(), 1024);
     let started = std::time::Instant::now();
     let error = get(&pki, &server, "/slow", 1024, Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("did not complete within 1s"),
+        "{error:#}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// One deadline covers the whole redirect chain: three hops that each
+/// answer within the budget, but not all together.
+#[tokio::test]
+async fn https_redirect_chains_share_one_deadline() {
+    let pki = pki(&[GITHUB, ASSETS]);
+    let slow = |reply: Reply| Reply {
+        head_delay: Duration::from_millis(700),
+        ..reply
+    };
+    let server = serve(&pki, |port| {
+        Routes::from([
+            (
+                route(GITHUB, "/a"),
+                slow(redirect(302, url(ASSETS, port, "/b"))),
+            ),
+            (
+                route(ASSETS, "/b"),
+                slow(redirect(302, url(GITHUB, port, "/c"))),
+            ),
+            (route(GITHUB, "/c"), slow(ok(b"late"))),
+        ])
+    })
+    .await;
+    // Each hop alone fits in 1.5 s ...
+    let one = get(&pki, &server, "/c", 1024, Duration::from_millis(1500))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(one, b"late");
+    // ... the chain of three does not.
+    let started = std::time::Instant::now();
+    let error = get(&pki, &server, "/a", 1024, Duration::from_millis(1500))
         .await
         .unwrap_err();
     assert!(
