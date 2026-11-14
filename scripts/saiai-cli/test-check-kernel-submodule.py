@@ -202,6 +202,9 @@ class KernelSubmoduleTests(unittest.TestCase):
             lock.replace('dependencies = [\n "tokio",\n]', 'dependencies = ["tokio"]'),
             lock.replace(' "tokio",\n', '  "tokio", # note\n'),
             lock.replace('name = "tokio"\n', ""),
+            lock.replace("dependencies = [\n", " dependencies = [\n"),
+            lock.replace('dependencies = [\n "tokio",\n]', '"dependencies" = ["tokio"]'),
+            lock.replace('name = "proxy-cli"\n', 'name = "proxy-cli"\nreplace = "x"\n'),
         ):
             with self.subTest(changed=changed):
                 _, findings = CHECK.lock_graph(changed, "lock")
@@ -222,13 +225,17 @@ class KernelSubmoduleTests(unittest.TestCase):
         closure, _ = CHECK.kernel_closure(graph, "lock")
         self.assertIn(("tokio", "1.0.0", fork, None), closure)
         self.assertNotIn(("tokio", "1.0.0", registry, "aa"), closure)
-        # Same packages, another edge: the kernel no longer depends on tokio
-        # but the program still locks it.
-        self.write_workspace_lock(
-            WORKSPACE_LOCK.format(checksum="aa").replace('dependencies = [\n "tokio",\n]\n', "")
-            .replace('name = "saiai"\nversion = "1.0.0"\n', 'name = "saiai"\nversion = "1.0.0"\ndependencies = [\n "proxy-cli",\n "tokio",\n]\n')
-        )
-        self.assertFinds("does not resolve the kernel's dependencies", offline=True)
+        # The same reachable packages, one more edge: the closures differ.
+        def lock(extra_edge: bool) -> str:
+            return (
+                '[[package]]\nname = "proxy-cli"\nversion = "0.1.0"\ndependencies = [\n "a",\n "b",\n]\n'
+                f'\n[[package]]\nname = "a"\nversion = "1.0.0"\nsource = "{registry}"\nchecksum = "11"\n'
+                + ('dependencies = [\n "b",\n]\n' if extra_edge else "")
+                + f'\n[[package]]\nname = "b"\nversion = "1.0.0"\nsource = "{registry}"\nchecksum = "22"\n'
+            )
+        plain, with_edge = (CHECK.kernel_closure(CHECK.lock_graph(lock(edge), "lock")[0], "lock")[0] for edge in (False, True))
+        self.assertEqual(set(plain), set(with_edge))
+        self.assertNotEqual(plain, with_edge)
 
     def test_rejects_another_gitlink_in_the_commit(self) -> None:
         git(self.root, "update-index", "--add", "--cacheinfo", f"160000,{self.on_main},vendor/other")

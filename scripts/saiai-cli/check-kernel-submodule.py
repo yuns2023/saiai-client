@@ -133,6 +133,8 @@ def check_structure(root: Path) -> tuple[str | None, list[str]]:
 
 KERNEL_PACKAGE = "proxy-cli"
 Package = tuple[str, str, str | None, str | None]  # name, version, source, checksum
+# Every line of a [[package]] table as cargo writes it.
+LOCK_LINE = re.compile(r'(?:name|version|source|checksum) = "[^"]*"|dependencies = \[| "[^"\n]*",|\]')
 
 
 def lock_graph(text: str, label: str) -> tuple[dict[Package, set[Package]], list[str]]:
@@ -150,6 +152,10 @@ def lock_graph(text: str, label: str) -> tuple[dict[Package, set[Package]], list
 
         # Only the layout cargo writes is read; anything else is refused
         # rather than read as "no dependencies".
+        unknown = [line for line in block.split("\n") if line and LOCK_LINE.fullmatch(line) is None]
+        if unknown:
+            findings.append(f"{label}: unsupported lock file lines {unknown}")
+            continue
         if field("name") is None or field("version") is None:
             findings.append(f"{label}: a package without a name or version")
             continue
