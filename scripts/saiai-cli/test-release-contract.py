@@ -389,24 +389,342 @@ class AitpArtifactTests(unittest.TestCase):
             with self.subTest(data=data), self.assertRaisesRegex(AssertionError, "build machine paths"):
                 self.check(self.brand + data)
 
-    def test_ci_checks_the_remapped_release_and_saiai_release_does_not(self) -> None:
+    def test_workflows_leave_aitp_releases_to_the_kernel_ci(self) -> None:
         def broken(path: str, old: str, new: str):
             def read(relative: str) -> str:
                 contents = ORIGINAL_TEXT(relative)
-                return contents.replace(old, new) if relative == path else contents
+                if relative == path:
+                    self.assertIn(old, contents)
+                    return contents.replace(old, new, 1)
+                return contents
             return read
 
         for path, old, new, message in (
-            (".github/workflows/ci.yml", '--aitp-artifact "$AITP_PROGRAM"', "", "does not check the remapped"),
-            (".github/workflows/ci.yml", "bash scripts/build-release.sh --locked", "cargo build --release --bin aitp", "does not check the remapped"),
             (VERIFIER.AITP_RELEASE_BUILD, '--target "$triple"', "", "build script is missing"),
-            (".github/workflows/saiai-cli-release.yml", "python3 scripts/saiai-cli/verify-release.py \\", "bash tools/saiai-cli/kernel/scripts/build-release.sh\n          python3 scripts/saiai-cli/verify-release.py \\", "must not use"),
+            (".github/workflows/saiai-cli-release.yml", "          python3 scripts/saiai-cli/verify-release.py\n", "          bash tools/saiai-cli/kernel/scripts/build-release.sh\n          python3 scripts/saiai-cli/verify-release.py\n", "must not use"),
+            (".github/workflows/ci.yml", '          echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"\n', "", "AITP release hand-over|GITHUB_ENV outside"),
+            (".github/workflows/ci.yml", '          --aitp-artifact "$AITP_PROGRAM"\n', "", "AITP release path check"),
+            (".github/workflows/ci.yml", "          cargo test --locked --target-dir \"$standalone/target\"\n", "", "stand-alone kernel tests"),
             (VERIFIER.AITP_RELEASE_BUILD, "--remap-path-prefix=", "--no-remap=", "build script is missing"),
             (VERIFIER.AITP_RELEASE_BUILD, 'add_mapping "$home" /aitp/home\n', "", "does not map to /aitp/home"),
         ):
             with self.subTest(path=path, old=old), patch.object(VERIFIER, "text", side_effect=broken(path, old, new)):
                 with self.assertRaisesRegex(AssertionError, message):
                     VERIFIER.verify_workflows_and_docs()
+
+
+CI = ".github/workflows/ci.yml"
+RELEASE = ".github/workflows/saiai-cli-release.yml"
+CARGO_TEST = "        run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace\n"
+
+
+class WorkflowStructureTests(unittest.TestCase):
+    """The division of work between the workflows is read from their
+    structure: text that only looks like a check does not count."""
+
+    def rejects(self, path: str, old: str, new: str, message: str, count: int = 1) -> None:
+        original = ORIGINAL_TEXT(path)
+        self.assertEqual(original.count(old), count, old)
+
+        def read(relative: str) -> str:
+            contents = ORIGINAL_TEXT(relative)
+            return contents.replace(old, new) if relative == path else contents
+
+        with patch.object(VERIFIER, "text", side_effect=read):
+            with self.assertRaisesRegex(AssertionError, message):
+                VERIFIER.verify_workflows_and_docs()
+
+    def test_accepts_the_workflows(self) -> None:
+        VERIFIER.verify_workflows_and_docs()
+
+    def test_foreign_names_cannot_be_overridden(self) -> None:
+        for value in ("''", "other", "saiai-x"):
+            with self.subTest(level="step", value=value):
+                self.rejects(CI, CARGO_TEST, CARGO_TEST + f"        env:\n          AITP_TEST_FOREIGN_NAMES: {value}\n", "overrides AITP_TEST_FOREIGN_NAMES")
+        self.rejects(CI, "    name: Config client\n", "    name: Config client\n    env:\n      AITP_TEST_FOREIGN_NAMES: ''\n", "overrides AITP_TEST_FOREIGN_NAMES")
+        self.rejects(CI, "  AITP_TEST_FOREIGN_NAMES: saiai\n", "  AITP_TEST_FOREIGN_NAMES: other\n", "overrides AITP_TEST_FOREIGN_NAMES")
+        self.rejects(
+            RELEASE, "          AITP_TEST_FOREIGN_NAMES: saiai\n", "          AITP_TEST_FOREIGN_NAMES: ''\n",
+            "overrides AITP_TEST_FOREIGN_NAMES", count=2,
+        )
+        # Dropped from the environment entirely, or cleared in the script.
+        self.rejects(CI, "env:\n  AITP_TEST_FOREIGN_NAMES: saiai\n", "", "does not name SAIAI")
+        self.rejects(
+            RELEASE, "        env:\n          # The kernel's tests also refuse this distribution's name (see ci.yml).\n          AITP_TEST_FOREIGN_NAMES: saiai\n", "",
+            "workspace tests with SAIAI", count=2,
+        )
+        self.rejects(
+            CI, CARGO_TEST,
+            "        run: |\n          unset AITP_TEST_FOREIGN_NAMES\n          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace\n",
+            "touches AITP_TEST_FOREIGN_NAMES",
+        )
+        self.rejects(
+            CI, "      - name: Format\n",
+            "      - name: Clear\n        run: echo AITP_TEST_FOREIGN_NAMES= >> $GITHUB_ENV\n\n      - name: Format\n",
+            "touches",
+        )
+
+    def test_skipped_steps_do_not_count(self) -> None:
+        for condition in ("false", "${{ false }}", "github.event_name == 'schedule'", "runner.os == 'Windows'", "failure()"):
+            with self.subTest(condition=condition):
+                self.rejects(CI, "      - name: Test\n", f"      - name: Test\n        if: {condition}\n", "does not run")
+        self.rejects(
+            RELEASE, "      - name: Verify native macOS environment lifecycle isolation\n        if: runner.os == 'macOS'\n",
+            "      - name: Verify native macOS environment lifecycle isolation\n        if: matrix.target == 'aarch64-apple-darwin'\n",
+            "does not run the macOS environment isolation on x86_64-apple-darwin",
+        )
+        # A condition this check cannot read is refused, not guessed.
+        self.rejects(CI, "      - name: Test\n", "      - name: Test\n        if: contains(github.ref, 'main')\n", "unsupported function")
+        self.rejects(CI, "      - name: Test\n", "      - name: Test\n        if: env.SKIP != 'yes'\n", "unknown here")
+
+    def test_commented_or_masked_commands_do_not_count(self) -> None:
+        cases = (
+            ("# cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace", "commented out"),
+            ("cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace || true", "|| true"),
+            ("cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace || :", "|| :"),
+            ("cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace; true", "; true"),
+            ("cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace | tee log", "pipe"),
+            ("cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace &", "background"),
+            ("echo cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace", "echo"),
+        )
+        for command, label in cases:
+            with self.subTest(label=label):
+                self.rejects(CI, CARGO_TEST, f"        run: |\n          {command}\n", "does not run")
+        for script in (
+            "set +e\n          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace\n          true",
+            "trap 'exit 0' EXIT\n          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace",
+            "exit 0\n          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace",
+            "if true; then\n            cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace\n          fi || true",
+            "{\n          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace\n          } || echo skipped",
+            "cat <<'NOTE'\n          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace\n          NOTE",
+            "skip() {\n          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace\n          }",
+        ):
+            with self.subTest(script=script):
+                self.rejects(CI, CARGO_TEST, f"        run: |\n          {script}\n", "does not run|unbalanced")
+        self.rejects(CI, CARGO_TEST, CARGO_TEST + "        continue-on-error: true\n", "continues on error")
+        self.rejects(CI, CARGO_TEST, CARGO_TEST + "        shell: bash {0}\n", "uses the shell")
+        self.rejects(CI, CARGO_TEST, CARGO_TEST + "        working-directory: tools\n", "working directory")
+        self.rejects(CI, "    timeout-minutes: 30\n", "    timeout-minutes: 30\n    continue-on-error: true\n", "continues on error", count=2)
+        self.rejects(CI, "    timeout-minutes: 30\n", "    timeout-minutes: 30\n    defaults:\n      run:\n        shell: sh\n", "defaults", count=2)
+
+    def test_windows_native_failures_stop_the_step(self) -> None:
+        stop = "          $PSNativeCommandUseErrorActionPreference = $true\n"
+        self.rejects(RELEASE, stop, "", "official Windows Codex 0.146.0 capture")
+        self.rejects(RELEASE, stop, stop + "          $PSNativeCommandUseErrorActionPreference = $false\n", "official Windows Codex")
+        self.rejects(
+            RELEASE, '          npm install --global --prefix "$env:RUNNER_TEMP/codex-0.146.0" "@openai/codex@0.146.0"\n',
+            '          try {\n          npm install --global --prefix "$env:RUNNER_TEMP/codex-0.146.0" "@openai/codex@0.146.0"\n          } catch {}\n',
+            "official Windows Codex",
+        )
+
+    def test_everyday_ci_stays_on_linux(self) -> None:
+        for runner in ("macos-15", "windows-latest"):
+            with self.subTest(runner=runner):
+                self.rejects(CI, "    runs-on: ubuntu-22.04\n", f"    runs-on: {runner}\n", "leaves Linux", count=2)
+        self.rejects(
+            CI, "          - os: ubuntu-22.04\n", "          - os: macos-15\n", "leaves Linux",
+        )
+        self.rejects(CI, "  pull_request:\n    branches: [main]\n", "  pull_request:\n    branches: [main]\n    paths: [tools/**]\n", "every pull request")
+        self.rejects(CI, "name: Client CI\n", "name: Client checks\n", "named 'Client CI'")
+
+    def test_release_keeps_every_platform_check(self) -> None:
+        for old, new, message in (
+            ("          - os: macos-15\n            target: aarch64-apple-darwin\n            asset: saiai-macos-aarch64\n", "", "build matrix differs"),
+            ("          python3 scripts/saiai-cli/test-macos-environments.py\n", "          echo\n", "macOS environment isolation"),
+            ("        run: python scripts/saiai-cli/test-windows-environments.py", "        run: echo skipped #", "Windows environment isolation"),
+            ("        run: python scripts/saiai-cli/test-windows-self-update.py", "        run: echo skipped #", "self-update"),
+            ("          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace\n", "", "native workspace tests"),
+            ("          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p proxy-cli --features contract --bin aitp\n", "", "AITP brand's platform services"),
+            ('          "dist/${{ matrix.asset }}" --version\n', "", "Linux startup check"),
+            ("          python3 scripts/saiai-cli/test-uninstall.py\n", "          echo\n", "uninstall"),
+        ):
+            with self.subTest(old=old):
+                self.rejects(RELEASE, old, new, message)
+        self.rejects(RELEASE, "name: SAIAI CLI Release\n", "name: Release\n", "named 'SAIAI CLI Release'")
+
+    def test_release_publishes_only_on_confirmation(self) -> None:
+        # A tag push alone may not publish, and nothing else may write.
+        self.rejects(RELEASE, "    if: needs.mode.outputs.mode == 'publish'\n", "    if: needs.mode.outputs.mode != 'preview'\n", "runs .* for a draft run")
+        self.rejects(RELEASE, "          draft: true\n", "          draft: false\n", "non-draft release")
+        self.rejects(RELEASE, '      if [ "$CONFIRMATION" != "publish $REF_NAME" ]; then\n', '      if false; then\n', "release gate")
+        self.rejects(RELEASE, "              mode=draft ;;\n", "              mode=publish ;;\n", "release gate")
+        self.rejects(
+            RELEASE, "    needs: [mode, build]\n    if: needs.mode.outputs.mode == 'draft'\n",
+            "    needs: [mode, build]\n    if: always()\n", "regardless of its needs",
+        )
+        self.rejects(
+            RELEASE, "    tags:\n      - 'saiai-v*'\n", "    tags:\n      - '*'\n", "only by hand or by a saiai-v",
+        )
+        self.rejects(RELEASE, "    environment: release\n", "", "lost its environment")
+        self.rejects(
+            RELEASE, "    permissions:\n      contents: write\n      actions: read\n",
+            "    permissions:\n      contents: read\n      actions: read\n", "contents permission",
+        )
+
+    def test_yaml_tricks_are_refused(self) -> None:
+        self.rejects(CI, CARGO_TEST, CARGO_TEST + "        run: echo skipped\n", "repeats the key")
+        self.rejects(CI, "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n", "      - uses: actions/checkout@v7\n", "not pinned", count=3)
+
+    def test_review_bypasses_are_refused(self) -> None:
+        c = "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace"
+        for script in (
+            f"true ||\n          {c}",
+            f":; set +e\n          {c}\n          true",
+            f"cat <<'123'\n          {c}\n          123",
+            f":; cargo() {{ :; }}\n          {c}",
+            f"export AITP_TEST_FOREIGN_''NAMES=\n          {c}",
+            f"key=GITHUB_''PATH; printf '%s\\n' /x >> \"${{!key}}\"\n          {c}",
+            f"set -n\n          {c}",
+            f"set -o noexec\n          {c}",
+            f"set -en\n          {c}",
+            f"alias cargo=true; {c}",
+        ):
+            with self.subTest(script=script):
+                self.rejects(CI, CARGO_TEST, f"        run: |\n          {script}\n", "does not run|unbalanced")
+        self.rejects(CI, "      - name: Test\n", "      - name: Test\n        if: github.ref == 'refs/heads/main'\n", "does not run")
+        for condition, message in (("null != ''", "not read here"), ("'0' != false", "not read here"), ("! 'x' == true", "not read here")):
+            with self.subTest(condition=condition):
+                self.rejects(CI, "      - name: Test\n", f"      - name: Test\n        if: \"{condition}\"\n", message)
+        self.assertFalse(VERIFIER.evaluate("!(runner.os == 'Linux')", {"runner.os": "Linux"}))
+
+    def test_release_publication_bypasses_are_refused(self) -> None:
+        self.rejects(
+            RELEASE, "      - name: Record the release digests\n",
+            "      - name: Publish early\n        run: gh release edit \"$GITHUB_REF_NAME\" --draft=false\n\n      - name: Record the release digests\n",
+            "must not publish",
+        )
+        self.rejects(
+            RELEASE, "        id: upload\n        if: steps.preflight.outputs.already_published != 'true'\n",
+            "        id: upload\n        if: false\n", "skips the draft upload",
+        )
+        self.rejects(
+            RELEASE, '          python3 scripts/saiai-cli/verify-github-release-draft.py --dist dist --tag "$GITHUB_REF_NAME" --state published <"$release_json"\n',
+            "", "published release check",
+        )
+        self.rejects(
+            RELEASE, '          cmp "$RUNNER_TEMP/manifest.json" dist/manifest.json\n',
+            '          cp "$RUNNER_TEMP/manifest.json" dist/manifest.json\n          cmp "$RUNNER_TEMP/manifest.json" dist/manifest.json\n',
+            "rewrites the fetched release assets",
+        )
+        self.rejects(
+            RELEASE, '          sha256sum --check --strict "$RUNNER_TEMP/release-digests/release-digests.sha256"\n', "",
+            "checks the digests",
+        )
+        self.rejects(
+            RELEASE, "          name: release-digests\n          path: release-digests.sha256\n",
+            "          name: release-digests\n          path: dist/manifest.json\n", "keep the draft's digests",
+        )
+        self.rejects(
+            CI, "    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n",
+            "    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          ref: main\n",
+            "check out the commit", count=3,
+        )
+        self.rejects(
+            RELEASE, "  build:\n    needs: verify\n",
+            "  build:\n    needs: mode\n    if: needs.mode.outputs.mode != 'publish'\n", "must need",
+        )
+
+    def test_second_review_bypasses_are_refused(self) -> None:
+        c = "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace"
+        for script in (
+            f"true || # optional check\n          {c}",
+            f"printf '%s\\n' '\n          {c}\n          '",
+        ):
+            with self.subTest(script=script):
+                self.rejects(CI, CARGO_TEST, f"        run: |\n          {script}\n", "does not run|unbalanced")
+        release = ORIGINAL_TEXT(RELEASE)
+        start = release.index("      - name: Publish immutable release\n")
+        publish_step = release[start:].rstrip("\n") + "\n\n"
+        moved = release[:start].rstrip("\n") + "\n"
+        fetch_end = moved.index("      - name: Download the digests the tag run recorded\n")
+        moved = moved[:fetch_end] + publish_step + moved[fetch_end:]
+        self.rejects(RELEASE, release, moved, "before it publishes")
+        self.rejects(
+            RELEASE, "      - name: Download the digests the tag run recorded\n        uses:",
+            "      - name: Download the digests the tag run recorded\n        if: false\n        uses:",
+            "tag run it fetched",
+        )
+        self.rejects(RELEASE, "          run-id: ${{ steps.fetch.outputs.run_id }}\n", "          run-id: ${{ github.run_id }}\n", "tag run it fetched")
+        self.rejects(
+            RELEASE, '          sha256sum --check --strict "$RUNNER_TEMP/release-digests/release-digests.sha256"\n',
+            '          sha256sum dist/* > "$RUNNER_TEMP/release-digests/release-digests.sha256"\n          sha256sum --check --strict "$RUNNER_TEMP/release-digests/release-digests.sha256"\n',
+            "rewrites|touches the downloaded digests",
+        )
+        start = release.index("      - name: Download the digests the tag run recorded\n")
+        end = release.index("      # The downloaded draft is this tag's release")
+        self.rejects(RELEASE, release[start:end], "", "downloads the digests")
+        record = release.index("      # The publish run accepts only assets with exactly these digests.\n")
+        keep = release.index("      - name: Upload the release digests\n")
+        keep_end = release.index("  publish:\n")
+        swapped = release[:record] + release[keep:keep_end].rstrip("\n") + "\n\n" + release[record:keep] + release[keep_end:]
+        self.rejects(RELEASE, release, swapped.replace("\n\n\n", "\n\n"), "then keep the digests")
+
+    def test_publish_checks_stay_before_publishing(self) -> None:
+        release = ORIGINAL_TEXT(RELEASE)
+        bundle = "          python3 scripts/saiai-cli/test-release-bundle.py \\\n            --bundle dist \\\n            --setup-sh dist/setup.sh\n"
+        start = release.index("      - name: Publish immutable release\n")
+        self.assertIn(bundle, release[release.index("  publish:\n"):start])
+        head, tail = release[:start], release[start:]
+        head = head[: head.rindex(bundle)] + head[head.rindex(bundle) + len(bundle):]
+        moved = head + tail.rstrip("\n") + "\n" + bundle.replace("          python3", "          python3", 1)
+        self.rejects(RELEASE, release, moved, "before publishing")
+
+    def test_third_review_bypasses_are_refused(self) -> None:
+        # GITHUB_ENV is written once, by the AITP release hand-over only.
+        self.rejects(
+            CI, "      - name: Format\n",
+            "      - name: Note\n        run: echo X=1 >> \"$GITHUB_ENV\"\n\n      - name: Format\n", "touches GITHUB_ENV",
+        )
+        # The publish step re-reads the release right before the PATCH.
+        recheck = '          python3 scripts/saiai-cli/verify-github-release-draft.py --dist dist --tag "$GITHUB_REF_NAME" --state draft <"$RUNNER_TEMP/before-publish.json"\n'
+        self.rejects(RELEASE, recheck, "", "re-check the release right before publishing")
+        release = ORIGINAL_TEXT(RELEASE)
+        start = release.index("          # Re-read this release right before publishing")
+        end = release.index("          publish_status=0\n")
+        tail_end = release.index('          echo "publish request status: $publish_status"\n')
+        moved = release[:start] + release[end:tail_end] + release[start:end] + release[tail_end:]
+        self.rejects(RELEASE, release, moved, "re-check the release right before publishing")
+
+    def test_standalone_kernel_runs_in_its_copy(self) -> None:
+        self.rejects(CI, '          cd "$standalone/kernel"\n', '          cd "$GITHUB_WORKSPACE/tools/saiai-cli/kernel"\n', "changes directory")
+        self.rejects(
+            CI, '          cd "$standalone/kernel"\n',
+            '          cd "$standalone/kernel"\n          if [ -d "$GITHUB_WORKSPACE/tools/saiai-cli/kernel" ]; then cd "$GITHUB_WORKSPACE/tools/saiai-cli/kernel"; fi\n',
+            "changes directory",
+        )
+        self.rejects(CI, CARGO_TEST, "        run: |\n          cd tools && cd ..\n          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace\n", "changes directory")
+
+    def test_quoted_shell_words_are_read_as_the_shell_reads_them(self) -> None:
+        c = "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace"
+        for script in (f"set '-n'\n          {c}", f'set -o "noexec"\n          {c}', f"s\"et\" -n\n          {c}"):
+            with self.subTest(script=script):
+                self.rejects(CI, CARGO_TEST, f"        run: |\n          {script}\n", "does not run")
+        self.rejects(CI, CARGO_TEST, f'        run: |\n          "cd" /tmp\n          {c}\n', "changes directory")
+        # The exceptions belong to one step each, once per workflow.
+        self.rejects(
+            CI, "      - name: Format\n",
+            '      - name: Kernel again\n        run: |\n          standalone="$(mktemp -d)"\n          cd "$standalone/kernel"\n\n      - name: Format\n',
+            "changes directory outside the stand-alone kernel step",
+        )
+        self.rejects(
+            CI, "      - name: Verify the AITP release names no build path\n",
+            '      - name: Hand over again\n        run: |\n          aitp=/bin/true\n          echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"\n\n      - name: Verify the AITP release names no build path\n',
+            "GITHUB_ENV outside the AITP release build",
+        )
+
+    def test_expression_reader(self) -> None:
+        context = {"runner.os": "macOS", "matrix.target": "aarch64-apple-darwin"}
+        for expression, expected in (
+            ("runner.os == 'macos'", True),
+            ("${{ runner.os != 'Linux' && matrix.target == 'aarch64-apple-darwin' }}", True),
+            ("!(runner.os == 'macOS')", False),
+            ("runner.os == 'Windows' || startsWith(matrix.target, 'aarch64')", True),
+            ("success() && runner.os == 'macOS'", True),
+            ("failure()", False),
+            (False, False),
+        ):
+            with self.subTest(expression=expression):
+                self.assertEqual(VERIFIER.evaluate(expression, context), expected)
 
 
 ORIGINAL_TEXT = VERIFIER.text

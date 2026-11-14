@@ -10,6 +10,11 @@ on:
 permissions:
   contents: read
 
+# Everyday CI runs on Linux only, including the kernel on its own and its
+# AITP release build (the kernel source still lives here). The native macOS
+# and Windows checks run in "SAIAI CLI Release" (every preview and every
+# release tag). verify-release.py holds this division of work.
+
 # The kernel's tests refuse a neutral test brand in everything `aitp`
 # prints, writes and carries; this distribution adds its own name here, so
 # the public kernel source never spells it.
@@ -64,6 +69,9 @@ jobs:
           cargo clippy --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace --features contract --all-targets -- -D warnings
           cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test contract_entry --test saiai_render_contract --test kernel_consumer
           cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p proxy-cli --features contract --bin aitp
+
+      - name: Install the workflow parser
+        run: python3 -m pip install --disable-pip-version-check --no-deps --only-binary pyyaml --require-hashes -r scripts/saiai-cli/requirements-verify.txt
 
       # The kernel package (kernel/ alone, as a public repository would hold
       # it) lints with and without the contract entries and passes its own
@@ -129,6 +137,8 @@ jobs:
         run: |
           node --test scripts/saiai-cli/test-vscode-certificates.js
           python3 scripts/saiai-cli/test-release-contract.py
+          python3 scripts/saiai-cli/test-github-release-draft.py
+          python3 scripts/saiai-cli/test-fetch-github-release.py
           python3 scripts/saiai-cli/test-brand-contract.py
           python3 tools/saiai-cli/kernel/scripts/test_release_manifest.py
           python3 scripts/saiai-cli/test-installed-codex-desktop-probe.py
@@ -151,9 +161,15 @@ jobs:
         with:
           python-version: '3.12'
 
+      # rust-toolchain.toml asks for clippy and rustfmt: installing them here
+      # avoids rustup adding rustfmt later over the runner's own cargo-fmt.
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: '1.97.0'
+          components: clippy, rustfmt
+
+      - name: Install the workflow parser
+        run: python3 -m pip install --disable-pip-version-check --no-deps --only-binary pyyaml --require-hashes -r scripts/saiai-cli/requirements-verify.txt
 
       - name: Build the AITP release with remapped paths
         env:
@@ -237,9 +253,8 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-musl
             asset: saiai-linux-x86_64
-          - os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-musl
-            asset: saiai-linux-aarch64
+          # The aarch64 static client runs the same checks in every preview
+          # and release build ("SAIAI CLI Release").
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -262,6 +277,9 @@ jobs:
           CC: musl-gcc
           CARGO_BUILD_JOBS: 2
         run: bash scripts/saiai-cli/build-linux.sh "${{ matrix.target }}"
+
+      - name: Install the workflow parser
+        run: python3 -m pip install --disable-pip-version-check --no-deps --only-binary pyyaml --require-hashes -r scripts/saiai-cli/requirements-verify.txt
 
       - name: Verify Linux portability and startup
         run: |
@@ -297,156 +315,3 @@ jobs:
         run: >-
           python3 scripts/saiai-cli/test-uninstall.py
           --binary dist/${{ matrix.asset }}
-
-  client-windows:
-    name: Native Windows config client
-    runs-on: windows-latest
-    timeout-minutes: 35
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Verify read-only Windows certificate inventory
-        run: >-
-          python -c "import runpy; runpy.run_path('scripts/saiai-cli/test-initialization-scope.py')['windows_roots'](); print('Windows Root inventory read passed')"
-
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
-        with:
-          toolchain: '1.97.0'
-
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
-        with:
-          workspaces: tools/saiai-cli -> target
-
-      - name: Verify native Windows Desktop runtime
-        shell: bash
-        run: bash scripts/saiai-cli/cargo-test-filtered.sh proxy-cli windows_desktop_runtime::tests -- --test-threads=1
-
-      - name: Test and build native Windows client
-        shell: bash
-        run: |
-          node --test scripts/saiai-cli/test-vscode-certificates.js
-          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace
-          # Platform-specific SAIAI goldens (LaunchAgent plist, Windows update
-          # helper) run through the contract entries on this platform.
-          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test saiai_render_contract --test kernel_consumer
-          # The AITP brand installs and renders its services on this platform.
-          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p proxy-cli --features contract --bin aitp
-          cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --bin saiai
-
-      - name: Smoke-test Windows configuration
-        shell: pwsh
-        run: |
-          & "$PWD/scripts/saiai-cli/test-windows-runtime.ps1" `
-            -BinaryPath "$PWD/tools/saiai-cli/target/debug/saiai.exe"
-
-      - name: Verify reproducible Windows image
-        run: python scripts/saiai-cli/verify-windows-reproducibility.py tools/saiai-cli/target/debug/saiai.exe
-
-      - name: Verify provider initialization preserves editor and certificate stores
-        run: python scripts/saiai-cli/test-initialization-scope.py --binary tools/saiai-cli/target/debug/saiai.exe
-
-      - name: Verify native Windows environment lifecycle isolation
-        timeout-minutes: 5
-        run: python scripts/saiai-cli/test-windows-environments.py --binary tools/saiai-cli/target/debug/saiai.exe
-
-      - name: Verify Windows installer environment routing
-        shell: pwsh
-        run: |
-          & "$env:WINDIR/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -File scripts/saiai-cli/test-setup-environments.ps1 -WrapperPath "$PWD/scripts/saiai-cli/setup.ps1"
-
-      - name: Smoke-test Windows PowerShell 5.1 setup wrapper
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path dist -Force | Out-Null
-          Copy-Item "$PWD/tools/saiai-cli/target/debug/saiai.exe" "$PWD/dist/saiai-windows-x86_64.exe"
-          Copy-Item "$PWD/scripts/saiai-cli/setup.sh", "$PWD/scripts/saiai-cli/setup.ps1", "$PWD/scripts/saiai-cli/setup.cmd" "$PWD/dist/"
-          python scripts/saiai-cli/generate-manifest.py `
-            --dist dist `
-            --cargo-toml tools/saiai-cli/Cargo.toml `
-            --asset saiai-windows-x86_64.exe `
-            --wrappers-dir dist `
-            --output dist/manifest.json
-          & "$PWD/scripts/saiai-cli/test-windows-release.ps1" `
-            -BundleDir dist `
-            -SetupPs1 dist/setup.ps1 `
-            -SetupCmd dist/setup.cmd `
-            -AssetName saiai-windows-x86_64.exe
-
-      - name: Smoke-test native Windows self-update with active proxy
-        shell: pwsh
-        run: python scripts/saiai-cli/test-windows-self-update.py --binary dist/saiai-windows-x86_64.exe
-
-      - name: Capture official Windows Codex through local proxy
-        shell: pwsh
-        run: |
-          foreach ($version in @("0.146.0", "0.153.4")) {
-            $prefix = Join-Path $env:RUNNER_TEMP "codex-$version"
-            npm install --global --prefix $prefix "@openai/codex@$version"
-            python scripts/saiai-cli/test-windows-codex-proxy.py `
-              --saiai tools/saiai-cli/target/debug/saiai.exe `
-              --codex-prefix $prefix `
-              --codex-version $version
-          }
-
-  client-macos:
-    name: Native macOS local proxy (${{ matrix.arch }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 35
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-15-intel
-            arch: x86_64
-          - os: macos-15
-            arch: arm64
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
-
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
-        with:
-          toolchain: '1.97.0'
-
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
-        with:
-          workspaces: tools/saiai-cli -> target
-
-      - name: Test and build native macOS client
-        run: |
-          node --test scripts/saiai-cli/test-vscode-certificates.js
-          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace
-          # Platform-specific SAIAI goldens (LaunchAgent plist, Windows update
-          # helper) run through the contract entries on this platform.
-          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test saiai_render_contract --test kernel_consumer
-          # The AITP brand installs and renders its services on this platform.
-          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p proxy-cli --features contract --bin aitp
-          cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --bin saiai
-
-      - name: Verify provider and project configuration isolation
-        run: >-
-          python3 scripts/saiai-cli/test-initialization-scope.py
-          --binary tools/saiai-cli/target/debug/saiai
-
-      - name: Smoke-test macOS LaunchAgent lifecycle
-        run: >-
-          python3 scripts/saiai-cli/test-macos-service.py
-          --binary tools/saiai-cli/target/debug/saiai
-
-      - name: Verify native macOS environment lifecycle isolation
-        run: >-
-          python3 scripts/saiai-cli/test-macos-environments.py
-          --binary tools/saiai-cli/target/debug/saiai
-
-      - name: Capture official macOS Codex through local proxy
-        if: matrix.arch == 'arm64'
-        run: |
-          prefix="$RUNNER_TEMP/codex-0.153.4"
-          npm install --global --prefix "$prefix" @openai/codex@0.153.4
-          python3 scripts/saiai-cli/test-windows-codex-proxy.py \
-            --saiai tools/saiai-cli/target/debug/saiai \
-            --codex-prefix "$prefix/bin" \
-            --codex-version 0.153.4

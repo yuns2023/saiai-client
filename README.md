@@ -358,5 +358,6 @@ Linux 资产使用静态 musl，避免旧发行版上的 GLIBC 版本错误。re
 cargo fmt --manifest-path tools/saiai-cli/Cargo.toml --check
 cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml
 bash scripts/saiai-cli/test-setup-wrappers.sh
+python3 -m pip install --require-hashes -r scripts/saiai-cli/requirements-verify.txt  # 若无 PyYAML
 python3 scripts/saiai-cli/verify-release.py
 ```
