@@ -662,6 +662,9 @@ ALLOWED_ACTIONS = frozenset(
         "softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65",
     }
 )
+# The only environment file write: the AITP release check passes the built
+# program's path to the next steps.
+AITP_PROGRAM_ENV_WRITE = 'echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"'
 RUNNER_SYSTEMS = (("ubuntu-", "Linux"), ("macos-", "macOS"), ("windows-", "Windows"))
 STATIC_LINUX_MATRIX = (
     {"os": "ubuntu-22.04", "target": "x86_64-unknown-linux-musl", "asset": "saiai-linux-x86_64"},
@@ -900,7 +903,7 @@ BASH_MASK_WORDS = frozenset(
     {
         "exec", "return", "trap", "alias", "shopt", "function", "source", ".", "eval",
         "unset", "export", "declare", "typeset", "readonly", "local", "enable",
-        "builtin", "command", "hash", "cd", "pushd", "popd",
+        "builtin", "command", "hash",
     }
 )
 BASH_MASKS = re.compile(
@@ -920,8 +923,12 @@ def bash_masks(command: str) -> bool:
         words = segment.split()
         if words and words[0] in BASH_MASK_WORDS:
             return True
-        # `set -euo pipefail` is fine; `set +e` / `set +o errexit` is not.
-        if words and words[0] == "set" and any(word.startswith("+") for word in words[1:]):
+        # `set -euo pipefail` is fine; `set +e` / `set +o errexit` turn
+        # failures off and `set -n` / `set -o noexec` stop running commands.
+        if words and words[0] == "set" and any(
+            word.startswith("+") or re.fullmatch(r"-[A-Za-z]*n[A-Za-z]*", word) or word == "noexec"
+            for word in words[1:]
+        ):
             return True
     return False
 
@@ -1106,8 +1113,14 @@ def check_workflow_basics(relative: str, workflow: dict) -> None:
                 require(name != FOREIGN_NAMES_ENV or value == "saiai", f"{label} overrides {FOREIGN_NAMES_ENV}")
             script = step.get("run")
             if isinstance(script, str):
-                for forbidden in (FOREIGN_NAMES_ENV, "GITHUB_ENV", "GITHUB_PATH"):
+                for forbidden in (FOREIGN_NAMES_ENV, "GITHUB_PATH"):
                     require(forbidden not in script, f"{label} touches {forbidden}")
+                if "GITHUB_ENV" in script:
+                    writes = [command for command, _ in logical_commands(script, "bash") if "GITHUB_ENV" in command]
+                    require(
+                        relative == CI_WORKFLOW and job_id == "aitp-release-linux" and writes == [AITP_PROGRAM_ENV_WRITE],
+                        f"{label} touches GITHUB_ENV",
+                    )
 
 
 def runs_command(
@@ -1224,6 +1237,33 @@ def verify_ci_workflow() -> None:
             "python3 scripts/saiai-cli/verify-release.py",
         ):
             check("client-linux", command, "the SAIAI contract and golden checks")
+        # Until the kernel moves to its own repository, its stand-alone build
+        # and AITP release checks run here too.
+        for command, purpose, options in (
+            ('cargo clippy --locked --target-dir "$standalone/target" --all-targets -- -D warnings', "the stand-alone kernel lint", {}),
+            ('cargo clippy --locked --target-dir "$standalone/target" --all-targets --features contract -- -D warnings', "the stand-alone kernel lint", {}),
+            ('cargo test --locked --target-dir "$standalone/target"', "the stand-alone kernel tests", {"foreign_names": True}),
+            ('cargo test --locked --target-dir "$standalone/target" --features contract --bin aitp', "the stand-alone AITP program tests", {}),
+            ("python3 scripts/test_release_manifest.py", "the stand-alone release manifest tests", {}),
+            ('aitp="$(CARGO_TARGET_DIR="$standalone/target" bash scripts/build-release.sh --locked)"', "the stand-alone AITP release build", {}),
+            ('"$aitp" --version', "the stand-alone AITP release startup", {}),
+            (
+                'python3 "$GITHUB_WORKSPACE/scripts/saiai-cli/verify-release.py" --aitp-artifact "$aitp" --build-dir "$standalone" --build-dir "$GITHUB_WORKSPACE"',
+                "the stand-alone AITP release check", {},
+            ),
+        ):
+            check("client-linux", command, purpose, **options)
+        for command, purpose in (
+            ('aitp="$(bash tools/saiai-cli/kernel/scripts/build-release.sh --locked)"', "the AITP release build"),
+            ('"$aitp" --version', "the AITP release startup"),
+            (AITP_PROGRAM_ENV_WRITE, "the AITP release hand-over"),
+            ('python3 scripts/saiai-cli/verify-release.py --aitp-artifact "$AITP_PROGRAM" --build-dir "$GITHUB_WORKSPACE"', "the AITP release path check"),
+            ('grep "update signing keys are placeholders" "$RUNNER_TEMP/build.log"', "the placeholder-key build control"),
+            ('grep "carries placeholder signing keys" "$RUNNER_TEMP/keys.log"', "the placeholder-key check control"),
+            ("cargo build --locked --manifest-path tools/saiai-cli/kernel/Cargo.toml --release --bin aitp", "the ordinary release control build"),
+            ('grep -E "carries build machine paths|names the other distribution" "$RUNNER_TEMP/control.log"', "the ordinary release control"),
+        ):
+            check("aitp-release-linux", command, purpose)
         require(
             tuple(matrix_entries(workflow["jobs"]["static-linux"])) == STATIC_LINUX_MATRIX,
             f"{relative} static Linux matrix differs",
@@ -1290,6 +1330,18 @@ def verify_publication_order(relative: str, jobs: dict) -> None:
         "checks the digests",
     )
     patch = single_step(publish, lambda step: "--method PATCH" in str(step.get("run", "")), "publishes")
+    # Right before the PATCH, the same release is read again and checked
+    # against the checked assets (the window to a swap stays seconds).
+    patch_commands = effective_commands(publish["steps"][patch], "Linux", {"steps.fetch.outputs.state": "draft"})
+    recheck = (
+        'gh api "$release_endpoint" >"$RUNNER_TEMP/before-publish.json"',
+        'python3 scripts/saiai-cli/verify-github-release-draft.py --dist dist --tag "$GITHUB_REF_NAME" --state draft <"$RUNNER_TEMP/before-publish.json"',
+    )
+    publishing = [index for index, command in enumerate(patch_commands) if "--method PATCH" in command]
+    require(
+        len(publishing) == 1 and all(command in patch_commands[: publishing[0]] for command in recheck),
+        f"{relative} publish step does not re-check the release right before publishing",
+    )
     require(fetch < download < check < patch, f"{relative} publish job must fetch, download the digests and check before it publishes")
     checked = effective_commands(publish["steps"][check], "Linux", {})
     every_artifact = " ".join(f"--artifact dist/{asset}" for asset in ASSETS)
@@ -1454,7 +1506,11 @@ def verify_release_workflow() -> None:
                 "cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --bin saiai --release --target {target}",
                 macos + windows, "the release build",
             ),
-            ("cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai", macos + windows_x64, "this distribution's tests"),
+            (
+                "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p proxy-cli --features contract --bin aitp",
+                macos + windows_x64, "the AITP brand's platform services",
+            ),
+            ('"dist/{asset}" --version', linux, "the Linux startup check"),
             (
                 "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test contract_entry --test saiai_render_contract --test kernel_consumer",
                 macos + windows_x64, "the platform SAIAI goldens",
@@ -1507,6 +1563,13 @@ def verify_release_workflow() -> None:
             for version in ("0.146.0", "0.153.4")
         ):
             check("build", command, purpose, entries=entries)
+        check(
+            "build",
+            "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace",
+            "the native workspace tests with SAIAI named to the kernel's tests",
+            entries=macos + windows_x64,
+            foreign_names=True,
+        )
 
     preview = {"needs.mode.outputs.mode": "preview"}
     every_artifact = " ".join(f"--artifact dist/{asset}" for asset in ASSETS)
@@ -1581,10 +1644,13 @@ def verify_workflows_and_docs() -> None:
         workflow = text(relative)
         for withdrawn in ("test-v2-", "V2 Preview", "saiai-core/Cargo.toml"):
             require(withdrawn not in workflow, f"{relative} still contains {withdrawn!r}")
-        # The placeholder exception is gone, and AITP releases are built and
-        # checked by the kernel's own CI, not here.
-        for forbidden in ("ALLOW_PLACEHOLDER", "allow-placeholder", "build-release.sh", "remap-path-prefix", "--aitp-artifact"):
+        # The placeholder exception is gone: no workflow may bring it back.
+        for forbidden in ("ALLOW_PLACEHOLDER", "allow-placeholder"):
             require(forbidden not in workflow, f"{relative} must not use {forbidden!r}")
+    # SAIAI release builds stay as they are: no AITP path remapping there.
+    release_text = text(RELEASE_WORKFLOW)
+    for forbidden in ("build-release.sh", "remap-path-prefix", "--aitp-artifact"):
+        require(forbidden not in release_text, f"SAIAI release workflow must not use {forbidden!r}")
     require(not (ROOT / ".github/workflows/saiai-desktop-preview.yml").exists(), "V2 desktop publisher still exists")
 
     combined_docs = "\n".join(

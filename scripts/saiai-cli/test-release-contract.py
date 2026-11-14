@@ -402,7 +402,9 @@ class AitpArtifactTests(unittest.TestCase):
         for path, old, new, message in (
             (VERIFIER.AITP_RELEASE_BUILD, '--target "$triple"', "", "build script is missing"),
             (".github/workflows/saiai-cli-release.yml", "          python3 scripts/saiai-cli/verify-release.py\n", "          bash tools/saiai-cli/kernel/scripts/build-release.sh\n          python3 scripts/saiai-cli/verify-release.py\n", "must not use"),
-            (".github/workflows/ci.yml", "          python3 scripts/saiai-cli/verify-release.py\n", "          python3 scripts/saiai-cli/verify-release.py\n          python3 scripts/saiai-cli/verify-release.py --aitp-artifact x --build-dir /x\n", "must not use"),
+            (".github/workflows/ci.yml", '          echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"\n', "", "AITP release hand-over"),
+            (".github/workflows/ci.yml", '          --aitp-artifact "$AITP_PROGRAM"\n', "", "AITP release path check"),
+            (".github/workflows/ci.yml", "          cargo test --locked --target-dir \"$standalone/target\"\n", "", "stand-alone kernel tests"),
             (VERIFIER.AITP_RELEASE_BUILD, "--remap-path-prefix=", "--no-remap=", "build script is missing"),
             (VERIFIER.AITP_RELEASE_BUILD, 'add_mapping "$home" /aitp/home\n', "", "does not map to /aitp/home"),
         ):
@@ -443,13 +445,13 @@ class WorkflowStructureTests(unittest.TestCase):
         self.rejects(CI, "  AITP_TEST_FOREIGN_NAMES: saiai\n", "  AITP_TEST_FOREIGN_NAMES: other\n", "overrides AITP_TEST_FOREIGN_NAMES")
         self.rejects(
             RELEASE, "          AITP_TEST_FOREIGN_NAMES: saiai\n", "          AITP_TEST_FOREIGN_NAMES: ''\n",
-            "overrides AITP_TEST_FOREIGN_NAMES",
+            "overrides AITP_TEST_FOREIGN_NAMES", count=2,
         )
         # Dropped from the environment entirely, or cleared in the script.
         self.rejects(CI, "env:\n  AITP_TEST_FOREIGN_NAMES: saiai\n", "", "does not name SAIAI")
         self.rejects(
             RELEASE, "        env:\n          # The kernel's tests also refuse this distribution's name (see ci.yml).\n          AITP_TEST_FOREIGN_NAMES: saiai\n", "",
-            "workspace tests with SAIAI",
+            "workspace tests with SAIAI", count=2,
         )
         self.rejects(
             CI, CARGO_TEST,
@@ -502,8 +504,8 @@ class WorkflowStructureTests(unittest.TestCase):
         self.rejects(CI, CARGO_TEST, CARGO_TEST + "        continue-on-error: true\n", "continues on error")
         self.rejects(CI, CARGO_TEST, CARGO_TEST + "        shell: bash {0}\n", "uses the shell")
         self.rejects(CI, CARGO_TEST, CARGO_TEST + "        working-directory: tools\n", "working directory")
-        self.rejects(CI, "    timeout-minutes: 30\n", "    timeout-minutes: 30\n    continue-on-error: true\n", "continues on error")
-        self.rejects(CI, "    timeout-minutes: 30\n", "    timeout-minutes: 30\n    defaults:\n      run:\n        shell: sh\n", "defaults")
+        self.rejects(CI, "    timeout-minutes: 30\n", "    timeout-minutes: 30\n    continue-on-error: true\n", "continues on error", count=2)
+        self.rejects(CI, "    timeout-minutes: 30\n", "    timeout-minutes: 30\n    defaults:\n      run:\n        shell: sh\n", "defaults", count=2)
 
     def test_windows_native_failures_stop_the_step(self) -> None:
         stop = "          $PSNativeCommandUseErrorActionPreference = $true\n"
@@ -518,7 +520,7 @@ class WorkflowStructureTests(unittest.TestCase):
     def test_everyday_ci_stays_on_linux(self) -> None:
         for runner in ("macos-15", "windows-latest"):
             with self.subTest(runner=runner):
-                self.rejects(CI, "    runs-on: ubuntu-22.04\n", f"    runs-on: {runner}\n", "leaves Linux", count=1)
+                self.rejects(CI, "    runs-on: ubuntu-22.04\n", f"    runs-on: {runner}\n", "leaves Linux", count=2)
         self.rejects(
             CI, "          - os: ubuntu-22.04\n", "          - os: macos-15\n", "leaves Linux",
         )
@@ -531,7 +533,9 @@ class WorkflowStructureTests(unittest.TestCase):
             ("          python3 scripts/saiai-cli/test-macos-environments.py\n", "          echo\n", "macOS environment isolation"),
             ("        run: python scripts/saiai-cli/test-windows-environments.py", "        run: echo skipped #", "Windows environment isolation"),
             ("        run: python scripts/saiai-cli/test-windows-self-update.py", "        run: echo skipped #", "self-update"),
-            ("          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai\n", "", "distribution's tests"),
+            ("          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace\n", "", "native workspace tests"),
+            ("          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p proxy-cli --features contract --bin aitp\n", "", "AITP brand's platform services"),
+            ('          "dist/${{ matrix.asset }}" --version\n', "", "Linux startup check"),
             ("          python3 scripts/saiai-cli/test-uninstall.py\n", "          echo\n", "uninstall"),
         ):
             with self.subTest(old=old):
@@ -559,7 +563,7 @@ class WorkflowStructureTests(unittest.TestCase):
 
     def test_yaml_tricks_are_refused(self) -> None:
         self.rejects(CI, CARGO_TEST, CARGO_TEST + "        run: echo skipped\n", "repeats the key")
-        self.rejects(CI, "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n", "      - uses: actions/checkout@v7\n", "not pinned", count=2)
+        self.rejects(CI, "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n", "      - uses: actions/checkout@v7\n", "not pinned", count=3)
 
     def test_review_bypasses_are_refused(self) -> None:
         c = "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace"
@@ -570,7 +574,9 @@ class WorkflowStructureTests(unittest.TestCase):
             f":; cargo() {{ :; }}\n          {c}",
             f"export AITP_TEST_FOREIGN_''NAMES=\n          {c}",
             f"key=GITHUB_''PATH; printf '%s\\n' /x >> \"${{!key}}\"\n          {c}",
-            f"cd /tmp && {c}",
+            f"set -n\n          {c}",
+            f"set -o noexec\n          {c}",
+            f"set -en\n          {c}",
             f"alias cargo=true; {c}",
         ):
             with self.subTest(script=script):
@@ -611,7 +617,7 @@ class WorkflowStructureTests(unittest.TestCase):
         self.rejects(
             CI, "    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n",
             "    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          ref: main\n",
-            "check out the commit", count=2,
+            "check out the commit", count=3,
         )
         self.rejects(
             RELEASE, "  build:\n    needs: verify\n",
@@ -662,6 +668,22 @@ class WorkflowStructureTests(unittest.TestCase):
         head = head[: head.rindex(bundle)] + head[head.rindex(bundle) + len(bundle):]
         moved = head + tail.rstrip("\n") + "\n" + bundle.replace("          python3", "          python3", 1)
         self.rejects(RELEASE, release, moved, "before publishing")
+
+    def test_third_review_bypasses_are_refused(self) -> None:
+        # GITHUB_ENV is written once, by the AITP release hand-over only.
+        self.rejects(
+            CI, "      - name: Format\n",
+            "      - name: Note\n        run: echo X=1 >> \"$GITHUB_ENV\"\n\n      - name: Format\n", "touches GITHUB_ENV",
+        )
+        # The publish step re-reads the release right before the PATCH.
+        recheck = '          python3 scripts/saiai-cli/verify-github-release-draft.py --dist dist --tag "$GITHUB_REF_NAME" --state draft <"$RUNNER_TEMP/before-publish.json"\n'
+        self.rejects(RELEASE, recheck, "", "re-check the release right before publishing")
+        release = ORIGINAL_TEXT(RELEASE)
+        start = release.index("          # Re-read this release right before publishing")
+        end = release.index("          publish_status=0\n")
+        tail_end = release.index('          echo "publish request status: $publish_status"\n')
+        moved = release[:start] + release[end:tail_end] + release[start:end] + release[tail_end:]
+        self.rejects(RELEASE, release, moved, "re-check the release right before publishing")
 
     def test_expression_reader(self) -> None:
         context = {"runner.os": "macOS", "matrix.target": "aarch64-apple-darwin"}

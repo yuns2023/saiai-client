@@ -22,6 +22,7 @@ def run(**changes):
     value = {
         "id": 7, "name": "SAIAI CLI Release", "event": "push", "head_branch": TAG,
         "head_sha": SHA, "status": "completed", "conclusion": "success",
+        "path": ".github/workflows/saiai-cli-release.yml",
     }
     value.update(changes)
     return value
@@ -43,7 +44,8 @@ class TagRunTests(unittest.TestCase):
     def test_rejects_other_runs(self) -> None:
         for other in (
             run(event="workflow_dispatch"), run(head_branch="main"), run(head_sha="b" * 40),
-            run(name="Client CI"), run(conclusion="failure"), run(status="in_progress"), run(id="7"),
+            run(name="Client CI"), run(conclusion="failure"),
+            run(path=".github/workflows/other.yml"), run(path=None), run(status="in_progress"), run(id="7"),
         ):
             with self.subTest(other=other), self.assertRaisesRegex(FETCH.FetchError, "no successful"):
                 FETCH.tag_run([other], TAG, SHA)

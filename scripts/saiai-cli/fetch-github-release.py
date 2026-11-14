@@ -19,6 +19,7 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORKFLOW_NAME = "SAIAI CLI Release"
+WORKFLOW_PATH = ".github/workflows/saiai-cli-release.yml"
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 
@@ -52,6 +53,7 @@ def tag_run(runs: Any, tag: str, sha: str) -> dict[str, Any]:
         for run in runs
         if isinstance(run, dict)
         and run.get("name") == WORKFLOW_NAME
+        and run.get("path") == WORKFLOW_PATH
         and run.get("event") == "push"
         and run.get("head_branch") == tag
         and run.get("head_sha") == sha
@@ -116,7 +118,11 @@ def main() -> int:
         require(re.fullmatch(r"saiai-v[0-9A-Za-z.+-]+", args.tag) is not None, "tag is not a saiai-v* tag")
         require(SHA_RE.fullmatch(args.sha) is not None, "commit is not a full SHA")
         require(not args.dist.exists(), f"{args.dist} already exists")
-        runs = json.loads(gh(f"repos/{args.repository}/actions/runs?event=push&head_sha={args.sha}&per_page=100"))
+        # Runs of this workflow file only: another workflow may carry the same name.
+        runs = json.loads(gh(
+            f"repos/{args.repository}/actions/workflows/{Path(WORKFLOW_PATH).name}/runs"
+            f"?event=push&head_sha={args.sha}&per_page=100"
+        ))
         run = tag_run(runs.get("workflow_runs") if isinstance(runs, dict) else None, args.tag, args.sha)
         pages = json.loads(gh("--paginate", "--slurp", f"repos/{args.repository}/releases?per_page=100"))
         release = tag_release(pages, args.tag)
