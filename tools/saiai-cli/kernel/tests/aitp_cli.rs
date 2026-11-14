@@ -1231,30 +1231,48 @@ fn next_version_after(version: &str) -> String {
 }
 
 /// Replaces `from` with `to` where it stands alone (no digit or dot right
-/// before or after), as the program's version text does.
+/// before or after), as the program's version text does in an ELF or PE
+/// file. Where no such occurrence exists (string data packed back to back,
+/// as in some Mach-O builds), every occurrence is replaced and the contexts
+/// are printed; the caller then proves the result by running it.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 fn replace_version(program: &mut [u8], from: &str, to: &str) {
     let (from, to) = (from.as_bytes(), to.as_bytes());
     assert_eq!(from.len(), to.len());
     let part_of_version = |byte: u8| byte.is_ascii_digit() || byte == b'.';
-    let mut found = 0;
-    let mut at = 0;
-    while at + from.len() <= program.len() {
-        if program[at] == from[0]
-            && program[at..].starts_with(from)
-            && (at == 0 || !part_of_version(program[at - 1]))
-            && program
-                .get(at + from.len())
-                .is_none_or(|byte| !part_of_version(*byte))
-        {
-            program[at..at + from.len()].copy_from_slice(to);
-            found += 1;
-            at += from.len();
-        } else {
-            at += 1;
+    let occurrences: Vec<usize> = (0..program.len().saturating_sub(from.len() - 1))
+        .filter(|&at| program[at] == from[0] && program[at..].starts_with(from))
+        .collect();
+    let alone: Vec<usize> = occurrences
+        .iter()
+        .copied()
+        .filter(|&at| {
+            (at == 0 || !part_of_version(program[at - 1]))
+                && program
+                    .get(at + from.len())
+                    .is_none_or(|byte| !part_of_version(*byte))
+        })
+        .collect();
+    assert!(
+        !occurrences.is_empty(),
+        "the version text is not in the program"
+    );
+    let chosen = if alone.is_empty() {
+        for &at in &occurrences {
+            let context =
+                &program[at.saturating_sub(12)..(at + from.len() + 12).min(program.len())];
+            eprintln!(
+                "version text at {at}: {:?}",
+                String::from_utf8_lossy(context)
+            );
         }
+        occurrences
+    } else {
+        alone
+    };
+    for at in chosen {
+        program[at..at + from.len()].copy_from_slice(to);
     }
-    assert!(found > 0, "the version text is not in the program");
 }
 
 /// `--version` of `path`, within 60 s.
@@ -1676,6 +1694,10 @@ fn test_helpers_read_keys_and_versions_exactly() {
     let mut program = b"0.1.0 x10.1.0 0.1.00 a0.1.0b 0.1.0".to_vec();
     replace_version(&mut program, "0.1.0", "0.1.1");
     assert_eq!(program, b"0.1.1 x10.1.0 0.1.00 a0.1.1b 0.1.1");
+    // Only packed occurrences: all of them.
+    let mut program = b"x10.1.0 0.1.00".to_vec();
+    replace_version(&mut program, "0.1.0", "0.1.1");
+    assert_eq!(program, b"x10.1.1 0.1.10");
     let mut program = b"aaa KEYKEY bbb".to_vec();
     replace_bytes(&mut program, b"KEYKEY", b"NEWKEY", 1);
     assert_eq!(program, b"aaa NEWKEY bbb");
