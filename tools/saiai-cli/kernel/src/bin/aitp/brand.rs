@@ -343,8 +343,10 @@ mod tests {
             let lock = script
                 .find(r"$helperLockPath = 'C:\Users\u\AppData\Local\AITP\bin\.aitp-update-helper-lock'")
                 .unwrap_or_else(|| panic!("{script}"));
-            let main = script.find("\r\ntry {\r\n").unwrap();
-            assert!(lock < main, "{script}");
+            // Before the command function and every `try` block.
+            let function = script.find("function Invoke-AitpCommand").unwrap();
+            let first_try = script.find("try {").unwrap();
+            assert!(lock < function && lock < first_try, "{script}");
             assert!(script.contains("foreach ($attempt in 1..600)"), "{script}");
         }
     }

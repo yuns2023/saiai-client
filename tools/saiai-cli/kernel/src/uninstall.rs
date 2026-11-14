@@ -3473,6 +3473,28 @@ mod tests {
         );
     }
 
+    /// Removing one installation directory's lock file releases that
+    /// directory's lock only; the others stay locked.
+    #[test]
+    fn releasing_one_directorys_lock_keeps_the_others() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let lock = |dir: &Path| crate::lock_installation(dir, ".ktest-update-", "ktest");
+        let mut locks: InstallLocks = vec![lock(a.path()).unwrap(), lock(b.path()).unwrap()];
+        release_lock_of(&mut locks, &a.path().join(".ktest-update-lock"));
+        assert!(lock(b.path()).is_err());
+        #[cfg(windows)]
+        {
+            assert_eq!(locks.len(), 1);
+            let _a = lock(a.path()).unwrap();
+        }
+        // Unix locks directories, not files: nothing is released by a path.
+        #[cfg(unix)]
+        {
+            assert_eq!(locks.len(), 2);
+            assert!(lock(a.path()).is_err());
+        }
+    }
+
     #[test]
     fn a_directory_changed_meanwhile_is_absent_or_kept() {
         let wrapped = |kind| {

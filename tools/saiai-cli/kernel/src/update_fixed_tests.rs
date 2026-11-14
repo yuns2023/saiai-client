@@ -791,6 +791,58 @@ fn a_held_helper_lock_keeps_the_installation_locked() {
     assert!(!lock.holds(&directory.path().join(".ktest-update-x")));
 }
 
+/// Windows: `finalize_update` with the installation lock (a fixed-source
+/// update) hands the lock to the helper it starts: once it returns and the
+/// updater lets go, the directory stays locked while the helper runs. (Here
+/// the helper waits for this test process, the "updater", which does not
+/// exit, and gives up after 30 s without replacing anything.)
+#[cfg(windows)]
+#[test]
+fn a_fixed_source_update_hands_its_lock_to_the_replacement_helper() {
+    let directory = tempfile::tempdir().unwrap();
+    let dir = directory.path();
+    let current = dir.join("current.cmd");
+    fs::write(&current, "@exit /b 0\r\n").unwrap();
+    let new_program = b"@exit /b 0\r\nrem new\r\n".to_vec();
+    let candidate = dir.join(".ktest-update-1.exe");
+    fs::write(&candidate, &new_program).unwrap();
+    let mut lock = lock_update_directory(dir).unwrap();
+    finalize_update(
+        &current,
+        &candidate,
+        &dir.join("ktest.bak-1.exe"),
+        false,
+        &sha256_hex(&new_program),
+        Some(&mut lock),
+    )
+    .unwrap();
+    drop(lock);
+    let error = lock_update_directory(dir).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("still being installed"),
+        "{error:#}"
+    );
+    let status = dir.join(".ktest-update-status.txt");
+    let until = std::time::Instant::now() + Duration::from_secs(90);
+    let report = loop {
+        let report = fs::read_to_string(&status).unwrap_or_default();
+        let report = report.trim_start_matches('\u{feff}').trim().to_string();
+        if report.starts_with("failed:") || report.starts_with("updated:") {
+            break report;
+        }
+        assert!(std::time::Instant::now() < until, "{report}");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(report.contains("Updater process did not exit"), "{report}");
+    assert_eq!(fs::read(&current).unwrap(), b"@exit /b 0\r\n");
+    // The helper has exited: the directory can be locked again.
+    let until = std::time::Instant::now() + Duration::from_secs(20);
+    while lock_update_directory(dir).is_err() {
+        assert!(std::time::Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// Windows: a helper that never takes the helper lock is reported (the
 /// caller stops it), and the lock is not kept open while waiting.
 #[cfg(windows)]

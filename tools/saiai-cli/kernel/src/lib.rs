@@ -8120,7 +8120,12 @@ fn finalize_update(
     let status_path = windows_update_status_path(current_exe)?;
     fs::write(&status_path, "pending\n")
         .with_context(|| format!("failed to write {}", status_path.display()))?;
-    let script = render_windows_update_script(
+    // With the installation lock (fixed-source updates), the helper takes
+    // over its helper lock; without it (Gateway channel), as before.
+    let helper_lock = lock
+        .as_ref()
+        .map(|lock| lock.helper_lock_path().to_path_buf());
+    let script = render_windows_update_script_locked(
         std::process::id(),
         current_exe,
         candidate_path,
@@ -8128,6 +8133,7 @@ fn finalize_update(
         &status_path,
         restart_service,
         expected_sha256,
+        helper_lock.as_deref(),
     )?;
     fs::write(&script_path, script)
         .with_context(|| format!("failed to write {}", script_path.display()))?;
@@ -8363,11 +8369,14 @@ if ($null -eq $helperLock) {{\r\n\
 }}\r\n",
         powershell_quote_path(helper_lock)?
     );
-    // Before the main block, which starts at the beginning of a line.
-    let at = script
-        .find("\r\ntry {\r\n")
-        .context("Windows update helper has no main block")?
-        + 2;
+    // First thing after the variables: before the command function (whose
+    // body, like the main block, has `try {` lines; the script is not
+    // indented).
+    let marker = "\r\nfunction Invoke-";
+    if script.matches(marker).count() != 1 {
+        bail!("Windows update helper has no single command function");
+    }
+    let at = script.find(marker).map_or(0, |at| at + 2);
     Ok(format!("{}{take_lock}{}", &script[..at], &script[at..]))
 }
 

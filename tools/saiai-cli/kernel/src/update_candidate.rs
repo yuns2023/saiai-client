@@ -450,6 +450,9 @@ pub(crate) struct InstallationLock {
     main: (PathBuf, fs::File),
     #[cfg(windows)]
     helper: Option<(PathBuf, fs::File)>,
+    /// The helper lock file (also once handed over).
+    #[cfg(windows)]
+    helper_path: PathBuf,
 }
 
 /// The lock files of `directory` (Windows): the main lock and the helper
@@ -505,6 +508,7 @@ pub(crate) fn lock_installation(
         };
         Ok(InstallationLock {
             main,
+            helper_path: helper.0.clone(),
             helper: Some(helper),
         })
     }
@@ -540,6 +544,12 @@ impl InstallationLock {
             let _ = path;
             false
         }
+    }
+
+    /// Windows: the helper lock file of this installation directory.
+    #[cfg(windows)]
+    pub(crate) fn helper_lock_path(&self) -> &Path {
+        &self.helper_path
     }
 
     /// Windows: releases the helper lock, runs `start` (which starts the
