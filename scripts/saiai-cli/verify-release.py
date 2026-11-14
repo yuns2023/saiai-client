@@ -641,12 +641,22 @@ def verify_workflows_and_docs() -> None:
     # The kernel's tests name this distribution only through the
     # environment, and the kernel source is scanned for its names.
     require(
-        re.search(r"^env:\n(?:  .*\n|#.*\n)*  AITP_TEST_FOREIGN_NAMES: saiai$", ci, re.MULTILINE)
+        re.search(
+            r"^env:\n(?:(?:  .*|\s*#.*|\s*)\n)*  AITP_TEST_FOREIGN_NAMES: (['\"]?)saiai\1\s*(?:#.*)?$",
+            ci,
+            re.MULTILINE,
+        )
         is not None,
         "CI does not name SAIAI to the kernel's tests for the whole workflow",
     )
     require(
-        "AITP_TEST_FOREIGN_NAMES: saiai" in release,
+        re.search(
+            r"^      - name: Test\n        run: cargo test [^\n]*--workspace\n        env:\n"
+            r"(?:\s*#.*\n)*          AITP_TEST_FOREIGN_NAMES: saiai$",
+            release,
+            re.MULTILINE,
+        )
+        is not None,
         "the release workflow does not name SAIAI to the kernel's tests",
     )
     pre_push = text("scripts/git-hooks/pre-push")
@@ -654,7 +664,7 @@ def verify_workflows_and_docs() -> None:
         "AITP_TEST_FOREIGN_NAMES=saiai" in pre_push,
         "the pre-push hook does not name SAIAI to the kernel's tests",
     )
-    for path, workflow in (("ci.yml", ci), ("pre-push", pre_push)):
+    for path, workflow in (("ci.yml", ci), ("release workflow", release), ("pre-push", pre_push)):
         require(
             "python3 scripts/saiai-cli/test-scan-kernel-names.py" in workflow
             and "python3 scripts/saiai-cli/scan-kernel-names.py tools/saiai-cli/kernel" in workflow,

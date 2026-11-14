@@ -5,11 +5,12 @@ Usage: scan-kernel-names.py [DIRECTORY ...]   (default: tools/saiai-cli/kernel)
 
 Every file (and every path) below each directory is read as bytes and
 checked in several views: as Latin-1 text (binary files keep their
-printable strings), with NUL bytes removed (UTF-16 in either byte order) and,
-when it is UTF-8, NFKC-normalized (full-width and other compatibility
-spellings). In each view the scan looks for
+printable strings), with NUL bytes removed, decoded as UTF-16 in either
+byte order, and (UTF-8 / UTF-16) with compatibility forms, accents and
+common Cyrillic/Greek look-alike letters folded to ASCII. In each view the scan looks for
 
 * the name in any case, spelled out with separators between the letters
+  or as a run of character / byte literals ('S' as u8, b'S', 0x53, 83u8)
   ("s", "a", ... / Sai-ai / s{}aiai), with one letter replaced by a
   symbol (SA$AI), reversed, or ROT13;
 * the name's bytes as Base64 / Base64url fragments (every case variant,
@@ -39,8 +40,9 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DIRECTORY = ROOT / "tools/saiai-cli/kernel"
 
 WORD = "saiai"
-# At most this many separator characters between two letters of the name.
-GAP = r"[^a-z0-9]{0,8}"
+# Between two letters of the name: any white space (indentation of a
+# multi-line array) and at most eight other separator characters.
+GAP = r"\s*(?:[^a-z0-9\s]\s*){0,8}"
 
 
 def spelled(word: str) -> re.Pattern[str]:
@@ -88,16 +90,20 @@ def base64_fragments(data: bytes) -> set[str]:
 def base64_needles() -> list[str]:
     needles = set()
     for variant in case_variants(WORD):
-        for fragment in base64_fragments(variant):
+        encodings = [variant] + [
+            variant.decode().encode(codec) for codec in ("utf-16-le", "utf-16-be")
+        ]
+        for fragment in {f for encoded in encodings for f in base64_fragments(encoded)}:
             needles.add(fragment)
             needles.add(fragment.replace("+", "-").replace("/", "_"))
     return sorted(needles)
 
 
 def hexadecimal_pattern() -> re.Pattern[str]:
+    # Also as UTF-16 (a 00 byte before or after each letter).
     digits = {"s": "[57]3", "a": "[46]1", "i": "[46]9"}
-    prefix = r"(?:0x|\\x|\\u\{?0{0,4}|%|&#x)?"
-    separator = r"[\s,;:_\-}]{0,3}"
+    prefix = r"(?:0x|\\x|\\u\{?0{0,4}|%|&#x)?(?:00)?"
+    separator = r"(?:00)?(?:u8)?\s*[,;:_\-}]{0,3}\s*"
     return re.compile(
         separator.join(prefix + digits[ch] for ch in WORD), re.IGNORECASE
     )
@@ -106,7 +112,7 @@ def hexadecimal_pattern() -> re.Pattern[str]:
 def decimal_pattern() -> re.Pattern[str]:
     codes = {"s": "(?:115|83)", "a": "(?:97|65)", "i": "(?:105|73)"}
     return re.compile(
-        r"(?<!\d)" + r"\s*[,;]\s*".join(codes[ch] for ch in WORD) + r"(?!\d)"
+        r"(?<!\d)" + r"(?:_?u8)?\s*[,;]\s*".join(codes[ch] for ch in WORD) + r"(?!\d)"
     )
 
 
@@ -126,8 +132,82 @@ RULES: list[tuple[str, re.Pattern[str]]] = [
         ),
     ),
     ("internal-address", re.compile(r"192\.168\.(?!0\.0/16(?![\d.]))")),
-    ("test-machine-user", re.compile(r"stoa|asus", re.IGNORECASE)),
+    ("test-machine-user", re.compile(r"(?<![a-z])(?:stoa|asus)(?![a-z])", re.IGNORECASE)),
 ]
+BASE64_RULE = next(pattern for rule, pattern in RULES if rule == "name-base64")
+INTERNAL_NAMES = next(pattern for rule, pattern in RULES if rule == "internal-name")
+
+# One character as a literal: 'S', b'S', "S", '\x53', '\u{53}', 0x53, 83u8,
+# optionally cast ('S' as u8, 83 as char).
+LITERAL = re.compile(
+    r"""(?:b?'(?P<char>\\x[0-9a-f]{2}|\\u\{[0-9a-f]{1,6}\}|[^'\\\n])'"""
+    r'|b?"(?P<string>[^"\\\n]{1,4})"'
+    r"|(?<![0-9a-z_])0x(?P<hex>[0-9a-f]{1,2})(?:_?u8)?(?![0-9a-z])"
+    r"|(?<![0-9a-z_.])(?P<decimal>[0-9]{2,3})(?:_?u8)?(?![0-9a-z.]))"
+    r"(?:\s+as\s+(?:u8|char|u16|u32))?",
+    re.IGNORECASE,
+)
+# What may stand between two literals of one spelled-out value.
+LITERAL_GAP = re.compile(r"[\s,;+&|()\[\]{}]*")
+
+CONFUSABLE = str.maketrans(
+    {
+        "\u0430": "a", "\u0410": "A", "\u03b1": "a", "\u0391": "A",
+        "\u0456": "i", "\u0406": "I", "\u03b9": "i", "\u0399": "I",
+        "\u0131": "i", "\u04cf": "i", "\u04c0": "I", "\u0455": "s", "\u0405": "S",
+        "\ua4e2": "S", "\ua4ee": "A", "\u01c0": "I",
+    }
+)
+
+
+def character(number: int) -> str | None:
+    """The character with this code, if it is a Unicode scalar value."""
+    if 0 <= number < 0x110000 and not 0xD800 <= number <= 0xDFFF:
+        return chr(number)
+    return None
+
+
+def literal_value(match: re.Match[str]) -> str | None:
+    """The literal's text, or None when it is no valid character."""
+    if match["char"] is not None:
+        value = match["char"]
+        if value.startswith("\\x"):
+            return character(int(value[2:], 16))
+        if value.startswith("\\u"):
+            return character(int(value[3:-1], 16))
+        return value
+    if match["string"] is not None:
+        return match["string"]
+    number = int(match["hex"], 16) if match["hex"] is not None else int(match["decimal"])
+    return character(number)
+
+
+def literal_runs(text: str) -> list[tuple[int, str]]:
+    """Adjacent character literals joined: (offset, value) per run. On
+    purpose this joins across arguments, tuples and arrays alike (the scan
+    cannot tell a constructed name from a list of its parts); an invalid
+    literal ends a run."""
+    runs: list[tuple[int, str]] = []
+    start, value, end = 0, "", -1
+    for match in LITERAL.finditer(text):
+        piece = literal_value(match)
+        if piece is not None and end >= 0 and LITERAL_GAP.fullmatch(text, end, match.start()):
+            value += piece
+        else:
+            if value:
+                runs.append((start, value))
+            start, value = match.start(), piece or ""
+        end = match.end() if piece is not None else -1
+    if value:
+        runs.append((start, value))
+    return [(at, folded(run)) for at, run in runs if len(run) >= 3]
+
+
+def folded(text: str) -> str:
+    """Compatibility forms, accents and common look-alike letters folded."""
+    text = unicodedata.normalize("NFKD", unicodedata.normalize("NFKC", text))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return text.translate(CONFUSABLE)
 
 LFS_POINTER = re.compile(r"^version https://git-lfs\.github\.com/spec/", re.MULTILINE)
 LFS_FILTER = re.compile(r"filter\s*=\s*lfs", re.IGNORECASE)
@@ -135,16 +215,27 @@ LFS_FILTER = re.compile(r"filter\s*=\s*lfs", re.IGNORECASE)
 
 def views(data: bytes) -> list[tuple[str, str]]:
     result = [("", data.decode("latin-1"))]
+    decoded = []
+    try:
+        decoded.append(("", data.decode("utf-8")))
+    except UnicodeDecodeError:
+        utf8 = False
+    else:
+        utf8 = True
     if b"\0" in data:
         result.append((" (NUL bytes removed)", data.replace(b"\0", b"").decode("latin-1")))
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        pass
-    else:
-        normalized = unicodedata.normalize("NFKC", text)
+    if b"\0" in data or not utf8 or data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        for codec in ("utf-16-le", "utf-16-be"):
+            for skip in (0, 1):
+                decoded.append(
+                    (f" ({codec})", data[skip:].decode(codec, errors="replace"))
+                )
+    for suffix, text in decoded:
+        if suffix:
+            result.append((suffix, text))
+        normalized = folded(text)
         if normalized != text:
-            result.append((" (NFKC)", normalized))
+            result.append((f"{suffix} (folded)", normalized))
     return result
 
 
@@ -161,6 +252,20 @@ def scan_text(label: str, text: str) -> list[str]:
             findings.append(
                 f"{label}:{line}: {rule}: {excerpt(text, match.start(), match.end())}"
             )
+    # Base64 wrapped over several lines.
+    unwrapped = re.sub(r"\s+", "", text)
+    if unwrapped != text:
+        for match in BASE64_RULE.finditer(unwrapped):
+            if not BASE64_RULE.search(text):
+                findings.append(
+                    f"{label} (white space removed):1: name-base64: "
+                    f"{excerpt(unwrapped, match.start(), match.end())}"
+                )
+                break
+    for at, run in literal_runs(text):
+        if WORD in run.lower() or INTERNAL_NAMES.search(run):
+            line = text.count("\n", 0, at) + 1
+            findings.append(f"{label}:{line}: name-literals: {run!r}")
     return findings
 
 

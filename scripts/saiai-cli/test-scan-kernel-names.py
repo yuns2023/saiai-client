@@ -60,6 +60,28 @@ PLANTED: list[tuple[bytes, str]] = [
     (f"x{NAME.upper()}y".encode("utf-16-be"), "name"),
     (b"\x00\x01\xff\xfe" + NAME.encode() + b"\x00\x02\x80", "name"),
     ("ＳＡＩＡＩ".encode(), "name"),
+    # Ordinary code formatting and literal forms.
+    (b'[\n        "S",\n        "A",\n        "I",\n        "A",\n        "I",\n]', "name"),
+    (b"['S' as u8, 'A' as u8, 'I' as u8, 'A' as u8, 'I' as u8]", "name-literals"),
+    (b"[b'S', b'A', b'I', b'A', b'I']", "name-literals"),
+    (b"[83u8, 65, 73, 65, 73]", "name-decimal"),
+    (b"[\n    0x73,\n        0x61,\n        0x69,\n        0x61,\n        0x69]", "name-hex"),
+    (b"['\\x73', '\\u{61}', 'i', 'a', 'i']", "name-literals"),
+    (b'concat!("sa",\n            "iai")', "name"),
+    (b'concat!("sub", "2api")', "name-literals"),
+    # Parts listed side by side count as spelling the name, on purpose.
+    (b'assert_eq!("sub", "2api");', "name-literals"),
+    (b"['\\u{455}', '\\u{430}', '\\u{456}', '\\u{430}', '\\u{456}']", "name-literals"),
+    (b"['\\u{110000}', 's', 'a', 'i', 'a', 'i']", "name-literals"),
+    ("S\u0410\u0406\u0410\u0406".encode(), "name"),
+    ("s\u00e0\u00ef\u00e1\u00ed".encode(), "name"),
+    (b"73006100690061006900", "name-hex"),
+    (b"cwBhAGkAYQBpAA==", "name-base64"),
+    (b"c2Fp\nYWk=", "name-base64"),
+    ("\uff33\uff21\uff29\uff21\uff29".encode("utf-16-le"), "name"),
+    (b"\xff\xfe" + "x\u0455aiai".encode("utf-16-le"), "name"),
+    (b"/home/stoa/x", "test-machine-user"),
+    (b"stoa@host", "test-machine-user"),
     # The fragments the publication plan lists, alone.
     *[(fragment.encode(), "name-base64") for fragment in (
         "NhaWFp", "c2FpYWk", "U0FJQUk", "U2FpYWk", "zYWlhaS", "TQUlBS",
@@ -80,6 +102,14 @@ CLEAN = [
     b"assistant said: aitp is a local proxy; data mai said",
     b"0x73, 0x61, 0x69, 0x62",
     "ordinary UTF-8 text: café".encode(),
+    b'const PEGASUS: &str = "Pegasus"; // Stoat, asusual',
+    b"let ports = [80, 443, 8080]; let bytes = [0x00, 0xff, 0x7f, 0x10];",
+    b"let letters = ['a', 'b', 'c']; let x = 115 + 97;",
+    b'assert_eq!(render("x"), "KTEST_X"); let v = ["", "a", "ab"];',
+    # Invalid escapes (parser negatives, comments) neither crash the scan
+    # nor join the literals around them.
+    b"// invalid: '\\u{110000}' '\\u{ffffff}' '\\u{d800}' 0x110000",
+    b"['s', 'a', '\\u{110000}', 'i', 'a', 'i']",
 ]
 
 

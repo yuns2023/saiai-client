@@ -216,7 +216,7 @@ impl Sandbox {
     /// checked separately (`the_program_carries_no_other_distribution_name`).
     fn assert_only_aitp_names(&self) {
         for text in self.printed.lock().unwrap().iter() {
-            assert_eq!(foreign_name_in(text), None, "{text}");
+            assert_eq!(foreign_name_in(&self.outside_root(text)), None, "{text}");
         }
         let mut pending = vec![self.root.clone()];
         let mut files = 0;
@@ -224,7 +224,7 @@ impl Sandbox {
             for entry in std::fs::read_dir(&dir).unwrap() {
                 let path = entry.unwrap().path();
                 assert_eq!(
-                    foreign_name_in(&path.to_string_lossy()),
+                    foreign_name_in(&path.strip_prefix(&self.root).unwrap().to_string_lossy()),
                     None,
                     "{}",
                     path.display()
@@ -236,7 +236,7 @@ impl Sandbox {
                 if kind.is_symlink() {
                     let target = std::fs::read_link(&path).unwrap();
                     assert_eq!(
-                        foreign_name_in(&target.to_string_lossy()),
+                        foreign_name_in(&self.outside_root(&target.to_string_lossy())),
                         None,
                         "{} -> {}",
                         path.display(),
@@ -248,7 +248,7 @@ impl Sandbox {
                     files += 1;
                     let bytes = std::fs::read(&path).unwrap();
                     assert_eq!(
-                        foreign_name_in(&String::from_utf8_lossy(&bytes)),
+                        foreign_name_in(&self.outside_root(&String::from_utf8_lossy(&bytes))),
                         None,
                         "{} names another distribution",
                         path.display()
@@ -258,6 +258,101 @@ impl Sandbox {
         }
         assert!(files > 0, "the program wrote nothing to check");
     }
+
+    /// `text` with the sandbox root removed where a path starts with it
+    /// (plain, either separator, JSON-escaped): the root is a system
+    /// temporary directory whose path may itself contain a checked name (a
+    /// user or `TMPDIR` called ktest). Only a root that starts a path value
+    /// and ends at a path boundary is removed, so everything the program
+    /// added below it, even a repeated copy of the root's text, is checked.
+    fn outside_root(&self, text: &str) -> String {
+        let root = self.root.to_string_lossy();
+        let forms = [
+            root.replace('\\', "\\\\"),
+            root.replace('\\', "/"),
+            root.replace('/', "\\"),
+            root.to_string(),
+        ];
+        strip_path_prefixes(text, &forms)
+    }
+}
+
+/// `text` without each occurrence of one of `prefixes` that is not preceded
+/// by a path character and is followed by a separator or a non-path
+/// character (or the end).
+fn strip_path_prefixes(text: &str, prefixes: &[String]) -> String {
+    let path_char = |ch: char| ch.is_alphanumeric() || "/\\._-~:$".contains(ch);
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    // The character before `rest` in `text`.
+    let mut previous: Option<char> = None;
+    'outer: while !rest.is_empty() {
+        for prefix in prefixes.iter().filter(|prefix| !prefix.is_empty()) {
+            if let Some(after) = rest.strip_prefix(prefix.as_str()) {
+                let before_ok = !previous.is_some_and(path_char);
+                let after_ok = after
+                    .chars()
+                    .next()
+                    .is_none_or(|ch| ch == '/' || ch == '\\' || !path_char(ch));
+                if before_ok && after_ok {
+                    previous = prefix.chars().next_back();
+                    rest = after;
+                    continue 'outer;
+                }
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        result.push(ch);
+        previous = Some(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    result
+}
+
+/// Only a root that starts a path is removed; a copy of its text below it,
+/// or a sibling that merely starts with it, stays to be checked.
+#[test]
+fn only_a_leading_sandbox_root_is_set_aside() {
+    let roots = ["/tmp/ktest-tmp/.tmpAbc".to_string()];
+    let strip = |text: &str| strip_path_prefixes(text, &roots);
+    assert_eq!(strip("/tmp/ktest-tmp/.tmpAbc/home/x"), "/home/x");
+    assert_eq!(
+        strip("Backup: /tmp/ktest-tmp/.tmpAbc/bin/a"),
+        "Backup: /bin/a"
+    );
+    assert_eq!(strip("\"/tmp/ktest-tmp/.tmpAbc\""), "\"\"");
+    assert_eq!(
+        strip("/tmp/ktest-tmp/.tmpAbc/tmp/ktest-tmp/.tmpAbc/file"),
+        "/tmp/ktest-tmp/.tmpAbc/file"
+    );
+    assert_eq!(
+        strip("/tmp/ktest-tmp/.tmpAbcktest/file"),
+        "/tmp/ktest-tmp/.tmpAbcktest/file"
+    );
+    assert_eq!(
+        strip("x/tmp/ktest-tmp/.tmpAbc/file"),
+        "x/tmp/ktest-tmp/.tmpAbc/file"
+    );
+    // The Windows spellings `outside_root` lists.
+    let root = r"C:\Users\ktest\AppData\Local\Temp\.tmpAbc";
+    let roots = [
+        root.replace('\\', "\\\\"),
+        root.replace('\\', "/"),
+        root.to_string(),
+    ];
+    let strip = |text: &str| strip_path_prefixes(text, &roots);
+    assert_eq!(
+        strip(r"Backup: C:\Users\ktest\AppData\Local\Temp\.tmpAbc\bin\ktest.exe"),
+        r"Backup: \bin\ktest.exe"
+    );
+    assert_eq!(
+        strip(r#"{"home":"C:\\Users\\ktest\\AppData\\Local\\Temp\\.tmpAbc\\home"}"#),
+        r#"{"home":"\\home"}"#
+    );
+    assert_eq!(
+        strip("C:/Users/ktest/AppData/Local/Temp/.tmpAbc/home"),
+        "/home"
+    );
 }
 
 fn canonical(path: &Path) -> PathBuf {
@@ -458,7 +553,11 @@ fn update_asks_the_release_channel_without_initialization() {
         })
         .collect();
     assert!(staged.is_empty(), "{staged:?}");
-    assert_eq!(foreign_name_in(&text), None, "{text}");
+    assert_eq!(
+        foreign_name_in(&sandbox.outside_root(&text)),
+        None,
+        "{text}"
+    );
 }
 
 /// A configuration that exists but cannot be read stops `update` before
@@ -1593,7 +1692,11 @@ fn update_downloads_probes_and_replaces_the_program() {
     );
     // (The backup is a copy of the test build, which may carry its build
     // path; only the output is checked here.)
-    assert_eq!(foreign_name_in(&text), None, "{text}");
+    assert_eq!(
+        foreign_name_in(&sandbox.outside_root(&text)),
+        None,
+        "{text}"
+    );
 }
 
 /// minisign's key id text (upper-case hexadecimal, no leading zeros).

@@ -39,6 +39,11 @@ jobs:
       - name: Lint
         run: cargo clippy --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace --all-targets -- -D warnings
 
+      - name: Scan the kernel for distribution names
+        run: |
+          python3 scripts/saiai-cli/test-scan-kernel-names.py
+          python3 scripts/saiai-cli/scan-kernel-names.py tools/saiai-cli/kernel
+
       - name: Test
         run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace
         env:
