@@ -56,6 +56,9 @@ jobs:
       # away, could not be rebuilt). AITP's lock file pins the same
       # third-party packages as this workspace's.
       - name: Check the kernel submodule
+        env:
+          # Reads AITP's public CI runs (avoids the anonymous rate limit).
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           python3 scripts/saiai-cli/test-check-kernel-submodule.py
           python3 scripts/saiai-cli/check-kernel-submodule.py
@@ -232,6 +235,9 @@ jobs:
         run: |
           & "$PWD/scripts/saiai-cli/test-windows-runtime.ps1" `
             -BinaryPath "$PWD/tools/saiai-cli/target/debug/saiai.exe"
+
+      - name: Verify Windows UTF-8 log reading
+        run: python scripts/saiai-cli/test-windows-log-encoding.py --binary tools/saiai-cli/target/debug/saiai.exe
 
       - name: Verify reproducible Windows image
         run: python scripts/saiai-cli/verify-windows-reproducibility.py tools/saiai-cli/target/debug/saiai.exe

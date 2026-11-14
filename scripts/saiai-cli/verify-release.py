@@ -1323,6 +1323,7 @@ def verify_ci_workflow() -> None:
             ),
             (f'& "$PWD/scripts/saiai-cli/test-windows-runtime.ps1" -BinaryPath "$PWD/{debug}.exe"', "the Windows configuration smoke"),
             (f"python scripts/saiai-cli/verify-windows-reproducibility.py {debug}.exe", "the reproducible Windows image check"),
+            (f"python scripts/saiai-cli/test-windows-log-encoding.py --binary {debug}.exe", "the Windows log encoding check"),
             (f"python scripts/saiai-cli/test-initialization-scope.py --binary {debug}.exe", "the initialization scope check"),
             (f"python scripts/saiai-cli/test-windows-environments.py --binary {debug}.exe", "the Windows environment isolation"),
             (

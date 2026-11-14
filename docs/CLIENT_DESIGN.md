@@ -1176,6 +1176,8 @@ Windows MSVC 的两种 release 目标使用 `/Brepro`，避免链接时间戳和
 - 日常 `Client CI`（每个 PR 与 main 推送）：Linux 上运行子模块检查
   （`check-kernel-submodule.py`：`.gitmodules` 只有这一个子模块且 URL 固定、检出的就是
   钉住的提交且无本地改动、该提交在 AITP main 上（每次重新取 AITP main 的提交历史）、
+  AITP 的 `.github/workflows/ci.yml` 对该提交有 main 上的 push 运行且成功（Actions API，
+  CI 中带 `GITHUB_TOKEN`；`--offline` 跳过这两项并明确打印）、
   AITP 的 Cargo.lock 中每个第三方包与本仓库 lock 相同）、壳的格式、lint、整个 workspace
   的测试（`AITP_TEST_FOREIGN_NAMES=saiai`，内核测试也拒绝 SAIAI 名字）、契约与金标准、
   内核名字扫描（扫子模块内容，只跳过其 `.git`）、静态 x86_64 构建及其 Linux 验证；
@@ -1187,7 +1189,8 @@ Windows MSVC 的两种 release 目标使用 `/Brepro`，避免链接时间戳和
   抓包、Linux 启动等；Windows ARM64 为交叉构建，不做原生运行检查），verify 阶段同样
   运行子模块检查。
 - 发版记录的 `source_commit` 是本仓库的提交，子模块指针包含在其中，已唯一确定内核
-  版本；因此 AITP main 不得强推、被引用的提交不得删除，否则旧版本无法重建。
+  版本；因此 AITP main 不得强推、被引用的提交不得删除，否则旧版本无法重建。每次移动
+  gitlink 时，维护者保留该 SHA 的 git bundle 备份（防 AITP 被删除或转私有）。
 - 子模块化本身不改变 SAIAI 产物：子模块内原有文件的 blob 与目录时代逐一相同，
   构建始终在仓库根目录以 `--manifest-path` 进行（内核是 workspace 成员，用工作区的
   `Cargo.lock`；cargo 和 rustup 按当前目录读取 `.cargo/config.toml` 与

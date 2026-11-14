@@ -558,6 +558,7 @@ class WorkflowStructureTests(unittest.TestCase):
             ("client-windows", "        run: python scripts/saiai-cli/test-windows-environments.py", "        run: echo skipped #", "the Windows environment isolation"),
             ("client-windows", "        run: python scripts/saiai-cli/test-windows-self-update.py", "        run: echo skipped #", "the Windows self-update"),
             ("client-windows", "        run: python scripts/saiai-cli/verify-windows-reproducibility.py", "        run: echo skipped #", "the reproducible Windows image"),
+            ("client-windows", "        run: python scripts/saiai-cli/test-windows-log-encoding.py", "        run: echo skipped #", "the Windows log encoding"),
             (
                 "client-windows",
                 "          $PSNativeCommandUseErrorActionPreference = $true\n          npm install",

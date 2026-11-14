@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import shutil
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -45,6 +46,19 @@ ENV = {
     "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
     "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
 }
+
+
+def ci_run(sha: str, **changes) -> dict:
+    run = {
+        "head_sha": sha, "event": "push", "head_branch": "main",
+        "path": ".github/workflows/ci.yml", "status": "completed", "conclusion": "success",
+    }
+    run.update(changes)
+    return run
+
+
+def passed_runs(pinned: str, token: str | None) -> dict:
+    return {"total_count": 1, "workflow_runs": [ci_run(pinned)]}
 
 
 def git(cwd: Path, *arguments: str) -> str:
@@ -95,7 +109,7 @@ class KernelSubmoduleTests(unittest.TestCase):
         git(self.root, "commit", "--quiet", "--allow-empty", "-m", f"pin {commit}")
 
     def findings(self, offline: bool = False) -> list[str]:
-        return CHECK.check(self.root, offline, url=str(self.aitp))
+        return CHECK.check(self.root, offline, url=str(self.aitp), runs=passed_runs, environ={})
 
     def assertFinds(self, text: str, offline: bool = False) -> None:
         findings = self.findings(offline)
@@ -284,7 +298,71 @@ class KernelSubmoduleTests(unittest.TestCase):
         (self.root / KERNEL / "new" / "src.rs").write_text("\n", encoding="utf-8")
         self.assertFinds("has local changes", offline=True)
 
+    def test_requires_a_successful_aitp_ci_push_run(self) -> None:
+        sha = "a" * 40
+
+        def runs(*listed):
+            return lambda pinned, token: {"workflow_runs": list(listed)}
+
+        self.assertEqual(CHECK.check_ci_run(sha, runs(ci_run(sha)), {}), [])
+        # A failed run next to a successful one (a rerun) passes.
+        self.assertEqual(CHECK.check_ci_run(sha, runs(ci_run(sha, conclusion="failure"), ci_run(sha)), {}), [])
+        for listed, message in (
+            ((ci_run(sha, conclusion="failure"),), "has not succeeded"),
+            ((ci_run(sha, status="in_progress", conclusion=None),), "has not succeeded"),
+            ((), "has no push run"),
+            ((ci_run(sha, path=".github/workflows/other.yml"),), "has no push run"),
+            ((ci_run(sha, path=".github/workflows/ci.yml@refs/heads/x"),), "has no push run"),
+            ((ci_run(sha, event="pull_request"),), "has no push run"),
+            ((ci_run(sha, head_branch="side"),), "has no push run"),
+            ((ci_run("b" * 40),), "has no push run"),
+        ):
+            with self.subTest(listed=listed):
+                findings = CHECK.check_ci_run(sha, runs(*listed), {})
+                self.assertTrue(any(message in finding for finding in findings), findings)
+
+    def test_unreadable_or_unreachable_ci_runs_fail(self) -> None:
+        sha = "a" * 40
+
+        def timeout(pinned, token):
+            raise TimeoutError("timed out")
+
+        for runs, message in (
+            (timeout, "cannot list AITP's CI runs"),
+            (lambda pinned, token: {"message": "API rate limit exceeded"}, "unreadable"),
+            (lambda pinned, token: [], "unreadable"),
+        ):
+            with self.subTest(message=message):
+                findings = CHECK.check_ci_run(sha, runs, {})
+                self.assertTrue(any(message in finding for finding in findings), findings)
+
+    def test_ci_runs_use_the_environment_token(self) -> None:
+        seen = []
+
+        def runs(pinned, token):
+            seen.append(token)
+            return passed_runs(pinned, token)
+
+        CHECK.check_ci_run("a" * 40, runs, {})
+        CHECK.check_ci_run("a" * 40, runs, {"GITHUB_TOKEN": "t1"})
+        CHECK.check_ci_run("a" * 40, runs, {"GH_TOKEN": "t2"})
+        self.assertEqual(seen, [None, "t1", "t2"])
+
+    def test_the_whole_check_runs_the_ci_check_only_online(self) -> None:
+        def missing(pinned, token):
+            return {"workflow_runs": []}
+
+        online = CHECK.check(self.root, False, url=str(self.aitp), runs=missing, environ={})
+        self.assertTrue(any("has no push run" in finding for finding in online), online)
+        self.assertEqual(CHECK.check(self.root, True, url=str(self.aitp), runs=missing, environ={}), [])
+        offline = subprocess.run(
+            [sys.executable, str(SCRIPT), "--offline"], capture_output=True, text=True,
+        )
+        self.assertIn("--offline: NOT checked", offline.stdout + offline.stderr)
+
     def test_the_real_constants(self) -> None:
+        self.assertEqual(CHECK.AITP_API, "https://api.github.com/repos/2742zdz/AITP")
+        self.assertEqual(CHECK.AITP_CI_WORKFLOW, ".github/workflows/ci.yml")
         self.assertEqual(CHECK.KERNEL_PATH, "tools/saiai-cli/kernel")
         self.assertEqual(CHECK.AITP_URL, "https://github.com/2742zdz/AITP")
         self.assertEqual(CHECK.AITP_BRANCH, "main")

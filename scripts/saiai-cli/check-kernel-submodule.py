@@ -16,7 +16,10 @@ This fails unless
   submodule moves);
 * unless --offline: the pinned commit is on AITP's main branch, fetched
   afresh (a commit never pushed there, or force-pushed away, could not be
-  rebuilt). Only commits are fetched, into a temporary repository.
+  rebuilt). Only commits are fetched, into a temporary repository;
+* unless --offline: AITP's own CI (.github/workflows/ci.yml) ran for the
+  pinned commit on a push to main and succeeded (GitHub Actions API; with
+  GITHUB_TOKEN or GH_TOKEN from the environment when set, else anonymous).
 
 Findings go to standard error, one per line, and the exit status is 1.
 """
@@ -24,10 +27,13 @@ Findings go to standard error, one per line, and the exit status is 1.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
 import subprocess
 import sys
 import tempfile
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -255,25 +261,72 @@ def check_on_main(pinned: str, url: str = AITP_URL, branch: str = AITP_BRANCH) -
     return []
 
 
-def check(root: Path, offline: bool, url: str = AITP_URL) -> list[str]:
+AITP_API = "https://api.github.com/repos/2742zdz/AITP"
+AITP_CI_WORKFLOW = ".github/workflows/ci.yml"
+API_TIMEOUT = 30
+
+
+def list_ci_runs(pinned: str, token: str | None) -> object:
+    """AITP's push runs on main for `pinned` (GitHub Actions API)."""
+    request = urllib.request.Request(
+        f"{AITP_API}/actions/runs?head_sha={pinned}&event=push&branch={AITP_BRANCH}&per_page=100",
+        headers={"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"},
+    )
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(request, timeout=API_TIMEOUT) as response:
+        return json.load(response)
+
+
+def check_ci_run(pinned: str, runs=list_ci_runs, environ=os.environ) -> list[str]:
+    token = environ.get("GITHUB_TOKEN") or environ.get("GH_TOKEN") or None
+    try:
+        listed = runs(pinned, token)
+    except Exception as error:  # network, HTTP status, timeout, bad JSON
+        return [f"cannot list AITP's CI runs for {pinned}: {type(error).__name__}: {error}"]
+    workflow_runs = listed.get("workflow_runs") if isinstance(listed, dict) else None
+    if not isinstance(workflow_runs, list):
+        return [f"AITP's CI runs for {pinned} are unreadable"]
+    matching = [
+        run for run in workflow_runs
+        if isinstance(run, dict)
+        and run.get("head_sha") == pinned
+        and run.get("event") == "push"
+        and run.get("head_branch") == AITP_BRANCH
+        and run.get("path") == AITP_CI_WORKFLOW
+    ]
+    if not matching:
+        return [f"AITP's CI ({AITP_CI_WORKFLOW}) has no push run on {AITP_BRANCH} for {pinned}"]
+    if not any(run.get("status") == "completed" and run.get("conclusion") == "success" for run in matching):
+        states = sorted({f"{run.get('status')}/{run.get('conclusion')}" for run in matching})
+        return [f"AITP's CI ({AITP_CI_WORKFLOW}) has not succeeded for {pinned} on {AITP_BRANCH}: {states}"]
+    return []
+
+
+def check(root: Path, offline: bool, url: str = AITP_URL, runs=list_ci_runs, environ=os.environ) -> list[str]:
     pinned, findings = check_structure(root)
     if pinned is not None and (root / KERNEL_PATH / ".git").exists():
         findings += check_locks(root)
     if pinned is not None and not offline:
         findings += check_on_main(pinned, url)
+        findings += check_ci_run(pinned, runs, environ)
     return findings
 
 
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--offline", action="store_true", help="skip the check against AITP's main branch")
+    parser.add_argument("--offline", action="store_true", help="skip the checks against AITP's main branch and CI")
     options = parser.parse_args(arguments)
     findings = check(ROOT, options.offline)
     for finding in findings:
         print(f"kernel submodule: {finding}", file=sys.stderr)
     if findings:
         return 1
-    print("kernel submodule: pinned commit checked out, locks agree" + ("" if options.offline else ", on AITP main"))
+    if options.offline:
+        print("kernel submodule: pinned commit checked out, locks agree; "
+              "--offline: NOT checked that the commit is on AITP main or that AITP's CI passed for it")
+    else:
+        print("kernel submodule: pinned commit checked out, locks agree, on AITP main, AITP CI passed")
     return 0
 
 
