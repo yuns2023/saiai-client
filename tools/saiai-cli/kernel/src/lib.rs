@@ -61,6 +61,12 @@ mod update_candidate;
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 mod update_fixed_tests;
+// The same over real HTTPS, with a test CA only the test client trusts.
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+mod update_fixed_https_tests;
 mod upstream_proxy;
 mod upstream_tls;
 mod vscode;
@@ -4584,6 +4590,11 @@ struct Egress {
     /// Tests: host names resolved to a local address (direct connections).
     #[cfg(test)]
     resolve: Vec<(String, SocketAddr)>,
+    /// Tests: the only CA this client trusts (PEM), for a local HTTPS
+    /// server; the system and bundled roots are not used, and nothing
+    /// outside this client changes.
+    #[cfg(test)]
+    test_ca_pem: Option<String>,
 }
 
 impl Egress {
@@ -4598,6 +4609,8 @@ impl Egress {
                 upstream: upstream_proxy::UpstreamProxy::new(None, None, Vec::new()).snapshot(),
                 #[cfg(test)]
                 resolve: Vec::new(),
+                #[cfg(test)]
+                test_ca_pem: None,
             },
         }
     }
@@ -4613,6 +4626,8 @@ impl Egress {
             upstream: upstream.snapshot(),
             #[cfg(test)]
             resolve: Vec::new(),
+            #[cfg(test)]
+            test_ca_pem: None,
         }
     }
 
@@ -4624,6 +4639,11 @@ impl Egress {
         let builder = match &self.installation_ca_pem {
             Some(pem) => upstream_tls::upstream_http_client_builder(pem),
             None => upstream_tls::uninstalled_http_client_builder(),
+        };
+        #[cfg(test)]
+        let builder = match &self.test_ca_pem {
+            Some(pem) => upstream_tls::test_http_client_builder(pem),
+            None => builder,
         };
         #[cfg(test)]
         let builder = self
@@ -11823,6 +11843,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
                     installation_ca_pem: Some(String::new()),
                     upstream: upstream_proxy::Snapshot::direct_for_tests(),
                     resolve: Vec::new(),
+                    test_ca_pem: None,
                 },
             ))
             .unwrap_err();

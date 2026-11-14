@@ -247,6 +247,23 @@ pub(crate) fn uninstalled_http_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder().use_preconfigured_tls(config)
 }
 
+/// Tests: a reqwest client that trusts only `ca_pem` (with the TLS
+/// parameters of the real update client), for a local HTTPS server.
+#[cfg(test)]
+pub(crate) fn test_http_client_builder(ca_pem: &str) -> reqwest::ClientBuilder {
+    let mut roots = RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()) {
+        roots.add(cert.expect("test CA PEM")).expect("test CA");
+    }
+    let mut config = ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(rustls::ALL_VERSIONS)
+        .expect("default TLS versions are supported by every rustls provider")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    reqwest::Client::builder().use_preconfigured_tls(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

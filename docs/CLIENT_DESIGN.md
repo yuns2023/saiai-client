@@ -1019,8 +1019,8 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
   - 首次公开发布前完成 manifest 签名评估。
 - **D4 前必须完成的跟进**（独立复核登记）：
   - ~~候选探测只回收直接子进程~~：已完成，进程组/Job Object，删除错误会报告；Windows 原生测试覆盖后代占住 stdout 时按时结束、候选可删除（见上文"候选二进制"）。
-  - 受控 HTTPS 的 Fixed 下载测试：向单个客户端注入测试 CA。
-  - 真实 `aitp update` 的完整黑盒（不访问 GitHub）：成功下载、候选探测、manifest 版本与候选 `--version` 不一致时拒绝替换，以及最终替换（D3 只覆盖到"未 init 也会请求正确渠道"和"配置损坏时在请求前失败"）。
+  - ~~受控 HTTPS 的 Fixed 下载测试~~：已完成（`kernel/src/update_fixed_https_tests.rs`）。本地 TLS 服务用测试 CA 签发，只有测试自己的客户端信任它（`Egress::test_ca_pem`，仅测试构建存在），系统和进程的信任不变；覆盖跨主机重定向、主机白名单（含已签证书但不在白名单的主机、白名单内但证书不含的主机）、降级 HTTP、换端口、userinfo、重定向 5 跳上限、大小上限（声明长度/流式）和总时限，并验证系统根和另一张 CA 都握手失败、请求到不了 HTTP 层。
+  - ~~真实 `aitp update` 的完整黑盒（不访问 GitHub）~~：已完成（`kernel/tests/aitp_cli.rs`）。真实 `aitp` 经 `AITP_UPSTREAM_PROXY` 连到本地代理，代理接下 CONNECT 后自己扮演 github.com / release-assets 主机。测试 CA 通过程序既有的生产入口 `SSL_CERT_FILE`（在系统根之外追加信任）注入，只设在这个子进程的环境里；这不是测试专属能力，单元测试用的 `Egress::test_ca_pem` 才是仅测试构建存在的字段。覆盖 manifest → 重定向资产 → sha256/size → 候选探测 → 替换（Windows 经替换助手，等到状态文件 `updated:`），旧程序留作备份、不留候选；manifest 版本与候选 `--version` 不一致时拒绝替换、原程序不变、候选删除。Linux 的候选是测试里手写的最小静态 ELF（debug 版程序超过 64 MiB 上限）；macOS/Windows 用程序副本加尾部填充。
   - 独立内核 CI 中"二进制不含其他发行版名字"的测试不得跳过：在工作区内，构建路径含该名字时会跳过。
   - ~~uninstall 与更新的互斥~~：已完成，含 Windows 替换助手（见上文"并发"）。
   - AITP 发布构建对路径前缀做 remap，并核对产物不含构建目录名。

@@ -724,3 +724,406 @@ fn update_and_uninstall_wait_for_a_held_installation() {
     assert!(!config.exists(), "{text}");
     sandbox.assert_only_aitp_names();
 }
+
+// ------------------------------------------------- Full update, no GitHub
+
+/// A test CA (PEM) and a TLS server configuration for the release hosts,
+/// signed by it. Only the program under test is told to trust the CA
+/// (`SSL_CERT_FILE` in its own environment).
+fn release_pki() -> (String, std::sync::Arc<rustls::ServerConfig>) {
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "Release Test CA");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let leaf_key = KeyPair::generate().unwrap();
+    let leaf = CertificateParams::new(vec![
+        "github.com".to_string(),
+        "release-assets.githubusercontent.com".to_string(),
+    ])
+    .unwrap()
+    .signed_by(&leaf_key, &ca, &ca_key)
+    .unwrap();
+    let mut config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![rustls::pki_types::CertificateDer::from(leaf.der().to_vec())],
+        rustls::pki_types::PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+    )
+    .unwrap();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    (ca.pem(), std::sync::Arc::new(config))
+}
+
+/// The program's upstream proxy: it accepts each CONNECT, plays the release
+/// host itself (TLS with the test CA) and answers from `routes` (path ->
+/// status, Location, body). Records `CONNECT <target>` and `<path>` lines.
+fn release_proxy(
+    config: std::sync::Arc<rustls::ServerConfig>,
+    routes: std::collections::HashMap<String, (u16, String, Vec<u8>)>,
+) -> (u16, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    let routes = Arc::new(routes);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let config = Arc::clone(&config);
+            let routes = Arc::clone(&routes);
+            let log = Arc::clone(&log);
+            std::thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+                let read_head = |stream: &mut dyn Read| {
+                    let mut head = Vec::new();
+                    let mut byte = [0_u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") && stream.read_exact(&mut byte).is_ok() {
+                        head.push(byte[0]);
+                    }
+                    String::from_utf8_lossy(&head).into_owned()
+                };
+                let connect = read_head(&mut stream);
+                let target = connect.split_whitespace().nth(1).unwrap_or_default();
+                log.lock().unwrap().push(format!("CONNECT {target}"));
+                if !connect.starts_with("CONNECT ") || !target.ends_with(":443") {
+                    let _ =
+                        stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+                    return;
+                }
+                if stream
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .is_err()
+                {
+                    return;
+                }
+                let Ok(connection) = rustls::ServerConnection::new(config) else {
+                    return;
+                };
+                let mut tls = rustls::StreamOwned::new(connection, stream);
+                let request = read_head(&mut tls);
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                log.lock().unwrap().push(path.clone());
+                let (status, location, body) =
+                    routes
+                        .get(&path)
+                        .cloned()
+                        .unwrap_or((404, String::new(), b"missing".to_vec()));
+                let mut head = format!(
+                    "HTTP/1.1 {status} X\r\nConnection: close\r\nContent-Length: {}\r\n",
+                    body.len()
+                );
+                if !location.is_empty() {
+                    head.push_str(&format!("Location: {location}\r\n"));
+                }
+                head.push_str("\r\n");
+                let _ = tls.write_all(head.as_bytes());
+                let _ = tls.write_all(&body);
+                let _ = tls.flush();
+                tls.conn.send_close_notify();
+                let _ = tls.flush();
+            });
+        }
+    });
+    (port, seen)
+}
+
+/// This platform's release asset name.
+fn asset_name() -> String {
+    let platform = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "linux-x86_64",
+        ("linux", "aarch64") => "linux-aarch64",
+        ("macos", "x86_64") => "macos-x86_64",
+        ("macos", "aarch64") => "macos-aarch64",
+        ("windows", "x86_64") => "windows-x86_64.exe",
+        ("windows", "aarch64") => "windows-aarch64.exe",
+        (os, arch) => panic!("no release asset for {os} {arch}"),
+    };
+    format!("aitp-{platform}")
+}
+
+/// A minimal static Linux program that prints `message` and exits 0,
+/// padded past the 1 MiB release minimum. (The debug build of the real
+/// program is larger than the 64 MiB release maximum.)
+#[cfg(target_os = "linux")]
+fn tiny_linux_program(message: &str) -> Vec<u8> {
+    let message = message.as_bytes();
+    let length = u32::try_from(message.len()).unwrap();
+    let (machine, code): (u16, Vec<u8>) = match std::env::consts::ARCH {
+        "x86_64" => {
+            let mut code = vec![0xb8, 1, 0, 0, 0]; // mov eax, 1 (write)
+            code.extend([0xbf, 1, 0, 0, 0]); // mov edi, 1
+            code.extend([0x48, 0x8d, 0x35, 16, 0, 0, 0]); // lea rsi, [rip + 16]
+            code.push(0xba); // mov edx, length
+            code.extend(length.to_le_bytes());
+            code.extend([0x0f, 0x05]); // syscall
+            code.extend([0xb8, 60, 0, 0, 0]); // mov eax, 60 (exit)
+            code.extend([0x31, 0xff]); // xor edi, edi
+            code.extend([0x0f, 0x05]); // syscall
+            assert_eq!(code.len(), 33);
+            (62, code)
+        }
+        "aarch64" => {
+            let words: [u32; 8] = [
+                0xd280_0020,                 // mov x0, #1
+                0x1000_00e1,                 // adr x1, .+28 (the message)
+                0xd280_0002 | (length << 5), // mov x2, #length
+                0xd280_0808,                 // mov x8, #64 (write)
+                0xd400_0001,                 // svc #0
+                0xd280_0000,                 // mov x0, #0
+                0xd280_0ba8,                 // mov x8, #93 (exit)
+                0xd400_0001,                 // svc #0
+            ];
+            (
+                183,
+                words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+            )
+        }
+        arch => panic!("no test program for {arch}"),
+    };
+    const BASE: u64 = 0x40_0000;
+    const CODE: u64 = 64 + 56;
+    let end = CODE + (code.len() + message.len()) as u64;
+    let mut program = Vec::new();
+    program.extend(b"\x7fELF\x02\x01\x01\x00");
+    program.extend([0; 8]);
+    program.extend(2_u16.to_le_bytes()); // executable
+    program.extend(machine.to_le_bytes());
+    program.extend(1_u32.to_le_bytes());
+    program.extend((BASE + CODE).to_le_bytes()); // entry
+    program.extend(64_u64.to_le_bytes()); // program headers
+    program.extend(0_u64.to_le_bytes()); // no section headers
+    program.extend(0_u32.to_le_bytes());
+    for value in [64_u16, 56, 1, 64, 0, 0] {
+        program.extend(value.to_le_bytes());
+    }
+    program.extend(1_u32.to_le_bytes()); // PT_LOAD
+    program.extend(5_u32.to_le_bytes()); // read + execute
+    for value in [0, BASE, BASE, end, end, 0x1_0000] {
+        program.extend(value.to_le_bytes());
+    }
+    assert_eq!(program.len() as u64, CODE);
+    program.extend(code);
+    program.extend(message);
+    program.resize(1024 * 1024 + 4096, 0);
+    program
+}
+
+/// A program for this platform that reports `aitp <this version>`: on
+/// Linux a minimal one, elsewhere the real program with trailing padding
+/// (so its hash differs from the installed copy).
+fn candidate_program(sandbox: &Sandbox) -> Vec<u8> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = sandbox;
+        tiny_linux_program(&format!("aitp {}\n", env!("CARGO_PKG_VERSION")))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut program = std::fs::read(&sandbox.program).unwrap();
+        program.extend([0_u8; 4096]);
+        assert!(
+            program.len() <= 64 * 1024 * 1024,
+            "the test program ({} bytes) exceeds the 64 MiB release limit",
+            program.len()
+        );
+        program
+    }
+}
+
+/// The release of `version` with `asset` for this platform, published like
+/// GitHub's: the versioned asset redirects to the asset host.
+fn release_routes(
+    version: &str,
+    asset: &[u8],
+) -> std::collections::HashMap<String, (u16, String, Vec<u8>)> {
+    use sha2::Digest;
+    let sha256: String = sha2::Sha256::digest(asset)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let name = asset_name();
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "version": version,
+        "assets": { &name: { "sha256": sha256, "size": asset.len() } },
+    }))
+    .unwrap();
+    std::collections::HashMap::from([
+        (
+            "/2742zdz/AITP/releases/latest/download/aitp-manifest.json".to_string(),
+            (200, String::new(), manifest),
+        ),
+        (
+            format!("/2742zdz/AITP/releases/download/v{version}/{name}"),
+            (
+                302,
+                "https://release-assets.githubusercontent.com/asset?sig=1".to_string(),
+                Vec::new(),
+            ),
+        ),
+        (
+            "/asset?sig=1".to_string(),
+            (200, String::new(), asset.to_vec()),
+        ),
+    ])
+}
+
+/// Runs `aitp update` against `routes` (no GitHub: the proxy plays it).
+fn update_from(
+    sandbox: &Sandbox,
+    routes: std::collections::HashMap<String, (u16, String, Vec<u8>)>,
+) -> (bool, String, Vec<String>) {
+    let (ca_pem, config) = release_pki();
+    let ca = sandbox.root.join("release-test-ca.pem");
+    std::fs::write(&ca, ca_pem).unwrap();
+    let (port, seen) = release_proxy(config, routes);
+    let (success, text) = sandbox.output(
+        sandbox
+            .command(&["update"])
+            .env("AITP_UPSTREAM_PROXY", format!("http://127.0.0.1:{port}"))
+            .env("SSL_CERT_FILE", &ca),
+    );
+    let requests = seen.lock().unwrap().clone();
+    (success, text, requests)
+}
+
+/// An installation-directory lock file (Windows), which stays.
+fn is_lock_file(name: &str) -> bool {
+    name.starts_with(".aitp-update-") && name.ends_with("lock")
+}
+
+/// Files the update left next to the program, other than the program.
+fn left_beside(sandbox: &Sandbox) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(sandbox.program.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| Path::new(name) != sandbox.program.file_name().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The whole `aitp update` over HTTPS: manifest, redirected asset, sha256
+/// and size checks, candidate probe, and replacement (on Windows by the
+/// replacement helper, which reports through its status file).
+#[test]
+fn update_downloads_probes_and_replaces_the_program() {
+    let sandbox = Sandbox::new();
+    let before = snapshot(&sandbox.program);
+    let candidate = candidate_program(&sandbox);
+    let version = env!("CARGO_PKG_VERSION");
+    let (success, text, requests) = update_from(&sandbox, release_routes(version, &candidate));
+    assert!(success, "{text}\n{requests:?}");
+    assert_eq!(
+        requests,
+        [
+            "CONNECT github.com:443".to_string(),
+            "/2742zdz/AITP/releases/latest/download/aitp-manifest.json".to_string(),
+            "CONNECT github.com:443".to_string(),
+            format!(
+                "/2742zdz/AITP/releases/download/v{version}/{}",
+                asset_name()
+            ),
+            "CONNECT release-assets.githubusercontent.com:443".to_string(),
+            "/asset?sig=1".to_string(),
+        ],
+        "{text}"
+    );
+    assert!(
+        text.contains("Same version but local binary hash differs"),
+        "{text}"
+    );
+    #[cfg(not(windows))]
+    {
+        assert!(text.contains(&format!("Updated: aitp {version}")), "{text}");
+        assert_eq!(snapshot(&sandbox.program), candidate);
+    }
+    #[cfg(windows)]
+    {
+        assert!(text.contains("Update staged"), "{text}");
+        let status = sandbox
+            .program
+            .parent()
+            .unwrap()
+            .join(".aitp-update-status.txt");
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let report = loop {
+            let report = std::fs::read_to_string(&status).unwrap_or_default();
+            let report = report.trim_start_matches('\u{feff}').trim().to_string();
+            if report.starts_with("updated:") || report.starts_with("failed:") {
+                break report;
+            }
+            assert!(Instant::now() < deadline, "helper still {report:?}");
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        assert!(report.starts_with("updated:"), "{report}");
+        // The helper removes its script last; give it a moment.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while left_beside(&sandbox)
+            .iter()
+            .any(|name| name.ends_with(".ps1"))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert_eq!(snapshot(&sandbox.program), candidate);
+    }
+    // The previous program is kept as a backup; no candidate is left.
+    let left = left_beside(&sandbox);
+    let backups: Vec<_> = left
+        .iter()
+        .filter(|name| name.starts_with("aitp.bak-"))
+        .collect();
+    assert_eq!(backups.len(), 1, "{left:?}");
+    let backup = sandbox.program.parent().unwrap().join(backups[0]);
+    assert_eq!(snapshot(&backup), before);
+    assert!(
+        left.iter().all(|name| name.starts_with("aitp.bak-")
+            || is_lock_file(name)
+            || name == ".aitp-update-status.txt"),
+        "{left:?}"
+    );
+    // (The backup is a copy of the test build, which may carry its build
+    // path; only the output is checked here.)
+    let other = other_brand();
+    assert!(!text.to_ascii_lowercase().contains(&other), "{text}");
+}
+
+/// A release whose program reports another version than its manifest is
+/// not installed: the program is unchanged and the candidate removed.
+#[test]
+fn update_refuses_a_program_that_reports_another_version() {
+    let sandbox = Sandbox::new();
+    let before = snapshot(&sandbox.program);
+    // The candidate reports this version; the manifest names the next.
+    let candidate = candidate_program(&sandbox);
+    let mut parts: Vec<u64> = env!("CARGO_PKG_VERSION")
+        .split('.')
+        .map(|part| part.parse().unwrap())
+        .collect();
+    parts[2] += 1;
+    let next = format!("{}.{}.{}", parts[0], parts[1], parts[2]);
+    let (success, text, requests) = update_from(&sandbox, release_routes(&next, &candidate));
+    assert!(!success, "{text}");
+    assert!(
+        text.contains(&format!(
+            "Downloading: https://github.com/2742zdz/AITP/releases/download/v{next}/"
+        )),
+        "{text}\n{requests:?}"
+    );
+    assert!(
+        text.contains("downloaded binary did not report a AITP version"),
+        "{text}"
+    );
+    assert_eq!(snapshot(&sandbox.program), before);
+    let left = left_beside(&sandbox);
+    assert!(left.iter().all(|name| is_lock_file(name)), "{left:?}");
+    sandbox.assert_only_aitp_names();
+}
