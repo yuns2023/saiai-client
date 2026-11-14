@@ -1031,7 +1031,7 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
   - ~~真实 `aitp update` 的完整黑盒（不访问 GitHub）~~：已完成（`kernel/tests/aitp_cli.rs`）。真实 `aitp` 经 `AITP_UPSTREAM_PROXY` 连到本地代理，代理接下 CONNECT 后自己扮演 github.com / release-assets 主机。测试 CA 通过程序既有的生产入口 `SSL_CERT_FILE`（在系统根之外追加信任）注入，只设在这个子进程的环境里；这不是测试专属能力，单元测试用的 `Egress::test_ca_pem` 才是仅测试构建存在的字段。覆盖 manifest → 重定向资产 → sha256/size → 候选探测 → 替换（Windows 经替换助手，等到状态文件 `updated:`），旧程序留作备份、不留候选；manifest 版本与候选 `--version` 不一致时拒绝替换、原程序不变、候选删除。Linux 的候选是测试里手写的最小静态 ELF（debug 版程序超过 64 MiB 上限）；macOS/Windows 用程序副本加尾部填充。
   - ~~独立内核 CI 中"二进制不含其他发行版名字"的测试不得跳过~~（已完成）：`the_program_carries_no_other_distribution_name` 不再跳过，在任何构建目录下都检查。它只把本次构建可能嵌入的、含该名字的绝对路径（包目录、程序所在 target 目录、`CARGO_HOME`/`RUSTUP_HOME`/`HOME`/`USERPROFILE` 的各级祖先及其规范化形式）精确地排除，比较时不分大小写、`/` 与 `\` 等同、去掉 `\\?\` 前缀；其余任何出现都判失败，并要求程序含 `AITP local installation CA`。工作区 CI 的三个平台（路径含该名字）和独立内核 CI 都实际检查。已知边界：与某个构建路径逐字相同（或以它开头）的字面量会被当作构建路径放过。
   - ~~uninstall 与更新的互斥~~：已完成，含 Windows 替换助手（见上文"并发"）。
-  - ~~AITP 发布构建对路径前缀做 remap，并核对产物不含构建目录名~~（已完成）：`kernel/scripts/build-release.sh` 用 `CARGO_ENCODED_RUSTFLAGS` 的 `--remap-path-prefix` 把 `HOME`、`RUSTUP_HOME`、`CARGO_HOME`、工作区和 target 目录映射到 `/aitp/{home,rustup,cargo,src,target}`，并向 `CFLAGS`/`CXXFLAGS`（及已设置的按目标区分的 C 标志变量）加 `-ffile-prefix-map`，构建 `--release --bin aitp`；目标（`--target`、`CARGO_BUILD_TARGET` 或宿主，只能一个）不是 Linux GNU 时拒绝，且总是显式传 `--target`（配置文件的 `build.target` 改不了它），产物在 `<target 目录>/<三元组>/release/aitp`，脚本把该路径输出到 stdout；因为 `CARGO_ENCODED_RUSTFLAGS` 会顶替配置文件里的 rustflags（如 Windows MSVC 的 `/Brepro`）。实测：Linux 发布构建原本只嵌入 `CARGO_HOME` 下的依赖源码路径（panic 位置）；AWS-LC 自己已映射其 C 源码路径，ring 不嵌入路径，C 标志是兜底。`verify-release.py --aitp-artifact PATH --build-dir DIR`（均可重复）要求 AITP 产物含全部 AITP 品牌标记、不含 SAIAI 名字（不分大小写），且不含构建目录及 `HOME`/`CARGO_HOME`/`RUSTUP_HOME` 的绝对路径（子串匹配，不分大小写、两种分隔符；只豁免完全落在中性前缀内的字节（中性前缀后须紧跟 `/`、NUL 或数据结尾，否则按普通路径处理，宁可误报），与 `/aitp/...` 重叠或是其开头部分的构建路径直接拒绝）。CI 在独立内核步骤和单独的 `AITP release paths` 任务（工作区检出路径含 SAIAI 名字）中用该脚本构建并检查，后者还以普通发布构建为对照，确认检查会失败。SAIAI 发布构建不变，`--artifact` 语义不变。目前只覆盖 Linux（gnu），脚本对其他目标拒绝；macOS、Windows 和 musl 的 AITP 发布构建在建发布工作流时再实测并放开。
+  - ~~AITP 发布构建对路径前缀做 remap，并核对产物不含构建目录名~~（已完成）：`kernel/scripts/build-release.sh` 用 `CARGO_ENCODED_RUSTFLAGS` 的 `--remap-path-prefix` 把 `HOME`、`RUSTUP_HOME`、`CARGO_HOME`、工作区和 target 目录映射到 `/aitp/{home,rustup,cargo,src,target}`，并向 `CFLAGS`/`CXXFLAGS`（及已设置的按目标区分的 C 标志变量）加 `-ffile-prefix-map`，构建 `--release --bin aitp`；目标（`--target`、`CARGO_BUILD_TARGET` 或宿主，只能一个）不是 Linux GNU 时拒绝，且总是显式传 `--target`（配置文件的 `build.target` 改不了它），产物在 `<target 目录>/<三元组>/release/aitp`，脚本把该路径输出到 stdout；因为 `CARGO_ENCODED_RUSTFLAGS` 会顶替配置文件里的 rustflags（如 Windows MSVC 的 `/Brepro`）。实测：Linux 发布构建原本只嵌入 `CARGO_HOME` 下的依赖源码路径（panic 位置）；AWS-LC 自己已映射其 C 源码路径，ring 不嵌入路径，C 标志是兜底。`verify-release.py --aitp-artifact PATH --build-dir DIR`（均可重复）要求 AITP 产物含全部 AITP 品牌标记、不含 SAIAI 名字（不分大小写），且不含构建目录及 `HOME`/`CARGO_HOME`/`RUSTUP_HOME` 的绝对路径（子串匹配，不分大小写、两种分隔符；只豁免完全落在中性前缀内的字节（中性前缀后须紧跟 `/`、NUL 或数据结尾，否则按普通路径处理，宁可误报），与 `/aitp/...` 重叠或是其开头部分的构建路径直接拒绝）。子模块化之前，CI 在独立内核步骤和单独的 `AITP release paths` 任务（工作区检出路径含 SAIAI 名字）中用该脚本构建并检查，后者还以普通发布构建为对照；内核改为 AITP 子模块后，这些检查由 AITP 自己的 CI（`scripts/check_release.py`）负责，本仓库 CI 不再构建 AITP 发布产物。SAIAI 发布构建不变，`--artifact` 语义不变。目前只覆盖 Linux（gnu），脚本对其他目标拒绝；macOS、Windows 和 musl 的 AITP 发布构建在建发布工作流时再实测并放开。
 - **D2 中改变 SAIAI 现有行为的修复**须满足：
   - 每个 PR 单列"SAIAI 用户可见的行为变化"，并说明只会少删或多拒绝；
   - 可能让现有 SAIAI 用户原地升级后功能失效的改动，先停下确认。
@@ -1057,7 +1057,7 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
 
 **核对方式**：以上面完整的 56 字符公钥文本为准（key id 只有 64 位，只用来快速对照，不能代替完整公钥）。维护者核对自己的 `.pub`：第一行是 `untrusted comment: minisign public key <key id>`，第二行逐字等于表中公钥；`python3 tools/saiai-cli/kernel/scripts/release_manifest.py keys` 打印当前品牌源码声明的 key id 和公钥（它读源码，不证明某个已下载或旧构建的程序用的是这些钥；程序是否内含它们由 `verify-release.py --aitp-artifact` 检查）；对已下载的 manifest 可用 `minisign -V -P <表中公钥> -m aitp-manifest.json` 独立验证。用户首次安装时，应通过与下载渠道独立控制的渠道核对这两段公钥文本：同一 GitHub 仓库的 README、Release 说明与下载地址属于同一控制渠道，不算独立来源；需要维护者另行在独立控制的地方（例如其他账号/站点）公布。
 
-**占位公钥与发布门禁**：`kernel/scripts/release_manifest.py` 的 `PLACEHOLDER_KEYS` 列出首发前用过的两把占位公钥（文本含 `PLACEHOLDER`，字节不是曲线上的点）。`kernel/scripts/build-release.sh` 在品牌含占位或不可用公钥时拒绝构建；`verify-release.py --aitp-artifact` 要求品牌公钥都是真实可用的、每个程序内含品牌全部公钥且不含占位公钥。真实公钥填入后已不再有放行开关；CI 用一份把公钥换回占位的内核副本确认 `build-release.sh` 拒绝，用一个追加了占位公钥的程序副本确认 `verify-release.py` 拒绝，`verify-release.py` 还核对 CI 和 SAIAI 发布工作流里没有任何放行（AITP 自己的发布工作流在 D4 建立时再加同样的检查）。注意：普通的 `cargo build --release` 产出的 `aitp` 带的是当前源码里的公钥，程序本身不做发布检查；唯一的门禁是 `build-release.sh` + `verify-release.py`（含 `--aitp-manifest`），D4 发布工作流必须强制走这两步，不得用其他方式构建或上传发布产物。SAIAI 走 `GatewayChannel`，没有这些字段，更新行为不变。
+**占位公钥与发布门禁**：`kernel/scripts/release_manifest.py` 的 `PLACEHOLDER_KEYS` 列出首发前用过的两把占位公钥（文本含 `PLACEHOLDER`，字节不是曲线上的点）。`kernel/scripts/build-release.sh` 在品牌含占位或不可用公钥时拒绝构建；`verify-release.py --aitp-artifact` 要求品牌公钥都是真实可用的、每个程序内含品牌全部公钥且不含占位公钥。真实公钥填入后已不再有放行开关；AITP 的 CI（子模块化之前为本仓库 CI）用一份把公钥换回占位的内核副本确认 `build-release.sh` 拒绝，用一个追加了占位公钥的程序副本确认发布检查拒绝，`verify-release.py` 还核对 CI 和 SAIAI 发布工作流里没有任何放行（AITP 自己的发布工作流在 D4 建立时再加同样的检查）。注意：普通的 `cargo build --release` 产出的 `aitp` 带的是当前源码里的公钥，程序本身不做发布检查；唯一的门禁是 `build-release.sh` + `verify-release.py`（含 `--aitp-manifest`），D4 发布工作流必须强制走这两步，不得用其他方式构建或上传发布产物。SAIAI 走 `GatewayChannel`，没有这些字段，更新行为不变。
 
 **一次性准备（维护者自己的电脑，离线）**：
 
@@ -1169,14 +1169,30 @@ Windows MSVC 的两种 release 目标使用 `/Brepro`，避免链接时间戳和
 
 ### CI 分工与发布闸门
 
-- 日常 `Client CI`（每个 PR 与 main 推送）只在 Linux 上运行：壳的格式、lint、
-  测试（`AITP_TEST_FOREIGN_NAMES=saiai`）、契约与金标准、内核名字扫描、内核单独
-  构建与测试、AITP release 构建及其路径/占位公钥/普通构建对照，静态 x86_64 构建
-  及其 Linux 验证。内核源码仍在本仓库（子模块化之前），所以这些不交给内核仓库的 CI。
+- 内核 `tools/saiai-cli/kernel` 是公开仓库 AITP 的 git 子模块。内核的单独构建、
+  Linux/macOS/Windows 原生测试和 AITP 发布构建（路径 remap、占位公钥与普通构建对照）
+  都在 AITP 自己的 CI 中运行，本仓库不再重复。所有 `actions/checkout` 都带
+  `submodules: true`（公开仓库，不需要密钥）。
+- 日常 `Client CI`（每个 PR 与 main 推送）：Linux 上运行子模块检查
+  （`check-kernel-submodule.py`：`.gitmodules` 只有这一个子模块且 URL 固定、检出的就是
+  钉住的提交且无本地改动、该提交在 AITP main 上（每次重新取 AITP main 的提交历史）、
+  AITP 的 Cargo.lock 中每个第三方包与本仓库 lock 相同）、壳的格式、lint、整个 workspace
+  的测试（`AITP_TEST_FOREIGN_NAMES=saiai`，内核测试也拒绝 SAIAI 名字）、契约与金标准、
+  内核名字扫描（扫子模块内容，只跳过其 `.git`）、静态 x86_64 构建及其 Linux 验证；
+  macOS（Intel、Apple Silicon）与 Windows 上运行壳的原生检查：`-p saiai` 测试与平台
+  金标准、LaunchAgent、环境隔离、Windows 证书清单/安装器/PS 5.1/自更新、官方 Codex 抓包。
 - `SAIAI CLI Release` 的每次 preview 与 release 构建六个目标，并在对应的原生 runner
   上运行 macOS/Windows/aarch64 Linux 检查（整个 workspace 的测试与平台金标准、
   AITP 品牌服务、LaunchAgent、环境隔离、Windows 安装器/PS 5.1/自更新、官方 Codex
-  抓包、Linux 启动等；Windows ARM64 为交叉构建，不做原生运行检查）。
+  抓包、Linux 启动等；Windows ARM64 为交叉构建，不做原生运行检查），verify 阶段同样
+  运行子模块检查。
+- 发版记录的 `source_commit` 是本仓库的提交，子模块指针包含在其中，已唯一确定内核
+  版本；因此 AITP main 不得强推、被引用的提交不得删除，否则旧版本无法重建。
+- 子模块化本身不改变 SAIAI 产物：子模块内原有文件的 blob 与目录时代逐一相同，
+  构建始终在仓库根目录以 `--manifest-path` 进行（内核是 workspace 成员，用工作区的
+  `Cargo.lock`；cargo 和 rustup 按当前目录读取 `.cargo/config.toml` 与
+  `rust-toolchain.toml`，不读子模块里的同名文件，两者内容也与根目录相同）。工作流
+  不允许切换目录。
 - `verify-release.py` 解析两个工作流的结构来核对这一分工：命令须是会因失败而让
   步骤失败的顶层命令，步骤条件按平台求值，注释、heredoc、`|| true`、`set +e`、
   `set -n`、`if: false`、`continue-on-error` 和环境变量覆盖都不算数。

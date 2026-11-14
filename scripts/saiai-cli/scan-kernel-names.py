@@ -21,7 +21,8 @@ common Cyrillic/Greek look-alike letters folded to ASCII. In each view the scan 
 * symbolic links, Git LFS pointers and filters, and submodules, which a
   plain file scan would not see through.
 
-Directories named .git are skipped. Findings go to standard output, one per
+Directories and files named .git are skipped (a submodule's git metadata);
+a directory with nothing else to scan fails. Findings go to standard output, one per
 line, and the exit status is 1; a clean scan prints nothing and exits 0.
 This script lives in the SAIAI repository on purpose: the kernel must not
 carry the list of names it is checked against.
@@ -294,6 +295,7 @@ def scan(directory: Path) -> list[str]:
     findings = []
     if not directory.is_dir():
         return [f"{directory}: not a directory"]
+    files = 0
     for path in sorted(directory.rglob("*")):
         relative = path.relative_to(directory).as_posix()
         if ".git" in path.relative_to(directory).parts:
@@ -302,7 +304,11 @@ def scan(directory: Path) -> list[str]:
         if path.is_symlink():
             findings.append(f"{relative}: symbolic link")
         elif path.is_file():
+            files += 1
             findings.extend(scan_file(path, relative))
+    # An empty directory (a submodule not checked out) would pass vacuously.
+    if not files:
+        findings.append("no files to scan (is the kernel submodule checked out?)")
     return findings
 
 

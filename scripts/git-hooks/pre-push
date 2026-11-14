@@ -11,6 +11,11 @@ if [ "${PREPUSH_DRY_RUN:-0}" = "1" ]; then
   exit 0
 fi
 
+# The kernel is the AITP submodule: the tests below must run on the pinned
+# commit, and that commit must already be on AITP's main.
+echo "[pre-push] client: kernel submodule"
+(cd "$repo_root" && python3 scripts/saiai-cli/check-kernel-submodule.py)
+
 echo "[pre-push] client: cargo fmt"
 cargo fmt --manifest-path "$repo_root/tools/saiai-cli/Cargo.toml" --check
 

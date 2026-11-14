@@ -633,10 +633,12 @@ def verify_manifest_and_wrappers() -> None:
 # ---------------------------------------------------------------------------
 # Workflows, read as GitHub reads them.
 #
-# Everyday "Client CI" runs on Linux only; the native macOS and Windows checks
-# of this distribution run in "SAIAI CLI Release" (every preview and release
-# tag); the kernel's own tests on every platform run in the kernel
-# repository's CI. The checks below hold that division by structure: a
+# The kernel is the AITP repository, a submodule: its own tests on every
+# platform and its releases run in AITP's CI. Everyday "Client CI" runs this
+# distribution's checks on Linux, macOS and Windows (the workspace tests,
+# which include the kernel's, on Linux); "SAIAI CLI Release" (every preview
+# and release tag) runs the whole workspace natively on every platform it
+# builds. The checks below hold that division by structure: a
 # required command counts only as a whole top-level command of a step that
 # runs for the platform in question (its `if` evaluated), in a shell that
 # stops on its failure, with nothing that masks the failure, and the kernel
@@ -662,13 +664,26 @@ ALLOWED_ACTIONS = frozenset(
         "softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65",
     }
 )
-# The only environment file write: the AITP release check passes the built
-# program's path to the next steps.
-STANDALONE_KERNEL_CD = 'cd "$standalone/kernel"'
-AITP_PROGRAM_ENV_WRITE = 'echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"'
+# Every checkout brings the kernel submodule (public, no key needed) and
+# nothing else differs from the commit that started the run.
+CHECKOUT_WITH = {"submodules": True}
+KERNEL_SUBMODULE_CHECK = "python3 scripts/saiai-cli/check-kernel-submodule.py"
 RUNNER_SYSTEMS = (("ubuntu-", "Linux"), ("macos-", "macOS"), ("windows-", "Windows"))
 STATIC_LINUX_MATRIX = (
     {"os": "ubuntu-22.04", "target": "x86_64-unknown-linux-musl", "asset": "saiai-linux-x86_64"},
+)
+# Everyday CI: its jobs and the system each runs on.
+CI_JOBS = {"client-linux": "Linux", "static-linux": "Linux", "client-windows": "Windows", "client-macos": "macOS"}
+MACOS_CI_MATRIX = (
+    {"os": "macos-15-intel", "arch": "x86_64"},
+    {"os": "macos-15", "arch": "arm64"},
+)
+# The SAIAI program's own tests and platform goldens, on each native runner.
+SHELL_NATIVE_TESTS = (
+    "node --test scripts/saiai-cli/test-vscode-certificates.js",
+    "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai",
+    "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test contract_entry --test saiai_render_contract --test kernel_consumer",
+    "cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --bin saiai",
 )
 RELEASE_MATRIX = (
     {"os": "ubuntu-22.04", "target": "x86_64-unknown-linux-musl", "asset": "saiai-linux-x86_64"},
@@ -1143,7 +1158,10 @@ def check_workflow_basics(relative: str, workflow: dict) -> None:
             uses = step.get("uses")
             require(uses is None or uses in ALLOWED_ACTIONS, f"{label} uses an action that is not pinned here: {uses}")
             if str(uses).startswith("actions/checkout@"):
-                require("with" not in step, f"{label} must check out the commit that started the run")
+                require(
+                    step.get("with") == CHECKOUT_WITH,
+                    f"{label} must check out the commit that started the run, with the kernel submodule ({CHECKOUT_WITH})",
+                )
             require((uses is None) != ("run" not in step), f"{label} must either run or use")
             for name, value in (step.get("env") or {}).items():
                 require(name != FOREIGN_NAMES_ENV or value == "saiai", f"{label} overrides {FOREIGN_NAMES_ENV}")
@@ -1160,17 +1178,10 @@ def check_workflow_basics(relative: str, workflow: dict) -> None:
                         moves.append((job_id, step.get("name"), command))
                     if "GITHUB_ENV" in command:
                         env_writes.append((job_id, step.get("name"), command))
-    # The one directory change (into the stand-alone kernel copy) and the
-    # one environment file write (the AITP program's path), each in its own
-    # step, exactly once in the workflow.
-    require(
-        moves == ([("client-linux", "Test the kernel on its own", STANDALONE_KERNEL_CD)] if relative == CI_WORKFLOW else []),
-        f"{relative} changes directory outside the stand-alone kernel step: {moves}",
-    )
-    require(
-        env_writes == ([("aitp-release-linux", "Build the AITP release with remapped paths", AITP_PROGRAM_ENV_WRITE)] if relative == CI_WORKFLOW else []),
-        f"{relative} touches GITHUB_ENV outside the AITP release build: {env_writes}",
-    )
+    # Every command runs from the checkout root, and no step hands
+    # environment changes to the next.
+    require(not moves, f"{relative} changes directory: {moves}")
+    require(not env_writes, f"{relative} touches GITHUB_ENV: {env_writes}")
 
 
 def runs_command(
@@ -1247,13 +1258,23 @@ def verify_ci_workflow() -> None:
         f"{relative} must run on every pull request to main and every push to main",
     )
     require((workflow.get("env") or {}).get(FOREIGN_NAMES_ENV) == "saiai", f"{relative} does not name SAIAI to the kernel's tests")
+    require(set(workflow["jobs"]) == set(CI_JOBS), f"{relative} jobs differ: {sorted(workflow['jobs'])}")
     for job_id, job in workflow["jobs"].items():
         require("needs" not in job, f"{relative} job {job_id} waits on another job")
         for entry in matrix_entries(job):
             require(
-                runner_system(job, entry) == "Linux",
-                f"{relative} job {job_id} leaves Linux: native macOS and Windows checks belong to the release workflow",
+                runner_system(job, entry) == CI_JOBS[job_id],
+                f"{relative} job {job_id} must run on {CI_JOBS[job_id]}",
             )
+    require(
+        tuple(matrix_entries(workflow["jobs"]["client-macos"])) == MACOS_CI_MATRIX,
+        f"{relative} native macOS matrix differs",
+    )
+    # AITP's own CI builds and checks AITP releases; this distribution's
+    # workflows never do.
+    ci_text = text(relative)
+    for forbidden in ("build-release.sh", "remap-path-prefix", "--aitp-artifact"):
+        require(forbidden not in ci_text, f"{relative} must not use {forbidden!r} (AITP releases belong to AITP's CI)")
     for event, ref in (("pull_request", "refs/pull/1/merge"), ("push", "refs/heads/main")):
         base = {"github.event_name": event, "github.ref": ref}
         require(jobs_that_run(workflow, base) == set(workflow["jobs"]), f"{relative} skips a job on {event}")
@@ -1287,34 +1308,50 @@ def verify_ci_workflow() -> None:
             "python3 scripts/saiai-cli/verify-release.py",
         ):
             check("client-linux", command, "the SAIAI contract and golden checks")
-        # Until the kernel moves to its own repository, its stand-alone build
-        # and AITP release checks run here too.
-        for command, purpose, options in (
-            ('cargo clippy --locked --target-dir "$standalone/target" --all-targets -- -D warnings', "the stand-alone kernel lint", {}),
-            ('cargo clippy --locked --target-dir "$standalone/target" --all-targets --features contract -- -D warnings', "the stand-alone kernel lint", {}),
-            (STANDALONE_KERNEL_CD, "the stand-alone kernel copy", {}),
-            ('cargo test --locked --target-dir "$standalone/target"', "the stand-alone kernel tests", {"foreign_names": True}),
-            ('cargo test --locked --target-dir "$standalone/target" --features contract --bin aitp', "the stand-alone AITP program tests", {}),
-            ("python3 scripts/test_release_manifest.py", "the stand-alone release manifest tests", {}),
-            ('aitp="$(CARGO_TARGET_DIR="$standalone/target" bash scripts/build-release.sh --locked)"', "the stand-alone AITP release build", {}),
-            ('"$aitp" --version', "the stand-alone AITP release startup", {}),
+        check("client-linux", "python3 scripts/saiai-cli/test-check-kernel-submodule.py", "the kernel submodule check tests")
+        check("client-linux", KERNEL_SUBMODULE_CHECK, "the kernel submodule check (pinned commit on AITP main)")
+        # This distribution's native checks; the kernel's own native tests
+        # run in AITP's CI.
+        debug = "tools/saiai-cli/target/debug/saiai"
+        for command in SHELL_NATIVE_TESTS:
+            check("client-windows", command, "the native Windows SAIAI tests")
+            check("client-macos", command, "the native macOS SAIAI tests")
+        for command, purpose in (
             (
-                'python3 "$GITHUB_WORKSPACE/scripts/saiai-cli/verify-release.py" --aitp-artifact "$aitp" --build-dir "$standalone" --build-dir "$GITHUB_WORKSPACE"',
-                "the stand-alone AITP release check", {},
+                "python -c \"import runpy; runpy.run_path('scripts/saiai-cli/test-initialization-scope.py')['windows_roots'](); print('Windows Root inventory read passed')\"",
+                "the read-only Windows certificate inventory",
+            ),
+            (f'& "$PWD/scripts/saiai-cli/test-windows-runtime.ps1" -BinaryPath "$PWD/{debug}.exe"', "the Windows configuration smoke"),
+            (f"python scripts/saiai-cli/verify-windows-reproducibility.py {debug}.exe", "the reproducible Windows image check"),
+            (f"python scripts/saiai-cli/test-initialization-scope.py --binary {debug}.exe", "the initialization scope check"),
+            (f"python scripts/saiai-cli/test-windows-environments.py --binary {debug}.exe", "the Windows environment isolation"),
+            (
+                '& "$env:WINDIR/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -File scripts/saiai-cli/test-setup-environments.ps1 -WrapperPath "$PWD/scripts/saiai-cli/setup.ps1"',
+                "the Windows installer environment routing",
+            ),
+            (
+                '& "$PWD/scripts/saiai-cli/test-windows-release.ps1" -BundleDir dist -SetupPs1 dist/setup.ps1 -SetupCmd dist/setup.cmd -AssetName saiai-windows-x86_64.exe',
+                "the Windows PowerShell 5.1 wrapper smoke",
+            ),
+            ("python scripts/saiai-cli/test-windows-self-update.py --binary dist/saiai-windows-x86_64.exe", "the Windows self-update smoke"),
+        ) + tuple(
+            (
+                f'python scripts/saiai-cli/test-windows-codex-proxy.py --saiai {debug}.exe --codex-prefix "$env:RUNNER_TEMP/codex-{version}" --codex-version {version}',
+                f"the official Windows Codex {version} capture",
+            )
+            for version in ("0.146.0", "0.153.4")
+        ):
+            check("client-windows", command, purpose)
+        for command, entries, purpose in (
+            (f"python3 scripts/saiai-cli/test-initialization-scope.py --binary {debug}", None, "the initialization scope check"),
+            (f"python3 scripts/saiai-cli/test-macos-service.py --binary {debug}", None, "the macOS LaunchAgent smoke"),
+            (f"python3 scripts/saiai-cli/test-macos-environments.py --binary {debug}", None, "the macOS environment isolation"),
+            (
+                f'python3 scripts/saiai-cli/test-windows-codex-proxy.py --saiai {debug} --codex-prefix "$prefix/bin" --codex-version 0.153.4',
+                [entry for entry in MACOS_CI_MATRIX if entry["arch"] == "arm64"], "the official macOS Codex capture",
             ),
         ):
-            check("client-linux", command, purpose, **options)
-        for command, purpose in (
-            ('aitp="$(bash tools/saiai-cli/kernel/scripts/build-release.sh --locked)"', "the AITP release build"),
-            ('"$aitp" --version', "the AITP release startup"),
-            (AITP_PROGRAM_ENV_WRITE, "the AITP release hand-over"),
-            ('python3 scripts/saiai-cli/verify-release.py --aitp-artifact "$AITP_PROGRAM" --build-dir "$GITHUB_WORKSPACE"', "the AITP release path check"),
-            ('grep "update signing keys are placeholders" "$RUNNER_TEMP/build.log"', "the placeholder-key build control"),
-            ('grep "carries placeholder signing keys" "$RUNNER_TEMP/keys.log"', "the placeholder-key check control"),
-            ("cargo build --locked --manifest-path tools/saiai-cli/kernel/Cargo.toml --release --bin aitp", "the ordinary release control build"),
-            ('grep -E "carries build machine paths|names the other distribution" "$RUNNER_TEMP/control.log"', "the ordinary release control"),
-        ):
-            check("aitp-release-linux", command, purpose)
+            check("client-macos", command, purpose, entries=entries)
         require(
             tuple(matrix_entries(workflow["jobs"]["static-linux"])) == STATIC_LINUX_MATRIX,
             f"{relative} static Linux matrix differs",
@@ -1535,6 +1572,7 @@ def verify_release_workflow() -> None:
             "python3 scripts/saiai-cli/verify-release.py",
         ):
             check("verify", command, "the release verification")
+        check("verify", KERNEL_SUBMODULE_CHECK, "the kernel submodule check (pinned commit on AITP main)")
         check(
             "verify",
             "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace",
@@ -1650,25 +1688,11 @@ def verify_workflows_and_docs() -> None:
         "AITP_TEST_FOREIGN_NAMES=saiai",
         "python3 scripts/saiai-cli/test-scan-kernel-names.py",
         "python3 scripts/saiai-cli/scan-kernel-names.py tools/saiai-cli/kernel",
+        KERNEL_SUBMODULE_CHECK,
     ):
         require(required in pre_push, f"the pre-push hook does not run {required!r}")
-    # The kernel's AITP release build script (built and checked by the
-    # kernel's own CI) keeps remapping the build machine's paths.
-    remap = text(AITP_RELEASE_BUILD)
-    for required in (
-        "--remap-path-prefix=",
-        "-ffile-prefix-map=",
-        "CARGO_ENCODED_RUSTFLAGS",
-        "--bin aitp",
-        "only Linux GNU targets are verified",
-        '--target "$triple"',
-    ):
-        require(required in remap, f"AITP release build script is missing {required!r}")
-    for prefix in AITP_NEUTRAL_PREFIXES:
-        require(
-            re.search(r'^add_mapping "\$\w+" ' + re.escape(prefix) + r"$", remap, re.MULTILINE) is not None,
-            f"AITP release build script does not map to {prefix}",
-        )
+    # AITP's release build script is AITP's: its own CI builds and checks
+    # its releases, and this repository only pins the kernel.
     linux_service = text("scripts/saiai-cli/test-linux-service.py")
     for required in (
         "test-forced headless mode",
@@ -1758,7 +1782,6 @@ def verify_no_non_test_credentials() -> None:
 
 
 AITP_BRAND_SOURCE = "tools/saiai-cli/kernel/src/bin/aitp/brand.rs"
-AITP_RELEASE_BUILD = "tools/saiai-cli/kernel/scripts/build-release.sh"
 AITP_RELEASE_MANIFEST = "tools/saiai-cli/kernel/scripts/release_manifest.py"
 
 

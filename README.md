@@ -355,6 +355,8 @@ Linux 资产使用静态 musl，避免旧发行版上的 GLIBC 版本错误。re
 ## 本地验证
 
 ```bash
+git submodule update --init   # 内核 tools/saiai-cli/kernel 是 AITP 子模块
+python3 scripts/saiai-cli/check-kernel-submodule.py
 cargo fmt --manifest-path tools/saiai-cli/Cargo.toml --check
 cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml
 bash scripts/saiai-cli/test-setup-wrappers.sh
