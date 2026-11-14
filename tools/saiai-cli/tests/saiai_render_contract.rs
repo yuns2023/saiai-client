@@ -11,7 +11,7 @@ use proxy_cli::contract::{
 };
 use proxy_cli::{
     Brand, CertificateNames, ConfigNames, EnvironmentNames, OwnershipMarkers,
-    PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
+    PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames, UpdateSource,
 };
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use serde_json::Value;

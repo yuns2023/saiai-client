@@ -8,7 +8,7 @@
 
 use crate::brand::{
     Brand, CertificateNames, ConfigNames, EnvironmentNames, OwnershipMarkers,
-    PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
+    PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames, UpdateSource,
 };
 
 /// The single test brand instance (a `static`, so repeated installation is
@@ -61,7 +61,9 @@ pub const KTEST_VALUES: Brand = Brand {
         log_filename: "ktest.log",
     },
     update: UpdateNames {
-        channel_path: "ktest-cli",
+        source: UpdateSource::GatewayChannel {
+            channel_path: "ktest-cli",
+        },
         asset_prefix: "ktest-",
         candidate_prefix: ".ktest-update-",
         backup_prefix: "ktest.bak-",

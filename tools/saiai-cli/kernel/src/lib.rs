@@ -51,6 +51,12 @@ mod local_proxy;
 mod runtime;
 mod script_brand;
 mod uninstall;
+// Fixed-URL self-update: redirects, limits, manifest and asset checks.
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+mod update_fixed_tests;
 mod upstream_proxy;
 mod upstream_tls;
 mod vscode;
@@ -61,8 +67,8 @@ mod windows_desktop_runtime;
 
 use brand::{BRAND, BrandText, BrandValue};
 pub use brand::{
-    Brand, CertificateNames, ConfigNames, EnvironmentNames, OwnershipMarkers,
-    PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
+    Brand, CertificateNames, ConfigNames, EnvironmentNames, FixedUpdateSource, OwnershipMarkers,
+    PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames, UpdateSource,
 };
 use desktop_product::DesktopProduct;
 pub use gateway::{
@@ -4274,12 +4280,33 @@ fn run_upstream_proxy_command(value: Option<String>) -> Result<()> {
 
 /// HTTP egress for one-shot CLI requests (health check, self-update), routed
 /// like the local proxy's own Gateway traffic.
+#[derive(Clone)]
 struct Egress {
-    installation_ca_pem: String,
+    /// `None`: not installed (no configuration), so no installation CA is
+    /// excluded from the system roots.
+    installation_ca_pem: Option<String>,
     upstream: Arc<upstream_proxy::Snapshot>,
+    /// Tests: host names resolved to a local address (direct connections).
+    #[cfg(test)]
+    resolve: Vec<(String, SocketAddr)>,
 }
 
 impl Egress {
+    /// Egress of an uninitialized installation: the default (system) route
+    /// and no installation CA to exclude.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn for_optional_config(cfg: Option<&AppConfig>) -> Self {
+        match cfg {
+            Some(cfg) => Self::for_config(cfg),
+            None => Self {
+                installation_ca_pem: None,
+                upstream: upstream_proxy::UpstreamProxy::new(None, None, Vec::new()).snapshot(),
+                #[cfg(test)]
+                resolve: Vec::new(),
+            },
+        }
+    }
+
     fn for_config(cfg: &AppConfig) -> Self {
         let upstream = upstream_proxy::UpstreamProxy::new(
             cfg.upstream_proxy.as_deref(),
@@ -4287,8 +4314,10 @@ impl Egress {
             Vec::new(),
         );
         Self {
-            installation_ca_pem: installation_ca_pem(cfg),
+            installation_ca_pem: Some(installation_ca_pem(cfg)),
             upstream: upstream.snapshot(),
+            #[cfg(test)]
+            resolve: Vec::new(),
         }
     }
 
@@ -4297,10 +4326,18 @@ impl Egress {
     /// proxy cannot be used.
     fn client_builder(&self, url: &str) -> Result<reqwest::ClientBuilder> {
         let route = upstream_proxy::route_for_url_blocking(&self.upstream, url)?;
-        upstream_proxy::client_builder_for_route(
-            upstream_tls::upstream_http_client_builder(&self.installation_ca_pem),
-            &route,
-        )
+        let builder = match &self.installation_ca_pem {
+            Some(pem) => upstream_tls::upstream_http_client_builder(pem),
+            None => upstream_tls::uninstalled_http_client_builder(),
+        };
+        #[cfg(test)]
+        let builder = self
+            .resolve
+            .iter()
+            .fold(builder, |builder, (host, address)| {
+                builder.resolve(host, *address)
+            });
+        upstream_proxy::client_builder_for_route(builder, &route)
     }
 }
 
@@ -4920,23 +4957,67 @@ fn start_managed_service_after_initialization(config_changed: bool) -> Result<()
     Ok(())
 }
 
-/// Manifest and asset URLs of the update channel below a Gateway base URL.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn update_urls(base_url: &str, asset: &str) -> (String, String) {
+/// Manifest and asset URLs of a Gateway update channel below a Gateway
+/// base URL; an error for a brand that updates from fixed URLs.
+#[cfg(any(test, feature = "contract"))]
+fn update_urls(base_url: &str, asset: &str) -> Result<(String, String)> {
+    match &BRAND.update.source {
+        UpdateSource::GatewayChannel { channel_path } => {
+            Ok(gateway_update_urls(channel_path, base_url, asset))
+        }
+        UpdateSource::Fixed(_) => bail!(
+            "{brand_binary} updates from fixed URLs, not below a Gateway base URL",
+            brand_binary = BRAND.binary_name
+        ),
+    }
+}
+
+fn gateway_update_urls(channel: &str, base_url: &str, asset: &str) -> (String, String) {
     let base = base_url.trim().trim_end_matches('/');
-    let channel = BRAND.update.channel_path;
     (
         format!("{base}/{channel}/manifest.json"),
         format!("{base}/{channel}/{asset}"),
     )
 }
 
+/// Where this run downloads its update from.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+enum UpdateOrigin {
+    Gateway {
+        cfg: AppConfig,
+        manifest_url: String,
+        url: String,
+    },
+    Fixed {
+        source: &'static FixedUpdateSource,
+        cfg: Option<AppConfig>,
+    },
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn run_update() -> Result<()> {
     let service_was_active = managed_service_is_active();
-    let cfg = read_app_config()?;
-    let asset = current_platform_asset_name()?;
-    let (manifest_url, url) = update_urls(&cfg.base_url, &asset);
+    let (origin, asset) = match &BRAND.update.source {
+        UpdateSource::GatewayChannel { channel_path } => {
+            let cfg = read_app_config()?;
+            let asset = current_platform_asset_name()?;
+            let (manifest_url, url) = gateway_update_urls(channel_path, &cfg.base_url, &asset);
+            let origin = UpdateOrigin::Gateway {
+                cfg,
+                manifest_url,
+                url,
+            };
+            (origin, asset)
+        }
+        // Fixed URLs need no Gateway: an uninitialized installation updates
+        // through the default (system) route, but a configuration that
+        // exists and cannot be read is an error, not a silent default.
+        UpdateSource::Fixed(source) => {
+            let cfg = read_app_config_if_present()?;
+            let asset = current_platform_asset_name()?;
+            (UpdateOrigin::Fixed { source, cfg }, asset)
+        }
+    };
     let current_exe = env::current_exe().with_context(|| {
         format!(
             "failed to resolve current {brand_binary} executable",
@@ -4953,6 +5034,13 @@ fn run_update() -> Result<()> {
             current_exe.display()
         );
     }
+    // One fixed-source update at a time per installation directory, held
+    // until this command returns (see `lock_update_directory` for the
+    // Windows replacement helper, which is not covered).
+    let _update_lock = match &origin {
+        UpdateOrigin::Fixed { .. } => Some(lock_update_directory(parent)?),
+        UpdateOrigin::Gateway { .. } => None,
+    };
     let current_bytes = fs::read(&current_exe)
         .with_context(|| format!("failed to read {}", current_exe.display()))?;
     let current_sha256 = sha256_hex(&current_bytes);
@@ -4967,75 +5055,128 @@ fn run_update() -> Result<()> {
         .build()
         .context("failed to start async runtime")?;
 
-    println!("Checking: {manifest_url}");
-    let egress = Egress::for_config(&cfg);
-    let manifest = runtime.block_on(download_update_manifest(&manifest_url, &egress))?;
-    let expected_sha256 = if let Some(manifest) = manifest {
-        let remote_version = manifest.version.trim();
-        let ordering = compare_versions(remote_version, runtime::version())
-            .with_context(|| format!("failed to compare remote version {remote_version:?}"))?;
-        let asset_info = manifest
-            .assets
-            .get(&asset)
-            .with_context(|| format!("manifest does not include asset {asset}"))?;
-        let expected = asset_info.sha256.trim().to_ascii_lowercase();
-        if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
-            bail!("manifest asset {asset} has invalid sha256 {expected:?}");
-        }
+    let (bytes, expected_version) = match origin {
+        UpdateOrigin::Gateway {
+            cfg,
+            manifest_url,
+            url,
+        } => {
+            println!("Checking: {manifest_url}");
+            let egress = Egress::for_config(&cfg);
+            let manifest = runtime.block_on(download_update_manifest(&manifest_url, &egress))?;
+            let expected_sha256 = if let Some(manifest) = manifest {
+                let remote_version = manifest.version.trim();
+                let ordering =
+                    compare_versions(remote_version, runtime::version()).with_context(|| {
+                        format!("failed to compare remote version {remote_version:?}")
+                    })?;
+                let asset_info = manifest
+                    .assets
+                    .get(&asset)
+                    .with_context(|| format!("manifest does not include asset {asset}"))?;
+                let expected = asset_info.sha256.trim().to_ascii_lowercase();
+                if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+                    bail!("manifest asset {asset} has invalid sha256 {expected:?}");
+                }
 
-        println!(
-            "Latest: {brand_binary} {remote_version}",
-            brand_binary = BRAND.binary_name
-        );
-        if ordering == Ordering::Less {
-            println!(
-                "Already current: {brand_binary} {} (remote {brand_binary} {remote_version})",
+                println!(
+                    "Latest: {brand_binary} {remote_version}",
+                    brand_binary = BRAND.binary_name
+                );
+                if ordering == Ordering::Less {
+                    println!(
+                        "Already current: {brand_binary} {} (remote {brand_binary} {remote_version})",
+                        runtime::version(),
+                        brand_binary = BRAND.binary_name
+                    );
+                    return Ok(());
+                }
+                if ordering == Ordering::Equal && current_sha256 == expected {
+                    println!(
+                        "Already current: {brand_binary} {}",
+                        runtime::version(),
+                        brand_binary = BRAND.binary_name
+                    );
+                    return Ok(());
+                }
+                if ordering == Ordering::Equal {
+                    println!("Same version but local binary hash differs; refreshing {asset}");
+                }
+                Some(expected)
+            } else {
+                println!("Manifest unavailable; falling back to binary download.");
+                None
+            };
+
+            println!("Downloading: {url}");
+            let bytes = runtime.block_on(download_update_asset(&url, &egress))?;
+            validate_update_asset(&bytes, &asset)?;
+            if let Some(expected) = &expected_sha256 {
+                let actual = sha256_hex(&bytes);
+                if actual != *expected {
+                    bail!("downloaded {asset} sha256 mismatch: expected {expected}, got {actual}");
+                }
+            }
+            (bytes, None)
+        }
+        UpdateOrigin::Fixed { source, cfg } => {
+            match fixed_download(
+                &FixedUrlPolicy::https(source.hosts),
+                source.manifest_url,
+                source.asset_url_template,
+                cfg,
+                &asset,
                 runtime::version(),
-                brand_binary = BRAND.binary_name
-            );
-            return Ok(());
+                &current_sha256,
+            )? {
+                FixedUpdate::Current(message) => {
+                    println!("{message}");
+                    return Ok(());
+                }
+                FixedUpdate::Download { bytes, version } => {
+                    validate_update_asset(&bytes, &asset)?;
+                    (bytes, Some(version))
+                }
+            }
         }
-        if ordering == Ordering::Equal && current_sha256 == expected {
-            println!(
-                "Already current: {brand_binary} {}",
-                runtime::version(),
-                brand_binary = BRAND.binary_name
-            );
-            return Ok(());
-        }
-        if ordering == Ordering::Equal {
-            println!("Same version but local binary hash differs; refreshing {asset}");
-        }
-        Some(expected)
-    } else {
-        println!("Manifest unavailable; falling back to binary download.");
-        None
     };
-
-    println!("Downloading: {url}");
-    let bytes = runtime.block_on(download_update_asset(&url, &egress))?;
-    validate_update_asset(&bytes, &asset)?;
-    if let Some(expected) = &expected_sha256 {
-        let actual = sha256_hex(&bytes);
-        if actual != *expected {
-            bail!("downloaded {asset} sha256 mismatch: expected {expected}, got {actual}");
-        }
-    }
 
     let unique = update_suffix();
     let candidate_name = update_candidate_name(&unique);
     let backup_name = update_backup_name();
     let candidate_path = parent.join(candidate_name);
     let backup_path = parent.join(backup_name);
-    write_update_candidate(&candidate_path, &bytes)
-        .with_context(|| format!("failed to write {}", candidate_path.display()))?;
-
-    let candidate_version = command_stdout(&candidate_path, &["--version"])
-        .with_context(|| format!("failed to run {}", candidate_path.display()))?;
+    let candidate_raw = if expected_version.is_some() {
+        // Fixed source: a new file only, and a bounded probe; a candidate
+        // that cannot be probed is removed.
+        write_new_update_candidate(&candidate_path, &bytes)
+            .with_context(|| format!("failed to write {}", candidate_path.display()))?;
+        match probe_candidate_version(
+            &candidate_path,
+            CANDIDATE_PROBE_TIMEOUT,
+            CANDIDATE_PROBE_LIMIT,
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = fs::remove_file(&candidate_path);
+                return Err(error)
+                    .with_context(|| format!("failed to run {}", candidate_path.display()));
+            }
+        }
+    } else {
+        write_update_candidate(&candidate_path, &bytes)
+            .with_context(|| format!("failed to write {}", candidate_path.display()))?;
+        command_stdout_raw(&candidate_path, &["--version"])
+            .with_context(|| format!("failed to run {}", candidate_path.display()))?
+    };
+    let candidate_version = candidate_raw.trim().to_string();
     if !candidate_version
         .trim_start()
         .strip_prefix(BRAND.binary_name)
         .is_some_and(|rest| rest.starts_with(' '))
+        || expected_version.as_ref().is_some_and(|version| {
+            !reports_exact_version(&candidate_raw, BRAND.binary_name, version)
+        })
     {
         let _ = fs::remove_file(&candidate_path);
         bail!(
@@ -7030,6 +7171,334 @@ async fn download_update_asset(url: &str, egress: &Egress) -> Result<Vec<u8>> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const EGRESS_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The whole fixed-source download on an abandonable runtime: egress setup
+/// (which may block on system proxy discovery, such as `scutil --proxy`)
+/// and the fetch each run within their time budgets.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[allow(clippy::too_many_arguments)]
+fn fixed_download(
+    policy: &FixedUrlPolicy<'_>,
+    manifest_url: &str,
+    asset_url_template: &str,
+    cfg: Option<AppConfig>,
+    asset: &str,
+    current_version: &str,
+    current_sha256: &str,
+) -> Result<FixedUpdate> {
+    block_on_abandoning(async move {
+        let egress = tokio::time::timeout(
+            EGRESS_SETUP_TIMEOUT,
+            tokio::task::spawn_blocking(move || Egress::for_optional_config(cfg.as_ref())),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "proxy discovery did not complete within {}s",
+                EGRESS_SETUP_TIMEOUT.as_secs()
+            )
+        })?
+        .context("proxy discovery failed")?;
+        fetch_fixed_update(
+            policy,
+            manifest_url,
+            asset_url_template,
+            asset,
+            current_version,
+            current_sha256,
+            &egress,
+        )
+        .await
+    })?
+}
+
+/// Runs `future` on its own runtime and then shuts that runtime down without
+/// waiting for blocking work a timed-out future left behind (route
+/// selection stuck on proxy auto-configuration, for example): the command
+/// returns when the future does. Such work ends with the process.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn block_on_abandoning<F: std::future::Future>(future: F) -> Result<F::Output> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to start async runtime")?;
+    let output = runtime.block_on(future);
+    runtime.shutdown_background();
+    Ok(output)
+}
+
+/// The URLs a fixed update source may request: exact hosts, a scheme and
+/// (for HTTPS) the default port only, no user information.
+pub(crate) struct FixedUrlPolicy<'a> {
+    hosts: &'a [&'a str],
+    scheme: &'static str,
+    /// Ports allowed besides none; empty: the scheme's default port only.
+    ports: &'a [u16],
+}
+
+impl<'a> FixedUrlPolicy<'a> {
+    pub(crate) fn https(hosts: &'a [&'a str]) -> Self {
+        Self {
+            hosts,
+            scheme: "https",
+            ports: &[],
+        }
+    }
+
+    pub(crate) fn check(&self, url: &str) -> Result<url::Url> {
+        let parsed = url::Url::parse(url).with_context(|| format!("invalid URL {url:?}"))?;
+        if parsed.scheme() != self.scheme {
+            bail!("{url} does not use {}", self.scheme);
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            bail!("{url} carries user information");
+        }
+        if parsed.fragment().is_some() {
+            bail!("{url} carries a fragment");
+        }
+        if parsed
+            .port()
+            .is_some_and(|port| !self.ports.contains(&port))
+        {
+            bail!("{url} names a port that is not allowed");
+        }
+        let host = parsed.host_str().unwrap_or_default();
+        if !self.hosts.contains(&host) {
+            bail!("{url} is not on an allowed update host");
+        }
+        Ok(parsed)
+    }
+}
+
+/// The asset URL of a fixed source for one release `version` (`X.Y.Z`).
+pub(crate) fn fixed_asset_url(template: &str, version: &str, asset: &str) -> String {
+    template
+        .replace("{version}", version)
+        .replace("{asset}", asset)
+}
+
+/// `X.Y.Z`, three decimal numbers without signs, spaces, prefixes or
+/// suffixes (leading zeros only for a lone `0`).
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn is_release_version(version: &str) -> bool {
+    let parts: Vec<_> = version.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.len() <= 9
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && (part.len() == 1 || !part.starts_with('0'))
+        })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const FIXED_MANIFEST_LIMIT: u64 = 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const FIXED_ASSET_MIN: u64 = 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const FIXED_ASSET_MAX: u64 = 64 * 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const FIXED_MAX_REDIRECTS: usize = 5;
+
+/// Body of a fixed-source GET, or `None` for 404 at the end of the chain.
+/// Each hop is checked against `policy` and routed for its own URL (a proxy
+/// that cannot be used fails the request instead of going direct); only
+/// 301/302/303/307/308 are followed, at most `FIXED_MAX_REDIRECTS` times,
+/// within `total` for the whole chain; the body is read up to `limit` bytes.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+async fn fixed_get(
+    policy: &FixedUrlPolicy<'_>,
+    url: &str,
+    limit: u64,
+    total: Duration,
+    egress: &Egress,
+) -> Result<Option<Vec<u8>>> {
+    let deadline = tokio::time::Instant::now() + total;
+    let mut current = policy.check(url)?;
+    let mut redirects = 0;
+    let expired = || anyhow::anyhow!("GET {url} did not complete within {}s", total.as_secs());
+    loop {
+        // Route selection (which may block on proxy auto-configuration) and
+        // the request both count against the chain's deadline.
+        let builder = {
+            let egress = egress.clone();
+            let target = current.to_string();
+            tokio::time::timeout_at(
+                deadline,
+                tokio::task::spawn_blocking(move || egress.client_builder(&target)),
+            )
+            .await
+            .map_err(|_| expired())?
+            .context("update route selection failed")??
+        };
+        // The deadline below bounds connect, response head and body alike.
+        let request = builder
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("failed to build update HTTP client")?
+            .get(current.as_str())
+            .send();
+        let response = tokio::time::timeout_at(deadline, request)
+            .await
+            .map_err(|_| expired())?
+            .with_context(|| format!("failed to GET {current}"))?;
+        let status = response.status();
+        if matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308) {
+            redirects += 1;
+            if redirects > FIXED_MAX_REDIRECTS {
+                bail!("GET {url} redirected more than {FIXED_MAX_REDIRECTS} times");
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .with_context(|| format!("GET {current} returned {status} without a Location"))?
+                .to_str()
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "GET {current} returned {status} with a Location that is not plain ASCII"
+                    )
+                })?;
+            let next = current
+                .join(location)
+                .with_context(|| format!("GET {current} redirected to an invalid Location"))?;
+            current = policy.check(next.as_str()).with_context(|| {
+                format!("GET {current} redirected to a URL that is not allowed")
+            })?;
+            continue;
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            bail!("GET {current} returned {status}");
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit)
+        {
+            bail!("GET {current} is larger than {limit} bytes");
+        }
+        let mut response = response;
+        let mut body = Vec::new();
+        while let Some(chunk) = tokio::time::timeout_at(deadline, response.chunk())
+            .await
+            .map_err(|_| expired())?
+            .with_context(|| format!("failed to read {current}"))?
+        {
+            if body.len() as u64 + chunk.len() as u64 > limit {
+                bail!("GET {current} is larger than {limit} bytes");
+            }
+            body.extend_from_slice(&chunk);
+        }
+        return Ok(Some(body));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+enum FixedUpdate {
+    /// Nothing to download; the message says why.
+    Current(String),
+    /// The verified asset of release `version`.
+    Download { bytes: Vec<u8>, version: String },
+}
+
+/// Fetches and verifies the update from a fixed source: the manifest is
+/// required (a missing one is an error, never an unverified download), its
+/// version must be `X.Y.Z`, and the asset of exactly that version must match
+/// the manifest's size and SHA-256.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+async fn fetch_fixed_update(
+    policy: &FixedUrlPolicy<'_>,
+    manifest_url: &str,
+    asset_url_template: &str,
+    asset: &str,
+    current_version: &str,
+    current_sha256: &str,
+    egress: &Egress,
+) -> Result<FixedUpdate> {
+    println!("Checking: {manifest_url}");
+    let Some(raw) = fixed_get(
+        policy,
+        manifest_url,
+        FIXED_MANIFEST_LIMIT,
+        Duration::from_secs(30),
+        egress,
+    )
+    .await?
+    else {
+        bail!(
+            "the {brand_product} update manifest is unavailable (HTTP 404 at {manifest_url}); no release may have been published yet",
+            brand_product = BRAND.product_name
+        );
+    };
+    let manifest = serde_json::from_slice::<UpdateManifest>(&raw)
+        .with_context(|| format!("failed to parse {manifest_url}"))?;
+    let version = manifest.version.as_str();
+    if !is_release_version(version) {
+        bail!("{manifest_url} names version {version:?}, not X.Y.Z");
+    }
+    let info = manifest
+        .assets
+        .get(asset)
+        .with_context(|| format!("manifest does not include asset {asset}"))?;
+    let expected = info.sha256.trim().to_ascii_lowercase();
+    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("manifest asset {asset} has invalid sha256 {expected:?}");
+    }
+    let size = info
+        .size
+        .filter(|size| (FIXED_ASSET_MIN..=FIXED_ASSET_MAX).contains(size))
+        .with_context(|| {
+            format!(
+                "manifest asset {asset} has no size between {FIXED_ASSET_MIN} and {FIXED_ASSET_MAX} bytes"
+            )
+        })?;
+    println!(
+        "Latest: {brand_binary} {version}",
+        brand_binary = BRAND.binary_name
+    );
+    let ordering = compare_versions(version, current_version)
+        .with_context(|| format!("failed to compare remote version {version:?}"))?;
+    if ordering == Ordering::Less {
+        return Ok(FixedUpdate::Current(format!(
+            "Already current: {brand_binary} {current_version} (remote {brand_binary} {version})",
+            brand_binary = BRAND.binary_name
+        )));
+    }
+    if ordering == Ordering::Equal && current_sha256 == expected {
+        return Ok(FixedUpdate::Current(format!(
+            "Already current: {brand_binary} {current_version}",
+            brand_binary = BRAND.binary_name
+        )));
+    }
+    if ordering == Ordering::Equal {
+        println!("Same version but local binary hash differs; refreshing {asset}");
+    }
+    let url = fixed_asset_url(asset_url_template, version, asset);
+    println!("Downloading: {url}");
+    let bytes = fixed_get(policy, &url, size, Duration::from_secs(300), egress)
+        .await?
+        .with_context(|| {
+            format!("release asset {asset} of {version} is missing (HTTP 404 at {url})")
+        })?;
+    if bytes.len() as u64 != size {
+        bail!(
+            "downloaded {asset} has {} bytes, the manifest says {size}",
+            bytes.len()
+        );
+    }
+    let actual = sha256_hex(&bytes);
+    if actual != expected {
+        bail!("downloaded {asset} sha256 mismatch: expected {expected}, got {actual}");
+    }
+    Ok(FixedUpdate::Download {
+        bytes,
+        version: version.to_string(),
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn compare_versions(left: &str, right: &str) -> Result<Ordering> {
     let left = parse_version_parts(left)?;
     let right = parse_version_parts(right)?;
@@ -7163,6 +7632,214 @@ fn validate_pe_asset(bytes: &[u8], asset: &str) -> Result<()> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+/// Like [`write_update_candidate`], but only as a new file (never through
+/// an existing file or link at that name).
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn write_new_update_candidate(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o755);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    // The file is new and ours: a partial one is removed.
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("failed to write {}", path.display()));
+    #[cfg(unix)]
+    let written = written.and_then(|()| {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("failed to chmod {}", path.display()))
+    });
+    if written.is_err() {
+        drop(file);
+        let _ = fs::remove_file(path);
+    }
+    written
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const CANDIDATE_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const CANDIDATE_PROBE_LIMIT: usize = 4096;
+
+/// `<candidate> --version` standard output, bounded: the direct child is
+/// killed and reaped when it runs past `timeout`, prints more than `limit`
+/// bytes or keeps running after closing its output, and a failed exit or a
+/// read error is an error. Descendants of the candidate are not tracked: one
+/// that keeps the output open ends the probe at the deadline.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn probe_candidate_version(path: &Path, timeout: Duration, limit: usize) -> Result<String> {
+    use std::io::Read;
+    let mut child = ProcessCommand::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to execute {}", path.display()))?;
+    let deadline = std::time::Instant::now() + timeout;
+    let Some(stdout) = child.stdout.take() else {
+        stop_candidate(&mut child)?;
+        bail!("candidate stdout is not captured");
+    };
+    let reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut output = Vec::new();
+        stdout.take(limit as u64 + 1).read_to_end(&mut output)?;
+        Ok(output)
+    });
+    let result = watch_candidate(path, &mut child, reader, deadline, timeout, limit);
+    // Every way out leaves the direct child exited and reaped (an extra
+    // bounded wait after the budget); a failed cleanup keeps both errors.
+    match result {
+        Err(error) => match stop_candidate(&mut child) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error.context(format!("{cleanup:#}"))),
+        },
+        ok => ok,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn watch_candidate(
+    path: &Path,
+    child: &mut std::process::Child,
+    reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    deadline: std::time::Instant,
+    timeout: Duration,
+    limit: usize,
+) -> Result<String> {
+    let mut exited = None;
+    loop {
+        if reader.is_finished() {
+            break;
+        }
+        if exited.is_none() {
+            exited = child
+                .try_wait()
+                .with_context(|| format!("failed to wait for {}", path.display()))?;
+        }
+        if std::time::Instant::now() >= deadline {
+            match exited {
+                // Exited, but something it started keeps the output open.
+                Some(_) => bail!("{} left its output open", path.display()),
+                None => bail!(
+                    "{} did not exit within {}s",
+                    path.display(),
+                    timeout.as_secs()
+                ),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let bytes = reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("reading {} panicked", path.display()))?
+        .with_context(|| format!("failed to read the output of {}", path.display()))?;
+    if bytes.len() > limit {
+        bail!("{} printed more than {limit} bytes", path.display());
+    }
+    // Output complete: the child must exit by the deadline.
+    let status = loop {
+        if let Some(status) = exited {
+            break status;
+        }
+        exited = child
+            .try_wait()
+            .with_context(|| format!("failed to wait for {}", path.display()))?;
+        if exited.is_none() {
+            if std::time::Instant::now() >= deadline {
+                bail!("{} did not exit after printing its version", path.display());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    if !status.success() {
+        bail!("{} exited with {status}", path.display());
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Kills the direct child if it still runs and confirms it was reaped
+/// (bounded: an error when it cannot be confirmed within two seconds).
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn stop_candidate(child: &mut std::process::Child) -> Result<()> {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return Ok(());
+    }
+    let killed = child.kill();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => bail!(
+                "candidate process {} could not be stopped ({killed:?})",
+                child.id()
+            ),
+            Err(error) => {
+                return Err(error)
+                    .context(format!("failed to reap candidate process {}", child.id()));
+            }
+        }
+    }
+}
+
+/// Exclusive lock of an installation directory's fixed-source update, held
+/// until the returned value is dropped; a second update fails at once. On
+/// Unix the directory itself is locked (nothing to delete or replace); on
+/// Windows `<candidate prefix>lock` next to the executable is held open
+/// without sharing, so neither another update nor `uninstall` can open or
+/// delete it meanwhile. The lock covers this command only: on Windows the
+/// replacement helper it starts runs after it returns and is not serialized.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn lock_update_directory(directory: &Path) -> Result<fs::File> {
+    let busy = || {
+        anyhow::anyhow!(
+            "another {brand_binary} update is running in {}",
+            directory.display(),
+            brand_binary = BRAND.binary_name
+        )
+    };
+    #[cfg(unix)]
+    {
+        let file = fs::File::open(directory)
+            .with_context(|| format!("failed to open {}", directory.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(fs::TryLockError::WouldBlock) => Err(busy()),
+            Err(fs::TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("failed to lock {}", directory.display()))
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        let path = directory.join(format!("{}lock", BRAND.update.candidate_prefix));
+        match OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .share_mode(0)
+            .open(&path)
+        {
+            Ok(file) => Ok(file),
+            Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => Err(busy()),
+            Err(error) => Err(error).with_context(|| format!("failed to lock {}", path.display())),
+        }
+    }
+}
+
 fn write_update_candidate(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
     #[cfg(unix)]
@@ -7175,7 +7852,8 @@ fn write_update_candidate(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn command_stdout(path: &Path, args: &[&str]) -> Result<String> {
+/// Standard output of a successful run, as printed (lossy UTF-8).
+fn command_stdout_raw(path: &Path, args: &[&str]) -> Result<String> {
     let output = ProcessCommand::new(path)
         .args(args)
         .stdin(Stdio::null())
@@ -7189,7 +7867,18 @@ fn command_stdout(path: &Path, args: &[&str]) -> Result<String> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Whether `--version` output is exactly `<binary> <version>`, optionally
+/// followed by one line ending (`\n` or `\r\n`), nothing else.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn reports_exact_version(output: &str, binary: &str, version: &str) -> bool {
+    let line = output
+        .strip_suffix("\r\n")
+        .or_else(|| output.strip_suffix('\n'))
+        .unwrap_or(output);
+    line == format!("{binary} {version}")
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -8854,6 +9543,27 @@ fn write_app_config_at(path: &Path, config: &AppConfig) -> Result<()> {
         )
     })?;
     write_json_object(path, value)
+}
+
+/// The configuration, or `None` when none was written yet; a configuration
+/// that exists but cannot be read or parsed is an error.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn read_app_config_if_present() -> Result<Option<AppConfig>> {
+    read_app_config_at_if_present(&app_config_path()?)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn read_app_config_at_if_present(path: &Path) -> Result<Option<AppConfig>> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        _ => {
+            let raw = fs::read_to_string(path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            serde_json::from_str(&raw)
+                .map(Some)
+                .with_context(|| format!("failed to parse {}", path.display()))
+        }
+    }
 }
 
 fn read_app_config() -> Result<AppConfig> {
@@ -10801,8 +11511,9 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             .block_on(check_gateway_health(
                 &format!("http://127.0.0.1:{port}"),
                 &Egress {
-                    installation_ca_pem: String::new(),
+                    installation_ca_pem: Some(String::new()),
                     upstream: upstream_proxy::Snapshot::direct_for_tests(),
+                    resolve: Vec::new(),
                 },
             ))
             .unwrap_err();

@@ -6,7 +6,7 @@
 
 use proxy_cli::{
     Brand, CertificateNames, ConfigNames, EnvironmentNames, OwnershipMarkers,
-    PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
+    PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames, UpdateSource,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -90,7 +90,12 @@ fn saiai_brand_values_are_frozen() {
     assert_eq!(service.lock_filename, "saiai.lock");
     assert_eq!(service.log_filename, "saiai.log");
     let update = &brand.update;
-    assert_eq!(update.channel_path, "saiai-cli");
+    assert!(matches!(
+        update.source,
+        UpdateSource::GatewayChannel {
+            channel_path: "saiai-cli"
+        }
+    ));
     assert_eq!(update.asset_prefix, "saiai-");
     assert_eq!(update.candidate_prefix, ".saiai-update-");
     assert_eq!(update.backup_prefix, "saiai.bak-");
@@ -334,7 +339,10 @@ fn inline_contract_literals_are_present() {
     for (file, needle) in [
         // Self-update channel below the configured Gateway base URL, and the
         // version prefix an update candidate must print.
-        ("lib.rs", "let channel = BRAND.update.channel_path;"),
+        (
+            "lib.rs",
+            "UpdateSource::GatewayChannel { channel_path } => {\n            let cfg = read_app_config()?;\n            let asset = current_platform_asset_name()?;\n            let (manifest_url, url) = gateway_update_urls(channel_path, &cfg.base_url, &asset);",
+        ),
         ("lib.rs", "\"{base}/{channel}/manifest.json\""),
         ("lib.rs", "\"{base}/{channel}/{asset}\""),
         (
