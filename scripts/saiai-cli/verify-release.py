@@ -917,23 +917,49 @@ PWSH_MASKS = re.compile(
 )
 
 
-def segment_heads(command: str) -> list[str]:
-    """The first word of every command in `command` (after ;, &&, ||, |, &,
-    parentheses, braces, then, do or else)."""
-    segments = re.split(r"\|\||&&|[|;&(){}]|\bthen\b|\bdo\b|\belse\b", command)
-    return [segment.split()[0] for segment in segments if segment.split()]
+SHELL_KEYWORDS = frozenset({"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "for", "case", "esac", "!", "{", "}"})
+
+
+def segment_words(command: str) -> list[list[str]] | None:
+    """The words of every simple command in `command`, quotes removed as the
+    shell removes them (`set '-n'` is `set -n`); None when the command
+    cannot be read that way."""
+    import shlex
+
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token and all(char in "();<>|&" for char in token) or token in SHELL_KEYWORDS:
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    return [words for words in segments if words]
+
+
+def segment_heads(command: str) -> list[str] | None:
+    """The first word of every simple command in `command`."""
+    segments = segment_words(command)
+    return None if segments is None else [words[0] for words in segments]
 
 
 def bash_masks(command: str) -> bool:
     if BASH_MASKS.search(command):
         return True
-    for segment in re.split(r"\|\||&&|[|;&(){}]|\bthen\b|\bdo\b|\belse\b", command):
-        words = segment.split()
-        if words and words[0] in BASH_MASK_WORDS:
+    segments = segment_words(command)
+    if segments is None:
+        return True
+    for words in segments:
+        if words[0] in BASH_MASK_WORDS:
             return True
         # `set -euo pipefail` is fine; `set +e` / `set +o errexit` turn
         # failures off and `set -n` / `set -o noexec` stop running commands.
-        if words and words[0] == "set" and any(
+        if words[0] == "set" and any(
             word.startswith("+") or re.fullmatch(r"-[A-Za-z]*n[A-Za-z]*", word) or word == "noexec"
             for word in words[1:]
         ):
@@ -1098,6 +1124,8 @@ def check_workflow_basics(relative: str, workflow: dict) -> None:
     require("defaults" not in workflow, f"{relative} must not change step defaults")
     for name, value in (workflow.get("env") or {}).items():
         require(name != FOREIGN_NAMES_ENV or value == "saiai", f"{relative} overrides {FOREIGN_NAMES_ENV}")
+    moves: list[tuple] = []
+    env_writes: list[tuple] = []
     for job_id, job in workflow["jobs"].items():
         require(isinstance(job, dict), f"{relative} job {job_id} is not a mapping")
         require("uses" not in job, f"{relative} job {job_id} calls another workflow")
@@ -1123,21 +1151,26 @@ def check_workflow_basics(relative: str, workflow: dict) -> None:
             if isinstance(script, str):
                 for forbidden in (FOREIGN_NAMES_ENV, "GITHUB_PATH"):
                     require(forbidden not in script, f"{label} touches {forbidden}")
-                # The one directory change: into the stand-alone kernel copy.
-                moves = [
-                    command for command, _ in logical_commands(script, "bash")
-                    if any(word in ("cd", "pushd", "popd") for word in segment_heads(command))
-                ]
-                require(
-                    not moves or (relative == CI_WORKFLOW and job_id == "client-linux" and moves == [STANDALONE_KERNEL_CD]),
-                    f"{label} changes directory: {moves}",
-                )
-                if "GITHUB_ENV" in script:
-                    writes = [command for command, _ in logical_commands(script, "bash") if "GITHUB_ENV" in command]
-                    require(
-                        relative == CI_WORKFLOW and job_id == "aitp-release-linux" and writes == [AITP_PROGRAM_ENV_WRITE],
-                        f"{label} touches GITHUB_ENV",
-                    )
+                for command, _ in logical_commands(script, "bash"):
+                    heads = segment_heads(command)
+                    # A command the quote reader cannot follow counts if it
+                    # names a directory change anywhere.
+                    unreadable = heads is None and re.search(r"cd|pushd|popd", command) is not None
+                    if unreadable or any(head in ("cd", "pushd", "popd") for head in heads or ()):
+                        moves.append((job_id, step.get("name"), command))
+                    if "GITHUB_ENV" in command:
+                        env_writes.append((job_id, step.get("name"), command))
+    # The one directory change (into the stand-alone kernel copy) and the
+    # one environment file write (the AITP program's path), each in its own
+    # step, exactly once in the workflow.
+    require(
+        moves == ([("client-linux", "Test the kernel on its own", STANDALONE_KERNEL_CD)] if relative == CI_WORKFLOW else []),
+        f"{relative} changes directory outside the stand-alone kernel step: {moves}",
+    )
+    require(
+        env_writes == ([("aitp-release-linux", "Build the AITP release with remapped paths", AITP_PROGRAM_ENV_WRITE)] if relative == CI_WORKFLOW else []),
+        f"{relative} touches GITHUB_ENV outside the AITP release build: {env_writes}",
+    )
 
 
 def runs_command(

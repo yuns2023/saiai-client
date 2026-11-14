@@ -402,7 +402,7 @@ class AitpArtifactTests(unittest.TestCase):
         for path, old, new, message in (
             (VERIFIER.AITP_RELEASE_BUILD, '--target "$triple"', "", "build script is missing"),
             (".github/workflows/saiai-cli-release.yml", "          python3 scripts/saiai-cli/verify-release.py\n", "          bash tools/saiai-cli/kernel/scripts/build-release.sh\n          python3 scripts/saiai-cli/verify-release.py\n", "must not use"),
-            (".github/workflows/ci.yml", '          echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"\n', "", "AITP release hand-over"),
+            (".github/workflows/ci.yml", '          echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"\n', "", "AITP release hand-over|GITHUB_ENV outside"),
             (".github/workflows/ci.yml", '          --aitp-artifact "$AITP_PROGRAM"\n', "", "AITP release path check"),
             (".github/workflows/ci.yml", "          cargo test --locked --target-dir \"$standalone/target\"\n", "", "stand-alone kernel tests"),
             (VERIFIER.AITP_RELEASE_BUILD, "--remap-path-prefix=", "--no-remap=", "build script is missing"),
@@ -693,6 +693,24 @@ class WorkflowStructureTests(unittest.TestCase):
             "changes directory",
         )
         self.rejects(CI, CARGO_TEST, "        run: |\n          cd tools && cd ..\n          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace\n", "changes directory")
+
+    def test_quoted_shell_words_are_read_as_the_shell_reads_them(self) -> None:
+        c = "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace"
+        for script in (f"set '-n'\n          {c}", f'set -o "noexec"\n          {c}', f"s\"et\" -n\n          {c}"):
+            with self.subTest(script=script):
+                self.rejects(CI, CARGO_TEST, f"        run: |\n          {script}\n", "does not run")
+        self.rejects(CI, CARGO_TEST, f'        run: |\n          "cd" /tmp\n          {c}\n', "changes directory")
+        # The exceptions belong to one step each, once per workflow.
+        self.rejects(
+            CI, "      - name: Format\n",
+            '      - name: Kernel again\n        run: |\n          standalone="$(mktemp -d)"\n          cd "$standalone/kernel"\n\n      - name: Format\n',
+            "changes directory outside the stand-alone kernel step",
+        )
+        self.rejects(
+            CI, "      - name: Verify the AITP release names no build path\n",
+            '      - name: Hand over again\n        run: |\n          aitp=/bin/true\n          echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"\n\n      - name: Verify the AITP release names no build path\n',
+            "GITHUB_ENV outside the AITP release build",
+        )
 
     def test_expression_reader(self) -> None:
         context = {"runner.os": "macOS", "matrix.target": "aarch64-apple-darwin"}
