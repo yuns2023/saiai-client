@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import re
 import sys
@@ -754,11 +755,57 @@ def verify_no_non_test_credentials() -> None:
                 )
 
 
+AITP_BRAND_SOURCE = "tools/saiai-cli/kernel/src/bin/aitp/brand.rs"
+
+
+def aitp_brand_markers() -> list[bytes]:
+    """Distinctive AITP brand strings (from its brand source) that only the
+    AITP program carries; short or generic values are left out."""
+    source = text(AITP_BRAND_SOURCE)
+    values = re.findall(r'b?"((?:[^"\\]|\\.)*)"', source.split("#[cfg(test)]")[0])
+    markers = sorted(
+        {
+            value
+            for value in values
+            if len(value) >= 10 and re.search(r"aitp|2742zdz", value, re.IGNORECASE)
+        }
+    )
+    require(len(markers) >= 10, f"too few AITP brand markers found in {AITP_BRAND_SOURCE}")
+    require(
+        "AITP local installation CA" in markers
+        and "io.github.2742zdz.aitp.local-proxy" in markers,
+        "AITP brand markers miss the CA and service identities",
+    )
+    return [marker.encode() for marker in markers]
+
+
+def verify_artifacts_carry_no_aitp_brand(artifacts: list[Path]) -> None:
+    """Built SAIAI programs contain none of the AITP distribution's data."""
+    markers = aitp_brand_markers()
+    for artifact in artifacts:
+        require(artifact.is_file(), f"release artifact is missing: {artifact}")
+        data = artifact.read_bytes()
+        found = [marker.decode() for marker in markers if marker in data]
+        require(not found, f"{artifact} carries AITP brand data: {found}")
+    if artifacts:
+        print(f"{len(artifacts)} release artifact(s) carry no AITP brand data")
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--artifact",
+        action="append",
+        default=[],
+        type=Path,
+        help="built SAIAI program that must not carry AITP brand data (repeatable)",
+    )
+    arguments = parser.parse_args()
     verify_cli()
     verify_manifest_and_wrappers()
     verify_workflows_and_docs()
     verify_no_non_test_credentials()
+    verify_artifacts_carry_no_aitp_brand(arguments.artifact)
     print("SAIAI local-proxy public release contract verified")
     return 0
 

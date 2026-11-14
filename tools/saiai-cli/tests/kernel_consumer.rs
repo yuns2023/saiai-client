@@ -71,7 +71,8 @@ const KTEST_VALUES: Brand = Brand {
         candidate_prefix: ".ktest-update-",
         backup_prefix: "ktest.bak-",
         status_filename: ".ktest-update-status.txt",
-        windows_setup_command: "ktest-setup",
+        windows_setup_command: Some("ktest-setup"),
+        release_page: None,
     },
     markers: OwnershipMarkers {
         codex_ide_env_begin: "# BEGIN KTEST CODEX IDE",

@@ -2196,11 +2196,19 @@ fn execute_user_path(
     replacement: &str,
 ) -> Result<Outcome> {
     if directory.exists() {
-        return Ok(Outcome::Kept(format!(
-            "{} still exists (a running copy is removed a few seconds after this window's command exits). Rerun after a few seconds: `{brand_windows_setup} uninstall` (it downloads a temporary client, since the installed one is gone)",
-            directory.display(),
-            brand_windows_setup = BRAND.update.windows_setup_command
-        )));
+        return Ok(Outcome::Kept(match BRAND.update.windows_setup_command {
+            Some(setup) => format!(
+                "{} still exists (a running copy is removed a few seconds after this window's command exits). Rerun after a few seconds: `{brand_windows_setup} uninstall` (it downloads a temporary client, since the installed one is gone)",
+                directory.display(),
+                brand_windows_setup = setup
+            ),
+            None => format!(
+                "{} still exists (a running copy is removed a few seconds after this window's command exits). Rerun after a few seconds with a copy of {brand_binary} downloaded from {page}: `{brand_binary} uninstall` (the installed one is gone)",
+                directory.display(),
+                page = BRAND.update.release_page.unwrap_or_default(),
+                brand_binary = BRAND.binary_name
+            ),
+        }));
     }
     powershell(
         &crate::script_brand::render(USER_PATH_SCRIPT),

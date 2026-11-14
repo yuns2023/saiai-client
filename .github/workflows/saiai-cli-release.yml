@@ -282,7 +282,13 @@ jobs:
             --cargo-toml tools/saiai-cli/Cargo.toml \
             --wrappers-dir dist \
             --output dist/manifest.json
-          python3 scripts/saiai-cli/verify-release.py
+          python3 scripts/saiai-cli/verify-release.py \
+            --artifact dist/saiai-linux-x86_64 \
+            --artifact dist/saiai-linux-aarch64 \
+            --artifact dist/saiai-macos-x86_64 \
+            --artifact dist/saiai-macos-aarch64 \
+            --artifact dist/saiai-windows-x86_64.exe \
+            --artifact dist/saiai-windows-aarch64.exe
           python3 scripts/saiai-cli/test-release-bundle.py \
             --bundle dist \
             --setup-sh dist/setup.sh

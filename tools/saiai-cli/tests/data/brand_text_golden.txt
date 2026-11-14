@@ -278,6 +278,7 @@
 ["uninstall.rs","\"value differs from what SAIAI wrote\""]
 ["uninstall.rs","\"{error:#}; it cannot identify a process. Close any remaining SAIAI proxy, delete the state file, then rerun\""]
 ["uninstall.rs","\"{error:#}; it cannot identify a process. Stop any remaining SAIAI proxy, delete the state file, then rerun\""]
+["uninstall.rs","\"{} still exists (a running copy is removed a few seconds after this window's command exits). Rerun after a few seconds with a copy of saiai downloaded from {page}: `saiai uninstall` (the installed one is gone)\""]
 ["uninstall.rs","\"{} still exists (a running copy is removed a few seconds after this window's command exits). Rerun after a few seconds: `irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai uninstall` (it downloads a temporary client, since the installed one is gone)\""]
 ["uninstall.rs","\"{}: keys SAIAI removed during setup (base_url, openai_base_url, chatgpt_base_url, model_providers, features.responses_websockets[_v2])\""]
 ["upstream_proxy.rs","\" (ignored {} pointing at this SAIAI proxy)\""]

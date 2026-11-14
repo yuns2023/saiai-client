@@ -134,6 +134,9 @@ fn validate(brand: &Brand) -> Result<()> {
         }
     }
     validate_update_source(&brand.update.source)?;
+    if brand.update.windows_setup_command.is_none() && brand.update.release_page.is_none() {
+        bail!("brand update needs a windows_setup_command or a release_page");
+    }
     Ok(())
 }
 
@@ -418,7 +421,11 @@ pub struct UpdateNames {
     pub status_filename: &'static str,
     /// PowerShell command that downloads and loads the public setup script,
     /// shown in messages; append a subcommand (`… uninstall`) to run it.
-    pub windows_setup_command: &'static str,
+    /// `None` when the distribution publishes no setup script.
+    pub windows_setup_command: Option<&'static str>,
+    /// Page where users download the program by hand, shown in messages
+    /// when there is no setup command.
+    pub release_page: Option<&'static str>,
 }
 
 /// Origin of the update manifest and release assets.

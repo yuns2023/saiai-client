@@ -50,6 +50,7 @@ jobs:
         run: |
           cargo clippy --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace --features contract --all-targets -- -D warnings
           cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test contract_entry --test saiai_render_contract --test kernel_consumer
+          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p proxy-cli --features contract --bin aitp
 
       # The kernel package (kernel/ alone, as a public repository would hold
       # it) lints with and without the contract entries and passes its own
@@ -80,6 +81,11 @@ jobs:
           cargo clippy --locked --target-dir "$standalone/target" --all-targets -- -D warnings
           cargo clippy --locked --target-dir "$standalone/target" --all-targets --features contract -- -D warnings
           cargo test --locked --target-dir "$standalone/target"
+          # The AITP program: its brand installs and renders its services
+          # (contract entries), and a release build runs.
+          cargo test --locked --target-dir "$standalone/target" --features contract --bin aitp
+          cargo build --locked --target-dir "$standalone/target" --release --bin aitp
+          "$standalone/target/release/aitp" --version
 
       - name: Verify official Codex daemon initialization without model turns
         env:
@@ -153,6 +159,7 @@ jobs:
           cp "tools/saiai-cli/target/${{ matrix.target }}/release/saiai" "dist/${{ matrix.asset }}"
           chmod +x "dist/${{ matrix.asset }}"
           python3 scripts/saiai-cli/verify-linux-portability.py "dist/${{ matrix.asset }}"
+          python3 scripts/saiai-cli/verify-release.py --artifact "dist/${{ matrix.asset }}"
           "dist/${{ matrix.asset }}" --version
           "dist/${{ matrix.asset }}" --help >/dev/null
 

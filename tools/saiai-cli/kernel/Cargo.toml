@@ -14,6 +14,12 @@ publish = false
 name = "proxy_cli"
 path = "src/lib.rs"
 
+# The AITP distribution: the kernel with the AITP names, no Gateway
+# extension, updated from the project's GitHub releases.
+[[bin]]
+name = "aitp"
+path = "src/bin/aitp/main.rs"
+
 [features]
 # Test entry points for a distribution's contract tests (see `contract`);
 # never enabled for a release build.

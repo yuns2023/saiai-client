@@ -66,7 +66,10 @@ pub const SAIAI_VALUES: Brand = Brand {
         candidate_prefix: ".saiai-update-",
         backup_prefix: "saiai.bak-",
         status_filename: ".saiai-update-status.txt",
-        windows_setup_command: "irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai",
+        windows_setup_command: Some(
+            "irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai",
+        ),
+        release_page: None,
     },
     markers: OwnershipMarkers {
         codex_ide_env_begin: "# BEGIN SAIAI CODEX IDE (managed)",
