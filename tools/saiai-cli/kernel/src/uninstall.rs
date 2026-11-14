@@ -2076,7 +2076,9 @@ foreach($file in ($env:@@ENV@@CA_FILES -split "`n")){
   if([string]::IsNullOrWhiteSpace($file)){continue}
   if(-not (Test-Path -LiteralPath $file -PathType Leaf)){continue}
   try{ $pem=[IO.File]::ReadAllText($file) }catch{ $errors.Add("${file}: $($_.Exception.Message)"); continue }
-  foreach($m in [regex]::Matches($pem,'-----BEGIN CERTIFICATE-----(?<der>[A-Za-z0-9+/=\s]+)-----END CERTIFICATE-----')){
+  $blocks=[regex]::Matches($pem,'-----BEGIN CERTIFICATE-----(?<der>.*?)-----END CERTIFICATE-----',[Text.RegularExpressions.RegexOptions]::Singleline)
+  if(([regex]::Matches($pem,'-----BEGIN CERTIFICATE-----')).Count -ne $blocks.Count){ $errors.Add("${file}: unterminated certificate block") }
+  foreach($m in $blocks){
     try{
       $raw=[Convert]::FromBase64String($m.Groups['der'].Value)
       $c=[Security.Cryptography.X509Certificates.X509Certificate2]::new($raw)
@@ -2144,7 +2146,8 @@ fn root_certificates(
     let list = |key: &str| -> std::result::Result<Vec<Value>, String> {
         match value.get(key) {
             Some(Value::Array(values)) => Ok(values.clone()),
-            Some(Value::Null) | None => Ok(Vec::new()),
+            Some(Value::Null) => Ok(Vec::new()),
+            None => Err(format!("inspection output without {key}")),
             Some(single @ (Value::Object(_) | Value::String(_))) => Ok(vec![single.clone()]),
             Some(other) => Err(format!("unexpected inspection {key}: {other}")),
         }
@@ -3054,8 +3057,11 @@ mod tests {
             "",
             "not json",
             "[]",
-            r#"{"present": 3}"#,
-            r#"{"present": [{"der": "x"}]}"#,
+            "{}",
+            r#"{"unexpected": true}"#,
+            r#"{"present": []}"#,
+            r#"{"present": 3, "errors": []}"#,
+            r#"{"present": [{"der": "x"}], "errors": []}"#,
         ] {
             assert!(root_certificates(output, &[]).is_err(), "{output}");
         }

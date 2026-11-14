@@ -59,12 +59,6 @@ pub(crate) fn classify_certificate(der: &[u8]) -> anyhow::Result<CertificateOwne
         .map(|attribute| attribute.as_str())
         .collect::<Result<Vec<&str>, _>>()
         .map_err(|error| anyhow::anyhow!("certificate organization does not decode: {error}"))?;
-    if organizations
-        .iter()
-        .any(|organization| *organization == BRAND.certificates.ca_organization)
-    {
-        return Ok(CertificateOwner::Ours);
-    }
     let common_names = subject
         .iter_common_name()
         .map(|attribute| attribute.as_str())
@@ -74,6 +68,12 @@ pub(crate) fn classify_certificate(der: &[u8]) -> anyhow::Result<CertificateOwne
         .basic_constraints()
         .map_err(|error| anyhow::anyhow!("certificate constraints do not decode: {error}"))?
         .is_some_and(|constraints| constraints.value.ca);
+    if organizations
+        .iter()
+        .any(|organization| *organization == BRAND.certificates.ca_organization)
+    {
+        return Ok(CertificateOwner::Ours);
+    }
     let self_issued = certificate.issuer() == subject;
     Ok(match (common_names.as_slice(), organizations.first()) {
         ([common_name], Some(organization))
