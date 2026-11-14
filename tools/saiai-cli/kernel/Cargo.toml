@@ -35,6 +35,8 @@ hkdf = "0.12"
 p256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa", "pkcs8", "std"] }
 rand = "0.10"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+# Ed25519 verification of signed update manifests; already built for rcgen.
+ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 rustls = "0.23"
 rustls-native-certs = "0.8"
