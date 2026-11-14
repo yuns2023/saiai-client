@@ -327,15 +327,21 @@ fn initialization_writes_only_aitp_names() {
     // Not started (AITP_SKIP_START): status reads the configuration and
     // succeeds.
     let status = sandbox.run(&["status"]);
-    let config_path = sandbox.home.join(".aitp/config.json");
-    assert!(
-        status.starts_with(&format!(
-            "aitp {}\nconfig: {}\nbase_url: {gateway}\n",
-            env!("CARGO_PKG_VERSION"),
-            config_path.display()
-        )),
+    let lines: Vec<&str> = status.lines().collect();
+    assert!(lines.len() >= 3, "{status}");
+    assert_eq!(
+        lines[0],
+        format!("aitp {}", env!("CARGO_PKG_VERSION")),
         "{status}"
     );
+    // The same file, however the platform spells the path.
+    let reported = lines[1].strip_prefix("config: ").expect(&status);
+    assert_eq!(
+        std::fs::canonicalize(reported).unwrap(),
+        std::fs::canonicalize(sandbox.home.join(".aitp").join("config.json")).unwrap(),
+        "{status}"
+    );
+    assert_eq!(lines[2], format!("base_url: {gateway}"), "{status}");
     sandbox.assert_only_aitp_names();
 }
 
