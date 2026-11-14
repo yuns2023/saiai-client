@@ -150,6 +150,7 @@ fn direct() -> Egress {
         installation_ca_pem: None,
         upstream: upstream_proxy::UpstreamProxy::new(Some("direct"), None, Vec::new()).snapshot(),
         resolve: Vec::new(),
+        test_ca_pem: None,
     }
 }
 
@@ -526,6 +527,7 @@ async fn every_hop_is_routed_for_its_own_target() {
         )
         .snapshot(),
         resolve: Vec::new(),
+        test_ca_pem: None,
     };
     let policy = FixedUrlPolicy {
         hosts: &["updates.invalid", "127.0.0.1"],
@@ -578,6 +580,7 @@ async fn a_failing_proxy_fails_the_request_without_going_direct() {
             "updates.invalid".to_string(),
             SocketAddr::from(([127, 0, 0, 1], origin.port)),
         )],
+        test_ca_pem: None,
     };
     let ports = [origin.port];
     let policy = FixedUrlPolicy {
@@ -638,6 +641,7 @@ async fn requests_carry_no_credentials_across_hosts() {
         )
         .snapshot(),
         resolve: Vec::new(),
+        test_ca_pem: None,
     };
     let policy = FixedUrlPolicy {
         hosts: &["updates.invalid", "127.0.0.1"],
