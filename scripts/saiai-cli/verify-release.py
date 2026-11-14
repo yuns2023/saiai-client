@@ -682,6 +682,8 @@ def verify_workflows_and_docs() -> None:
     remap = text(AITP_RELEASE_BUILD)
     for required in ("--remap-path-prefix=", "-ffile-prefix-map=", "CARGO_ENCODED_RUSTFLAGS", "--bin aitp"):
         require(required in remap, f"AITP release build script is missing {required!r}")
+    for prefix in AITP_NEUTRAL_PREFIXES:
+        require(f" {prefix}\n" in remap, f"AITP release build script does not map to {prefix}")
     for required in (
         'CARGO_TARGET_DIR="$standalone/target" bash scripts/build-release.sh --locked',
         '--aitp-artifact "$standalone/target/release/aitp"',
@@ -843,12 +845,19 @@ def build_machine_paths(build_dirs: list[Path], environ) -> list[str]:
     return paths
 
 
+# The neutral prefixes build-release.sh maps the build machine's paths to.
+AITP_NEUTRAL_PREFIXES = ("/aitp/home", "/aitp/rustup", "/aitp/cargo", "/aitp/src", "/aitp/target")
+
+
 def names_path(view: bytes, path: str) -> bool:
-    """Whether `view` (see `path_view`) holds `path` as a whole directory:
-    not followed by another file name character, so `/build/ai` does not
-    match `/build/aitp`."""
-    pattern = re.escape(path_view(path.encode())) + rb"(?![a-z0-9._+~-])"
-    return re.search(pattern, view) is not None
+    """Whether `view` (see `path_view`) holds `path` anywhere, as a plain
+    substring (strings in a program sit next to each other without a
+    separator, so no boundary is required). Only the neutral prefixes are
+    blanked out first, so a build path that happens to be a prefix of one
+    (`HOME=/ait` against `/aitp/src`) is not reported for them."""
+    for prefix in AITP_NEUTRAL_PREFIXES:
+        view = view.replace(prefix.encode(), b"\0" * len(prefix))
+    return path_view(path.encode()) in view
 
 
 def path_view(data: bytes) -> bytes:

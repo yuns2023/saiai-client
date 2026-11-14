@@ -358,11 +358,19 @@ class AitpArtifactTests(unittest.TestCase):
             with self.subTest(leak=leak), self.assertRaisesRegex(AssertionError, "build machine paths"):
                 self.check(self.brand + b" " + leak, build_dirs=[Path("/x")])
 
-    def test_a_path_matches_only_as_a_whole_directory(self) -> None:
-        # The neutral prefixes do not count as a build directory that is
-        # a prefix of their name.
-        self.ENVIRON = {"HOME": "/ait"}
-        self.check(self.brand + b" /aitp/src/lib.rs /aitp/home", build_dirs=[Path("/aitp/s")])
+    def test_neutral_prefixes_are_not_build_paths(self) -> None:
+        # A build path that is a prefix of a neutral prefix's name.
+        self.ENVIRON = {"HOME": "/aitp/hom"}
+        self.check(self.brand + b" /aitp/src/lib.rs /aitp/home", build_dirs=[Path("/aitp/sr")])
+        # ... is still found anywhere else.
+        for leak in (b"/aitp/hom/x", b"/aitp/srx"):
+            with self.subTest(leak=leak), self.assertRaisesRegex(AssertionError, "build machine paths"):
+                self.check(self.brand + b" /aitp/src/lib.rs " + leak, build_dirs=[Path("/aitp/sr")])
+
+    def test_a_build_path_next_to_another_string_is_found(self) -> None:
+        for data in (b"\0/home/builder/work/clientNextString\0", b"/home/builder/work/client@x"):
+            with self.subTest(data=data), self.assertRaisesRegex(AssertionError, "build machine paths"):
+                self.check(self.brand + data)
 
     def test_ci_checks_the_remapped_release_and_saiai_release_does_not(self) -> None:
         def broken(path: str, old: str, new: str):
