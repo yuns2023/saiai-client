@@ -71,6 +71,9 @@ struct Reply {
     head_delay: Duration,
     /// Pause after the head, before the body.
     delay: Duration,
+    /// Send the body in pieces of this many bytes (0: at once), flushing
+    /// and pausing briefly after each.
+    piece: usize,
 }
 
 /// One canned response per (Host, path).
@@ -148,7 +151,19 @@ async fn serve(pki: &Pki, routes: impl FnOnce(u16) -> Routes) -> Server {
                 }
                 let _ = stream.flush().await;
                 tokio::time::sleep(reply.delay).await;
-                let _ = stream.write_all(&reply.body).await;
+                let piece = if reply.piece == 0 {
+                    reply.body.len().max(1)
+                } else {
+                    reply.piece
+                };
+                for chunk in reply.body.chunks(piece) {
+                    if stream.write_all(chunk).await.is_err() || stream.flush().await.is_err() {
+                        return;
+                    }
+                    if reply.piece != 0 {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
                 let _ = stream.shutdown().await;
             });
         }
@@ -443,11 +458,21 @@ async fn https_bodies_are_limited_in_size_and_time() {
     let pki = pki(&[GITHUB]);
     let server = serve(&pki, |_| {
         Routes::from([
-            (route(GITHUB, "/declared"), ok(&[1; 2048])),
+            // The declared length alone must stop it: the body would come
+            // only after the request's whole budget.
+            (
+                route(GITHUB, "/declared"),
+                Reply {
+                    delay: Duration::from_secs(30),
+                    ..ok(&[1; 2048])
+                },
+            ),
+            // No length: pieces each below the limit, together above it.
             (
                 route(GITHUB, "/streamed"),
                 Reply {
                     no_length: true,
+                    piece: 300,
                     ..ok(&[1; 2048])
                 },
             ),
@@ -463,12 +488,18 @@ async fn https_bodies_are_limited_in_size_and_time() {
     })
     .await;
     for path in ["/declared", "/streamed"] {
+        let started = std::time::Instant::now();
         let error = get(&pki, &server, path, 1024, Duration::from_secs(10))
             .await
             .unwrap_err();
         assert!(
             format!("{error:#}").contains("is larger than 1024 bytes"),
             "{path}: {error:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{path}: {:?}",
+            started.elapsed()
         );
     }
     let exact = get(&pki, &server, "/exact", 1024, Duration::from_secs(10))
@@ -488,12 +519,14 @@ async fn https_bodies_are_limited_in_size_and_time() {
 }
 
 /// One deadline covers the whole redirect chain: three hops that each
-/// answer within the budget, but not all together.
+/// answer within the budget, but not all together. The margins (2 s for
+/// one hop, 4 s for the chain) keep a busy machine from flipping either
+/// outcome; a deadline reset per hop lets the chain through.
 #[tokio::test]
 async fn https_redirect_chains_share_one_deadline() {
     let pki = pki(&[GITHUB, ASSETS]);
     let slow = |reply: Reply| Reply {
-        head_delay: Duration::from_millis(700),
+        head_delay: Duration::from_secs(3),
         ..reply
     };
     let server = serve(&pki, |port| {
@@ -510,20 +543,20 @@ async fn https_redirect_chains_share_one_deadline() {
         ])
     })
     .await;
-    // Each hop alone fits in 1.5 s ...
-    let one = get(&pki, &server, "/c", 1024, Duration::from_millis(1500))
+    // Each hop alone (3 s) fits in 5 s, with 2 s to spare ...
+    let one = get(&pki, &server, "/c", 1024, Duration::from_secs(5))
         .await
         .unwrap()
         .unwrap();
     assert_eq!(one, b"late");
-    // ... the chain of three does not.
+    // ... the chain of three (9 s) does not, by 4 s.
     let started = std::time::Instant::now();
-    let error = get(&pki, &server, "/a", 1024, Duration::from_millis(1500))
+    let error = get(&pki, &server, "/a", 1024, Duration::from_secs(5))
         .await
         .unwrap_err();
     assert!(
-        format!("{error:#}").contains("did not complete within 1s"),
+        format!("{error:#}").contains("did not complete within 5s"),
         "{error:#}"
     );
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < Duration::from_secs(8));
 }
