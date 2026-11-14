@@ -2995,8 +2995,9 @@ fn execute(plan: &mut Plan, args: &Args, locks: &mut InstallLocks) {
                         release_lock_of(locks, path);
                         execute_remove_lock_file(path)
                     }
-                    // After the locks are released, another update or
-                    // uninstall may change the directory meanwhile.
+                    // Another update or uninstall may change the
+                    // directory meanwhile (no lock covers it any more, or
+                    // never did).
                     Action::RemoveEmptyDir(path) if serializes_installation_changes() => {
                         execute_remove_empty_dir_concurrently(path)
                     }
