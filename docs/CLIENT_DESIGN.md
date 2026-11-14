@@ -1055,7 +1055,7 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
 | 主钥 | `aitp-release.pub` | `F7823EF82178E6E0` | `RWTg5ngh+D6C99dBN+56y4B/nIF4hSSNbCG86wuZr4Knpg+Lc4KxnAgr` |
 | 恢复钥 | `aitp-recovery.pub` | `30D8EBD4CDEAE8F0` | `RWTw6OrN1OvYMNRnHzX9mhZugihDvcDXMqqpCGfKAIOxZwUnQU1sba/L` |
 
-**核对方式**：以上面完整的 56 字符公钥文本为准（key id 只有 64 位，只用来快速对照，不能代替完整公钥）。维护者核对自己的 `.pub`：第一行是 `untrusted comment: minisign public key <key id>`，第二行逐字等于表中公钥；`python3 tools/saiai-cli/kernel/scripts/release_manifest.py keys` 打印品牌里实际编进程序的 key id 和公钥；对已下载的 manifest 可用 `minisign -V -P <表中公钥> -m aitp-manifest.json` 独立验证。用户首次安装时，应通过与下载渠道不同的渠道（README、发布说明、维护者另行公布处）核对这两段公钥文本。
+**核对方式**：以上面完整的 56 字符公钥文本为准（key id 只有 64 位，只用来快速对照，不能代替完整公钥）。维护者核对自己的 `.pub`：第一行是 `untrusted comment: minisign public key <key id>`，第二行逐字等于表中公钥；`python3 tools/saiai-cli/kernel/scripts/release_manifest.py keys` 打印当前品牌源码声明的 key id 和公钥（它读源码，不证明某个已下载或旧构建的程序用的是这些钥；程序是否内含它们由 `verify-release.py --aitp-artifact` 检查）；对已下载的 manifest 可用 `minisign -V -P <表中公钥> -m aitp-manifest.json` 独立验证。用户首次安装时，应通过与下载渠道独立控制的渠道核对这两段公钥文本：同一 GitHub 仓库的 README、Release 说明与下载地址属于同一控制渠道，不算独立来源；需要维护者另行在独立控制的地方（例如其他账号/站点）公布。
 
 **占位公钥与发布门禁**：`kernel/scripts/release_manifest.py` 的 `PLACEHOLDER_KEYS` 列出首发前用过的两把占位公钥（文本含 `PLACEHOLDER`，字节不是曲线上的点）。`kernel/scripts/build-release.sh` 在品牌含占位或不可用公钥时拒绝构建；`verify-release.py --aitp-artifact` 要求品牌公钥都是真实可用的、每个程序内含品牌全部公钥且不含占位公钥。真实公钥填入后已不再有放行开关；CI 用一份把公钥换回占位的内核副本确认 `build-release.sh` 拒绝，用一个追加了占位公钥的程序副本确认 `verify-release.py` 拒绝，`verify-release.py` 还核对 CI 和 SAIAI 发布工作流里没有任何放行（AITP 自己的发布工作流在 D4 建立时再加同样的检查）。注意：普通的 `cargo build --release` 产出的 `aitp` 带的是当前源码里的公钥，程序本身不做发布检查；唯一的门禁是 `build-release.sh` + `verify-release.py`（含 `--aitp-manifest`），D4 发布工作流必须强制走这两步，不得用其他方式构建或上传发布产物。SAIAI 走 `GatewayChannel`，没有这些字段，更新行为不变。
 
