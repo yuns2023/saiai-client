@@ -1561,6 +1561,25 @@ async fn an_unsigned_or_badly_signed_manifest_stops_before_any_download() {
             "manifest.json.minisig is larger than 4096 bytes",
         ),
         ("empty signature", body.clone(), Some(Vec::new()), "1 lines"),
+        // `latest` moved between the two requests: each file is valid, but
+        // the signature belongs to the other release's manifest.
+        (
+            "signature of another release",
+            body.clone(),
+            Some(primary.sign(&manifest(
+                "9.9.8",
+                &sha256_hex(&bytes),
+                Some(bytes.len() as u64),
+            ))),
+            "does not verify with key",
+        ),
+        // Not even JSON: the signature is what fails first.
+        (
+            "unsigned garbage",
+            b"<html>".to_vec(),
+            Some(signed.clone()),
+            "does not verify with key",
+        ),
     ];
     for (name, manifest_body, signature, expected) in cases {
         let server = serve_with(|_| release_signed(manifest_body, signature, bytes.clone())).await;

@@ -560,6 +560,14 @@ fn manifests_name_schema_one_and_this_distribution() {
         ),
         (format!("\u{feff}{good}"), "expected value"),
         (format!("{good} {{}}"), "trailing characters"),
+        // The same field name, once escaped.
+        (
+            good.replace(
+                r#""version":"9.9.9""#,
+                r#""version":"9.9.9","vers\u0069on":"9.9.8""#,
+            ),
+            "duplicate field `version`",
+        ),
     ] {
         let error = parse(&text).unwrap_err();
         assert!(format!("{error:#}").contains(expected), "{text}: {error:#}");
@@ -573,4 +581,34 @@ fn manifests_name_schema_one_and_this_distribution() {
     ] {
         assert!(!is_sha256_hex(&bad), "{bad}");
     }
+}
+
+/// Every small-order encoding (libsodium's list, written out independently
+/// as hexadecimal here), in both signs, is refused as a trusted key.
+#[test]
+fn every_small_order_key_encoding_is_refused() {
+    let encodings = [
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0100000000000000000000000000000000000000000000000000000000000000",
+        "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+        "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+        "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    ];
+    for hex in encodings {
+        let mut key: Vec<u8> = (0..32)
+            .map(|index| u8::from_str_radix(&hex[2 * index..2 * index + 2], 16).unwrap())
+            .collect();
+        for sign in [0, 0x80] {
+            key[31] = (key[31] & 0x7f) | sign;
+            let mut raw = b"Ed".to_vec();
+            raw.extend([7; 8]);
+            raw.extend(&key);
+            let error = parse_public_key(&b64(&raw)).unwrap_err();
+            assert!(format!("{error:#}").contains("small-order"), "{hex} {sign}");
+        }
+    }
+    // An ordinary key is accepted.
+    parse_public_key(&TestKey::generate().public_text()).unwrap();
 }

@@ -125,7 +125,7 @@ def noisy_padding(line: bytes) -> bytes:
     data = line[:-2]
     value = alphabet.index(data[-1:])
     assert value & 0x0F == 0
-    return data[:-1] + alphabet[value | 1:value | 1 + 1] + b"=="
+    return data[:-1] + bytes([alphabet[value | 1]]) + b"=="
 
 
 MANIFEST = b'{"assets":{},"distribution":"aitp","manifest_schema":1,"version":"9.9.9"}\n'
@@ -228,6 +228,7 @@ class ManifestTests(unittest.TestCase):
             (self.good(assets={"a": {"sha256": "a" * 64}}), "no size"),
             (self.good(assets={"a": {"sha256": "a" * 64, "size": 2097152, "url": "x"}}), "malformed"),
             (self.good().replace(b'"version"', b'"version": "1.2.4", "version"'), "repeats the field 'version'"),
+            (self.good().replace(b'"version"', b'"version": "1.2.4", "vers\\u0069on"'), "repeats the field 'version'"),
             (('{"manifest_schema":1,"distribution":"aitp","version":"1.2.3","assets":{"a":' + asset + ',"a":' + asset + "}}").encode(), "repeats the field 'a'"),
             (b"\xef\xbb\xbf" + self.good(), "not JSON"),
         ]:

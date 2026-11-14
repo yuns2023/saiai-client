@@ -89,7 +89,7 @@ if [[ "${AITP_ALLOW_PLACEHOLDER_SIGNING_KEY:-}" != "1" ]]; then
   python3 -B "$kernel/scripts/release_manifest.py" keys --require-real >&2 || status=$?
   case "$status" in
     0) ;;
-    3) fail "the update signing keys are placeholders (AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1 only for builds that are never published)" ;;
+    3) fail "the update signing keys are placeholders or unusable (AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1 only for builds that are never published)" ;;
     *) fail "cannot read the update signing keys (release_manifest.py exited $status)" ;;
   esac
 fi

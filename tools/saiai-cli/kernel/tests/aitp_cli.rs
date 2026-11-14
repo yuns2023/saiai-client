@@ -1086,6 +1086,17 @@ fn brand_signing_keys() -> Vec<String> {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/aitp/brand.rs"),
     )
     .unwrap();
+    let keys = signing_keys_in(&source);
+    assert!(
+        !keys.is_empty() && keys.iter().all(|key| key.len() == 56),
+        "{keys:?}"
+    );
+    keys
+}
+
+/// The string literals of the one `signing_keys: &[ ... ]` list before the
+/// tests in a brand source.
+fn signing_keys_in(source: &str) -> Vec<String> {
     let body = source.split("#[cfg(test)]").next().unwrap();
     let mut parts = body.split("signing_keys: &[");
     let rest = parts.nth(1).expect("the brand declares its signing keys");
@@ -1111,10 +1122,6 @@ fn brand_signing_keys() -> Vec<String> {
             break;
         }
     }
-    assert!(
-        !keys.is_empty() && keys.iter().all(|key| key.len() == 56),
-        "{keys:?}"
-    );
     keys
 }
 
@@ -1197,7 +1204,10 @@ impl Sandbox {
 /// a program): the last component that can grow without a longer number,
 /// later components reset to the smallest number of their length.
 fn next_version() -> String {
-    let version = env!("CARGO_PKG_VERSION");
+    next_version_after(env!("CARGO_PKG_VERSION"))
+}
+
+fn next_version_after(version: &str) -> String {
     let parts: Vec<&str> = version.split('.').collect();
     for index in (0..parts.len()).rev() {
         let grown = (parts[index].parse::<u64>().unwrap() + 1).to_string();
@@ -1222,7 +1232,7 @@ fn next_version() -> String {
 
 /// Replaces `from` with `to` where it stands alone (no digit or dot right
 /// before or after), as the program's version text does.
-#[cfg(not(target_os = "linux"))]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn replace_version(program: &mut [u8], from: &str, to: &str) {
     let (from, to) = (from.as_bytes(), to.as_bytes());
     assert_eq!(from.len(), to.len());
@@ -1639,4 +1649,34 @@ fn update_trusts_the_recovery_key() {
     );
     assert!(text.contains("(remote aitp 0.0.1)"), "{text}");
     assert!(!text.contains("Downloading:"), "{text}");
+}
+
+/// The test helpers that read the brand source and edit program copies.
+#[test]
+fn test_helpers_read_keys_and_versions_exactly() {
+    let source = r#"
+        signing_keys: &[
+            // primary // with "quotes" ] and brackets
+            "RWT//////////+a", // trailing
+            "RWQb",
+        ],
+        #[cfg(test)]
+        signing_keys: &["ignored"]
+    "#;
+    assert_eq!(signing_keys_in(source), ["RWT//////////+a", "RWQb"]);
+    for (version, next) in [
+        ("0.1.0", "0.1.1"),
+        ("0.1.9", "0.2.0"),
+        ("1.9.9", "2.0.0"),
+        ("0.10.99", "0.11.10"),
+        ("3.4.5", "3.4.6"),
+    ] {
+        assert_eq!(next_version_after(version), next, "{version}");
+    }
+    let mut program = b"0.1.0 x10.1.0 0.1.00 a0.1.0b 0.1.0".to_vec();
+    replace_version(&mut program, "0.1.0", "0.1.1");
+    assert_eq!(program, b"0.1.1 x10.1.0 0.1.00 a0.1.1b 0.1.1");
+    let mut program = b"aaa KEYKEY bbb".to_vec();
+    replace_bytes(&mut program, b"KEYKEY", b"NEWKEY", 1);
+    assert_eq!(program, b"aaa NEWKEY bbb");
 }
