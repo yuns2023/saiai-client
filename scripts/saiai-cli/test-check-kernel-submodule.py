@@ -5,18 +5,28 @@ stand-in for AITP and a workspace that pins it as tools/saiai-cli/kernel."""
 from __future__ import annotations
 
 import importlib.util
+import io
 import os
 import shutil
-import sys
 import subprocess
+import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent / "check-kernel-submodule.py"
 SPEC = importlib.util.spec_from_file_location("check_kernel_submodule", SCRIPT)
 CHECK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CHECK)
+
+
+def no_network(*arguments, **options):
+    raise AssertionError("a test reached the network (inject runs=...)")
+
+
+# No test may call the real GitHub API.
+CHECK.urllib.request.urlopen = no_network
 
 KERNEL = CHECK.KERNEL_PATH
 GITMODULES = f'[submodule "{KERNEL}"]\n\tpath = {KERNEL}\n\turl = {CHECK.AITP_URL}\n'
@@ -133,7 +143,7 @@ class KernelSubmoduleTests(unittest.TestCase):
         self.assertFinds("is not on main")
 
     def test_rejects_an_unreachable_repository(self) -> None:
-        findings = CHECK.check(self.root, False, url=str(self.root / "missing"))
+        findings = CHECK.check(self.root, False, url=str(self.root / "missing"), runs=passed_runs, environ={})
         self.assertTrue(any("cannot fetch main" in finding for finding in findings), findings)
 
     def test_rejects_another_checked_out_commit(self) -> None:
@@ -302,7 +312,7 @@ class KernelSubmoduleTests(unittest.TestCase):
         sha = "a" * 40
 
         def runs(*listed):
-            return lambda pinned, token: {"workflow_runs": list(listed)}
+            return lambda pinned, token: {"total_count": len(listed), "workflow_runs": list(listed)}
 
         self.assertEqual(CHECK.check_ci_run(sha, runs(ci_run(sha)), {}), [])
         # A failed run next to a successful one (a rerun) passes.
@@ -336,6 +346,63 @@ class KernelSubmoduleTests(unittest.TestCase):
                 findings = CHECK.check_ci_run(sha, runs, {})
                 self.assertTrue(any(message in finding for finding in findings), findings)
 
+    def test_a_truncated_listing_without_success_fails(self) -> None:
+        sha = "a" * 40
+        listed = {"total_count": 150, "workflow_runs": [ci_run(sha, conclusion="failure")] * 100}
+        findings = CHECK.check_ci_run(sha, lambda pinned, token: listed, {})
+        self.assertTrue(any("not listed completely" in finding for finding in findings), findings)
+        listed["workflow_runs"] = listed["workflow_runs"][:99] + [ci_run(sha)]
+        self.assertEqual(CHECK.check_ci_run(sha, lambda pinned, token: listed, {}), [])
+
+    def test_errors_never_print_the_token(self) -> None:
+        secret = "ghs_SECRETTOKENVALUE"
+
+        def leaky(pinned, token):
+            raise ValueError(f"Invalid header value b'Bearer {token}\\n'")
+
+        def http(pinned, token):
+            raise urllib.error.HTTPError("https://api.github.com/x", 403, f"Bearer {token}", {}, None)
+
+        for runs, expected in ((leaky, "ValueError"), (http, "HTTP 403")):
+            findings = CHECK.check_ci_run("a" * 40, runs, {"GITHUB_TOKEN": secret})
+            self.assertTrue(any(expected in finding for finding in findings), findings)
+            self.assertNotIn(secret, "\n".join(findings))
+
+    def test_the_request_and_its_failures(self) -> None:
+        seen = []
+
+        def answer(body):
+            def opener(request, timeout):
+                seen.append((request.full_url, dict(request.header_items()), timeout))
+                if isinstance(body, Exception):
+                    raise body
+                return io.BytesIO(body)
+            return opener
+
+        sha = "a" * 40
+        try:
+            CHECK.urllib.request.urlopen = answer(b'{"total_count": 0, "workflow_runs": []}')
+            self.assertEqual(CHECK.list_ci_runs(sha, "tok"), {"total_count": 0, "workflow_runs": []})
+            url, headers, timeout = seen[-1]
+            self.assertEqual(
+                url,
+                f"https://api.github.com/repos/2742zdz/AITP/actions/runs?head_sha={sha}&event=push&branch=main&per_page=100",
+            )
+            self.assertEqual(headers.get("Authorization"), "Bearer tok")
+            self.assertEqual(timeout, CHECK.API_TIMEOUT)
+            CHECK.list_ci_runs(sha, None)
+            self.assertNotIn("Authorization", seen[-1][1])
+            for body, expected in (
+                (b"not json", "JSONDecodeError"),
+                (urllib.error.HTTPError("u", 404, "x", {}, None), "HTTP 404"),
+                (TimeoutError(), "TimeoutError"),
+            ):
+                CHECK.urllib.request.urlopen = answer(body)
+                findings = CHECK.check_ci_run(sha, environ={})
+                self.assertTrue(any(expected in finding for finding in findings), findings)
+        finally:
+            CHECK.urllib.request.urlopen = no_network
+
     def test_ci_runs_use_the_environment_token(self) -> None:
         seen = []
 
@@ -350,7 +417,7 @@ class KernelSubmoduleTests(unittest.TestCase):
 
     def test_the_whole_check_runs_the_ci_check_only_online(self) -> None:
         def missing(pinned, token):
-            return {"workflow_runs": []}
+            return {"total_count": 0, "workflow_runs": []}
 
         online = CHECK.check(self.root, False, url=str(self.aitp), runs=missing, environ={})
         self.assertTrue(any("has no push run" in finding for finding in online), online)

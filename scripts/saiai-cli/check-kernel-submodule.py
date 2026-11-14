@@ -283,10 +283,16 @@ def check_ci_run(pinned: str, runs=list_ci_runs, environ=os.environ) -> list[str
     try:
         listed = runs(pinned, token)
     except Exception as error:  # network, HTTP status, timeout, bad JSON
-        return [f"cannot list AITP's CI runs for {pinned}: {type(error).__name__}: {error}"]
+        # Only the type and an HTTP status: an exception's text may quote
+        # the request's headers, token included.
+        status = getattr(error, "code", None)
+        detail = f" (HTTP {status})" if isinstance(status, int) else ""
+        return [f"cannot list AITP's CI runs for {pinned}: {type(error).__name__}{detail}"]
     workflow_runs = listed.get("workflow_runs") if isinstance(listed, dict) else None
     if not isinstance(workflow_runs, list):
         return [f"AITP's CI runs for {pinned} are unreadable"]
+    total = listed.get("total_count")
+    complete = isinstance(total, int) and total <= len(workflow_runs)
     matching = [
         run for run in workflow_runs
         if isinstance(run, dict)
@@ -295,9 +301,13 @@ def check_ci_run(pinned: str, runs=list_ci_runs, environ=os.environ) -> list[str
         and run.get("head_branch") == AITP_BRANCH
         and run.get("path") == AITP_CI_WORKFLOW
     ]
+    succeeded = any(run.get("status") == "completed" and run.get("conclusion") == "success" for run in matching)
+    if not succeeded and not complete:
+        # Only the first page is read (100 runs of one commit).
+        return [f"AITP's CI runs for {pinned} were not listed completely ({total} runs); no successful run among them"]
     if not matching:
         return [f"AITP's CI ({AITP_CI_WORKFLOW}) has no push run on {AITP_BRANCH} for {pinned}"]
-    if not any(run.get("status") == "completed" and run.get("conclusion") == "success" for run in matching):
+    if not succeeded:
         states = sorted({f"{run.get('status')}/{run.get('conclusion')}" for run in matching})
         return [f"AITP's CI ({AITP_CI_WORKFLOW}) has not succeeded for {pinned} on {AITP_BRANCH}: {states}"]
     return []
