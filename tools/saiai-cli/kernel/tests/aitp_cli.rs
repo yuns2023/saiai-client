@@ -382,7 +382,11 @@ fn update_asks_the_release_channel_without_initialization() {
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .filter(|name| name.to_string_lossy().starts_with(".aitp-update-"))
-        .filter(|name| name.to_string_lossy() != ".aitp-update-lock")
+        // The installation-directory lock files (Windows) stay.
+        .filter(|name| {
+            ![".aitp-update-lock", ".aitp-update-helper-lock"]
+                .contains(&name.to_string_lossy().as_ref())
+        })
         .collect();
     assert!(staged.is_empty(), "{staged:?}");
     let other = other_brand();
