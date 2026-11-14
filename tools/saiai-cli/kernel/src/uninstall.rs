@@ -2927,6 +2927,34 @@ fn release_lock_of(locks: &mut InstallLocks, path: &Path) {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn release_lock_of(_locks: &mut InstallLocks, _path: &Path) {}
 
+fn serializes_installation_changes() -> bool {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    {
+        crate::serializes_installation_changes()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        false
+    }
+}
+
+/// Like [`execute_remove_empty_dir`], for a directory another process may
+/// change between the check and the removal: gone meanwhile is absent, no
+/// longer empty is kept.
+fn execute_remove_empty_dir_concurrently(path: &Path) -> Result<Outcome> {
+    execute_remove_empty_dir(path).or_else(concurrent_removal_outcome)
+}
+
+fn concurrent_removal_outcome(error: anyhow::Error) -> Result<Outcome> {
+    match error.downcast_ref::<std::io::Error>() {
+        Some(io) if io.kind() == ErrorKind::NotFound => Ok(Outcome::Absent),
+        Some(io) if io.kind() == ErrorKind::DirectoryNotEmpty => {
+            Ok(Outcome::Kept("not empty".into()))
+        }
+        _ => Err(error),
+    }
+}
+
 /// Removes a lock file after its lock was released. Another update or
 /// uninstall that took it meanwhile keeps it: reported, so a rerun after
 /// that one finishes removes it.
@@ -2966,6 +2994,11 @@ fn execute(plan: &mut Plan, args: &Args, locks: &mut InstallLocks) {
                     Action::RemoveFile(path) if is_install_lock_file(path) => {
                         release_lock_of(locks, path);
                         execute_remove_lock_file(path)
+                    }
+                    // After the locks are released, another update or
+                    // uninstall may change the directory meanwhile.
+                    Action::RemoveEmptyDir(path) if serializes_installation_changes() => {
+                        execute_remove_empty_dir_concurrently(path)
                     }
                     action => execute_item(action, args),
                 };
@@ -3436,6 +3469,41 @@ mod tests {
         assert_eq!(
             remove_path_entries(r"C:\Tools;;C:\Users\u\AppData\Local\KTEST\bin2", dir),
             None
+        );
+    }
+
+    #[test]
+    fn a_directory_changed_meanwhile_is_absent_or_kept() {
+        let wrapped = |kind| {
+            Err::<(), _>(std::io::Error::from(kind))
+                .context("failed to remove x")
+                .unwrap_err()
+        };
+        assert_eq!(
+            concurrent_removal_outcome(wrapped(ErrorKind::NotFound)).unwrap(),
+            Outcome::Absent
+        );
+        assert_eq!(
+            concurrent_removal_outcome(wrapped(ErrorKind::DirectoryNotEmpty)).unwrap(),
+            Outcome::Kept("not empty".into())
+        );
+        assert!(concurrent_removal_outcome(wrapped(ErrorKind::PermissionDenied)).is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let dir = directory.path().join("bin");
+        assert_eq!(
+            execute_remove_empty_dir_concurrently(&dir).unwrap(),
+            Outcome::Absent
+        );
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("other"), b"").unwrap();
+        assert!(matches!(
+            execute_remove_empty_dir_concurrently(&dir).unwrap(),
+            Outcome::Kept(_)
+        ));
+        fs::remove_file(dir.join("other")).unwrap();
+        assert_eq!(
+            execute_remove_empty_dir_concurrently(&dir).unwrap(),
+            Outcome::Done
         );
     }
 
