@@ -1052,3 +1052,43 @@ fn existing_saiai_state_is_never_another_programs() {
     );
     assert!(plan.contains("env.https_proxy"), "{plan}");
 }
+
+/// SAIAI's `vscode` keeps its behavior with another program's editor proxy
+/// (no new refusal): it stops at the different explicit proxy, as before.
+#[test]
+fn saiai_vscode_keeps_its_behavior_with_another_programs_editor_proxy() {
+    let sandbox = Sandbox::new();
+    sandbox.run(&mut sandbox.command(&[
+        "init",
+        "--base-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "TEST_ONLY_CONTRACT_KEY",
+    ]));
+    let portable = sandbox.home.with_file_name("vscode-portable");
+    let editor = portable.join("user-data/User/settings.json");
+    std::fs::create_dir_all(editor.parent().unwrap()).unwrap();
+    std::fs::write(
+        &editor,
+        "{\n // AITP managed VSCode proxy: http://127.0.0.1:4000\n \"http.proxy\": \"http://127.0.0.1:4000\"\n}\n",
+    )
+    .unwrap();
+    let before = std::fs::read(&editor).unwrap();
+    let output = sandbox
+        .command(&["vscode"])
+        .env("VSCODE_PORTABLE", &portable)
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("different explicit http.proxy"), "{text}");
+    assert!(
+        !text.contains("managed by another local proxy program"),
+        "{text}"
+    );
+    assert_eq!(std::fs::read(&editor).unwrap(), before);
+}

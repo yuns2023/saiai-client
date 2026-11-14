@@ -98,11 +98,22 @@ impl Sandbox {
     fn output(&self, command: &mut Command) -> (bool, String) {
         let log = self.root.join(format!("run-{}.log", std::process::id()));
         let file = std::fs::File::create(&log).unwrap();
-        let mut child = command
-            .stdout(file.try_clone().unwrap())
-            .stderr(file)
-            .spawn()
-            .unwrap();
+        command.stdout(file.try_clone().unwrap()).stderr(file);
+        // A test running in parallel may fork while another sandbox's copy
+        // of the program is still open for writing ("text file busy").
+        let mut attempts = 0;
+        let mut child = loop {
+            match command.spawn() {
+                Ok(child) => break child,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("{command:?}: {error}"),
+            }
+        };
         let deadline = Instant::now() + Duration::from_secs(120);
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {

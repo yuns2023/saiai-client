@@ -52,24 +52,27 @@ pub(crate) fn classify_certificate(der: &[u8]) -> anyhow::Result<CertificateOwne
     let (_, certificate) = x509_parser::parse_x509_certificate(der)
         .map_err(|error| anyhow::anyhow!("certificate does not parse: {error}"))?;
     let subject = certificate.subject();
-    let organizations: Vec<&str> = subject
+    // An attribute that cannot be read is an error (a caller that deletes
+    // keeps the certificate), never silently skipped.
+    let organizations = subject
         .iter_organization()
-        .filter_map(|attribute| attribute.as_str().ok())
-        .collect();
+        .map(|attribute| attribute.as_str())
+        .collect::<Result<Vec<&str>, _>>()
+        .map_err(|error| anyhow::anyhow!("certificate organization does not decode: {error}"))?;
     if organizations
         .iter()
         .any(|organization| *organization == BRAND.certificates.ca_organization)
     {
         return Ok(CertificateOwner::Ours);
     }
-    let common_names: Vec<&str> = subject
+    let common_names = subject
         .iter_common_name()
-        .filter_map(|attribute| attribute.as_str().ok())
-        .collect();
+        .map(|attribute| attribute.as_str())
+        .collect::<Result<Vec<&str>, _>>()
+        .map_err(|error| anyhow::anyhow!("certificate common name does not decode: {error}"))?;
     let is_ca = certificate
         .basic_constraints()
-        .ok()
-        .flatten()
+        .map_err(|error| anyhow::anyhow!("certificate constraints do not decode: {error}"))?
         .is_some_and(|constraints| constraints.value.ca);
     let self_issued = certificate.issuer() == subject;
     Ok(match (common_names.as_slice(), organizations.first()) {
@@ -160,8 +163,9 @@ pub(crate) fn claude_settings_evidence(settings: &Map<String, Value>) -> Option<
     }
 }
 
-/// One `KEY=value` line of a dotenv file: key and decoded value.
-fn dotenv_assignment(line: &str) -> Option<(&str, String)> {
+/// One `KEY=value` line of a dotenv file: key and decoded value (`None`
+/// when the value cannot be decoded, which makes that key ambiguous).
+fn dotenv_assignment(line: &str) -> Option<(&str, Option<String>)> {
     let mut assignment = line.trim();
     if let Some(rest) = assignment.strip_prefix("export ") {
         assignment = rest.trim_start();
@@ -180,26 +184,28 @@ fn dotenv_assignment(line: &str) -> Option<(&str, String)> {
     }
     let raw = raw.trim();
     let value = if raw.starts_with('"') {
-        serde_json::from_str::<String>(raw).ok()?
-    } else if let Some(inner) = raw
-        .strip_prefix('\'')
-        .and_then(|rest| rest.strip_suffix('\''))
-    {
-        inner.to_string()
+        serde_json::from_str::<String>(raw).ok()
+    } else if raw.starts_with('\'') {
+        raw.strip_prefix('\'')
+            .and_then(|rest| rest.strip_suffix('\''))
+            .filter(|inner| !inner.contains('\''))
+            .map(str::to_string)
     } else {
-        raw.to_string()
+        // Unquoted: plain characters only (no comment, quote or space).
+        (!raw.contains(['#', '"', '\'', ' ', '\t'])).then(|| raw.to_string())
     };
     Some((key, value))
 }
 
-/// The value of `key` when every assignment of it in the file agrees.
-fn unambiguous<'a>(assignments: &'a [(String, String)], key: &str) -> Option<&'a str> {
+/// The value of `key` when every assignment of it in the file decodes and
+/// agrees.
+fn unambiguous<'a>(assignments: &'a [(String, Option<String>)], key: &str) -> Option<&'a str> {
     let mut values = assignments
         .iter()
         .filter(|(name, _)| name == key)
-        .map(|(_, value)| value.as_str());
-    let first = values.next()?;
-    values.all(|value| value == first).then_some(first)
+        .map(|(_, value)| value.as_deref());
+    let first = values.next()??;
+    values.all(|value| value == Some(first)).then_some(first)
 }
 
 /// `# BEGIN <NAME> CODEX IDE (managed)` / `# END …`: the name, if the line is
@@ -218,7 +224,7 @@ fn codex_marker(line: &str, kind: &str) -> Option<String> {
 pub(crate) fn codex_env_evidence(raw: &str) -> Option<String> {
     let text = raw.replace("\r\n", "\n");
     let lines: Vec<&str> = text.lines().collect();
-    let assignments: Vec<(String, String)> = lines
+    let assignments: Vec<(String, Option<String>)> = lines
         .iter()
         .filter_map(|line| dotenv_assignment(line))
         .map(|(key, value)| (key.to_string(), value))
@@ -228,6 +234,25 @@ pub(crate) fn codex_env_evidence(raw: &str) -> Option<String> {
             .filter(|value| is_loopback_proxy(value))
             .map(|_| *key)
     });
+    if let Some(name) = foreign_codex_block(&lines, &assignments) {
+        return Some(format!(
+            "it holds the managed block \"{name} CODEX IDE\" of another local proxy program"
+        ));
+    }
+    let proxy = effective_proxy?;
+    let ca = unambiguous(&assignments, "SSL_CERT_FILE")?;
+    match classify_ca_file(Path::new(ca)) {
+        CertificateOwner::Foreign(organization) => Some(format!(
+            "{proxy} points at a local proxy and SSL_CERT_FILE ({ca}) is the installation CA of \"{organization}\""
+        )),
+        _ => None,
+    }
+}
+
+/// E2: the name of another program's managed block that still routes
+/// through a loopback proxy. Nested, crossed or unterminated blocks make
+/// the blocks ambiguous: no E2 (E3 is still checked).
+fn foreign_codex_block(lines: &[&str], assignments: &[(String, Option<String>)]) -> Option<String> {
     // Blocks: every BEGIN closed by the matching END before another marker.
     let mut open: Option<(String, usize)> = None;
     let mut foreign_block = None;
@@ -248,9 +273,11 @@ pub(crate) fn codex_env_evidence(raw: &str) -> Option<String> {
             }
             let routes = lines[start + 1..index].iter().any(|line| {
                 dotenv_assignment(line).is_some_and(|(key, value)| {
-                    PROXY_KEYS.contains(&key)
-                        && is_loopback_proxy(&value)
-                        && unambiguous(&assignments, key) == Some(value.as_str())
+                    value.as_deref().is_some_and(|value| {
+                        PROXY_KEYS.contains(&key)
+                            && is_loopback_proxy(value)
+                            && unambiguous(assignments, key) == Some(value)
+                    })
                 })
             });
             if routes && foreign_block.is_none() {
@@ -261,19 +288,7 @@ pub(crate) fn codex_env_evidence(raw: &str) -> Option<String> {
     if open.is_some() {
         return None;
     }
-    if let Some(name) = foreign_block {
-        return Some(format!(
-            "it holds the managed block \"{name} CODEX IDE\" of another local proxy program"
-        ));
-    }
-    let proxy = effective_proxy?;
-    let ca = unambiguous(&assignments, "SSL_CERT_FILE")?;
-    match classify_ca_file(Path::new(ca)) {
-        CertificateOwner::Foreign(organization) => Some(format!(
-            "{proxy} points at a local proxy and SSL_CERT_FILE ({ca}) is the installation CA of \"{organization}\""
-        )),
-        _ => None,
-    }
+    foreign_block
 }
 
 /// The `<x>` of a kernel-shaped placeholder login token, if `token` is one.
@@ -629,6 +644,13 @@ mod tests {
         ] {
             assert!(codex_env_evidence(&raw).is_none(), "{raw}");
         }
+        // An assignment of the same key that does not decode (a comment
+        // after a quoted value) makes that key ambiguous; with both keys
+        // overridden this way, the block no longer routes anywhere certain.
+        let overrides = "HTTPS_PROXY=\"http://corp.example:8080\" # user override\nhttps_proxy=\"http://corp.example:8080\" # user override\n";
+        assert!(codex_env_evidence(&format!("{block}{overrides}")).is_none());
+        let one_override = "HTTPS_PROXY=\"http://corp.example:8080\" # user override\n";
+        assert!(codex_env_evidence(&format!("{block}{one_override}")).is_some());
         // The same assignment repeated identically is still unambiguous.
         assert!(
             codex_env_evidence(&format!("{block}https_proxy=\"http://127.0.0.1:4000\"\n"))
@@ -658,6 +680,8 @@ mod tests {
         );
         assert!(codex_env_evidence(&format!("{raw}SSL_CERT_FILE=\"/elsewhere.crt\"\n")).is_none());
         assert!(codex_env_evidence(&format!("SSL_CERT_FILE={ca}\n")).is_none());
+        // Ambiguous managed blocks do not hide this evidence.
+        assert!(codex_env_evidence(&format!("# BEGIN OTHER CODEX IDE (managed)\n{raw}")).is_some());
     }
 
     fn jwt(header: &Value, payload: &Value, signature: &str) -> String {

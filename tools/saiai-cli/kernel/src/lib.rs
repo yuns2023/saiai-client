@@ -659,6 +659,8 @@ fn validate_api_key(api_key: &str) -> Result<()> {
 }
 
 fn ensure_installation_ca(cert_path: &Path, key_path: &Path, timestamp: &str) -> Result<bool> {
+    // Never reuse another program's CA (also checked before any write).
+    refuse_foreign_ca_file(cert_path)?;
     if let (Ok(cert_pem), Ok(key_pem)) =
         (fs::read_to_string(cert_path), fs::read_to_string(key_path))
         && local_proxy::validate_tls_config(&cert_pem, &key_pem).is_ok()
@@ -852,13 +854,32 @@ fn refuse_foreign_targets(command: &Command) -> Result<()> {
     if !BRAND.refuse_foreign_profiles {
         return Ok(());
     }
+    // The editor is configured when asked to, or (Windows) to trust the CA.
     let (claude, codex, editor) = match command {
-        Command::Init(args) => (true, false, args.configure_vscode_editor),
-        Command::InitCodex(args) => (false, true, args.configure_vscode_editor),
+        Command::Init(args) => (
+            true,
+            false,
+            args.configure_vscode_editor || args.trust_vscode_ca,
+        ),
+        Command::InitCodex(args) => (
+            false,
+            true,
+            args.configure_vscode_editor || args.trust_vscode_ca,
+        ),
         Command::VSCode => (false, true, true),
         _ => return Ok(()),
     };
+    // Every CA the command could reuse: the configured one and the default
+    // locations (program home; Claude directory for the default profile).
     refuse_foreign_configured_ca()?;
+    refuse_foreign_ca_file(&app_config_dir()?.join(CA_FILENAME.get()))?;
+    if claude {
+        refuse_foreign_ca_file(
+            &resolve_claude_config_paths()?
+                .config_dir
+                .join(CA_FILENAME.get()),
+        )?;
+    }
     if claude {
         let paths = resolve_claude_config_paths()?;
         if let Some(reason) = coexistence::claude_profile_evidence(&paths.settings_path) {
@@ -3508,6 +3529,8 @@ fn check_desktop_permission_visibility(report: &mut DoctorReport) {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn prepare_isolated_desktop_state(desktop_root: &Path, desktop_codex: &Path) -> Result<()> {
+    // Before the first copy or replacement below.
+    refuse_foreign_codex_profile(desktop_codex)?;
     let auth_path = desktop_codex.join("auth.json");
     let source_auth_path = codex_config_dir()?.join("auth.json");
     if !copy_real_codex_oauth_auth(&source_auth_path, &auth_path)?
@@ -12133,6 +12156,26 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             }
         );
         assert_eq!(*removed.borrow(), ["OURS", "CORP", "STUCK"]);
+    }
+
+    /// Leases written before `proxy_handled` read as not handled; a lease
+    /// rewritten for a retry keeps everything else.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn lease_markers_without_proxy_handled_still_read_and_round_trip() {
+        let old: LegacyWindowsPackagedProxyLeaseMarker = serde_json::from_str(
+            r#"{"previous":{"proxy_enable":0,"proxy_server":null,"auto_config_url":null},"managed_server":"127.0.0.1:64196","added_ca_thumbprints":["AA"]}"#,
+        )
+        .unwrap();
+        assert!(!old.proxy_handled);
+        let mut retry = old.clone();
+        retry.proxy_handled = true;
+        let again: LegacyWindowsPackagedProxyLeaseMarker =
+            serde_json::from_slice(&serde_json::to_vec(&retry).unwrap()).unwrap();
+        assert!(again.proxy_handled);
+        assert_eq!(again.managed_server, "127.0.0.1:64196");
+        assert_eq!(again.added_ca_thumbprints, ["AA"]);
+        assert_eq!(again.previous.proxy_enable, Some(0));
     }
 
     #[cfg(target_os = "windows")]
