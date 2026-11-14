@@ -148,7 +148,7 @@ const DEFAULT_LOCAL_PROXY_LISTEN: &str = "127.0.0.1:19908";
 // local proxy follows the user's network (proxy or direct) for passthrough
 // destinations such as downloads.claude.ai.
 const DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local";
-// Written by Client 1.1.0–1.1.57; recognized by uninstall and migrated at
+// Written by older releases; recognized by uninstall and migrated at
 // local proxy startup.
 const LEGACY_DEFAULT_NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fc00::/7,fe80::/10,.local,downloads.claude.ai";
 const CONFIG_FILENAME: BrandValue<&'static str> = BrandValue(|brand| brand.config.filename);
@@ -9764,7 +9764,7 @@ fn migrate_legacy_codex_system_proxy_for_instance(cfg: &AppConfig) -> Result<()>
     migrate_legacy_codex_system_proxy(&codex_dir, &cfg.listen, &cfg.ca_cert_path)
 }
 
-/// Linux clients up to 1.1.58 persisted `features.respect_system_proxy = true`
+/// Older Linux releases persisted `features.respect_system_proxy = true`
 /// into the Codex config they manage. Turn it off in a directory whose `.env`
 /// carries this listener's managed block, so IDE and daemon sessions stop
 /// advertising it without re-running init.
