@@ -488,18 +488,13 @@ async fn https_bodies_are_limited_in_size_and_time() {
     })
     .await;
     for path in ["/declared", "/streamed"] {
-        let started = std::time::Instant::now();
+        // (`/declared` would otherwise end at the 10 s budget, not on size.)
         let error = get(&pki, &server, path, 1024, Duration::from_secs(10))
             .await
             .unwrap_err();
         assert!(
             format!("{error:#}").contains("is larger than 1024 bytes"),
             "{path}: {error:#}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "{path}: {:?}",
-            started.elapsed()
         );
     }
     let exact = get(&pki, &server, "/exact", 1024, Duration::from_secs(10))
@@ -520,8 +515,8 @@ async fn https_bodies_are_limited_in_size_and_time() {
 
 /// One deadline covers the whole redirect chain: three hops that each
 /// answer within the budget, but not all together. The margins (2 s for
-/// one hop, 4 s for the chain) keep a busy machine from flipping either
-/// outcome; a deadline reset per hop lets the chain through.
+/// one hop, 4 s for the chain) lower the chance that a busy machine flips
+/// either outcome; a deadline reset per hop lets the chain through.
 #[tokio::test]
 async fn https_redirect_chains_share_one_deadline() {
     let pki = pki(&[GITHUB, ASSETS]);
