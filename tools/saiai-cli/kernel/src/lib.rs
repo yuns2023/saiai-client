@@ -4286,6 +4286,9 @@ struct Egress {
     /// excluded from the system roots.
     installation_ca_pem: Option<String>,
     upstream: Arc<upstream_proxy::Snapshot>,
+    /// Tests: host names resolved to a local address (direct connections).
+    #[cfg(test)]
+    resolve: Vec<(String, SocketAddr)>,
 }
 
 impl Egress {
@@ -4298,6 +4301,8 @@ impl Egress {
             None => Self {
                 installation_ca_pem: None,
                 upstream: upstream_proxy::UpstreamProxy::new(None, None, Vec::new()).snapshot(),
+                #[cfg(test)]
+                resolve: Vec::new(),
             },
         }
     }
@@ -4311,6 +4316,8 @@ impl Egress {
         Self {
             installation_ca_pem: Some(installation_ca_pem(cfg)),
             upstream: upstream.snapshot(),
+            #[cfg(test)]
+            resolve: Vec::new(),
         }
     }
 
@@ -4323,6 +4330,13 @@ impl Egress {
             Some(pem) => upstream_tls::upstream_http_client_builder(pem),
             None => upstream_tls::uninstalled_http_client_builder(),
         };
+        #[cfg(test)]
+        let builder = self
+            .resolve
+            .iter()
+            .fold(builder, |builder, (host, address)| {
+                builder.resolve(host, *address)
+            });
         upstream_proxy::client_builder_for_route(builder, &route)
     }
 }
@@ -5020,9 +5034,9 @@ fn run_update() -> Result<()> {
             current_exe.display()
         );
     }
-    // One fixed-source update at a time per installation directory. The lock
-    // is held until this command returns; on Windows the replacement helper
-    // started at the end runs after that (it serializes on the executable).
+    // One fixed-source update at a time per installation directory, held
+    // until this command returns (see `lock_update_directory` for the
+    // Windows replacement helper, which is not covered).
     let _update_lock = match &origin {
         UpdateOrigin::Fixed { .. } => Some(lock_update_directory(parent)?),
         UpdateOrigin::Gateway { .. } => None,
@@ -7632,16 +7646,22 @@ fn write_new_update_candidate(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = options
         .open(path)
         .with_context(|| format!("failed to create {}", path.display()))?;
-    file.write_all(bytes)
+    // The file is new and ours: a partial one is removed.
+    let written = file
+        .write_all(bytes)
         .and_then(|()| file.sync_all())
-        .with_context(|| format!("failed to write {}", path.display()))?;
+        .with_context(|| format!("failed to write {}", path.display()));
     #[cfg(unix)]
-    {
+    let written = written.and_then(|()| {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("failed to chmod {}", path.display()))?;
+            .with_context(|| format!("failed to chmod {}", path.display()))
+    });
+    if written.is_err() {
+        drop(file);
+        let _ = fs::remove_file(path);
     }
-    Ok(())
+    written
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -7649,9 +7669,11 @@ const CANDIDATE_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const CANDIDATE_PROBE_LIMIT: usize = 4096;
 
-/// `<candidate> --version` standard output, bounded: the candidate is killed
-/// and reaped when it runs past `timeout` or prints more than `limit` bytes,
-/// and a failed exit is an error.
+/// `<candidate> --version` standard output, bounded: the direct child is
+/// killed and reaped when it runs past `timeout`, prints more than `limit`
+/// bytes or keeps running after closing its output, and a failed exit or a
+/// read error is an error. Descendants of the candidate are not tracked: one
+/// that keeps the output open ends the probe at the deadline.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn probe_candidate_version(path: &Path, timeout: Duration, limit: usize) -> Result<String> {
     use std::io::Read;
@@ -7662,107 +7684,154 @@ fn probe_candidate_version(path: &Path, timeout: Duration, limit: usize) -> Resu
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("failed to execute {}", path.display()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("candidate stdout is not captured")?;
-    let reader = std::thread::spawn(move || {
-        let mut output = Vec::new();
-        let _ = stdout.take(limit as u64 + 1).read_to_end(&mut output);
-        output
-    });
     let deadline = std::time::Instant::now() + timeout;
-    let stop = |child: &mut std::process::Child| {
-        let _ = child.kill();
-        let _ = child.wait();
+    let Some(stdout) = child.stdout.take() else {
+        stop_candidate(&mut child)?;
+        bail!("candidate stdout is not captured");
     };
-    let status = loop {
-        if reader.is_finished() && child.try_wait()?.is_none() {
-            // The reader stops at the limit or at end of output; a child
-            // still running after printing too much is stopped now.
-            let output = reader.join().unwrap_or_default();
-            if output.len() > limit {
-                stop(&mut child);
-                bail!("{} printed more than {limit} bytes", path.display());
+    let reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut output = Vec::new();
+        stdout.take(limit as u64 + 1).read_to_end(&mut output)?;
+        Ok(output)
+    });
+    let result = watch_candidate(path, &mut child, reader, deadline, timeout, limit);
+    // Every way out leaves the direct child exited and reaped.
+    if result.is_err() {
+        stop_candidate(&mut child)?;
+    }
+    result
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn watch_candidate(
+    path: &Path,
+    child: &mut std::process::Child,
+    reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    deadline: std::time::Instant,
+    timeout: Duration,
+    limit: usize,
+) -> Result<String> {
+    let mut exited = None;
+    loop {
+        if reader.is_finished() {
+            break;
+        }
+        if exited.is_none() {
+            exited = child
+                .try_wait()
+                .with_context(|| format!("failed to wait for {}", path.display()))?;
+        }
+        if std::time::Instant::now() >= deadline {
+            match exited {
+                // Exited, but something it started keeps the output open.
+                Some(_) => bail!("{} left its output open", path.display()),
+                None => bail!(
+                    "{} did not exit within {}s",
+                    path.display(),
+                    timeout.as_secs()
+                ),
             }
-            return finish_probe(path, &mut child, output, deadline, stop);
-        }
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if std::time::Instant::now() >= deadline {
-            stop(&mut child);
-            bail!(
-                "{} did not exit within {}s",
-                path.display(),
-                timeout.as_secs()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    // Exited: the reader ends when the pipe closes (a descendant keeping it
-    // open is not waited for past the deadline).
-    while !reader.is_finished() {
-        if std::time::Instant::now() >= deadline {
-            bail!("{} left its output open", path.display());
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let output = reader.join().unwrap_or_default();
-    if output.len() > limit {
+    let bytes = reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("reading {} panicked", path.display()))?
+        .with_context(|| format!("failed to read the output of {}", path.display()))?;
+    if bytes.len() > limit {
         bail!("{} printed more than {limit} bytes", path.display());
     }
+    // Output complete: the child must exit by the deadline.
+    let status = loop {
+        if let Some(status) = exited {
+            break status;
+        }
+        exited = child
+            .try_wait()
+            .with_context(|| format!("failed to wait for {}", path.display()))?;
+        if exited.is_none() {
+            if std::time::Instant::now() >= deadline {
+                bail!("{} did not exit after printing its version", path.display());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
     if !status.success() {
         bail!("{} exited with {status}", path.display());
     }
-    Ok(String::from_utf8_lossy(&output).into_owned())
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// The child finished printing (within `limit`) but has not exited yet: wait
-/// for it until `deadline`.
+/// Kills the direct child if it still runs and confirms it was reaped
+/// (bounded: an error when it cannot be confirmed within two seconds).
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn finish_probe(
-    path: &Path,
-    child: &mut std::process::Child,
-    output: Vec<u8>,
-    deadline: std::time::Instant,
-    stop: impl Fn(&mut std::process::Child),
-) -> Result<String> {
+fn stop_candidate(child: &mut std::process::Child) -> Result<()> {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return Ok(());
+    }
+    let killed = child.kill();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
-        if let Some(status) = child.try_wait()? {
-            if !status.success() {
-                bail!("{} exited with {status}", path.display());
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
             }
-            return Ok(String::from_utf8_lossy(&output).into_owned());
+            Ok(None) => bail!(
+                "candidate process {} could not be stopped ({killed:?})",
+                child.id()
+            ),
+            Err(error) => {
+                return Err(error)
+                    .context(format!("failed to reap candidate process {}", child.id()));
+            }
         }
-        if std::time::Instant::now() >= deadline {
-            stop(child);
-            bail!("{} did not exit after printing its version", path.display());
-        }
-        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
-/// Exclusive lock of an installation directory's update (`<candidate
-/// prefix>lock` next to the executable); a second update fails at once.
+/// Exclusive lock of an installation directory's fixed-source update, held
+/// until the returned value is dropped; a second update fails at once. On
+/// Unix the directory itself is locked (nothing to delete or replace); on
+/// Windows `<candidate prefix>lock` next to the executable is held open
+/// without sharing, so neither another update nor `uninstall` can open or
+/// delete it meanwhile. The lock covers this command only: on Windows the
+/// replacement helper it starts runs after it returns and is not serialized.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn lock_update_directory(directory: &Path) -> Result<fs::File> {
-    let path = directory.join(format!("{}lock", BRAND.update.candidate_prefix));
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(fs::TryLockError::WouldBlock) => bail!(
+    let busy = || {
+        anyhow::anyhow!(
             "another {brand_binary} update is running in {}",
             directory.display(),
             brand_binary = BRAND.binary_name
-        ),
-        Err(fs::TryLockError::Error(error)) => {
-            Err(error).with_context(|| format!("failed to lock {}", path.display()))
+        )
+    };
+    #[cfg(unix)]
+    {
+        let file = fs::File::open(directory)
+            .with_context(|| format!("failed to open {}", directory.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(fs::TryLockError::WouldBlock) => Err(busy()),
+            Err(fs::TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("failed to lock {}", directory.display()))
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        let path = directory.join(format!("{}lock", BRAND.update.candidate_prefix));
+        match OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .share_mode(0)
+            .open(&path)
+        {
+            Ok(file) => Ok(file),
+            Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => Err(busy()),
+            Err(error) => Err(error).with_context(|| format!("failed to lock {}", path.display())),
         }
     }
 }
@@ -11440,6 +11509,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
                 &Egress {
                     installation_ca_pem: Some(String::new()),
                     upstream: upstream_proxy::Snapshot::direct_for_tests(),
+                    resolve: Vec::new(),
                 },
             ))
             .unwrap_err();

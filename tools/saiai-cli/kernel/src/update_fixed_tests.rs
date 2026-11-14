@@ -149,6 +149,7 @@ fn direct() -> Egress {
     Egress {
         installation_ca_pem: None,
         upstream: upstream_proxy::UpstreamProxy::new(Some("direct"), None, Vec::new()).snapshot(),
+        resolve: Vec::new(),
     }
 }
 
@@ -524,6 +525,7 @@ async fn every_hop_is_routed_for_its_own_target() {
             Vec::new(),
         )
         .snapshot(),
+        resolve: Vec::new(),
     };
     let policy = FixedUrlPolicy {
         hosts: &["updates.invalid", "127.0.0.1"],
@@ -552,13 +554,15 @@ async fn every_hop_is_routed_for_its_own_target() {
 }
 
 /// A proxy that fails (accepts, then closes: deterministic, unlike a freed
-/// port another process may take) fails the request. The origin is a name
-/// only that proxy could reach, so there is no direct way to it; the proxy
-/// saw the one attempt.
+/// port another process may take) fails the request, and the origin is
+/// never contacted directly: the client resolves the origin's name to an
+/// observable local server, which a direct attempt would reach (shown by
+/// the direct control).
 #[tokio::test]
-async fn a_failing_proxy_fails_the_request() {
+async fn a_failing_proxy_fails_the_request_without_going_direct() {
+    let origin = serve_with(|_| Routes::from([("/a".to_string(), ok(b"origin"))])).await;
     let closing = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = closing.local_addr().unwrap().port();
+    let proxy_port = closing.local_addr().unwrap().port();
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let seen = Arc::clone(&attempts);
     tokio::spawn(async move {
@@ -567,34 +571,49 @@ async fn a_failing_proxy_fails_the_request() {
             drop(socket);
         }
     });
-    let egress = Egress {
+    let egress = |setting: &str| Egress {
         installation_ca_pem: None,
-        upstream: upstream_proxy::UpstreamProxy::new(
-            Some(&format!("http://127.0.0.1:{port}")),
-            None,
-            Vec::new(),
-        )
-        .snapshot(),
+        upstream: upstream_proxy::UpstreamProxy::new(Some(setting), None, Vec::new()).snapshot(),
+        resolve: vec![(
+            "updates.invalid".to_string(),
+            SocketAddr::from(([127, 0, 0, 1], origin.port)),
+        )],
     };
+    let ports = [origin.port];
     let policy = FixedUrlPolicy {
         hosts: &["updates.invalid"],
         scheme: "http",
-        ports: &[8080],
+        ports: &ports,
     };
-    let error = fixed_get(
+    let url = format!("http://updates.invalid:{}/a", origin.port);
+    // Control: going direct with this resolution reaches the origin.
+    let body = fixed_get(
         &policy,
-        "http://updates.invalid:8080/a",
+        &url,
         1024,
         Duration::from_secs(10),
-        &egress,
+        &egress("direct"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(body, b"origin");
+    assert_eq!(origin.requested().len(), 1);
+    let error = fixed_get(
+        &policy,
+        &url,
+        1024,
+        Duration::from_secs(10),
+        &egress(&format!("http://127.0.0.1:{proxy_port}")),
     )
     .await
     .unwrap_err();
     assert!(
-        format!("{error:#}").contains("failed to GET http://updates.invalid:8080/a"),
+        format!("{error:#}").contains(&format!("failed to GET {url}")),
         "{error:#}"
     );
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(origin.requested().len(), 1, "{:?}", origin.requested());
 }
 
 /// No hop carries credentials: no Authorization or Cookie anywhere, and the
@@ -618,6 +637,7 @@ async fn requests_carry_no_credentials_across_hosts() {
             Vec::new(),
         )
         .snapshot(),
+        resolve: Vec::new(),
     };
     let policy = FixedUrlPolicy {
         hosts: &["updates.invalid", "127.0.0.1"],
@@ -673,10 +693,12 @@ async fn a_slow_body_runs_out_of_time() {
     assert!(started.elapsed() < Duration::from_secs(3));
 }
 
-/// The fixed-source download as `update` runs it, without a configuration
-/// (not initialized): it proceeds to a verified download.
+/// The download layer of a fixed-source update (egress setup and fetch, as
+/// `update` runs them) without a configuration, i.e. not initialized: it
+/// proceeds to a verified download. (The command end to end is covered by
+/// the distribution's black-box tests.)
 #[test]
-fn an_uninitialized_installation_downloads_through_the_default_route() {
+fn the_download_layer_needs_no_configuration() {
     let server = tokio::runtime::Runtime::new().unwrap();
     let bytes = release_bytes();
     let sha = sha256_hex(&bytes);
@@ -735,6 +757,10 @@ fn one_update_at_a_time_per_installation_directory() {
     let _other = lock_update_directory(second.path()).unwrap();
     drop(held);
     let _again = lock_update_directory(first.path()).unwrap();
+    // Unix locks the directory itself: nothing that uninstall could delete.
+    #[cfg(unix)]
+    assert_eq!(fs::read_dir(first.path()).unwrap().count(), 0);
+    #[cfg(windows)]
     assert!(first.path().join(".ktest-update-lock").is_file());
 }
 
@@ -776,6 +802,12 @@ fn candidate_probes_are_bounded() {
         probe_candidate_version(&good, budget, 4096).unwrap(),
         "ktest 1.2.3\n"
     );
+    // Closing its output early and exiting a little later is fine.
+    let closes_early = script("closes-early", "echo 'ktest 1.2.3'; exec >&-; sleep 0.3");
+    assert_eq!(
+        probe_candidate_version(&closes_early, budget, 4096).unwrap(),
+        "ktest 1.2.3\n"
+    );
     for (name, body, expected) in [
         ("hangs", "exec sleep 30", "did not exit within 1s"),
         ("floods", "exec yes", "printed more than 4096 bytes"),
@@ -784,6 +816,16 @@ fn candidate_probes_are_bounded() {
             "lingers",
             "echo 'ktest 1.2.3'; exec sleep 30 >&-",
             "did not exit after printing",
+        ),
+        (
+            "succeeds-too-loud",
+            "printf '%5000s' x; exit 0",
+            "printed more than 4096 bytes",
+        ),
+        (
+            "orphans",
+            "echo 'ktest 1.2.3'; sleep 30 & exit 0",
+            "left its output open",
         ),
     ] {
         let started = std::time::Instant::now();
