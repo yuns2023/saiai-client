@@ -808,8 +808,27 @@ fn a_helper_that_does_not_take_over_is_reported() {
         .unwrap();
     assert!(!handed_over);
     assert!(started.elapsed() < Duration::from_secs(10));
-    let _ = child.kill();
-    let _ = child.wait();
+    // The update then stops it and cleans up.
+    let dir = directory.path();
+    let candidate = dir.join(".ktest-update-1.exe");
+    let script = dir.join(".ktest-update-1.ps1");
+    let status = dir.join(".ktest-update-status.txt");
+    for path in [&candidate, &script, &status] {
+        fs::write(path, b"x").unwrap();
+    }
+    let error = cancel_windows_update_helper(&mut child, &candidate, &script, &status);
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("did not lock the installation directory"),
+        "{error}"
+    );
+    assert!(child.try_wait().unwrap().is_some());
+    assert!(!candidate.exists() && !script.exists());
+    let report = fs::read_to_string(&status).unwrap();
+    assert!(
+        report.starts_with("failed: the Windows update helper"),
+        "{report}"
+    );
 }
 
 /// Windows: the real replacement helper takes the helper lock before the

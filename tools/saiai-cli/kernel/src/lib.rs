@@ -8163,17 +8163,12 @@ fn finalize_update(
             let (mut helper, handed_over) =
                 lock.hand_over_to_helper(WINDOWS_HELPER_HANDOVER, start_helper)?;
             if !handed_over {
-                // It has done nothing yet (it waits for this command to
-                // exit): stop it rather than leave it running unlocked.
-                let _ = helper.kill();
-                let _ = helper.wait();
-                let message = format!(
-                    "the Windows update helper did not lock the installation directory within {}s; nothing was replaced",
-                    WINDOWS_HELPER_HANDOVER.as_secs()
-                );
-                let _ = fs::write(&status_path, format!("failed: {message}\n"));
-                let _ = fs::remove_file(&script_path);
-                return Err(discard_candidate(candidate_path, anyhow::anyhow!(message)));
+                return Err(cancel_windows_update_helper(
+                    &mut helper,
+                    candidate_path,
+                    &script_path,
+                    &status_path,
+                ));
             }
         }
         None => {
@@ -8185,6 +8180,41 @@ fn finalize_update(
         status_path.display()
     );
     Ok(())
+}
+
+/// Stops a replacement helper that did not take over the installation
+/// lock in time. It has changed nothing yet: it waits for this command to
+/// exit before stopping or replacing anything. Records the failure, removes
+/// the script and the candidate, and returns the error to report (with any
+/// cleanup that failed).
+#[cfg(target_os = "windows")]
+fn cancel_windows_update_helper(
+    helper: &mut std::process::Child,
+    candidate_path: &Path,
+    script_path: &Path,
+    status_path: &Path,
+) -> anyhow::Error {
+    let mut error = anyhow::anyhow!(
+        "the Windows update helper did not lock the installation directory within {}s; nothing was replaced",
+        WINDOWS_HELPER_HANDOVER.as_secs()
+    );
+    let _ = helper.kill();
+    if let Err(wait) = helper.wait() {
+        error = error.context(format!(
+            "the helper (process {}) could not be confirmed stopped: {wait}",
+            helper.id()
+        ));
+    }
+    if let Err(write) = fs::write(status_path, format!("failed: {error:#}\n")) {
+        error = error.context(format!(
+            "failed to write {}: {write}",
+            status_path.display()
+        ));
+    }
+    if let Err(remove) = remove_candidate(script_path) {
+        error = error.context(format!("the helper script was left behind: {remove:#}"));
+    }
+    discard_candidate(candidate_path, error)
 }
 
 /// How long a fixed-source update waits for its Windows replacement helper
