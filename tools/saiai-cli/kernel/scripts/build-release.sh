@@ -31,9 +31,35 @@ fail() {
   exit 1
 }
 
+# Only Linux GNU targets are verified: CARGO_ENCODED_RUSTFLAGS replaces the
+# rustflags of Cargo configuration files (the repository sets
+# `link-arg=/Brepro` for Windows MSVC), and other platforms embed paths
+# differently. Build targets come from --target or CARGO_BUILD_TARGET (a
+# `build.target` in a configuration file is not supported), else the host.
+targets=()
+previous=""
 for argument in "$@"; do
   case "$argument" in
     --target-dir | --target-dir=*) fail "set CARGO_TARGET_DIR instead of $argument" ;;
+    --target=*) targets+=("${argument#--target=}") ;;
+  esac
+  [[ "$previous" == "--target" ]] && targets+=("$argument")
+  previous="$argument"
+done
+[[ "$previous" == "--target" ]] && fail "--target needs a value"
+if [[ ${#targets[@]} -eq 0 ]]; then
+  if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+    targets=("$CARGO_BUILD_TARGET")
+  else
+    host="$(rustc -vV | sed -n 's/^host: //p')"
+    [[ -n "$host" ]] || fail "cannot read the host target from rustc -vV"
+    targets=("$host")
+  fi
+fi
+for target in "${targets[@]}"; do
+  case "$target" in
+    *-linux-gnu | *-linux-gnu?*) ;;
+    *) fail "only Linux GNU targets are verified for the remapped release build, not $target" ;;
   esac
 done
 if env | grep -E '^(C|CXX)FLAGS_[^=]*-' >/dev/null; then
@@ -80,12 +106,15 @@ add_mapping "$target_dir" /aitp/target
 
 # The compilers apply the last matching mapping: the longest (most specific)
 # prefix goes last, so a directory inside another maps to its own prefix.
+# (Generated first, so a failure stops the script under set -e/pipefail.)
+ordered="$(printf '%s' "$mappings" | awk -F '\t' 'NF == 2 { print length($1) "\t" $0 }' | sort -n -k1,1)"
 rust_flags=()
 c_flags=""
 while IFS=$'\t' read -r _ from to; do
+  [[ -n "$from" ]] || continue
   rust_flags+=("--remap-path-prefix=$from=$to")
   c_flags+=" -ffile-prefix-map=$from=$to"
-done < <(printf '%s' "$mappings" | awk -F '\t' 'NF == 2 { print length($1) "\t" $0 }' | sort -n -k1,1)
+done <<<"$ordered"
 [[ ${#rust_flags[@]} -gt 0 ]] || fail "no directory to remap"
 
 separator=$'\x1f'

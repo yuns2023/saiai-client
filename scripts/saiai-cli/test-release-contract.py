@@ -358,16 +358,29 @@ class AitpArtifactTests(unittest.TestCase):
             with self.subTest(leak=leak), self.assertRaisesRegex(AssertionError, "build machine paths"):
                 self.check(self.brand + b" " + leak, build_dirs=[Path("/x")])
 
-    def test_neutral_prefixes_are_not_build_paths(self) -> None:
-        # A build path that is a prefix of a neutral prefix's name.
+    def test_paths_overlapping_the_neutral_prefixes_are_refused(self) -> None:
+        for build in ("/aitp", "/aitp/src", "/aitp/sr", "/AITP/Src/x", "/ait", "/aitp/target/release"):
+            with self.subTest(build=build), self.assertRaisesRegex(AssertionError, "overlaps the neutral prefixes"):
+                self.check(self.brand, build_dirs=[Path(build)])
         self.ENVIRON = {"HOME": "/aitp/hom"}
-        self.check(self.brand + b" /aitp/src/lib.rs /aitp/home", build_dirs=[Path("/aitp/sr")])
-        # ... is still found anywhere else.
-        for leak in (b"/aitp/hom/x", b"/aitp/srx"):
+        with self.assertRaisesRegex(AssertionError, "overlaps the neutral prefixes"):
+            self.check(self.brand)
+
+    def test_a_path_ending_a_neutral_prefix_is_not_a_leak(self) -> None:
+        # `/src` and `/home` (a container's mount point, a root HOME) end
+        # the neutral prefixes `/aitp/src` and `/aitp/home` ...
+        self.ENVIRON = {"HOME": "/home"}
+        self.check(self.brand + b" /aitp/src/lib.rs\0/aitp/home/x /aitp/src", build_dirs=[Path("/src")])
+        # A path inside a neutral prefix (`/sr` in `/aitp/src`) is the
+        # prefix's own bytes.
+        self.check(self.brand + b" /aitp/src/lib.rs", build_dirs=[Path("/sr")])
+        # ... and are still found anywhere else, including past the end of a
+        # neutral prefix or around one.
+        for leak in (b"/src/lib.rs", b"/aitp/srcx/lib.rs", b"/home/x", b"/x/aitp/src/lib.rs"):
             with self.subTest(leak=leak), self.assertRaisesRegex(AssertionError, "build machine paths"):
-                self.check(self.brand + b" /aitp/src/lib.rs " + leak, build_dirs=[Path("/aitp/sr")])
+                self.check(self.brand + b" /aitp/src/lib.rs " + leak, build_dirs=[Path("/src"), Path("/x/aitp/src")])
         # A build path that holds a neutral prefix is found in full.
-        for build, leak in (("/opt/aitp/src/build", b"\0/opt/aitp/src/build/lib.rs\0"), ("/aitp/src-real", b"/aitp/src-real/lib.rs")):
+        for build, leak in (("/opt/aitp/src/build", b"\0/opt/aitp/src/build/lib.rs\0"), ("/opt/aitp/src-real", b"/opt/aitp/src-real/lib.rs")):
             with self.subTest(build=build), self.assertRaisesRegex(AssertionError, "build machine paths"):
                 self.check(self.brand + leak, build_dirs=[Path(build)])
 

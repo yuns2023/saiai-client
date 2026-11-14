@@ -680,7 +680,13 @@ def verify_workflows_and_docs() -> None:
     # with --aitp-artifact, both stand-alone and in this checkout (whose path
     # names SAIAI); SAIAI release builds stay as they are.
     remap = text(AITP_RELEASE_BUILD)
-    for required in ("--remap-path-prefix=", "-ffile-prefix-map=", "CARGO_ENCODED_RUSTFLAGS", "--bin aitp"):
+    for required in (
+        "--remap-path-prefix=",
+        "-ffile-prefix-map=",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "--bin aitp",
+        "only Linux GNU targets are verified",
+    ):
         require(required in remap, f"AITP release build script is missing {required!r}")
     for prefix in AITP_NEUTRAL_PREFIXES:
         require(
@@ -822,6 +828,10 @@ def verify_artifacts_carry_no_aitp_brand(artifacts: list[Path]) -> None:
 OTHER_DISTRIBUTION_NAME = b"saiai"
 
 
+# The neutral prefixes build-release.sh maps the build machine's paths to.
+AITP_NEUTRAL_PREFIXES = ("/aitp/home", "/aitp/rustup", "/aitp/cargo", "/aitp/src", "/aitp/target")
+
+
 def build_machine_paths(build_dirs: list[Path], environ) -> list[str]:
     """Absolute paths of the build machine that an AITP release program must
     not carry: the given build directories and the HOME, CARGO_HOME and
@@ -845,24 +855,36 @@ def build_machine_paths(build_dirs: list[Path], environ) -> list[str]:
             # The file system root (or a bare drive) would match every path.
             if re.fullmatch(r"(?:[A-Za-z]:)?", form) is None and form not in paths:
                 paths.append(form)
+    for path in paths:
+        # A build path at or below /aitp, or a leading part of a neutral
+        # prefix, cannot be told apart from the remapped paths.
+        view = path_view(path.encode()).decode(errors="replace")
+        require(
+            not (view == "/aitp" or view.startswith("/aitp/"))
+            and not any(prefix.startswith(view) for prefix in AITP_NEUTRAL_PREFIXES),
+            f"build machine path {path} overlaps the neutral prefixes {AITP_NEUTRAL_PREFIXES}",
+        )
     return paths
 
 
-# The neutral prefixes build-release.sh maps the build machine's paths to.
-AITP_NEUTRAL_PREFIXES = ("/aitp/home", "/aitp/rustup", "/aitp/cargo", "/aitp/src", "/aitp/target")
+# A byte that continues a file name (ASCII), for the directory boundaries below.
+FILE_NAME_BYTE = rb"[a-z0-9._+~-]"
 
 
 def names_path(view: bytes, path: str) -> bool:
     """Whether `view` (see `path_view`) holds `path` anywhere, as a plain
     substring (strings in a program sit next to each other without a
-    separator, so no boundary is required). An occurrence that lies wholly
-    inside one of the neutral prefixes (`HOME=/aitp/hom` inside `/aitp/home`)
-    does not count; one that only overlaps a neutral prefix does."""
-    neutral = [
+    separator, so no boundary is required). Only an occurrence that lies
+    wholly inside a whole neutral prefix (one not continued by another file
+    name byte), such as `/src` or `/home` inside `/aitp/src/…` or
+    `/aitp/home/…`, is not counted: those bytes are the neutral prefix
+    itself. `build_machine_paths` refuses build paths that could be mistaken
+    for the prefixes (`/aitp/…`, `/ait`)."""
+    neutral = {
         (match.start(), match.end())
         for prefix in AITP_NEUTRAL_PREFIXES
-        for match in re.finditer(re.escape(prefix.encode()), view)
-    ]
+        for match in re.finditer(re.escape(prefix.encode()) + rb"(?!" + FILE_NAME_BYTE + rb")", view)
+    }
     needle = path_view(path.encode())
     start = view.find(needle)
     while start >= 0:
