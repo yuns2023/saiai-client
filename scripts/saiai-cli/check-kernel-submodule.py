@@ -139,6 +139,7 @@ def lock_graph(text: str, label: str) -> tuple[dict[Package, set[Package]], list
     """The dependency graph of a Cargo.lock (version 3/4 layout): each
     package with the packages its `dependencies` entries resolve to."""
     packages: list[tuple[Package, list[str]]] = []
+    findings = []
     for block in text.split("[[package]]")[1:]:
         # Without a trailing table such as [metadata] (older lock files).
         block = block.split("\n[", 1)[0]
@@ -147,10 +148,19 @@ def lock_graph(text: str, label: str) -> tuple[dict[Package, set[Package]], list
             match = re.search(rf'^{name} = "([^"]*)"', block, re.MULTILINE)
             return match.group(1) if match else None
 
-        listed = re.search(r"^dependencies = \[\n(.*?)^\]", block, re.MULTILINE | re.DOTALL)
-        dependencies = re.findall(r'^ "([^"]*)",$', listed.group(1), re.MULTILINE) if listed else []
+        # Only the layout cargo writes is read; anything else is refused
+        # rather than read as "no dependencies".
+        if field("name") is None or field("version") is None:
+            findings.append(f"{label}: a package without a name or version")
+            continue
+        dependencies = []
+        if re.search(r"^dependencies\b", block, re.MULTILINE):
+            listed = re.search(r"^dependencies = \[\n((?: \"[^\"\n]*\",\n)*)\]$", block, re.MULTILINE)
+            if listed is None:
+                findings.append(f"{label}: cannot read the dependencies of {field('name')} {field('version')}")
+                continue
+            dependencies = re.findall(r'^ "([^"]*)",$', listed.group(1), re.MULTILINE)
         packages.append(((field("name"), field("version"), field("source"), field("checksum")), dependencies))
-    findings = []
     graph: dict[Package, set[Package]] = {}
     for package, dependencies in packages:
         edges = set()

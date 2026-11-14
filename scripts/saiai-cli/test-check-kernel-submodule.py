@@ -196,6 +196,60 @@ class KernelSubmoduleTests(unittest.TestCase):
         self.write_workspace_lock(WORKSPACE_LOCK.format(checksum="aa").replace(' "tokio",\n', ' "tokio 9.9.9",\n'))
         self.assertFinds("which names 0 packages", offline=True)
 
+    def test_lock_graph_reads_only_the_cargo_layout(self) -> None:
+        lock = WORKSPACE_LOCK.format(checksum="aa")
+        for changed in (
+            lock.replace('dependencies = [\n "tokio",\n]', 'dependencies = ["tokio"]'),
+            lock.replace(' "tokio",\n', '  "tokio", # note\n'),
+            lock.replace('name = "tokio"\n', ""),
+        ):
+            with self.subTest(changed=changed):
+                _, findings = CHECK.lock_graph(changed, "lock")
+                self.assertTrue(findings, changed)
+        graph, findings = CHECK.lock_graph(lock + "\n[metadata]\nx = \"y\"\n", "lock")
+        self.assertEqual(findings, [])
+        self.assertEqual(len(graph), 3)
+
+    def test_lock_graph_resolves_sources_and_compares_edges(self) -> None:
+        registry = "registry+https://github.com/rust-lang/crates.io-index"
+        fork = "git+https://example.invalid/tokio#abc"
+        two = WORKSPACE_LOCK.format(checksum="aa") + f'\n[[package]]\nname = "tokio"\nversion = "1.0.0"\nsource = "{fork}"\n'
+        # Ambiguous without a source, resolved with one.
+        _, findings = CHECK.lock_graph(two, "lock")
+        self.assertTrue(any("names 2 packages" in finding for finding in findings), findings)
+        graph, findings = CHECK.lock_graph(two.replace(' "tokio",\n', f' "tokio 1.0.0 ({fork})",\n'), "lock")
+        self.assertEqual(findings, [])
+        closure, _ = CHECK.kernel_closure(graph, "lock")
+        self.assertIn(("tokio", "1.0.0", fork, None), closure)
+        self.assertNotIn(("tokio", "1.0.0", registry, "aa"), closure)
+        # Same packages, another edge: the kernel no longer depends on tokio
+        # but the program still locks it.
+        self.write_workspace_lock(
+            WORKSPACE_LOCK.format(checksum="aa").replace('dependencies = [\n "tokio",\n]\n', "")
+            .replace('name = "saiai"\nversion = "1.0.0"\n', 'name = "saiai"\nversion = "1.0.0"\ndependencies = [\n "proxy-cli",\n "tokio",\n]\n')
+        )
+        self.assertFinds("does not resolve the kernel's dependencies", offline=True)
+
+    def test_rejects_another_gitlink_in_the_commit(self) -> None:
+        git(self.root, "update-index", "--add", "--cacheinfo", f"160000,{self.on_main},vendor/other")
+        git(self.root, "commit", "--quiet", "-m", "another gitlink")
+        git(self.root, "rm", "--quiet", "--cached", "vendor/other")
+        self.assertFinds("other submodules in the commit", offline=True)
+
+    def test_a_fetch_timeout_fails(self) -> None:
+        real = CHECK.git
+
+        def slow(*arguments, **options):
+            if "fetch" in arguments:
+                raise subprocess.TimeoutExpired(["git", "fetch"], CHECK.FETCH_TIMEOUT)
+            return real(*arguments, **options)
+
+        CHECK.git = slow
+        try:
+            self.assertFinds("took longer than")
+        finally:
+            CHECK.git = real
+
     def test_rejects_repeated_gitmodules_keys(self) -> None:
         for gitmodules in (
             f'[submodule "{KERNEL}"]\n\tpath = {KERNEL}\n\turl = https://example.invalid/x\n\turl = {CHECK.AITP_URL}\n',
