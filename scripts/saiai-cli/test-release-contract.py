@@ -561,6 +561,63 @@ class WorkflowStructureTests(unittest.TestCase):
         self.rejects(CI, CARGO_TEST, CARGO_TEST + "        run: echo skipped\n", "repeats the key")
         self.rejects(CI, "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n", "      - uses: actions/checkout@v7\n", "not pinned", count=2)
 
+    def test_review_bypasses_are_refused(self) -> None:
+        c = "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace"
+        for script in (
+            f"true ||\n          {c}",
+            f":; set +e\n          {c}\n          true",
+            f"cat <<'123'\n          {c}\n          123",
+            f":; cargo() {{ :; }}\n          {c}",
+            f"export AITP_TEST_FOREIGN_''NAMES=\n          {c}",
+            f"key=GITHUB_''PATH; printf '%s\\n' /x >> \"${{!key}}\"\n          {c}",
+            f"cd /tmp && {c}",
+            f"alias cargo=true; {c}",
+        ):
+            with self.subTest(script=script):
+                self.rejects(CI, CARGO_TEST, f"        run: |\n          {script}\n", "does not run|unbalanced")
+        self.rejects(CI, "      - name: Test\n", "      - name: Test\n        if: github.ref == 'refs/heads/main'\n", "does not run")
+        for condition, message in (("null != ''", "not read here"), ("'0' != false", "not read here"), ("! 'x' == true", "not read here")):
+            with self.subTest(condition=condition):
+                self.rejects(CI, "      - name: Test\n", f"      - name: Test\n        if: \"{condition}\"\n", message)
+        self.assertFalse(VERIFIER.evaluate("!(runner.os == 'Linux')", {"runner.os": "Linux"}))
+
+    def test_release_publication_bypasses_are_refused(self) -> None:
+        self.rejects(
+            RELEASE, "      - name: Record the release digests\n",
+            "      - name: Publish early\n        run: gh release edit \"$GITHUB_REF_NAME\" --draft=false\n\n      - name: Record the release digests\n",
+            "must not publish",
+        )
+        self.rejects(
+            RELEASE, "        id: upload\n        if: steps.preflight.outputs.already_published != 'true'\n",
+            "        id: upload\n        if: false\n", "skips the draft upload",
+        )
+        self.rejects(
+            RELEASE, '          python3 scripts/saiai-cli/verify-github-release-draft.py --dist dist --tag "$GITHUB_REF_NAME" --state published <"$release_json"\n',
+            "", "published release check",
+        )
+        self.rejects(
+            RELEASE, '          cmp "$RUNNER_TEMP/manifest.json" dist/manifest.json\n',
+            '          cp "$RUNNER_TEMP/manifest.json" dist/manifest.json\n          cmp "$RUNNER_TEMP/manifest.json" dist/manifest.json\n',
+            "rewrites the fetched release assets",
+        )
+        self.rejects(
+            RELEASE, '          sha256sum --check --strict "$RUNNER_TEMP/release-digests/release-digests.sha256"\n', "",
+            "published release check",
+        )
+        self.rejects(
+            RELEASE, "          name: release-digests\n          path: release-digests.sha256\n",
+            "          name: release-digests\n          path: dist/manifest.json\n", "keep the draft's digests",
+        )
+        self.rejects(
+            CI, "    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n",
+            "    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          ref: main\n",
+            "check out the commit", count=2,
+        )
+        self.rejects(
+            RELEASE, "  build:\n    needs: verify\n",
+            "  build:\n    needs: mode\n    if: needs.mode.outputs.mode != 'publish'\n", "must need",
+        )
+
     def test_expression_reader(self) -> None:
         context = {"runner.os": "macOS", "matrix.target": "aarch64-apple-darwin"}
         for expression, expected in (

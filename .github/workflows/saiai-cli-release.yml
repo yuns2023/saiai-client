@@ -380,7 +380,7 @@ jobs:
       - name: Assemble and verify public bundle
         run: |
           mkdir -p dist
-          find release-assets -maxdepth 2 -type f -exec cp {} dist/ \;
+          cp release-assets/*/* dist/
           cp scripts/saiai-cli/setup.sh scripts/saiai-cli/setup.ps1 scripts/saiai-cli/setup.cmd dist/
           chmod +x dist/setup.sh dist/saiai-linux-* dist/saiai-macos-*
           python3 scripts/saiai-cli/verify-linux-portability.py \
@@ -439,7 +439,7 @@ jobs:
             exit 1
           fi
           mkdir -p dist
-          find release-assets -maxdepth 2 -type f -exec cp {} dist/ \;
+          cp release-assets/*/* dist/
           cp scripts/saiai-cli/setup.sh scripts/saiai-cli/setup.ps1 scripts/saiai-cli/setup.cmd dist/
           chmod +x dist/setup.sh dist/saiai-linux-* dist/saiai-macos-*
           python3 scripts/saiai-cli/verify-linux-portability.py \
@@ -533,6 +533,18 @@ jobs:
           fi
           echo "::notice::draft ready; publish with: gh workflow run 'SAIAI CLI Release' --ref $GITHUB_REF_NAME -f publish_confirmation='publish $GITHUB_REF_NAME'"
 
+      # The publish run accepts only assets with exactly these digests.
+      - name: Record the release digests
+        run: sha256sum dist/manifest.json dist/saiai-linux-aarch64 dist/saiai-linux-x86_64 dist/saiai-macos-aarch64 dist/saiai-macos-x86_64 dist/saiai-windows-aarch64.exe dist/saiai-windows-x86_64.exe dist/setup.cmd dist/setup.ps1 dist/setup.sh > release-digests.sha256
+
+      - name: Upload the release digests
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-digests
+          path: release-digests.sha256
+          if-no-files-found: error
+          retention-days: 30
+
   publish:
     name: Publish the verified draft
     needs: mode
@@ -576,12 +588,22 @@ jobs:
             --release-json "$RUNNER_TEMP/release.json" \
             --github-output "$GITHUB_OUTPUT"
 
+      - name: Download the digests the tag run recorded
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-digests
+          path: ${{ runner.temp }}/release-digests
+          run-id: ${{ steps.fetch.outputs.run_id }}
+          github-token: ${{ github.token }}
+
       # The downloaded draft is this tag's release: the wrappers and manifest
       # this commit produces, six SAIAI programs without AITP brand data.
       - name: Verify the release assets
         shell: bash
         run: |
           set -euo pipefail
+          [ "$(wc -l <"$RUNNER_TEMP/release-digests/release-digests.sha256")" -eq 10 ]
+          sha256sum --check --strict "$RUNNER_TEMP/release-digests/release-digests.sha256"
           for wrapper in setup.sh setup.ps1 setup.cmd; do
             cmp "scripts/saiai-cli/$wrapper" "dist/$wrapper"
           done
@@ -621,24 +643,20 @@ jobs:
           set -euo pipefail
           [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
           release_endpoint="repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}"
-          release_json="$(mktemp)"
-          trap 'rm -f "$release_json"' EXIT
+          release_json="$RUNNER_TEMP/published.json"
 
           publish_status=0
           payload='{"draft":false,"prerelease":false}'
-          printf '%s' "$payload" |
-            gh api --method PATCH "$release_endpoint" --input - >/dev/null || publish_status=$?
+          printf '%s' "$payload" | gh api --method PATCH "$release_endpoint" --input - >/dev/null || publish_status=$?
+          echo "publish request status: $publish_status"
 
+          # Wait until GitHub reports the release published; the final check
+          # below decides.
           for attempt in 1 2 3 4 5; do
-            if gh api "$release_endpoint" >"$release_json" &&
-              python3 scripts/saiai-cli/verify-github-release-draft.py \
-                --dist dist \
-                --tag "$GITHUB_REF_NAME" \
-                --state published \
-                <"$release_json"; then
-              exit 0
+            if [ "$(gh api "$release_endpoint" --jq .draft)" = false ]; then
+              break
             fi
             sleep 2
           done
-          echo "immutable release postcondition failed (publish status $publish_status)" >&2
-          exit 1
+          gh api "$release_endpoint" >"$release_json"
+          python3 scripts/saiai-cli/verify-github-release-draft.py --dist dist --tag "$GITHUB_REF_NAME" --state published <"$release_json"

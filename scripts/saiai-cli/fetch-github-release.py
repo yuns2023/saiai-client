@@ -129,7 +129,7 @@ def main() -> int:
         args.release_json.write_text(json.dumps(release), encoding="utf-8")
         state = "draft" if release["draft"] else "published"
         with args.github_output.open("a", encoding="utf-8") as output:
-            output.write(f"id={release['id']}\nstate={state}\n")
+            output.write(f"id={release['id']}\nstate={state}\nrun_id={run['id']}\n")
     except (FetchError, OSError, ValueError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1

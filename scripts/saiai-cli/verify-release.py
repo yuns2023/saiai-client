@@ -806,9 +806,13 @@ def evaluate(expression, context: dict[str, str]):
         return value not in (False, None, "", 0)
 
     def equal(left, right) -> bool:
-        if isinstance(left, str) and isinstance(right, str):
-            return left.lower() == right.lower()
-        return left == right
+        # GitHub converts mixed types to numbers before comparing; only
+        # text against text is read here.
+        require(
+            isinstance(left, str) and isinstance(right, str),
+            f"condition {expression!r} compares {left!r} with {right!r}, which is not read here",
+        )
+        return left.lower() == right.lower()
 
     def primary():
         token = take()
@@ -843,27 +847,28 @@ def evaluate(expression, context: dict[str, str]):
         require(word in context, f"condition {expression!r} uses {word}, unknown here")
         return context[word]
 
-    def comparison():
-        left = primary()
-        token = peek()
-        if token is not None and token.group("op") in ("==", "!="):
-            take()
-            right = primary()
-            return equal(left, right) == (token.group("op") == "==")
-        return left
-
+    # Precedence as GitHub documents it: ! binds tighter than == and !=.
     def negation():
         token = peek()
         if token is not None and token.group("op") == "!":
             take("!")
             return not truthy(negation())
-        return comparison()
+        return primary()
+
+    def comparison():
+        left = negation()
+        token = peek()
+        if token is not None and token.group("op") in ("==", "!="):
+            take()
+            right = negation()
+            return equal(left, right) == (token.group("op") == "==")
+        return left
 
     def both():
-        value = negation()
+        value = comparison()
         while peek() is not None and peek().group("op") == "&&":
             take("&&")
-            right = negation()
+            right = comparison()
             value = right if truthy(value) else value
         return value
 
@@ -889,15 +894,38 @@ def substitute(script: str, context: dict[str, str]) -> str:
     return re.sub(r"\$\{\{\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\}\}", fill, script)
 
 
-# Commands that let a later failure pass (or end the script early), per shell.
+# Words that change how later commands run, or whether their failure
+# counts, wherever they start a command (after ;, &&, ||, | or a newline).
+BASH_MASK_WORDS = frozenset(
+    {
+        "exec", "return", "trap", "alias", "shopt", "function", "source", ".", "eval",
+        "unset", "export", "declare", "typeset", "readonly", "local", "enable",
+        "builtin", "command", "hash", "cd", "pushd", "popd",
+    }
+)
 BASH_MASKS = re.compile(
-    r"^(?:exec|return|trap|alias|shopt|function|source|\.|eval|unset)\b|^set\b.*\s\+"
-    r"|^[A-Za-z_][A-Za-z0-9_]*\s*\(\)|\|\|\s*(?:true|:)(?:\s|;|$)|\bexit\s+0\b"
+    r"\|\|\s*(?:true|:)(?:\s|;|$)|\bexit\s+0\b|[A-Za-z0-9_-]+\s*\(\s*\)|\$\{!|(?:\|\||&&|\|)\s*$"
 )
 PWSH_MASKS = re.compile(
-    r"\b(?:try|catch|trap|return)\b|ErrorActionPreference|SilentlyContinue|-ErrorAction\b|\bexit\s+0\b",
+    r"\b(?:try|catch|trap|return|function|filter|Set-Alias|New-Alias|Set-Location|Push-Location|Invoke-Expression|iex)\b"
+    r"|ErrorActionPreference|SilentlyContinue|-ErrorAction\b|\bexit\s+0\b|\$env:\w+\s*=",
     re.IGNORECASE,
 )
+
+
+def bash_masks(command: str) -> bool:
+    if BASH_MASKS.search(command):
+        return True
+    for segment in re.split(r"\|\||&&|[|;&(){}]|\bthen\b|\bdo\b|\belse\b", command):
+        words = segment.split()
+        if words and words[0] in BASH_MASK_WORDS:
+            return True
+        # `set -euo pipefail` is fine; `set +e` / `set +o errexit` is not.
+        if words and words[0] == "set" and any(word.startswith("+") for word in words[1:]):
+            return True
+    return False
+
+
 NATIVE_FAILURES_STOP = "$PSNativeCommandUseErrorActionPreference = $true"
 
 
@@ -926,10 +954,11 @@ def logical_commands(script: str, shell: str) -> list[tuple[str, int]]:
         pending = ""
         commands.append((command, depth))
         if shell != "pwsh":
-            marker = re.search(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1", command)
+            marker = re.search(r"<<-?\s*(['\"]?)([^\s'\"<>|;&]+)\1", command)
             if marker:
                 heredoc = marker.group(2)
-            words = [word for word in re.split(r"[\s;]+", command) if word]
+            unquoted = re.sub(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"", " ", command)
+            words = [word for word in re.split(r"[\s;]+", unquoted) if word]
             depth += sum(word in ("if", "case", "for", "while", "until", "select", "{", "(") for word in words)
             depth -= sum(word in ("fi", "esac", "done", "}", ")") for word in words)
         else:
@@ -959,7 +988,7 @@ def effective_commands(step: dict, system: str, context: dict[str, str]) -> list
         first = 1 if commands and commands[0][0] == NATIVE_FAILURES_STOP else 0
         if any(PWSH_MASKS.search(command) for command, _ in commands[first:]):
             return []
-    elif any(BASH_MASKS.search(command) for command, _ in commands):
+    elif any(bash_masks(command) for command, _ in commands):
         return []
     top = [command for command, depth in commands if depth == 0]
     if shell == "bash":
@@ -1021,6 +1050,8 @@ def check_workflow_basics(relative: str, workflow: dict) -> None:
             require("working-directory" not in step, f"{label} changes the working directory")
             uses = step.get("uses")
             require(uses is None or uses in ALLOWED_ACTIONS, f"{label} uses an action that is not pinned here: {uses}")
+            if str(uses).startswith("actions/checkout@"):
+                require("with" not in step, f"{label} must check out the commit that started the run")
             require((uses is None) != ("run" not in step), f"{label} must either run or use")
             for name, value in (step.get("env") or {}).items():
                 require(name != FOREIGN_NAMES_ENV or value == "saiai", f"{label} overrides {FOREIGN_NAMES_ENV}")
@@ -1105,13 +1136,14 @@ def verify_ci_workflow() -> None:
     )
     require((workflow.get("env") or {}).get(FOREIGN_NAMES_ENV) == "saiai", f"{relative} does not name SAIAI to the kernel's tests")
     for job_id, job in workflow["jobs"].items():
+        require("needs" not in job, f"{relative} job {job_id} waits on another job")
         for entry in matrix_entries(job):
             require(
                 runner_system(job, entry) == "Linux",
                 f"{relative} job {job_id} leaves Linux: native macOS and Windows checks belong to the release workflow",
             )
-    for event in ("pull_request", "push"):
-        base = {"github.event_name": event, "github.ref": "refs/heads/main"}
+    for event, ref in (("pull_request", "refs/pull/1/merge"), ("push", "refs/heads/main")):
+        base = {"github.event_name": event, "github.ref": ref}
         require(jobs_that_run(workflow, base) == set(workflow["jobs"]), f"{relative} skips a job on {event}")
 
         def check(job_id: str, command: str, purpose: str, **options) -> None:
@@ -1213,6 +1245,51 @@ def verify_release_workflow() -> None:
                 files = set(step.get("with", {}).get("files", "").split())
                 require(files == {f"dist/{name}" for name in ASSETS + WRAPPERS + ("manifest.json",)}, f"{relative} draft files differ")
     require(jobs["publish"].get("environment") == "release", f"{relative} publish job lost its environment")
+    # Each job waits on exactly these: a failed verify or build stops the
+    # draft and the preview.
+    for job_id, needs in (
+        ("verify", ["mode"]), ("build", ["verify"]), ("package-preview", ["mode", "build"]),
+        ("draft", ["mode", "build"]), ("publish", ["mode"]),
+    ):
+        actual = jobs[job_id].get("needs")
+        require(([actual] if isinstance(actual, str) else actual) == needs, f"{relative} job {job_id} must need {needs}")
+    # Nothing but the publish job may make a release public, by any means.
+    for job_id, job in jobs.items():
+        for step in job["steps"]:
+            script = str(step.get("run", ""))
+            if job_id != "publish":
+                for publishing in ("gh release", "PATCH", "draft\":false", "--draft", "draft=false"):
+                    require(publishing not in script, f"{relative} job {job_id} must not publish ({publishing!r})")
+    # The draft is uploaded (its condition holds whenever nothing is
+    # published yet) and its digests recorded for the publish run.
+    upload = [step for step in jobs["draft"]["steps"] if str(step.get("uses", "")).startswith("softprops/action-gh-release@")]
+    require(len(upload) == 1, f"{relative} draft job must upload one release draft")
+    require(
+        evaluate(upload[0].get("if", True), {"steps.preflight.outputs.already_published": "false"}),
+        f"{relative} draft job skips the draft upload",
+    )
+    draft = {"needs.mode.outputs.mode": "draft"}
+    runs_command(
+        relative, workflow, "draft",
+        "sha256sum " + " ".join(f"dist/{name}" for name in sorted(ASSETS + WRAPPERS + ("manifest.json",))) + " > release-digests.sha256",
+        base=draft, purpose="the record of the draft's digests",
+    )
+    digests = [
+        step for step in jobs["draft"]["steps"]
+        if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+        and step.get("with", {}).get("name") == "release-digests"
+        and step.get("with", {}).get("path") == "release-digests.sha256"
+        and "if" not in step
+    ]
+    require(len(digests) == 1, f"{relative} draft job does not keep the draft's digests")
+    # The publish run checks the fetched assets against those digests and
+    # never rewrites them before checking.
+    for step in jobs["publish"]["steps"]:
+        script = str(step.get("run", ""))
+        require(
+            re.search(r"(?:\b(?:cp|mv|install|ln|tee|touch|rm|sed)\b[^\n]*|>>?\s*\"?)\bdist/", script) is None,
+            f"{relative} publish job rewrites the fetched release assets",
+        )
 
     for mode_name in ("preview", "draft"):
         base = {"needs.mode.outputs.mode": mode_name}
@@ -1319,9 +1396,11 @@ def verify_release_workflow() -> None:
         "python3 scripts/saiai-cli/test-release-bundle.py --bundle dist --setup-sh dist/setup.sh",
     ):
         runs_command(relative, workflow, "package-preview", command, base=preview, purpose="the six-platform validation bundle")
-    publish = {"needs.mode.outputs.mode": "publish"}
+    publish = {"needs.mode.outputs.mode": "publish", "steps.fetch.outputs.state": "draft"}
     for command in (
+        'sha256sum --check --strict "$RUNNER_TEMP/release-digests/release-digests.sha256"',
         'cmp "$RUNNER_TEMP/manifest.json" dist/manifest.json',
+        'python3 scripts/saiai-cli/verify-github-release-draft.py --dist dist --tag "$GITHUB_REF_NAME" --state published <"$release_json"',
         f"python3 scripts/saiai-cli/verify-release.py {every_artifact}",
         "python3 scripts/saiai-cli/test-release-bundle.py --bundle dist --setup-sh dist/setup.sh",
     ):
