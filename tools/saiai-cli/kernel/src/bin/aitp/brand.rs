@@ -95,6 +95,7 @@ pub static AITP_BRAND: Brand = Brand {
     },
     winhttp_agent: "AITP",
     codex_daemon_client_name: "aitp_daemon_check",
+    refuse_foreign_profiles: true,
 };
 
 #[cfg(test)]
@@ -231,6 +232,7 @@ mod tests {
         assert_eq!(brand.scripts.identifier_prefix, "Aitp");
         assert_eq!(brand.winhttp_agent, "AITP");
         assert_eq!(brand.codex_daemon_client_name, "aitp_daemon_check");
+        assert!(brand.refuse_foreign_profiles);
     }
 
     /// The placeholder JWT: an unsigned token whose claims name the AITP

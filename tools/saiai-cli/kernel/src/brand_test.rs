@@ -96,4 +96,5 @@ pub const KTEST_VALUES: Brand = Brand {
     },
     winhttp_agent: "KTEST",
     codex_daemon_client_name: "ktest_daemon_check",
+    refuse_foreign_profiles: true,
 };

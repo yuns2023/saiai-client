@@ -415,3 +415,211 @@ fn the_program_carries_no_other_distribution_name() {
     assert!(!contains(&lower, other.as_bytes()));
     assert!(contains(&bytes, b"AITP local installation CA"));
 }
+
+/// An installation CA of another program built on this kernel ("OTHER"),
+/// with its key when `key` is given.
+fn other_installation_ca_with_key(path: &Path, key_path: Option<&Path>) {
+    use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let mut name = DistinguishedName::new();
+    name.push(DnType::CommonName, "OTHER local installation CA 0123abcd");
+    name.push(DnType::OrganizationName, "OTHER");
+    params.distinguished_name = name;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, params.self_signed(&key).unwrap().pem()).unwrap();
+    if let Some(key_path) = key_path {
+        std::fs::write(key_path, key.serialize_pem()).unwrap();
+    }
+}
+
+fn other_installation_ca(path: &Path) {
+    other_installation_ca_with_key(path, None);
+}
+
+/// The placeholder login of another program built on this kernel.
+fn other_placeholder_login() -> String {
+    use base64::Engine;
+    let encode = |text: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text);
+    format!(
+        "{}.{}.{}",
+        encode(r#"{"alg":"none","typ":"JWT"}"#),
+        encode(
+            r#"{"email":"other-local-proxy@invalid","https://api.openai.com/auth":{"chatgpt_account_id":"other-local-proxy-account"}}"#
+        ),
+        encode("other-local-proxy")
+    )
+}
+
+fn snapshot(path: &Path) -> Vec<u8> {
+    std::fs::read(path).unwrap()
+}
+
+/// aitp refuses to take over a configuration another local proxy program
+/// manages, before it writes anything, and says how to proceed.
+#[test]
+fn aitp_does_not_take_over_another_programs_configuration() {
+    let gateway = "http://127.0.0.1:9";
+    let refused = |sandbox: &Sandbox, args: &[&str]| {
+        let (success, text) = sandbox.output(&mut sandbox.command(args));
+        assert!(!success, "aitp {args:?} succeeded:\n{text}");
+        assert!(
+            text.contains("is managed by another local proxy program")
+                || text.contains("another local proxy program; AITP does not use it"),
+            "{text}"
+        );
+        assert!(
+            text.contains("CLAUDE_CONFIG_DIR or CODEX_HOME") || text.contains("separate AITP home"),
+            "{text}"
+        );
+        assert!(!sandbox.home.join(".aitp").join("config.json").exists());
+        text
+    };
+
+    // Claude: a local proxy with another program's installation CA.
+    let sandbox = Sandbox::new();
+    let ca = sandbox.home.join("other/other-ca.crt");
+    other_installation_ca(&ca);
+    let settings = sandbox.home.join(".claude").join("settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings,
+        serde_json::to_vec(&serde_json::json!({"env": {
+            "https_proxy": "http://127.0.0.1:4000",
+            "NODE_EXTRA_CA_CERTS": ca,
+        }}))
+        .unwrap(),
+    )
+    .unwrap();
+    let before = snapshot(&settings);
+    refused(
+        &sandbox,
+        &["init", "--base-url", gateway, "--api-key", "TEST_ONLY_AITP"],
+    );
+    assert_eq!(snapshot(&settings), before);
+
+    // Codex: another program's managed block.
+    let sandbox = Sandbox::new();
+    let env = sandbox.home.join(".codex").join(".env");
+    std::fs::create_dir_all(env.parent().unwrap()).unwrap();
+    std::fs::write(
+        &env,
+        "# BEGIN OTHER CODEX IDE (managed)\nHTTPS_PROXY=\"http://127.0.0.1:4000\"\nhttps_proxy=\"http://127.0.0.1:4000\"\n# END OTHER CODEX IDE (managed)\n",
+    )
+    .unwrap();
+    let before = snapshot(&env);
+    refused(
+        &sandbox,
+        &[
+            "init-codex",
+            "--base-url",
+            gateway,
+            "--api-key",
+            "TEST_ONLY_AITP",
+        ],
+    );
+    assert_eq!(snapshot(&env), before);
+    assert!(!sandbox.home.join(".codex/auth.json").exists());
+
+    // Codex: signed in with another program's placeholder.
+    let sandbox = Sandbox::new();
+    let auth = sandbox.home.join(".codex").join("auth.json");
+    std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
+    let token = other_placeholder_login();
+    std::fs::write(
+        &auth,
+        serde_json::to_vec(&serde_json::json!({"auth_mode": "chatgpt", "tokens": {"access_token": token, "id_token": token}}))
+            .unwrap(),
+    )
+    .unwrap();
+    let before = snapshot(&auth);
+    refused(
+        &sandbox,
+        &[
+            "init-codex",
+            "--base-url",
+            gateway,
+            "--api-key",
+            "TEST_ONLY_AITP",
+        ],
+    );
+    assert_eq!(snapshot(&auth), before);
+
+    // The editor: another program's live proxy marker.
+    let sandbox = Sandbox::new();
+    let editor = sandbox.root.join("vscode/user-data/User/settings.json");
+    std::fs::create_dir_all(editor.parent().unwrap()).unwrap();
+    std::fs::write(
+        &editor,
+        "{\n // OTHER managed VSCode proxy: http://127.0.0.1:4000\n \"http.proxy\": \"http://127.0.0.1:4000\"\n}\n",
+    )
+    .unwrap();
+    let before = snapshot(&editor);
+    let (success, text) = sandbox.output(
+        sandbox
+            .command(&["vscode"])
+            .env("VSCODE_PORTABLE", sandbox.root.join("vscode")),
+    );
+    assert!(!success, "{text}");
+    assert!(
+        text.contains("is managed by another local proxy program"),
+        "{text}"
+    );
+    assert_eq!(snapshot(&editor), before);
+}
+
+/// aitp does not use another program's installation CA as its own, even
+/// when its configuration names it.
+#[test]
+fn aitp_does_not_use_another_programs_ca() {
+    let sandbox = Sandbox::new();
+    let gateway = "http://127.0.0.1:9";
+    sandbox.run(&["init", "--base-url", gateway, "--api-key", "TEST_ONLY_AITP"]);
+    let config = read_json(&sandbox.home.join(".aitp/config.json"));
+    let ca = PathBuf::from(config["ca_cert_path"].as_str().unwrap());
+    let key = PathBuf::from(config["ca_key_path"].as_str().unwrap());
+    other_installation_ca_with_key(&ca, Some(&key));
+    let (success, text) = sandbox.output(&mut sandbox.command(&[
+        "init",
+        "--base-url",
+        gateway,
+        "--api-key",
+        "TEST_ONLY_AITP",
+    ]));
+    assert!(!success, "{text}");
+    assert!(
+        text.contains("is the installation CA of \"OTHER\""),
+        "{text}"
+    );
+    // The proxy itself (it reads the CA when it starts) refuses too.
+    let (success, text) = sandbox.output(&mut sandbox.command(&[]));
+    assert!(!success, "{text}");
+    assert!(
+        text.contains("is the installation CA of \"OTHER\""),
+        "{text}"
+    );
+}
+
+/// Without any other program's remains, initialization works as before.
+#[test]
+fn aitp_initializes_over_its_own_and_unrelated_settings() {
+    let sandbox = Sandbox::new();
+    let settings = sandbox.home.join(".claude").join("settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    // A corporate proxy and CA that are not an installation of this kernel.
+    std::fs::write(
+        &settings,
+        r#"{"env": {"https_proxy": "http://10.0.0.1:3128", "NODE_EXTRA_CA_CERTS": "/etc/ssl/corporate.pem"}}"#,
+    )
+    .unwrap();
+    let args = [
+        "init",
+        "--base-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "TEST_ONLY_AITP",
+    ];
+    sandbox.run(&args);
+    sandbox.run(&args);
+}

@@ -894,6 +894,19 @@ fn plan_claude(discovery: &Discovery, product: &ProductDir, plan: &mut Plan) {
                 Outcome::Failed("could not be parsed as a JSON object; not changed".into()),
             ),
             Some(settings) => {
+                // Another local proxy program manages these settings: none
+                // of their values is removed, ours included (they would be
+                // indistinguishable from its own, e.g. the same API key).
+                if let Some(reason) = crate::coexistence::claude_settings_evidence(&settings) {
+                    plan.note(
+                        Area::Claude,
+                        label.clone(),
+                        Outcome::Kept(format!(
+                            "managed by another local proxy program ({reason}); not changed"
+                        )),
+                    );
+                    return;
+                }
                 let removal = claude_settings_removal(&settings, &owned);
                 let modified_reason = if product.candidates.is_empty() {
                     format!(
@@ -1997,6 +2010,7 @@ fn plan_windows_certificates(
     files: &[PathBuf],
     plan: &mut Plan,
 ) -> Result<()> {
+    // Certificates a lease lists are decided by its Lease action alone.
     let mut thumbprints = Vec::new();
     for instance in &discovery.instances {
         for lease in [
@@ -2050,21 +2064,23 @@ fn plan_windows_certificates(
             }
         }
     }
+    // Each installed certificate from the instances' CA files, with its own
+    // DER (the file's copy), so it is decided by its own identity.
     const SCRIPT: &str = r#"
 $ErrorActionPreference='Stop'
-$found=New-Object System.Collections.Generic.List[string]
+$found=@{}
 foreach($file in ($env:@@ENV@@CA_FILES -split "`n")){
   if([string]::IsNullOrWhiteSpace($file)){continue}
   try{
     $pem=[IO.File]::ReadAllText($file)
     foreach($m in [regex]::Matches($pem,'-----BEGIN CERTIFICATE-----(?<der>[A-Za-z0-9+/=\s]+)-----END CERTIFICATE-----')){
-      $c=[Security.Cryptography.X509Certificates.X509Certificate2]::new([Convert]::FromBase64String($m.Groups['der'].Value))
-      $found.Add($c.Thumbprint.ToUpperInvariant()); $c.Dispose()
+      $raw=[Convert]::FromBase64String($m.Groups['der'].Value)
+      $c=[Security.Cryptography.X509Certificates.X509Certificate2]::new($raw)
+      $found[$c.Thumbprint.ToUpperInvariant()]=[Convert]::ToBase64String($raw); $c.Dispose()
     }
   }catch{}
 }
-foreach($t in ($env:@@ENV@@CA_THUMBPRINTS -split "`n")){ $t=$t.Trim(); if($t -match '^[0-9A-Fa-f]{40}$'){ $found.Add($t.ToUpperInvariant()) } }
-$present=@($found | Sort-Object -Unique | Where-Object { Test-Path -LiteralPath ('Cert:\CurrentUser\Root\'+$_) })
+$present=@($found.Keys | Sort-Object | Where-Object { Test-Path -LiteralPath ('Cert:\CurrentUser\Root\'+$_) } | ForEach-Object { [pscustomobject]@{t=$_;der=$found[$_]} })
 ConvertTo-Json -Compress -InputObject $present
 "#;
     let files = files
@@ -2072,19 +2088,16 @@ ConvertTo-Json -Compress -InputObject $present
         .map(|path| path.to_string_lossy().to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    let thumbprints = thumbprints.join("\n");
+    let leased: std::collections::HashSet<String> = thumbprints
+        .iter()
+        .map(|thumbprint| thumbprint.to_ascii_uppercase())
+        .collect();
     let output = match powershell(
         &crate::script_brand::render(SCRIPT),
-        &[
-            (
-                crate::script_brand::env("CA_FILES").as_str(),
-                std::ffi::OsStr::new(&files),
-            ),
-            (
-                crate::script_brand::env("CA_THUMBPRINTS").as_str(),
-                std::ffi::OsStr::new(&thumbprints),
-            ),
-        ],
+        &[(
+            crate::script_brand::env("CA_FILES").as_str(),
+            std::ffi::OsStr::new(&files),
+        )],
         Duration::from_secs(60),
     ) {
         Ok(output) => output,
@@ -2099,17 +2112,46 @@ ConvertTo-Json -Compress -InputObject $present
     };
     let present = match serde_json::from_str::<Value>(&output) {
         Ok(Value::Array(values)) => values,
-        Ok(Value::String(value)) => vec![Value::String(value)],
+        Ok(value @ Value::Object(_)) => vec![value],
         _ => Vec::new(),
     };
-    for thumbprint in present.iter().filter_map(Value::as_str) {
-        plan.act(
-            Area::Certificates,
-            format!(
-                "remove {brand_product} CA {thumbprint} from Windows CurrentUser\\Root (Windows may ask you to confirm)", brand_product = BRAND.product_name
+    for item in &present {
+        let Some(thumbprint) = item.get("t").and_then(Value::as_str) else {
+            continue;
+        };
+        if leased.contains(&thumbprint.to_ascii_uppercase()) {
+            continue;
+        }
+        let owner = item
+            .get("der")
+            .and_then(Value::as_str)
+            .and_then(|der| {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.decode(der).ok()
+            })
+            .context("certificate data is missing")
+            .and_then(|der| crate::coexistence::classify_certificate(&der));
+        match owner {
+            Ok(crate::coexistence::CertificateOwner::Foreign(organization)) => plan.note(
+                Area::Certificates,
+                format!("CA {thumbprint} in Windows CurrentUser\\Root"),
+                Outcome::Kept(format!(
+                    "installation CA of \"{organization}\", another local proxy program"
+                )),
             ),
-            Action::RootCa(thumbprint.to_string()),
-        );
+            Ok(_) => plan.act(
+                Area::Certificates,
+                format!(
+                    "remove {brand_product} CA {thumbprint} from Windows CurrentUser\\Root (Windows may ask you to confirm)", brand_product = BRAND.product_name
+                ),
+                Action::RootCa(thumbprint.to_string()),
+            ),
+            Err(error) => plan.note(
+                Area::Certificates,
+                format!("CA {thumbprint} in Windows CurrentUser\\Root"),
+                Outcome::Failed(format!("could not be identified ({error:#}); kept, rerun uninstall")),
+            ),
+        }
     }
     Ok(())
 }
@@ -2627,8 +2669,22 @@ fn execute_item(action: &Action, args: &Args) -> Result<Outcome> {
         Action::Launchd { target, plist } => execute_launchd(target, plist),
         #[cfg(windows)]
         Action::Lease(path) => {
-            crate::restore_legacy_windows_packaged_proxy_lease_at(path)?;
-            Ok(Outcome::Done)
+            let settled = crate::restore_legacy_windows_packaged_proxy_lease_at(path)?;
+            Ok(if !settled.pending.is_empty() {
+                // Keeps the lease (and, through the gate, the data and the
+                // program) so that rerunning uninstall retries them.
+                Outcome::Failed(format!(
+                    "CA(s) {} could not be inspected or removed; they and the lease are kept, rerun uninstall",
+                    settled.pending.join(", ")
+                ))
+            } else if !settled.foreign.is_empty() {
+                Outcome::Kept(format!(
+                    "proxy restored; CA(s) {} belong to another local proxy program and are kept",
+                    settled.foreign.join(", ")
+                ))
+            } else {
+                Outcome::Done
+            })
         }
         #[cfg(windows)]
         Action::RootCa(thumbprint) => {

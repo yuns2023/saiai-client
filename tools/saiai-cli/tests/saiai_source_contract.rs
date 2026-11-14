@@ -169,6 +169,7 @@ fn saiai_brand_values_are_frozen() {
     );
     assert_eq!(brand.winhttp_agent, "SAIAI");
     assert_eq!(brand.codex_daemon_client_name, "saiai_daemon_check");
+    assert!(!brand.refuse_foreign_profiles);
     assert_eq!(brand.scripts.env_prefix, "SAIAI_");
     assert_eq!(brand.scripts.identifier_prefix, "Saiai");
     assert_eq!(brand.sensitive_inbound_headers, ["x-saiai-client-proof"]);

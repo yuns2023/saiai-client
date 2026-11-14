@@ -49,7 +49,7 @@ const KTEST_VALUES: Brand = Brand {
         ca_cert_filename: "ktest-ca.crt",
         ca_key_filename: "ktest-ca.key",
         ca_backup_prefix: "ktest-ca.",
-        ca_common_name_prefix: "KTEST local CA",
+        ca_common_name_prefix: "KTEST local installation CA",
         ca_organization: "KTEST",
         nss_nickname: "ktest-local-proxy",
         tls_leaf_salt: b"KTEST leaf v1",
@@ -96,6 +96,7 @@ const KTEST_VALUES: Brand = Brand {
     },
     winhttp_agent: "KTEST",
     codex_daemon_client_name: "ktest_daemon_check",
+    refuse_foreign_profiles: false,
 };
 
 static NONE: NoGatewayExtension = NoGatewayExtension;

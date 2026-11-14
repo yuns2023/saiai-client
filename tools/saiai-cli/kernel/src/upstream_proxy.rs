@@ -51,6 +51,11 @@ pub(crate) struct Endpoint {
 }
 
 impl Endpoint {
+    /// `host:port` when the proxy runs on this machine (a loopback host).
+    pub(crate) fn loopback_address(&self) -> Option<String> {
+        is_loopback_target(&self.host).then(|| format!("{}:{}", self.host, self.port))
+    }
+
     /// Parses `http://[user:password@]host[:port]` or a bare `host:port`.
     /// Errors never echo the value, which may contain a password.
     pub(crate) fn parse(value: &str) -> Result<Self> {

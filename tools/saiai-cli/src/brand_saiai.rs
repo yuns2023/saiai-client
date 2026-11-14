@@ -95,4 +95,5 @@ pub const SAIAI_VALUES: Brand = Brand {
     },
     winhttp_agent: "SAIAI",
     codex_daemon_client_name: "saiai_daemon_check",
+    refuse_foreign_profiles: false,
 };

@@ -1018,6 +1018,46 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
   - 每个 PR 单列"SAIAI 用户可见的行为变化"，并说明只会少删或多拒绝；
   - 可能让现有 SAIAI 用户原地升级后功能失效的改动，先停下确认。
 
+### 同机共存（D2，缩小范围）
+
+两个基于本内核的发行版可能装在同一台机器上，并共用默认的 Claude、Codex 和 VS Code 配置。内核据此做以下处理（`kernel/src/coexistence.rs`）。
+
+**残留证据**：只认"另一个发行版留下、结构上能识别的残留"，不写 owner 记录。
+
+- **安装 CA 约定**：CN 为 `<前缀>` 或 `<前缀> <8 位小写十六进制>`，前缀以 ` local installation CA` 结尾（品牌校验强制此约定）；证书须为自颁发的 CA，且带 O。按单张证书判断：
+  - O 等于本品牌 → 自己的；
+  - 符合约定且 O 是别的值 → 外来；
+  - 其余（不符合约定、没有 O 等）→ 未知，不算证据。
+  - PEM bundle：任一证书是自己的就算自己的。
+- **E1 Claude**：`settings.json` 的代理变量指向本机回环地址，且 `NODE_EXTRA_CA_CERTS` 指向外来 CA。
+- **E2 Codex `.env`**：存在另一品牌的托管块，且块内有一个代理赋值指向回环地址。该键在整个文件中的所有赋值必须一致；嵌套、交叉或未闭合的块，以及空的残留块，都不算。
+- **E3 Codex `.env`**：`SSL_CERT_FILE` 指向外来 CA，且有一个代理赋值指向回环地址。
+- **E4 Codex `auth.json`**：以 `access_token` 为准，必须是内核形状的外来占位 JWT。单独的 `id_token` 不算。
+- **E5 VS Code**：注释中有另一品牌的 managed 标记，且标记里的地址正是当前的 `http.proxy`。
+
+**所有品牌都生效**：
+
+- 启动时的迁移写入：Claude 设置满足 E1、Codex `.env` 满足 E2/E3 时跳过。
+- `uninstall`：Claude 设置满足 E1 时整个文件不编辑。
+- Windows 卸载与 Desktop 启动时的旧 lease 恢复：
+  - 代理是否恢复，沿用原有的归属判断，与证书无关；
+  - 证书逐张判断：外来的保留；身份读不出或删除失败的，保留并把 lease 改写为待重试（`proxy_handled`）；
+  - 卸载时出现待重试证书，记为失败，借助卸载原有的门控保留数据和程序，以便重跑。
+- `doctor`：上游代理是本机回环地址时给出提示，不改退出码。
+
+**仅当品牌开启 `refuse_foreign_profiles` 时生效**（AITP 开，SAIAI 关）：
+
+- `init`、`init-codex`、`vscode`，以及准备 Codex profile 的启动器，在写入任何东西之前检查 E1–E5，命中即拒绝；
+- 读取或复用运行时 CA 的入口拒绝外来 CA。
+
+**已知边界**：
+
+- 对方 CA 已删除、只配置了 Claude 时会漏判；
+- 企业 CA 恰好按约定命名时会误判为另一个发行版；
+- 混合 PEM 中只要有一张自己的证书就判为自己的，会掩盖外来证据；
+- 不加跨发行版锁，AITP 的"检查后写入"存在并发竞态；
+- update 与 uninstall、与 Windows 替换助手之间的互斥仍在 D4 前置清单中。
+
 ### Linux 随机数兼容性
 
 Linux musl 资产通过 `scripts/saiai-cli/build-linux.sh` 构建。构建机需安装
