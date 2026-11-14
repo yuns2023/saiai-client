@@ -1067,7 +1067,7 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
    ```sh
    python3 tools/saiai-cli/kernel/scripts/release_manifest.py generate --dist dist
    ```
-   它写出 `dist/aitp-manifest.json`（规范 JSON：键排序、紧凑、末尾换行；版本默认取 `kernel/Cargo.toml`），并打印 manifest 的 sha256 和确切的签名命令。manifest 文件名只允许字母、数字、`.`、`_`、`-`（不以 `-` 开头），其他名字直接拒绝；打印的签名命令只有 trusted comment 用单引号括起，POSIX shell（macOS/Linux 终端、Git Bash、WSL）和 Windows PowerShell 都可原样粘贴（cmd.exe 不行）；打印的上传前检查命令按 POSIX shell 规则引用路径。
+   它写出 `dist/aitp-manifest.json`（规范 JSON：键排序、紧凑、末尾换行；版本默认取 `kernel/Cargo.toml`），并打印 manifest 的 sha256 和确切的签名命令。manifest 文件名只允许字母、数字、`.`、`_`、`-`，且必须以字母或数字开头，其他名字直接拒绝；打印的签名命令只有 trusted comment 用单引号括起，POSIX shell（macOS/Linux 终端、Git Bash、WSL）和 Windows PowerShell 都可原样粘贴（cmd.exe 不行）；打印的上传前检查命令按 POSIX shell 规则引用路径。
 2. 维护者把 `aitp-manifest.json` 拷到签名电脑，先核对打印的 sha256（`shasum -a 256 aitp-manifest.json`，Windows `certutil -hashfile aitp-manifest.json SHA256`）以及这次要发布的源码提交，再执行打印的命令，例如：
    ```sh
    minisign -S -l -s aitp-release.key -p aitp-release.pub -m aitp-manifest.json -x aitp-manifest.json.minisig -t "aitp-manifest 0.2.0 sha256:<manifest sha256>"

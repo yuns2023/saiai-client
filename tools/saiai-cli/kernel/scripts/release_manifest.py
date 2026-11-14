@@ -449,7 +449,7 @@ def command_generate(args) -> int:
     output = args.output or args.dist / MANIFEST_NAME
     require(
         SAFE_NAME.fullmatch(output.name) is not None,
-        f"the manifest file name {output.name!r} may only use letters, digits, '.', '_' and '-'",
+        f"the manifest file name {output.name!r} may only use letters, digits, '.', '_' and '-', starting with a letter or digit",
     )
     output.write_bytes(rendered)
     digest = hashlib.sha256(rendered).hexdigest()
