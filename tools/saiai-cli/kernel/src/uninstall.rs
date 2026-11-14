@@ -349,7 +349,20 @@ pub(crate) fn run(args: Args) -> Result<()> {
     {
         std::process::exit(code);
     }
-    execute(&mut plan, &args);
+    // No update (or Windows replacement helper) may change an installation
+    // directory while this runs; nothing has changed yet if one does.
+    let mut locks = match lock_install_dirs(&plan) {
+        Ok(locks) => locks,
+        Err(error) => {
+            #[cfg(windows)]
+            if args.relaunched_from.is_some() {
+                schedule_temporary_copy_removal();
+            }
+            return Err(error);
+        }
+    };
+    execute(&mut plan, &args, &mut locks);
+    drop(locks);
     print_summary(&plan);
     #[cfg(windows)]
     if args.relaunched_from.is_some() {
@@ -1662,6 +1675,61 @@ fn same_file(left: &Path, right: &Path) -> bool {
                 .map(|name| name.to_string_lossy().to_lowercase())
 }
 
+/// The lock files of every existing installation directory, when this brand
+/// serializes installation changes (none on Unix, which locks directories).
+fn install_lock_files(discovery: &Discovery) -> Vec<PathBuf> {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    if crate::serializes_installation_changes() {
+        return discovery
+            .install_dirs
+            .iter()
+            .filter(|dir| dir.is_dir())
+            .flat_map(|dir| {
+                crate::update_candidate::installation_lock_files(dir, BRAND.update.candidate_prefix)
+            })
+            .collect();
+    }
+    let _ = discovery;
+    Vec::new()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+type InstallLocks = Vec<crate::InstallationLock>;
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+type InstallLocks = Vec<()>;
+
+/// Locks, against updates, every installation directory the plan removes
+/// program files (and so, on Windows, the lock files) from, when this brand
+/// serializes installation changes; fails, before any change, while one is
+/// held. The plan names every lock file this creates.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn lock_install_dirs(plan: &Plan) -> Result<InstallLocks> {
+    if !crate::serializes_installation_changes() {
+        return Ok(Vec::new());
+    }
+    let mut dirs: Vec<&Path> = Vec::new();
+    for item in &plan.items {
+        if let (Area::Program, Action::RemoveFile(path)) = (item.area, &item.action)
+            && let Some(dir) = path.parent()
+            && !dirs.contains(&dir)
+        {
+            dirs.push(dir);
+        }
+    }
+    dirs.into_iter()
+        .map(|dir| {
+            crate::lock_installation(dir, BRAND.update.candidate_prefix, BRAND.binary_name).context(
+                "uninstall stopped before changing any configuration, service or program file",
+            )
+        })
+        .collect()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn lock_install_dirs(_plan: &Plan) -> Result<InstallLocks> {
+    Ok(Vec::new())
+}
+
 fn is_main_program(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -1676,9 +1744,27 @@ fn plan_program(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
     for dir in &discovery.install_dirs {
         files.extend(matching_files(dir, is_program_file)?);
     }
+    // The installation locks (Windows lock files) are held while the other
+    // files go and removed last: planned even when absent, because taking
+    // the lock creates them.
+    let lock_files = install_lock_files(discovery);
+    files.retain(|path| !lock_files.contains(path));
+    // Only where there is an installation to lock (a program file or a lock
+    // file): all of that directory's lock files, since locking it (see
+    // `lock_install_dirs`) creates any that are missing.
+    let lock_files: Vec<_> = lock_files
+        .iter()
+        .filter(|lock| {
+            lock_files
+                .iter()
+                .chain(&files)
+                .any(|other| other.parent() == lock.parent() && other.exists())
+        })
+        .cloned()
+        .collect();
     let (main, auxiliary): (Vec<_>, Vec<_>) =
         files.into_iter().partition(|path| is_main_program(path));
-    for path in auxiliary.into_iter().chain(main) {
+    for path in auxiliary.into_iter().chain(main).chain(lock_files) {
         plan.remove_file(Area::Program, path);
     }
     for dir in &discovery.install_dirs {
@@ -2816,7 +2902,78 @@ fn gate_blocked(items: &[Item], area: Area) -> bool {
                 .any(|other| other.area == Area::Data && !other.outcome.succeeded()))
 }
 
-fn execute(plan: &mut Plan, args: &Args) {
+/// Whether `path` is an installation lock file of this brand (Windows,
+/// brands that serialize installation changes).
+fn is_install_lock_file(path: &Path) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    if crate::serializes_installation_changes() {
+        return path.parent().is_some_and(|dir| {
+            crate::update_candidate::installation_lock_files(dir, BRAND.update.candidate_prefix)
+                .iter()
+                .any(|lock| lock == path)
+        });
+    }
+    let _ = path;
+    false
+}
+
+/// Releases the lock (of one installation directory) that holds `path`;
+/// the other directories stay locked.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn release_lock_of(locks: &mut InstallLocks, path: &Path) {
+    locks.retain(|lock| !lock.holds(path));
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn release_lock_of(_locks: &mut InstallLocks, _path: &Path) {}
+
+fn serializes_installation_changes() -> bool {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    {
+        crate::serializes_installation_changes()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        false
+    }
+}
+
+/// Like [`execute_remove_empty_dir`], for a directory another process may
+/// change between the check and the removal: gone meanwhile is absent, no
+/// longer empty is kept.
+fn execute_remove_empty_dir_concurrently(path: &Path) -> Result<Outcome> {
+    execute_remove_empty_dir(path).or_else(concurrent_removal_outcome)
+}
+
+fn concurrent_removal_outcome(error: anyhow::Error) -> Result<Outcome> {
+    match error.downcast_ref::<std::io::Error>() {
+        Some(io) if io.kind() == ErrorKind::NotFound => Ok(Outcome::Absent),
+        Some(io) if io.kind() == ErrorKind::DirectoryNotEmpty => {
+            Ok(Outcome::Kept("not empty".into()))
+        }
+        _ => Err(error),
+    }
+}
+
+/// Removes a lock file after its lock was released. Another update or
+/// uninstall that took it meanwhile keeps it: reported, so a rerun after
+/// that one finishes removes it.
+fn execute_remove_lock_file(path: &Path) -> Result<Outcome> {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(Outcome::Done),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(Outcome::Absent),
+        Err(error) if cfg!(windows) && error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+            Ok(Outcome::Kept(
+                "in use by another update or uninstall; run uninstall again after it finishes"
+                    .into(),
+            ))
+        }
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+fn execute(plan: &mut Plan, args: &Args, locks: &mut InstallLocks) {
     println!();
     for gated in [false, true] {
         for index in 0..plan.items.len() {
@@ -2829,7 +2986,24 @@ fn execute(plan: &mut Plan, args: &Args) {
             let outcome = if dependency_failed || (gated && gate_blocked(&plan.items, item.area)) {
                 Outcome::Skipped
             } else {
-                match execute_item(&item.action, args) {
+                let result = match &item.action {
+                    // A directory's lock files go after its program files:
+                    // its lock is released just before, and a lock file
+                    // that another update or uninstall holds by then is
+                    // kept (reported), not a failure.
+                    Action::RemoveFile(path) if is_install_lock_file(path) => {
+                        release_lock_of(locks, path);
+                        execute_remove_lock_file(path)
+                    }
+                    // Another update or uninstall may change the
+                    // directory meanwhile (no lock covers it any more, or
+                    // never did).
+                    Action::RemoveEmptyDir(path) if serializes_installation_changes() => {
+                        execute_remove_empty_dir_concurrently(path)
+                    }
+                    action => execute_item(action, args),
+                };
+                match result {
                     Ok(outcome) => outcome,
                     Err(error) => Outcome::Failed(format!("{error:#}")),
                 }
@@ -3297,6 +3471,85 @@ mod tests {
             remove_path_entries(r"C:\Tools;;C:\Users\u\AppData\Local\KTEST\bin2", dir),
             None
         );
+    }
+
+    /// Removing one installation directory's lock file releases that
+    /// directory's lock only; the others stay locked.
+    #[test]
+    fn releasing_one_directorys_lock_keeps_the_others() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let lock = |dir: &Path| crate::lock_installation(dir, ".ktest-update-", "ktest");
+        let mut locks: InstallLocks = vec![lock(a.path()).unwrap(), lock(b.path()).unwrap()];
+        release_lock_of(&mut locks, &a.path().join(".ktest-update-lock"));
+        assert!(lock(b.path()).is_err());
+        #[cfg(windows)]
+        {
+            assert_eq!(locks.len(), 1);
+            let _a = lock(a.path()).unwrap();
+        }
+        // Unix locks directories, not files: nothing is released by a path.
+        #[cfg(unix)]
+        {
+            assert_eq!(locks.len(), 2);
+            assert!(lock(a.path()).is_err());
+        }
+    }
+
+    #[test]
+    fn a_directory_changed_meanwhile_is_absent_or_kept() {
+        let wrapped = |kind| {
+            Err::<(), _>(std::io::Error::from(kind))
+                .context("failed to remove x")
+                .unwrap_err()
+        };
+        assert_eq!(
+            concurrent_removal_outcome(wrapped(ErrorKind::NotFound)).unwrap(),
+            Outcome::Absent
+        );
+        assert_eq!(
+            concurrent_removal_outcome(wrapped(ErrorKind::DirectoryNotEmpty)).unwrap(),
+            Outcome::Kept("not empty".into())
+        );
+        assert!(concurrent_removal_outcome(wrapped(ErrorKind::PermissionDenied)).is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let dir = directory.path().join("bin");
+        assert_eq!(
+            execute_remove_empty_dir_concurrently(&dir).unwrap(),
+            Outcome::Absent
+        );
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("other"), b"").unwrap();
+        assert!(matches!(
+            execute_remove_empty_dir_concurrently(&dir).unwrap(),
+            Outcome::Kept(_)
+        ));
+        fs::remove_file(dir.join("other")).unwrap();
+        assert_eq!(
+            execute_remove_empty_dir_concurrently(&dir).unwrap(),
+            Outcome::Done
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_lock_file_in_use_is_kept_not_failed() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".ktest-update-lock");
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        assert!(matches!(
+            execute_remove_lock_file(&path).unwrap(),
+            Outcome::Kept(reason) if reason.contains("run uninstall again")
+        ));
+        drop(held);
+        assert_eq!(execute_remove_lock_file(&path).unwrap(), Outcome::Done);
+        assert_eq!(execute_remove_lock_file(&path).unwrap(), Outcome::Absent);
     }
 
     #[test]

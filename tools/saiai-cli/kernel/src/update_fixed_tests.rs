@@ -751,7 +751,7 @@ fn one_update_at_a_time_per_installation_directory() {
     let held = lock_update_directory(first.path()).unwrap();
     let error = lock_update_directory(first.path()).unwrap_err();
     assert!(
-        format!("{error:#}").contains("another ktest update is running"),
+        format!("{error:#}").contains("another ktest update or uninstall is running"),
         "{error:#}"
     );
     let _other = lock_update_directory(second.path()).unwrap();
@@ -762,6 +762,206 @@ fn one_update_at_a_time_per_installation_directory() {
     assert_eq!(fs::read_dir(first.path()).unwrap().count(), 0);
     #[cfg(windows)]
     assert!(first.path().join(".ktest-update-lock").is_file());
+}
+
+/// Windows: a replacement helper holding the helper lock keeps updates and
+/// uninstall out after the updater has gone.
+#[cfg(windows)]
+#[test]
+fn a_held_helper_lock_keeps_the_installation_locked() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let helper = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .share_mode(0)
+        .open(directory.path().join(".ktest-update-helper-lock"))
+        .unwrap();
+    let error = lock_update_directory(directory.path()).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("a previous ktest update is still being installed"),
+        "{error:#}"
+    );
+    // Refused without keeping the main lock.
+    drop(helper);
+    let lock = lock_update_directory(directory.path()).unwrap();
+    assert!(lock.holds(&directory.path().join(".ktest-update-lock")));
+    assert!(lock.holds(&directory.path().join(".ktest-update-helper-lock")));
+    assert!(!lock.holds(&directory.path().join(".ktest-update-x")));
+}
+
+/// Windows: `finalize_update` with the installation lock (a fixed-source
+/// update) hands the lock to the helper it starts: once it returns and the
+/// updater lets go, the directory stays locked while the helper runs. (Here
+/// the helper waits for this test process, the "updater", which does not
+/// exit, and gives up after 30 s without replacing anything.)
+#[cfg(windows)]
+#[test]
+fn a_fixed_source_update_hands_its_lock_to_the_replacement_helper() {
+    let directory = tempfile::tempdir().unwrap();
+    let dir = directory.path();
+    let current = dir.join("current.cmd");
+    fs::write(&current, "@exit /b 0\r\n").unwrap();
+    let new_program = b"@exit /b 0\r\nrem new\r\n".to_vec();
+    let candidate = dir.join(".ktest-update-1.exe");
+    fs::write(&candidate, &new_program).unwrap();
+    let mut lock = lock_update_directory(dir).unwrap();
+    finalize_update(
+        &current,
+        &candidate,
+        &dir.join("ktest.bak-1.exe"),
+        false,
+        &sha256_hex(&new_program),
+        Some(&mut lock),
+    )
+    .unwrap();
+    drop(lock);
+    let error = lock_update_directory(dir).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("still being installed"),
+        "{error:#}"
+    );
+    let status = dir.join(".ktest-update-status.txt");
+    let until = std::time::Instant::now() + Duration::from_secs(90);
+    let report = loop {
+        let report = fs::read_to_string(&status).unwrap_or_default();
+        let report = report.trim_start_matches('\u{feff}').trim().to_string();
+        if report.starts_with("failed:") || report.starts_with("updated:") {
+            break report;
+        }
+        assert!(std::time::Instant::now() < until, "{report}");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(report.contains("Updater process did not exit"), "{report}");
+    assert_eq!(fs::read(&current).unwrap(), b"@exit /b 0\r\n");
+    // The helper has exited: the directory can be locked again.
+    let until = std::time::Instant::now() + Duration::from_secs(20);
+    while lock_update_directory(dir).is_err() {
+        assert!(std::time::Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Windows: a helper that never takes the helper lock is reported (the
+/// caller stops it), and the lock is not kept open while waiting.
+#[cfg(windows)]
+#[test]
+fn a_helper_that_does_not_take_over_is_reported() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut lock = lock_update_directory(directory.path()).unwrap();
+    let started = std::time::Instant::now();
+    let (mut child, handed_over) = lock
+        .hand_over_to_helper(Duration::from_secs(1), || {
+            Ok(ProcessCommand::new("cmd")
+                .args(["/c", "ping -n 30 127.0.0.1 >nul"])
+                .spawn()?)
+        })
+        .unwrap();
+    assert!(!handed_over);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    // The update then stops it and cleans up.
+    let dir = directory.path();
+    let candidate = dir.join(".ktest-update-1.exe");
+    let script = dir.join(".ktest-update-1.ps1");
+    let status = dir.join(".ktest-update-status.txt");
+    for path in [&candidate, &script, &status] {
+        fs::write(path, b"x").unwrap();
+    }
+    let error = cancel_windows_update_helper(&mut child, &candidate, &script, &status);
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("did not lock the installation directory"),
+        "{error}"
+    );
+    assert!(child.try_wait().unwrap().is_some());
+    assert!(!candidate.exists() && !script.exists());
+    let report = fs::read_to_string(&status).unwrap();
+    assert!(
+        report.starts_with("failed: the Windows update helper"),
+        "{report}"
+    );
+}
+
+/// Windows: the real replacement helper takes the helper lock before the
+/// updater lets go, and holds it until it has replaced the program; only
+/// then can the next update or uninstall lock the directory.
+#[cfg(windows)]
+#[test]
+fn the_windows_replacement_helper_holds_the_installation_until_done() {
+    let directory = tempfile::tempdir().unwrap();
+    let dir = directory.path();
+    // The "installed program": its `stop` waits until the test lets it go.
+    let current = dir.join("current.cmd");
+    let release = dir.join("release");
+    fs::write(
+        &current,
+        format!(
+            "@echo off\r\n:wait\r\nif exist \"{}\" exit /b 0\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n",
+            release.display()
+        ),
+    )
+    .unwrap();
+    let new_program = b"@exit /b 0\r\n".to_vec();
+    let candidate = dir.join(".ktest-update-1.exe");
+    fs::write(&candidate, &new_program).unwrap();
+    let script_path = dir.join(".ktest-update-1.ps1");
+    let status_path = dir.join(".ktest-update-status.txt");
+    fs::write(&status_path, "pending\n").unwrap();
+    // The updater the helper waits for: a short-lived process.
+    let mut updater = ProcessCommand::new("cmd")
+        .args(["/c", "ping -n 2 127.0.0.1 >nul"])
+        .spawn()
+        .unwrap();
+    let mut lock = lock_update_directory(dir).unwrap();
+    let helper_lock = dir.join(".ktest-update-helper-lock");
+    let script = render_windows_update_script_locked(
+        updater.id(),
+        &current,
+        &candidate,
+        &script_path,
+        &status_path,
+        false,
+        &sha256_hex(&new_program),
+        Some(&helper_lock),
+    )
+    .unwrap();
+    fs::write(&script_path, script).unwrap();
+    let mut helper = None;
+    let ((), handed_over) = lock
+        .hand_over_to_helper(Duration::from_secs(30), || {
+            helper = Some(
+                ProcessCommand::new("powershell")
+                    .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+                    .arg(&script_path)
+                    .stdin(Stdio::null())
+                    .spawn()?,
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert!(handed_over);
+    drop(lock);
+    // The updater has let go; the helper still waits for it and stops the
+    // program, holding the installation.
+    let error = lock_update_directory(dir).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("still being installed"),
+        "{error:#}"
+    );
+    fs::write(&release, b"").unwrap();
+    let status = helper.unwrap().wait().unwrap();
+    let _ = updater.wait();
+    let report = fs::read_to_string(&status_path).unwrap();
+    assert!(status.success(), "{report}");
+    assert!(
+        report
+            .trim_start_matches('\u{feff}')
+            .starts_with("updated:"),
+        "{report}"
+    );
+    assert_eq!(fs::read(&current).unwrap(), new_program);
+    let _again = lock_update_directory(dir).unwrap();
 }
 
 #[test]
@@ -827,6 +1027,11 @@ fn candidate_probes_are_bounded() {
             "echo 'ktest 1.2.3'; sleep 30 & echo $! > \"$0.pid\"; exit 0",
             "left its output open",
         ),
+        (
+            "orphans-and-hangs",
+            "echo 'ktest 1.2.3'; sleep 30 & echo $! > \"$0.pid\"; exec sleep 30 >&-",
+            "did not exit within 1s",
+        ),
     ] {
         let started = std::time::Instant::now();
         let error = probe_candidate_version(&script(name, body), budget, 4096).unwrap_err();
@@ -837,9 +1042,115 @@ fn candidate_probes_are_bounded() {
             started.elapsed()
         );
     }
-    // The orphan outlives the probe by design; end it here.
-    let orphan = fs::read_to_string(directory.path().join("orphans.pid")).unwrap();
-    let _ = ProcessCommand::new("kill").arg(orphan.trim()).status();
+    // Whatever the candidates started ended with the probe.
+    for name in ["orphans", "orphans-and-hangs"] {
+        let orphan = fs::read_to_string(directory.path().join(format!("{name}.pid"))).unwrap();
+        assert!(!process_runs(orphan.trim()), "{name}: {orphan}");
+    }
+    // A candidate that succeeds but leaves something running (its output
+    // closed): the version is read and the leftover ended.
+    let leaves = script(
+        "leaves",
+        "echo 'ktest 1.2.3'; (exec >/dev/null 2>&1; sleep 30) & echo $! > \"$0.pid\"",
+    );
+    assert_eq!(
+        probe_candidate_version(&leaves, budget, 4096).unwrap(),
+        "ktest 1.2.3\n"
+    );
+    let leftover = fs::read_to_string(directory.path().join("leaves.pid")).unwrap();
+    assert!(!process_runs(leftover.trim()), "{leftover}");
+}
+
+/// Whether process `pid` runs (a zombie, ended but not yet reaped by its
+/// new parent, does not).
+#[cfg(unix)]
+fn process_runs(pid: &str) -> bool {
+    let until = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let output = ProcessCommand::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let runs = !state.is_empty() && !state.starts_with('Z');
+        // A killed process may take a moment to go.
+        if !runs || std::time::Instant::now() >= until {
+            return runs;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Windows: the probe runs the candidate (here a batch file, run by
+/// cmd.exe) in a job: a descendant that keeps the output and the candidate
+/// file open ends with the probe, which finishes within its budget, and the
+/// candidate can then be removed.
+#[cfg(windows)]
+#[test]
+fn candidate_probes_end_their_descendants_on_windows() {
+    let directory = tempfile::tempdir().unwrap();
+    let script = |name: &str, body: &str| {
+        let path = directory.path().join(format!("{name}.cmd"));
+        fs::write(&path, body.replace('\n', "\r\n")).unwrap();
+        path
+    };
+    let budget = Duration::from_secs(30);
+    let good = script("good", "@echo ktest 1.2.3\n");
+    assert_eq!(
+        probe_candidate_version(&good, budget, 4096).unwrap(),
+        "ktest 1.2.3\r\n"
+    );
+    let started = std::time::Instant::now();
+    let hangs = script("hangs", "@ping -n 30 127.0.0.1 >nul\n");
+    let error = probe_candidate_version(&hangs, Duration::from_secs(2), 4096).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("did not exit within 2s"),
+        "{error:#}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+    remove_candidate(&hangs).unwrap();
+
+    // The descendant opens the candidate (no delete sharing), records its
+    // process ID, and sleeps holding the output; the candidate waits for
+    // that record, prints its version and exits.
+    let path = directory.path().join("orphans.cmd");
+    let marker = directory.path().join("orphans.pid");
+    let held = format!(
+        "$f = [IO.File]::Open('{}', 'Open', 'Read', 'Read'); Set-Content -LiteralPath '{}' -Value $PID; Start-Sleep 60",
+        path.display(),
+        marker.display()
+    );
+    let orphans = script(
+        "orphans",
+        &format!(
+            "@echo off\nstart \"\" /b powershell -NoProfile -NonInteractive -Command \"{held}\"\n:wait\nif exist \"{}\" goto done\nping -n 2 127.0.0.1 >nul\ngoto wait\n:done\necho ktest 1.2.3\n",
+            marker.display()
+        ),
+    );
+    let started = std::time::Instant::now();
+    let error = probe_candidate_version(&orphans, budget, 4096).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("left its output open"),
+        "{error:#}"
+    );
+    assert!(started.elapsed() < budget, "{:?}", started.elapsed());
+    let pid = fs::read_to_string(&marker).unwrap();
+    let pid = pid.trim_start_matches('\u{feff}').trim();
+    let listed = ProcessCommand::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .unwrap();
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        !listed.contains(&format!("\"{pid}\"")),
+        "descendant {pid} still runs: {listed}"
+    );
+    remove_candidate(&orphans).unwrap();
+    assert!(!orphans.exists());
 }
 
 #[tokio::test]

@@ -52,6 +52,9 @@ mod local_proxy;
 mod runtime;
 mod script_brand;
 mod uninstall;
+// The fixed-source update candidate: bounded probe, removal, directory lock.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+mod update_candidate;
 // Fixed-URL self-update: redirects, limits, manifest and asset checks.
 #[cfg(all(
     test,
@@ -77,6 +80,11 @@ pub use gateway::{
     NativeChatProtocol, NoGatewayExtension, SignInput, StateFile, Transport, wire_target,
 };
 pub use runtime::RuntimeContext;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use update_candidate::{
+    InstallationLock, discard_candidate, lock_installation, probe_candidate_version,
+    remove_candidate,
+};
 
 const ANTHROPIC_HOST: &str = "api.anthropic.com";
 #[cfg(target_os = "linux")]
@@ -5322,10 +5330,10 @@ fn run_update() -> Result<()> {
             current_exe.display()
         );
     }
-    // One fixed-source update at a time per installation directory, held
-    // until this command returns (see `lock_update_directory` for the
-    // Windows replacement helper, which is not covered).
-    let _update_lock = match &origin {
+    // One fixed-source update at a time per installation directory, and
+    // never during `uninstall` or a Windows replacement helper's work: held
+    // until this command returns (on Windows, handed over to the helper).
+    let mut update_lock = match &origin {
         UpdateOrigin::Fixed { .. } => Some(lock_update_directory(parent)?),
         UpdateOrigin::Gateway { .. } => None,
     };
@@ -5446,9 +5454,8 @@ fn run_update() -> Result<()> {
         ) {
             Ok(output) => output,
             Err(error) => {
-                let _ = fs::remove_file(&candidate_path);
-                return Err(error)
-                    .with_context(|| format!("failed to run {}", candidate_path.display()));
+                let error = error.context(format!("failed to run {}", candidate_path.display()));
+                return Err(discard_candidate(&candidate_path, error));
             }
         }
     } else {
@@ -5466,15 +5473,26 @@ fn run_update() -> Result<()> {
             !reports_exact_version(&candidate_raw, BRAND.binary_name, version)
         })
     {
-        let _ = fs::remove_file(&candidate_path);
-        bail!(
+        let error = anyhow::anyhow!(
             "downloaded binary did not report a {brand_product} version: {candidate_version:?}",
             brand_product = BRAND.product_name
         );
+        // A fixed-source candidate that is left behind is reported.
+        if expected_version.is_some() {
+            return Err(discard_candidate(&candidate_path, error));
+        }
+        let _ = fs::remove_file(&candidate_path);
+        return Err(error);
     }
 
     if current_bytes == bytes {
-        let _ = fs::remove_file(&candidate_path);
+        if expected_version.is_some() {
+            if let Err(error) = remove_candidate(&candidate_path) {
+                eprintln!("WARN the downloaded candidate was left behind: {error:#}");
+            }
+        } else {
+            let _ = fs::remove_file(&candidate_path);
+        }
         println!("Already current: {}", candidate_version.trim());
         return Ok(());
     }
@@ -5485,6 +5503,7 @@ fn run_update() -> Result<()> {
         &backup_path,
         service_was_active,
         &sha256_hex(&bytes),
+        update_lock.as_mut(),
     )?;
 
     #[cfg(target_os = "windows")]
@@ -7959,11 +7978,13 @@ fn write_new_update_candidate(path: &Path, bytes: &[u8]) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))
             .with_context(|| format!("failed to chmod {}", path.display()))
     });
-    if written.is_err() {
-        drop(file);
-        let _ = fs::remove_file(path);
+    match written {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            drop(file);
+            Err(discard_candidate(path, error))
+        }
     }
-    written
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -7971,175 +7992,19 @@ const CANDIDATE_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const CANDIDATE_PROBE_LIMIT: usize = 4096;
 
-/// `<candidate> --version` standard output, bounded: the direct child is
-/// killed and reaped when it runs past `timeout`, prints more than `limit`
-/// bytes or keeps running after closing its output, and a failed exit or a
-/// read error is an error. Descendants of the candidate are not tracked: one
-/// that keeps the output open ends the probe at the deadline.
+/// The installation-directory lock of this brand (see [`InstallationLock`]).
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn probe_candidate_version(path: &Path, timeout: Duration, limit: usize) -> Result<String> {
-    use std::io::Read;
-    let mut child = ProcessCommand::new(path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("failed to execute {}", path.display()))?;
-    let deadline = std::time::Instant::now() + timeout;
-    let Some(stdout) = child.stdout.take() else {
-        stop_candidate(&mut child)?;
-        bail!("candidate stdout is not captured");
-    };
-    let reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
-        let mut output = Vec::new();
-        stdout.take(limit as u64 + 1).read_to_end(&mut output)?;
-        Ok(output)
-    });
-    let result = watch_candidate(path, &mut child, reader, deadline, timeout, limit);
-    // Every way out leaves the direct child exited and reaped (an extra
-    // bounded wait after the budget); a failed cleanup keeps both errors.
-    match result {
-        Err(error) => match stop_candidate(&mut child) {
-            Ok(()) => Err(error),
-            Err(cleanup) => Err(error.context(format!("{cleanup:#}"))),
-        },
-        ok => ok,
-    }
+fn lock_update_directory(directory: &Path) -> Result<InstallationLock> {
+    lock_installation(directory, BRAND.update.candidate_prefix, BRAND.binary_name)
 }
 
+/// Whether this brand serializes changes to an installation directory:
+/// brands that update from fixed URLs do (updates, `uninstall` and the
+/// Windows replacement helper); a Gateway-channel brand keeps its earlier,
+/// unserialized behavior.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn watch_candidate(
-    path: &Path,
-    child: &mut std::process::Child,
-    reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
-    deadline: std::time::Instant,
-    timeout: Duration,
-    limit: usize,
-) -> Result<String> {
-    let mut exited = None;
-    loop {
-        if reader.is_finished() {
-            break;
-        }
-        if exited.is_none() {
-            exited = child
-                .try_wait()
-                .with_context(|| format!("failed to wait for {}", path.display()))?;
-        }
-        if std::time::Instant::now() >= deadline {
-            match exited {
-                // Exited, but something it started keeps the output open.
-                Some(_) => bail!("{} left its output open", path.display()),
-                None => bail!(
-                    "{} did not exit within {}s",
-                    path.display(),
-                    timeout.as_secs()
-                ),
-            }
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let bytes = reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("reading {} panicked", path.display()))?
-        .with_context(|| format!("failed to read the output of {}", path.display()))?;
-    if bytes.len() > limit {
-        bail!("{} printed more than {limit} bytes", path.display());
-    }
-    // Output complete: the child must exit by the deadline.
-    let status = loop {
-        if let Some(status) = exited {
-            break status;
-        }
-        exited = child
-            .try_wait()
-            .with_context(|| format!("failed to wait for {}", path.display()))?;
-        if exited.is_none() {
-            if std::time::Instant::now() >= deadline {
-                bail!("{} did not exit after printing its version", path.display());
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    };
-    if !status.success() {
-        bail!("{} exited with {status}", path.display());
-    }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-/// Kills the direct child if it still runs and confirms it was reaped
-/// (bounded: an error when it cannot be confirmed within two seconds).
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn stop_candidate(child: &mut std::process::Child) -> Result<()> {
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return Ok(());
-    }
-    let killed = child.kill();
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Ok(None) => bail!(
-                "candidate process {} could not be stopped ({killed:?})",
-                child.id()
-            ),
-            Err(error) => {
-                return Err(error)
-                    .context(format!("failed to reap candidate process {}", child.id()));
-            }
-        }
-    }
-}
-
-/// Exclusive lock of an installation directory's fixed-source update, held
-/// until the returned value is dropped; a second update fails at once. On
-/// Unix the directory itself is locked (nothing to delete or replace); on
-/// Windows `<candidate prefix>lock` next to the executable is held open
-/// without sharing, so neither another update nor `uninstall` can open or
-/// delete it meanwhile. The lock covers this command only: on Windows the
-/// replacement helper it starts runs after it returns and is not serialized.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn lock_update_directory(directory: &Path) -> Result<fs::File> {
-    let busy = || {
-        anyhow::anyhow!(
-            "another {brand_binary} update is running in {}",
-            directory.display(),
-            brand_binary = BRAND.binary_name
-        )
-    };
-    #[cfg(unix)]
-    {
-        let file = fs::File::open(directory)
-            .with_context(|| format!("failed to open {}", directory.display()))?;
-        match file.try_lock() {
-            Ok(()) => Ok(file),
-            Err(fs::TryLockError::WouldBlock) => Err(busy()),
-            Err(fs::TryLockError::Error(error)) => {
-                Err(error).with_context(|| format!("failed to lock {}", directory.display()))
-            }
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const ERROR_SHARING_VIOLATION: i32 = 32;
-        let path = directory.join(format!("{}lock", BRAND.update.candidate_prefix));
-        match OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .share_mode(0)
-            .open(&path)
-        {
-            Ok(file) => Ok(file),
-            Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => Err(busy()),
-            Err(error) => Err(error).with_context(|| format!("failed to lock {}", path.display())),
-        }
-    }
+fn serializes_installation_changes() -> bool {
+    matches!(BRAND.update.source, UpdateSource::Fixed(_))
 }
 
 fn write_update_candidate(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -8216,6 +8081,7 @@ fn finalize_update(
     backup_path: &Path,
     _restart_service: bool,
     _expected_sha256: &str,
+    _lock: Option<&mut InstallationLock>,
 ) -> Result<()> {
     fs::copy(current_exe, backup_path).with_context(|| {
         format!(
@@ -8241,6 +8107,7 @@ fn finalize_update(
     backup_path: &Path,
     restart_service: bool,
     expected_sha256: &str,
+    lock: Option<&mut InstallationLock>,
 ) -> Result<()> {
     fs::copy(current_exe, backup_path).with_context(|| {
         format!(
@@ -8253,7 +8120,12 @@ fn finalize_update(
     let status_path = windows_update_status_path(current_exe)?;
     fs::write(&status_path, "pending\n")
         .with_context(|| format!("failed to write {}", status_path.display()))?;
-    let script = render_windows_update_script(
+    // With the installation lock (fixed-source updates), the helper takes
+    // over its helper lock; without it (Gateway channel), as before.
+    let helper_lock = lock
+        .as_ref()
+        .map(|lock| lock.helper_lock_path().to_path_buf());
+    let script = render_windows_update_script_locked(
         std::process::id(),
         current_exe,
         candidate_path,
@@ -8261,28 +8133,53 @@ fn finalize_update(
         &status_path,
         restart_service,
         expected_sha256,
+        helper_lock.as_deref(),
     )?;
     fs::write(&script_path, script)
         .with_context(|| format!("failed to write {}", script_path.display()))?;
-    if let Err(err) = ProcessCommand::new("powershell")
-        .env(BRAND.env.home, app_config_dir()?)
-        .env_remove("CLAUDE_CONFIG_DIR")
-        .env_remove("CODEX_HOME")
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-File")
-        .arg(&script_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        let _ = fs::write(
-            &status_path,
-            format!("failed: could not start update helper: {err}\n"),
-        );
-        return Err(err).context("failed to start Windows update helper");
+    let start_helper = || -> Result<std::process::Child> {
+        match ProcessCommand::new("powershell")
+            .env(BRAND.env.home, app_config_dir()?)
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("CODEX_HOME")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&script_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => Ok(child),
+            Err(err) => {
+                let _ = fs::write(
+                    &status_path,
+                    format!("failed: could not start update helper: {err}\n"),
+                );
+                Err(err).context("failed to start Windows update helper")
+            }
+        }
+    };
+    match lock {
+        // The helper takes over the installation lock before this command
+        // exits (its script takes the helper lock first).
+        Some(lock) => {
+            let (mut helper, handed_over) =
+                lock.hand_over_to_helper(WINDOWS_HELPER_HANDOVER, start_helper)?;
+            if !handed_over {
+                return Err(cancel_windows_update_helper(
+                    &mut helper,
+                    candidate_path,
+                    &script_path,
+                    &status_path,
+                ));
+            }
+        }
+        None => {
+            start_helper()?;
+        }
     }
     println!(
         "Windows update helper started; replacement result: {}",
@@ -8290,6 +8187,46 @@ fn finalize_update(
     );
     Ok(())
 }
+
+/// Stops a replacement helper that did not take over the installation
+/// lock in time. It has changed nothing yet: it waits for this command to
+/// exit before stopping or replacing anything. Records the failure, removes
+/// the script and the candidate, and returns the error to report (with any
+/// cleanup that failed).
+#[cfg(target_os = "windows")]
+fn cancel_windows_update_helper(
+    helper: &mut std::process::Child,
+    candidate_path: &Path,
+    script_path: &Path,
+    status_path: &Path,
+) -> anyhow::Error {
+    let mut error = anyhow::anyhow!(
+        "the Windows update helper did not lock the installation directory within {}s; nothing was replaced",
+        WINDOWS_HELPER_HANDOVER.as_secs()
+    );
+    let _ = helper.kill();
+    if let Err(wait) = helper.wait() {
+        error = error.context(format!(
+            "the helper (process {}) could not be confirmed stopped: {wait}",
+            helper.id()
+        ));
+    }
+    if let Err(write) = fs::write(status_path, format!("failed: {error:#}\n")) {
+        error = error.context(format!(
+            "failed to write {}: {write}",
+            status_path.display()
+        ));
+    }
+    if let Err(remove) = remove_candidate(script_path) {
+        error = error.context(format!("the helper script was left behind: {remove:#}"));
+    }
+    discard_candidate(candidate_path, error)
+}
+
+/// How long a fixed-source update waits for its Windows replacement helper
+/// to take over the installation lock.
+#[cfg(target_os = "windows")]
+const WINDOWS_HELPER_HANDOVER: Duration = Duration::from_secs(60);
 
 #[cfg(target_os = "windows")]
 fn render_windows_update_script(
@@ -8301,10 +8238,47 @@ fn render_windows_update_script(
     restart_service: bool,
     expected_sha256: &str,
 ) -> Result<String> {
+    // A brand that serializes installation changes: the helper lock of the
+    // installation directory (see `InstallationLock`).
+    let helper_lock = if serializes_installation_changes() {
+        let directory = current_exe
+            .parent()
+            .context("failed to resolve current executable directory")?;
+        update_candidate::installation_lock_files(directory, BRAND.update.candidate_prefix).pop()
+    } else {
+        None
+    };
+    render_windows_update_script_locked(
+        pid,
+        current_exe,
+        candidate_path,
+        script_path,
+        status_path,
+        restart_service,
+        expected_sha256,
+        helper_lock.as_deref(),
+    )
+}
+
+/// The helper script; with `helper_lock`, it takes that lock first and
+/// holds it until it exits, while the updater holds the main lock until it
+/// sees the helper holding this one.
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn render_windows_update_script_locked(
+    pid: u32,
+    current_exe: &Path,
+    candidate_path: &Path,
+    script_path: &Path,
+    status_path: &Path,
+    restart_service: bool,
+    expected_sha256: &str,
+    helper_lock: Option<&Path>,
+) -> Result<String> {
     if expected_sha256.len() != 64 || !expected_sha256.chars().all(|c| c.is_ascii_hexdigit()) {
         bail!("invalid expected Windows update sha256");
     }
-    Ok(format!(
+    let script = format!(
         "$ErrorActionPreference = 'Stop'\r\n\
 $currentExe = {}\r\n\
 $candidate = {}\r\n\
@@ -8378,7 +8352,32 @@ try {{\r\n\
         powershell_quote_path(script_path)?,
         id = script_brand::identifier_prefix(),
         brand_product = BRAND.product_name,
-    ))
+    );
+    let Some(helper_lock) = helper_lock else {
+        return Ok(script);
+    };
+    let take_lock = format!(
+        "$helperLockPath = {}\r\n\
+$helperLock = $null\r\n\
+foreach ($attempt in 1..600) {{\r\n\
+    try {{ $helperLock = [IO.File]::Open($helperLockPath, 'OpenOrCreate', 'ReadWrite', 'None'); break }}\r\n\
+    catch {{ Start-Sleep -Milliseconds 100 }}\r\n\
+}}\r\n\
+if ($null -eq $helperLock) {{\r\n\
+    Set-Content -LiteralPath $statusPath -Value 'failed: could not lock the installation directory' -Encoding UTF8\r\n\
+    exit 1\r\n\
+}}\r\n",
+        powershell_quote_path(helper_lock)?
+    );
+    // First thing after the variables: before the command function (whose
+    // body, like the main block, has `try {` lines; the script is not
+    // indented).
+    let marker = "\r\nfunction Invoke-";
+    if script.matches(marker).count() != 1 {
+        bail!("Windows update helper has no single command function");
+    }
+    let at = script.find(marker).map_or(0, |at| at + 2);
+    Ok(format!("{}{take_lock}{}", &script[..at], &script[at..]))
 }
 
 #[cfg(target_os = "windows")]
