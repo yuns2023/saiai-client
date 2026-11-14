@@ -1048,7 +1048,7 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
 
 只接受 legacy（算法 `Ed`）：minisign 默认的预哈希格式（`ED`，先做 BLAKE2b-512）需要 `ring` 没有的 BLAKE2b；忘了加 `-l` 时，客户端和上传前检查都会明确提示"用 `minisign -S -l` 重签"。签名文件里的 trusted comment 也会验签（与 `minisign -V` 一致），但内容不参与判断；版本和发行版只看 manifest 本身。
 
-**信任根**：品牌 `update.source = Fixed { distribution, signing_keys, … }`。AITP 是 `distribution: "aitp"`，`signing_keys` 是两把 minisign 公钥（`.pub` 文件第二行，56 个字符）：主钥和恢复钥。在维护者提供真实公钥之前是两把**明显的占位公钥**（文本含 `PLACEHOLDER`，其字节不是曲线上的点，任何签名都验不过）；`kernel/scripts/build-release.sh` 和 `verify-release.py --aitp-artifact` 都会拒绝含占位公钥的发布构建，只有从不发布的 CI 路径检查显式放行（`AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1` / `--allow-placeholder-signing-key`），另有对照步骤确认不放行时会失败；`verify-release.py` 核对 CI 里构建放行恰好两处、SAIAI 发布工作流里没有放行（AITP 自己的发布工作流在 D4 建立时再加同样的检查）。真实公钥由单独的 PR 填入（同时改 `aitp_values_are_frozen`）。SAIAI 走 `GatewayChannel`，没有这些字段，更新行为不变。
+**信任根**：品牌 `update.source = Fixed { distribution, signing_keys, … }`。AITP 是 `distribution: "aitp"`，`signing_keys` 是两把 minisign 公钥（`.pub` 文件第二行，56 个字符）：主钥和恢复钥。在维护者提供真实公钥之前是两把**明显的占位公钥**（文本含 `PLACEHOLDER`，其字节不是曲线上的点，任何签名都验不过）；`kernel/scripts/build-release.sh` 和 `verify-release.py --aitp-artifact` 都会拒绝含占位公钥的发布构建，只有从不发布的 CI 路径检查显式放行（`AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1` / `--allow-placeholder-signing-key`），另有对照步骤确认不放行时会失败；`verify-release.py` 核对 CI 里构建放行恰好两处、SAIAI 发布工作流里没有放行（AITP 自己的发布工作流在 D4 建立时再加同样的检查）。真实公钥由单独的 PR 填入（同时改 `aitp_values_are_frozen`）。注意：普通的 `cargo build --release` 仍会产出带占位钥（或任意当前源码里公钥）的 `aitp`，程序本身不拒绝；唯一的门禁是 `build-release.sh` + `verify-release.py`（含 `--aitp-manifest`），D4 发布工作流必须强制走这两步，不得用其他方式构建或上传发布产物。SAIAI 走 `GatewayChannel`，没有这些字段，更新行为不变。
 
 **一次性准备（维护者自己的电脑，离线）**：
 
@@ -1067,7 +1067,7 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
    ```sh
    python3 tools/saiai-cli/kernel/scripts/release_manifest.py generate --dist dist
    ```
-   它写出 `dist/aitp-manifest.json`（规范 JSON：键排序、紧凑、末尾换行；版本默认取 `kernel/Cargo.toml`），并打印 manifest 的 sha256 和确切的签名命令。
+   它写出 `dist/aitp-manifest.json`（规范 JSON：键排序、紧凑、末尾换行；版本默认取 `kernel/Cargo.toml`），并打印 manifest 的 sha256 和确切的签名命令。manifest 文件名只允许字母、数字、`.`、`_`、`-`（不以 `-` 开头），其他名字直接拒绝；打印的签名命令只有 trusted comment 用单引号括起，POSIX shell（macOS/Linux 终端、Git Bash、WSL）和 Windows PowerShell 都可原样粘贴（cmd.exe 不行）；打印的上传前检查命令按 POSIX shell 规则引用路径。
 2. 维护者把 `aitp-manifest.json` 拷到签名电脑，先核对打印的 sha256（`shasum -a 256 aitp-manifest.json`，Windows `certutil -hashfile aitp-manifest.json SHA256`）以及这次要发布的源码提交，再执行打印的命令，例如：
    ```sh
    minisign -S -l -s aitp-release.key -p aitp-release.pub -m aitp-manifest.json -x aitp-manifest.json.minisig -t "aitp-manifest 0.2.0 sha256:<manifest sha256>"

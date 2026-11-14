@@ -39,6 +39,7 @@ import base64
 import hashlib
 import json
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -411,11 +412,25 @@ def cargo_version() -> str:
     return match.group(1)
 
 
+# File names the printed commands may carry: nothing a shell would
+# interpret, so the commands read the same in a POSIX shell and PowerShell.
+SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
 def sign_command(manifest: Path, version: str, digest: str, key: str = "aitp-release") -> str:
-    return (
-        f'minisign -S -l -s {key}.key -p {key}.pub -m {manifest.name} '
-        f'-x {manifest.name}{SIGNATURE_SUFFIX} -t "aitp-manifest {version} sha256:{digest}"'
-    )
+    """The minisign command for the signing machine (POSIX shell quoting;
+    with a safe manifest name only the trusted comment is quoted, in single
+    quotes, which PowerShell reads the same way)."""
+    require(SAFE_NAME.fullmatch(manifest.name) is not None, f"unsafe manifest file name {manifest.name!r}")
+    return shlex.join([
+        "minisign", "-S", "-l", "-s", f"{key}.key", "-p", f"{key}.pub", "-m", manifest.name,
+        "-x", manifest.name + SIGNATURE_SUFFIX, "-t", f"aitp-manifest {version} sha256:{digest}",
+    ])
+
+
+def verify_command(manifest: Path, dist: Path) -> str:
+    """The pre-upload check (POSIX shell quoting, any path)."""
+    return shlex.join(["python3", str(Path(__file__)), "verify", "--manifest", str(manifest), "--dist", str(dist)])
 
 
 # --- commands ---------------------------------------------------------------
@@ -432,13 +447,18 @@ def command_generate(args) -> int:
     rendered = render_manifest(distribution, version, assets)
     parse_manifest(rendered, distribution)
     output = args.output or args.dist / MANIFEST_NAME
+    require(
+        SAFE_NAME.fullmatch(output.name) is not None,
+        f"the manifest file name {output.name!r} may only use letters, digits, '.', '_' and '-'",
+    )
     output.write_bytes(rendered)
     digest = hashlib.sha256(rendered).hexdigest()
     print(f"wrote {output} ({len(rendered)} bytes, sha256 {digest})")
-    print("Sign it on the offline signing machine, in the directory holding the key and the manifest:")
+    print("Sign it on the offline signing machine, in the directory holding the key and the manifest")
+    print("(POSIX shell or PowerShell):")
     print(f"  {sign_command(output, version, digest)}")
-    print("Then copy back only the signature file; check it before upload with:")
-    print(f"  python3 {Path(__file__)} verify --manifest {output} --dist {args.dist}")
+    print("Then copy back only the signature file; check it before upload with (POSIX shell):")
+    print(f"  {verify_command(output, args.dist)}")
     return 0
 
 

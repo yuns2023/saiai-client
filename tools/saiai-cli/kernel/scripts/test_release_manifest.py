@@ -10,6 +10,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -236,6 +237,40 @@ class ManifestTests(unittest.TestCase):
                 rm.parse_manifest(text, "aitp")
 
 
+class PrintedCommandTests(unittest.TestCase):
+    def test_commands_are_quoted_and_names_are_safe(self):
+        digest = "a" * 64
+        command = rm.sign_command(Path("/x/aitp-manifest.json"), "1.2.3", digest)
+        self.assertEqual(
+            command,
+            "minisign -S -l -s aitp-release.key -p aitp-release.pub -m aitp-manifest.json "
+            f"-x aitp-manifest.json.minisig -t 'aitp-manifest 1.2.3 sha256:{digest}'",
+        )
+        for name in ["release manifest.json", "a'b.json", "$(touch x).json", "a;b.json", "-x.json", "a`b`.json"]:
+            with self.assertRaisesRegex(rm.CheckError, "unsafe manifest file name"):
+                rm.sign_command(Path("/x") / name, "1.2.3", digest)
+        # Any path in the check command stays one argument.
+        for odd in ["/tmp/dist dir", "/tmp/it's", "/tmp/$(touch x)", "/tmp/a;b", "/tmp/a`b`"]:
+            command = rm.verify_command(Path(odd) / "aitp-manifest.json", Path(odd))
+            words = shlex.split(command)
+            self.assertEqual(words[2:], ["verify", "--manifest", f"{odd}/aitp-manifest.json", "--dist", odd])
+
+    def test_generate_refuses_an_unsafe_output_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            dist = Path(temporary)
+            for index, name in enumerate(rm.ASSETS):
+                (dist / name).write_bytes(bytes([index]) * (1024 * 1024))
+            for name in ["release manifest.json", "a'b.json", "$(touch x).json", "a;b.json"]:
+                result = subprocess.run(
+                    [sys.executable, "-I", "-B", str(HERE / "release_manifest.py"), "generate",
+                     "--dist", str(dist), "--version", "1.2.3", "--output", str(dist / name)],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 1, result)
+                self.assertIn("may only use letters", result.stderr)
+                self.assertFalse((dist / name).exists())
+
+
 class BrandAndReleaseTests(unittest.TestCase):
     def test_key_lists_are_read_as_string_literals(self):
         a, b = TestKey(key_id=b"\xff" * 8), TestKey()
@@ -286,8 +321,8 @@ class BrandAndReleaseTests(unittest.TestCase):
             manifest = manifest_path.read_bytes()
             digest = hashlib.sha256(manifest).hexdigest()
             self.assertIn(
-                f'minisign -S -l -s aitp-release.key -p aitp-release.pub -m aitp-manifest.json '
-                f'-x aitp-manifest.json.minisig -t "aitp-manifest 1.2.3 sha256:{digest}"',
+                f"minisign -S -l -s aitp-release.key -p aitp-release.pub -m aitp-manifest.json "
+                f"-x aitp-manifest.json.minisig -t 'aitp-manifest 1.2.3 sha256:{digest}'",
                 result.stdout,
             )
             self.assertEqual(json.loads(manifest)["distribution"], "aitp")
