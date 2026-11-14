@@ -1002,7 +1002,8 @@ fn saiai_keeps_initializing_and_uninstall_leaves_another_programs_settings() {
         after["env"]["NODE_EXTRA_CA_CERTS"],
         sandbox
             .home
-            .join(".claude/saiai-ca.crt")
+            .join(".claude")
+            .join("saiai-ca.crt")
             .to_string_lossy()
             .as_ref()
     );
