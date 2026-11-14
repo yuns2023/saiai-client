@@ -1292,7 +1292,14 @@ def verify_publication_order(relative: str, jobs: dict) -> None:
     patch = single_step(publish, lambda step: "--method PATCH" in str(step.get("run", "")), "publishes")
     require(fetch < download < check < patch, f"{relative} publish job must fetch, download the digests and check before it publishes")
     checked = effective_commands(publish["steps"][check], "Linux", {})
-    for required in DIGEST_CHECKS + ('cmp "$RUNNER_TEMP/manifest.json" dist/manifest.json',):
+    every_artifact = " ".join(f"--artifact dist/{asset}" for asset in ASSETS)
+    for required in DIGEST_CHECKS + (
+        'cmp "$RUNNER_TEMP/manifest.json" dist/manifest.json',
+        "python3 scripts/saiai-cli/verify-linux-portability.py dist/saiai-linux-x86_64 dist/saiai-linux-aarch64",
+        f"python3 scripts/saiai-cli/verify-release.py {every_artifact}",
+        "python3 scripts/saiai-cli/test-release-bundle.py --bundle dist --setup-sh dist/setup.sh",
+        'python3 scripts/saiai-cli/verify-github-release-draft.py --dist dist --tag "$GITHUB_REF_NAME" --state "${{ steps.fetch.outputs.state }}" <"$RUNNER_TEMP/release.json"',
+    ):
         require(required in checked, f"{relative} publish job does not check {required!r} before publishing")
     for step in publish["steps"]:
         script = step.get("run")

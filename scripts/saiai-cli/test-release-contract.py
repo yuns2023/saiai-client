@@ -653,6 +653,16 @@ class WorkflowStructureTests(unittest.TestCase):
         swapped = release[:record] + release[keep:keep_end].rstrip("\n") + "\n\n" + release[record:keep] + release[keep_end:]
         self.rejects(RELEASE, release, swapped.replace("\n\n\n", "\n\n"), "then keep the digests")
 
+    def test_publish_checks_stay_before_publishing(self) -> None:
+        release = ORIGINAL_TEXT(RELEASE)
+        bundle = "          python3 scripts/saiai-cli/test-release-bundle.py \\\n            --bundle dist \\\n            --setup-sh dist/setup.sh\n"
+        start = release.index("      - name: Publish immutable release\n")
+        self.assertIn(bundle, release[release.index("  publish:\n"):start])
+        head, tail = release[:start], release[start:]
+        head = head[: head.rindex(bundle)] + head[head.rindex(bundle) + len(bundle):]
+        moved = head + tail.rstrip("\n") + "\n" + bundle.replace("          python3", "          python3", 1)
+        self.rejects(RELEASE, release, moved, "before publishing")
+
     def test_expression_reader(self) -> None:
         context = {"runner.os": "macOS", "matrix.target": "aarch64-apple-darwin"}
         for expression, expected in (
