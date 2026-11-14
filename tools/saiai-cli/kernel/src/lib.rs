@@ -2636,16 +2636,7 @@ fn run_windows_packaged_desktop(
         bail!("Desktop certificate binding changed; use normal File > Quit and retry");
     }
     if matches!(decision, windows_desktop_runtime::Decision::Cold) {
-        let settled = restore_legacy_windows_packaged_proxy_lease()?;
-        // A failed removal stops the launch, as before; the lease keeps the
-        // certificates for the next attempt.
-        if !settled.pending.is_empty() {
-            bail!(
-                "could not remove CA(s) {} of a legacy {brand_product} Desktop lease from Windows CurrentUser\\Root; retry the launch",
-                settled.pending.join(", "),
-                brand_product = BRAND.product_name
-            );
-        }
+        lease_launch_result(&restore_legacy_windows_packaged_proxy_lease()?)?;
     }
 
     // Toast replies and other shell activations carry no launcher arguments.
@@ -2891,6 +2882,35 @@ struct LegacyWindowsPackagedProxyLeaseMarker {
     #[serde(default)]
     proxy_handled: bool,
 }
+/// The result of removing one certificate: a failed removal command is an
+/// error (as before); otherwise `false` only when the follow-up check
+/// confirms the certificate is still listed (reported, not a failure), and
+/// `true` when it is gone or the check cannot run (the removal was not
+/// checked before). The check runs only after a successful command.
+#[cfg(any(target_os = "windows", test))]
+fn removal_result(
+    removed: Result<()>,
+    check: impl FnOnce() -> Result<Option<Vec<u8>>>,
+) -> Result<bool> {
+    removed?;
+    Ok(!matches!(check(), Ok(Some(_))))
+}
+
+/// A Desktop launch after a lease restore: a failed removal stops it, as
+/// before (the lease keeps the certificates for the next attempt); a
+/// certificate still listed after its removal does not.
+#[cfg(any(target_os = "windows", test))]
+fn lease_launch_result(settled: &LeaseCertificates) -> Result<()> {
+    if !settled.pending.is_empty() {
+        bail!(
+            "could not remove CA(s) {} of a legacy {brand_product} Desktop lease from Windows CurrentUser\\Root; retry the launch",
+            settled.pending.join(", "),
+            brand_product = BRAND.product_name
+        );
+    }
+    Ok(())
+}
+
 /// What became of a lease's certificates.
 #[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Default, PartialEq)]
@@ -3071,10 +3091,8 @@ fn windows_root_ca_der(thumbprint: &str) -> Result<Option<Vec<u8>>> {
 /// Removes a CurrentUser\Root certificate; true when it is gone after.
 #[cfg(target_os = "windows")]
 fn windows_remove_root_ca_checked(thumbprint: &str) -> Result<bool> {
-    windows_remove_user_ca(Some(thumbprint))?;
-    // Reported when confirmed still listed; never a failure (the removal
-    // was not checked before).
-    Ok(!matches!(windows_root_ca_der(thumbprint), Ok(Some(_))))
+    let removed = windows_remove_user_ca(Some(thumbprint));
+    removal_result(removed, || windows_root_ca_der(thumbprint))
 }
 
 #[cfg(target_os = "windows")]
@@ -11912,6 +11930,47 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         .unwrap();
         migrate_legacy_codex_system_proxy(dir.path(), listen, "/ca.pem").unwrap();
         assert_eq!(read_str(&dir.path().join("config.toml")), legacy);
+    }
+
+    /// One removal: a failed command is an error (and the store is not
+    /// checked); a check that confirms the certificate still listed gives
+    /// false; a check that finds nothing or cannot run gives true.
+    #[test]
+    fn a_removal_fails_only_when_its_command_fails() {
+        let checked = std::cell::Cell::new(false);
+        let error = removal_result(Err(anyhow::anyhow!("removal command failed")), || {
+            checked.set(true);
+            Ok(None)
+        });
+        assert!(error.is_err());
+        assert!(!checked.get());
+        assert!(!removal_result(Ok(()), || Ok(Some(vec![1]))).unwrap());
+        assert!(removal_result(Ok(()), || Ok(None)).unwrap());
+        assert!(removal_result(Ok(()), || Err(anyhow::anyhow!("query failed"))).unwrap());
+    }
+
+    /// A Desktop launch stops on a failed removal only, not on a
+    /// certificate still listed or another program's CA kept.
+    #[test]
+    fn the_desktop_launch_stops_only_on_a_failed_removal() {
+        assert!(lease_launch_result(&LeaseCertificates::default()).is_ok());
+        assert!(
+            lease_launch_result(&LeaseCertificates {
+                lingering: vec!["AA".to_string()],
+                foreign: vec!["BB".to_string()],
+                ..LeaseCertificates::default()
+            })
+            .is_ok()
+        );
+        let error = lease_launch_result(&LeaseCertificates {
+            pending: vec!["AA".to_string(), "BB".to_string()],
+            ..LeaseCertificates::default()
+        })
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("could not remove CA(s) AA, BB"),
+            "{error:#}"
+        );
     }
 
     /// A lease retry touches certificates only: the first run restores the

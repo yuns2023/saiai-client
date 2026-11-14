@@ -2243,6 +2243,37 @@ fn plan_root_certificates(output: &str, leased: &[String], plan: &mut Plan) {
     }
 }
 
+/// The uninstall outcome of a lease restore: a failed removal fails the
+/// step, as before (the gate keeps data and program; the lease keeps the
+/// certificates for a rerun); another program's CA kept and a certificate
+/// still listed after its removal do not.
+#[cfg(any(windows, test))]
+fn lease_outcome(settled: &crate::LeaseCertificates) -> Outcome {
+    if !settled.pending.is_empty() {
+        Outcome::Failed(format!(
+            "CA(s) {} could not be removed; they and the lease are kept, rerun uninstall",
+            settled.pending.join(", ")
+        ))
+    } else if !settled.foreign.is_empty() || !settled.lingering.is_empty() {
+        let mut notes = Vec::new();
+        if !settled.foreign.is_empty() {
+            notes.push(format!(
+                "CA(s) {} belong to another local proxy program and are kept",
+                settled.foreign.join(", ")
+            ));
+        }
+        if !settled.lingering.is_empty() {
+            notes.push(format!(
+                "CA(s) {} are still listed after their removal; remove them in certmgr.msc if needed",
+                settled.lingering.join(", ")
+            ));
+        }
+        Outcome::Kept(format!("lease settled; {}", notes.join("; ")))
+    } else {
+        Outcome::Done
+    }
+}
+
 #[cfg(any(windows, test))]
 fn remove_path_entries(value: &str, directory: &str) -> Option<String> {
     let target = directory.trim_end_matches('\\').to_uppercase();
@@ -2755,24 +2786,9 @@ fn execute_item(action: &Action, args: &Args) -> Result<Outcome> {
         #[cfg(target_os = "macos")]
         Action::Launchd { target, plist } => execute_launchd(target, plist),
         #[cfg(windows)]
-        Action::Lease(path) => {
-            let settled = crate::restore_legacy_windows_packaged_proxy_lease_at(path)?;
-            Ok(if !settled.pending.is_empty() {
-                // Keeps the lease (and, through the gate, the data and the
-                // program) so that rerunning uninstall retries them.
-                Outcome::Failed(format!(
-                    "CA(s) {} could not be removed; they and the lease are kept, rerun uninstall",
-                    settled.pending.join(", ")
-                ))
-            } else if !settled.foreign.is_empty() {
-                Outcome::Kept(format!(
-                    "lease settled; CA(s) {} belong to another local proxy program and are kept",
-                    settled.foreign.join(", ")
-                ))
-            } else {
-                Outcome::Done
-            })
-        }
+        Action::Lease(path) => Ok(lease_outcome(
+            &crate::restore_legacy_windows_packaged_proxy_lease_at(path)?,
+        )),
         #[cfg(windows)]
         Action::RootCa(thumbprint) => {
             execute_root_ca(thumbprint)?;
@@ -3013,6 +3029,26 @@ mod tests {
         name.push(DnType::OrganizationName, organization);
         params.distinguished_name = name;
         base64::engine::general_purpose::STANDARD.encode(params.self_signed(&key).unwrap().der())
+    }
+
+    #[test]
+    fn lease_outcomes_fail_only_on_a_failed_removal() {
+        use crate::LeaseCertificates;
+        assert_eq!(lease_outcome(&LeaseCertificates::default()), Outcome::Done);
+        let kept = lease_outcome(&LeaseCertificates {
+            lingering: vec!["AA".to_string()],
+            foreign: vec!["BB".to_string()],
+            ..LeaseCertificates::default()
+        });
+        assert!(kept.succeeded(), "{kept:?}");
+        assert!(matches!(&kept, Outcome::Kept(text) if text.contains("AA") && text.contains("BB")));
+        let failed = lease_outcome(&LeaseCertificates {
+            pending: vec!["AA".to_string()],
+            lingering: vec!["CC".to_string()],
+            ..LeaseCertificates::default()
+        });
+        assert!(!failed.succeeded());
+        assert!(matches!(failed, Outcome::Failed(_)));
     }
 
     /// The Windows root-certificate inspection: each certificate decided by
