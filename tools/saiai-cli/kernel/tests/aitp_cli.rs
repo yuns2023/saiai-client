@@ -634,3 +634,84 @@ fn aitp_initializes_over_its_own_and_unrelated_settings() {
     sandbox.run(&args);
     sandbox.run(&args);
 }
+
+/// Holds the installation-directory lock of `bin` the way an update does
+/// (Unix: the directory; Windows: its lock file, or the helper lock).
+fn hold_installation_lock(bin: &Path, file: &str) -> std::fs::File {
+    #[cfg(unix)]
+    {
+        let _ = file;
+        let directory = std::fs::File::open(bin).unwrap();
+        directory.try_lock().unwrap();
+        directory
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .share_mode(0)
+            .open(bin.join(file))
+            .unwrap()
+    }
+}
+
+/// While an update (or, on Windows, its replacement helper) holds the
+/// installation directory, neither another update nor `uninstall` starts:
+/// both fail before any request or change.
+#[test]
+fn update_and_uninstall_wait_for_a_held_installation() {
+    let sandbox = Sandbox::new();
+    sandbox.run(&[
+        "init",
+        "--base-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "TEST_ONLY_AITP",
+    ]);
+    let bin = sandbox.program.parent().unwrap().to_path_buf();
+    let config = sandbox.home.join(".aitp").join("config.json");
+    let config_before = snapshot(&config);
+    let program_before = snapshot(&sandbox.program);
+    let mut held = vec![(
+        ".aitp-update-lock",
+        "another aitp update or uninstall is running",
+    )];
+    if cfg!(windows) {
+        held.push((
+            ".aitp-update-helper-lock",
+            "a previous aitp update is still being installed",
+        ));
+    }
+    for (file, expected) in held {
+        let lock = hold_installation_lock(&bin, file);
+        let (port, seen) = refusing_proxy();
+        let (success, text) = sandbox.output(
+            sandbox
+                .command(&["update"])
+                .env("AITP_UPSTREAM_PROXY", format!("http://127.0.0.1:{port}")),
+        );
+        assert!(!success, "{text}");
+        assert!(text.contains(expected), "{file}: {text}");
+        assert!(seen.lock().unwrap().is_empty(), "{file}: {text}");
+
+        let (success, text) = sandbox.output(&mut sandbox.command(&["uninstall", "--yes"]));
+        assert!(!success, "{text}");
+        assert!(text.contains(expected), "{file}: {text}");
+        assert!(text.contains("uninstall did not change anything"), "{text}");
+        assert_eq!(snapshot(&config), config_before, "{file}");
+        assert_eq!(snapshot(&sandbox.program), program_before, "{file}");
+        drop(lock);
+    }
+    // Released: uninstall removes the program and (Windows) the lock files
+    // it held meanwhile.
+    let text = sandbox.run(&["uninstall", "--yes"]);
+    let left: Vec<_> = std::fs::read_dir(&bin)
+        .map(|entries| entries.map(|entry| entry.unwrap().file_name()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "{left:?}\n{text}");
+    assert!(!config.exists(), "{text}");
+    sandbox.assert_only_aitp_names();
+}

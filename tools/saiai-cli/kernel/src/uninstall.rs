@@ -349,7 +349,20 @@ pub(crate) fn run(args: Args) -> Result<()> {
     {
         std::process::exit(code);
     }
-    execute(&mut plan, &args);
+    // No update (or Windows replacement helper) may change an installation
+    // directory while this runs; nothing has changed yet if one does.
+    let mut locks = match lock_install_dirs(&discovery) {
+        Ok(locks) => locks,
+        Err(error) => {
+            #[cfg(windows)]
+            if args.relaunched_from.is_some() {
+                schedule_temporary_copy_removal();
+            }
+            return Err(error);
+        }
+    };
+    execute(&mut plan, &args, &mut locks);
+    drop(locks);
     print_summary(&plan);
     #[cfg(windows)]
     if args.relaunched_from.is_some() {
@@ -1662,6 +1675,53 @@ fn same_file(left: &Path, right: &Path) -> bool {
                 .map(|name| name.to_string_lossy().to_lowercase())
 }
 
+/// The lock files of every existing installation directory, when this brand
+/// serializes installation changes (none on Unix, which locks directories).
+fn install_lock_files(discovery: &Discovery) -> Vec<PathBuf> {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    if crate::serializes_installation_changes() {
+        return discovery
+            .install_dirs
+            .iter()
+            .filter(|dir| dir.is_dir())
+            .flat_map(|dir| {
+                crate::update_candidate::installation_lock_files(dir, BRAND.update.candidate_prefix)
+            })
+            .collect();
+    }
+    let _ = discovery;
+    Vec::new()
+}
+
+/// Locks every existing installation directory against updates, when this
+/// brand serializes installation changes; fails, before any change, while
+/// one is held.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+type InstallLocks = Vec<crate::InstallationLock>;
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+type InstallLocks = Vec<()>;
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn lock_install_dirs(discovery: &Discovery) -> Result<InstallLocks> {
+    if !crate::serializes_installation_changes() {
+        return Ok(Vec::new());
+    }
+    discovery
+        .install_dirs
+        .iter()
+        .filter(|dir| dir.is_dir())
+        .map(|dir| {
+            crate::lock_installation(dir, BRAND.update.candidate_prefix, BRAND.binary_name)
+                .context("uninstall did not change anything")
+        })
+        .collect()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn lock_install_dirs(_discovery: &Discovery) -> Result<InstallLocks> {
+    Ok(Vec::new())
+}
+
 fn is_main_program(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -1676,9 +1736,19 @@ fn plan_program(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
     for dir in &discovery.install_dirs {
         files.extend(matching_files(dir, is_program_file)?);
     }
+    // The installation locks (Windows lock files) are held while the other
+    // files go and removed last: planned even when absent, because taking
+    // the lock creates them.
+    let lock_files = install_lock_files(discovery);
+    files.retain(|path| !lock_files.contains(path));
+    // Only where there is an installation to lock (or a lock file).
+    let lock_files: Vec<_> = lock_files
+        .into_iter()
+        .filter(|lock| lock.exists() || files.iter().any(|file| file.parent() == lock.parent()))
+        .collect();
     let (main, auxiliary): (Vec<_>, Vec<_>) =
         files.into_iter().partition(|path| is_main_program(path));
-    for path in auxiliary.into_iter().chain(main) {
+    for path in auxiliary.into_iter().chain(main).chain(lock_files) {
         plan.remove_file(Area::Program, path);
     }
     for dir in &discovery.install_dirs {
@@ -2816,7 +2886,18 @@ fn gate_blocked(items: &[Item], area: Area) -> bool {
                 .any(|other| other.area == Area::Data && !other.outcome.succeeded()))
 }
 
-fn execute(plan: &mut Plan, args: &Args) {
+/// Whether removing `path` needs the installation locks released first.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn held_lock_file(locks: &InstallLocks, path: &Path) -> bool {
+    locks.iter().any(|lock| lock.holds(path))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn held_lock_file(_locks: &InstallLocks, _path: &Path) -> bool {
+    false
+}
+
+fn execute(plan: &mut Plan, args: &Args, locks: &mut InstallLocks) {
     println!();
     for gated in [false, true] {
         for index in 0..plan.items.len() {
@@ -2829,6 +2910,13 @@ fn execute(plan: &mut Plan, args: &Args) {
             let outcome = if dependency_failed || (gated && gate_blocked(&plan.items, item.area)) {
                 Outcome::Skipped
             } else {
+                // The lock files go last; nothing else of the installation
+                // remains to protect by then.
+                if let Action::RemoveFile(path) = &item.action
+                    && held_lock_file(locks, path)
+                {
+                    locks.clear();
+                }
                 match execute_item(&item.action, args) {
                     Ok(outcome) => outcome,
                     Err(error) => Outcome::Failed(format!("{error:#}")),
