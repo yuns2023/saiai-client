@@ -27,6 +27,10 @@ fn foreign_variable(name: &str) -> bool {
         || upper.starts_with(&format!("{}_", other_brand().to_ascii_uppercase()))
         || [
             "CLAUDE_CONFIG_DIR",
+            // Claude settings a shell may export; status warns about them.
+            "ANTHROPIC_BASE_URL",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_ATTRIBUTION_HEADER",
             "CODEX_HOME",
             "HTTP_PROXY",
             "HTTPS_PROXY",
