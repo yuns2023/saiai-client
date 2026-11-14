@@ -1021,9 +1021,9 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
   - ~~候选探测只回收直接子进程~~：已完成，进程组/Job Object，删除错误会报告；Windows 原生测试覆盖后代占住 stdout 时按时结束、候选可删除（见上文"候选二进制"）。
   - ~~受控 HTTPS 的 Fixed 下载测试~~：已完成（`kernel/src/update_fixed_https_tests.rs`）。本地 TLS 服务用测试 CA 签发，只有测试自己的客户端信任它（`Egress::test_ca_pem`，仅测试构建存在），系统和进程的信任不变；覆盖跨主机重定向、主机白名单（含已签证书但不在白名单的主机、白名单内但证书不含的主机）、降级 HTTP、换端口、userinfo、重定向 5 跳上限、大小上限（声明长度/流式）和总时限，并验证系统根和另一张 CA 都握手失败、请求到不了 HTTP 层。
   - ~~真实 `aitp update` 的完整黑盒（不访问 GitHub）~~：已完成（`kernel/tests/aitp_cli.rs`）。真实 `aitp` 经 `AITP_UPSTREAM_PROXY` 连到本地代理，代理接下 CONNECT 后自己扮演 github.com / release-assets 主机。测试 CA 通过程序既有的生产入口 `SSL_CERT_FILE`（在系统根之外追加信任）注入，只设在这个子进程的环境里；这不是测试专属能力，单元测试用的 `Egress::test_ca_pem` 才是仅测试构建存在的字段。覆盖 manifest → 重定向资产 → sha256/size → 候选探测 → 替换（Windows 经替换助手，等到状态文件 `updated:`），旧程序留作备份、不留候选；manifest 版本与候选 `--version` 不一致时拒绝替换、原程序不变、候选删除。Linux 的候选是测试里手写的最小静态 ELF（debug 版程序超过 64 MiB 上限）；macOS/Windows 用程序副本加尾部填充。
-  - 独立内核 CI 中"二进制不含其他发行版名字"的测试不得跳过：在工作区内，构建路径含该名字时会跳过。
+  - ~~独立内核 CI 中"二进制不含其他发行版名字"的测试不得跳过~~（已完成）：`the_program_carries_no_other_distribution_name` 不再跳过，在任何构建目录下都检查。它只把本次构建可能嵌入的、含该名字的绝对路径（包目录、程序所在 target 目录、`CARGO_HOME`/`RUSTUP_HOME`/`HOME`/`USERPROFILE` 的各级祖先及其规范化形式）精确地排除，比较时不分大小写、`/` 与 `\` 等同、去掉 `\\?\` 前缀；其余任何出现都判失败，并要求程序含 `AITP local installation CA`。工作区 CI 的三个平台（路径含该名字）和独立内核 CI 都实际检查。已知边界：与某个构建路径逐字相同（或以它开头）的字面量会被当作构建路径放过。
   - ~~uninstall 与更新的互斥~~：已完成，含 Windows 替换助手（见上文"并发"）。
-  - AITP 发布构建对路径前缀做 remap，并核对产物不含构建目录名。
+  - ~~AITP 发布构建对路径前缀做 remap，并核对产物不含构建目录名~~（已完成）：`kernel/scripts/build-release.sh` 用 `CARGO_ENCODED_RUSTFLAGS` 的 `--remap-path-prefix` 把 `HOME`、`RUSTUP_HOME`、`CARGO_HOME`、工作区和 target 目录映射到 `/aitp/{home,rustup,cargo,src,target}`，并向 `CFLAGS`/`CXXFLAGS`（及已设置的按目标区分的 C 标志变量）加 `-ffile-prefix-map`，构建 `--release --bin aitp`。实测：Linux 发布构建原本只嵌入 `CARGO_HOME` 下的依赖源码路径（panic 位置）；AWS-LC 自己已映射其 C 源码路径，ring 不嵌入路径，C 标志是兜底。`verify-release.py --aitp-artifact PATH --build-dir DIR`（均可重复）要求 AITP 产物含全部 AITP 品牌标记、不含 SAIAI 名字（不分大小写），且不含构建目录及 `HOME`/`CARGO_HOME`/`RUSTUP_HOME` 的绝对路径（不分大小写、两种分隔符）。CI 在独立内核步骤和单独的 `AITP release paths` 任务（工作区检出路径含 SAIAI 名字）中用该脚本构建并检查，后者还以普通发布构建为对照，确认检查会失败。SAIAI 发布构建不变，`--artifact` 语义不变。目前只覆盖 Linux（gnu）；macOS、Windows 和 musl 的 AITP 发布构建在建发布工作流时再实测。
 - **D2 中改变 SAIAI 现有行为的修复**须满足：
   - 每个 PR 单列"SAIAI 用户可见的行为变化"，并说明只会少删或多拒绝；
   - 可能让现有 SAIAI 用户原地升级后功能失效的改动，先停下确认。

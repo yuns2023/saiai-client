@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -292,6 +293,83 @@ class OptionalClaudeContractTests(unittest.TestCase):
                 with patch.object(VERIFIER, "text", side_effect=read):
                     with self.assertRaisesRegex(AssertionError, "does not run"):
                         VERIFIER.verify_workflows_and_docs()
+
+
+class AitpArtifactTests(unittest.TestCase):
+    """--aitp-artifact on synthetic programs: AITP brand data present, no
+    other distribution name, no build machine path in any case or with
+    either separator."""
+
+    BUILD = Path("/home/builder/work/client")
+    ENVIRON = {"HOME": "/home/builder", "CARGO_HOME": "/opt/cargo-home"}
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.brand = b"\n".join(VERIFIER.aitp_brand_markers())
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def check(self, data: bytes, build_dirs: list[Path] | None = None) -> None:
+        artifact = Path(self.directory.name) / "aitp"
+        artifact.write_bytes(data)
+        VERIFIER.verify_aitp_artifacts(
+            [artifact], [self.BUILD] if build_dirs is None else build_dirs, self.ENVIRON
+        )
+
+    def test_accepts_remapped_program(self) -> None:
+        self.check(self.brand + b"/aitp/cargo/registry/src/x/tokio/src/lib.rs /aitp/src/kernel/src/lib.rs")
+
+    def test_rejects_missing_brand_data(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "lacks AITP brand data"):
+            self.check(self.brand.replace(b"AITP local installation CA", b""))
+
+    def test_rejects_other_distribution_name_in_any_case(self) -> None:
+        for name in (b"saiai", b"SAIAI", b"SaiAi"):
+            with self.subTest(name=name), self.assertRaisesRegex(AssertionError, "names the other distribution"):
+                self.check(self.brand + b" " + name + b" ")
+
+    def test_rejects_build_machine_paths(self) -> None:
+        for leak in (
+            b"/home/builder/work/client/tools/kernel/src/lib.rs",
+            b"\\home\\BUILDER\\Work\\client\\target",
+            b"/home/builder/.cargo/registry/src/x/tokio/src/lib.rs",
+            b"/opt/cargo-home/registry/src/x/tokio/src/lib.rs",
+            b"/home/builder/.rustup/toolchains/x/lib",
+        ):
+            with self.subTest(leak=leak), self.assertRaisesRegex(AssertionError, "build machine paths"):
+                self.check(self.brand + leak)
+
+    def test_requires_build_directory(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "needs at least one --build-dir"):
+            self.check(self.brand, build_dirs=[])
+        with self.assertRaisesRegex(AssertionError, "not absolute"):
+            self.check(self.brand, build_dirs=[Path("relative/dir")])
+
+    def test_never_treats_the_root_as_a_build_path(self) -> None:
+        paths = VERIFIER.build_machine_paths([Path("/")], {"HOME": "/"})
+        self.assertNotIn("", paths)
+        self.assertNotIn("/", paths)
+
+    def test_ci_checks_the_remapped_release_and_saiai_release_does_not(self) -> None:
+        def broken(path: str, old: str, new: str):
+            def read(relative: str) -> str:
+                contents = ORIGINAL_TEXT(relative)
+                return contents.replace(old, new) if relative == path else contents
+            return read
+
+        for path, old, new, message in (
+            (".github/workflows/ci.yml", "--aitp-artifact tools/saiai-cli/target/release/aitp", "", "does not check the remapped"),
+            (".github/workflows/ci.yml", "bash scripts/build-release.sh --locked", "cargo build --release --bin aitp", "does not check the remapped"),
+            (".github/workflows/saiai-cli-release.yml", "python3 scripts/saiai-cli/verify-release.py \\", "bash tools/saiai-cli/kernel/scripts/build-release.sh\n          python3 scripts/saiai-cli/verify-release.py \\", "must not use"),
+            (VERIFIER.AITP_RELEASE_BUILD, "--remap-path-prefix=", "--no-remap=", "build script is missing"),
+        ):
+            with self.subTest(path=path, old=old), patch.object(VERIFIER, "text", side_effect=broken(path, old, new)):
+                with self.assertRaisesRegex(AssertionError, message):
+                    VERIFIER.verify_workflows_and_docs()
+
+
+ORIGINAL_TEXT = VERIFIER.text
 
 
 if __name__ == "__main__":
