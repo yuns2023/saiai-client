@@ -4,6 +4,7 @@
 //! checked as a pure function).
 
 use super::*;
+use crate::update_signature_tests::{TestKey, leak_keys};
 use std::collections::HashMap;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -241,11 +242,14 @@ fn asset_urls_substitute_version_and_asset() {
 fn brand_update_sources_are_validated_at_install() {
     use crate::brand::{FixedUpdateSource, UpdateSource};
     static HOSTS: &[&str] = &["github.com"];
+    let keys = leak_keys(&[&TestKey::generate(), &TestKey::generate()]);
     let fixed = |manifest_url, asset_url_template, hosts| {
         crate::brand::validate_update_source(&UpdateSource::Fixed(FixedUpdateSource {
             manifest_url,
             asset_url_template,
             hosts,
+            distribution: "ktest",
+            signing_keys: keys,
         }))
     };
     fixed(
@@ -290,11 +294,52 @@ fn brand_update_sources_are_validated_at_install() {
             "https://github.com/v{version}/{asset}",
             &[],
         ),
+        // The signature URL is the manifest URL plus a suffix: no query.
+        (
+            "https://github.com/m.json?x=1",
+            "https://github.com/v{version}/{asset}",
+            HOSTS,
+        ),
+        (
+            "https://github.com/m.json?",
+            "https://github.com/v{version}/{asset}",
+            HOSTS,
+        ),
+        (
+            "https://github.com/m.json#",
+            "https://github.com/v{version}/{asset}",
+            HOSTS,
+        ),
     ] {
         assert!(
             fixed(manifest, template, hosts).is_err(),
             "{manifest} {template} {hosts:?}"
         );
+    }
+    // A fixed source needs its distribution and at least one usable
+    // signing key.
+    let source = |distribution, signing_keys| {
+        crate::brand::validate_update_source(&UpdateSource::Fixed(FixedUpdateSource {
+            manifest_url: "https://github.com/m.json",
+            asset_url_template: "https://github.com/v{version}/{asset}",
+            hosts: HOSTS,
+            distribution,
+            signing_keys,
+        }))
+    };
+    source("ktest", keys).unwrap();
+    let key = TestKey::generate();
+    let same = leak_keys(&[&key, &key]);
+    for (distribution, signing_keys, expected) in [
+        ("ktest", &[][..], "at least one"),
+        ("ktest", &["not a key"][..], "signing_keys"),
+        ("ktest", same, "repeats"),
+        ("", keys, "distribution"),
+        ("KTest", keys, "distribution"),
+        ("k test", keys, "distribution"),
+    ] {
+        let error = source(distribution, signing_keys).unwrap_err();
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
     }
     let gateway = |channel_path| {
         crate::brand::validate_update_source(&UpdateSource::GatewayChannel { channel_path })
@@ -711,16 +756,7 @@ fn the_download_layer_needs_no_configuration() {
         bytes.clone(),
     )));
     let policy = loopback(port);
-    let result = fixed_download(
-        &policy,
-        &format!("http://127.0.0.1:{port}/releases/latest/download/manifest.json"),
-        &format!("http://127.0.0.1:{port}/releases/download/v{{version}}/{{asset}}"),
-        None,
-        ASSET,
-        "1.0.0",
-        "0",
-    )
-    .unwrap();
+    let result = fixed_download(&policy, loopback_source(port), None, ASSET, "1.0.0", "0").unwrap();
     assert!(matches!(result, FixedUpdate::Download { version, .. } if version == "9.9.9"));
 }
 
@@ -1227,15 +1263,44 @@ async fn missing_large_and_failed_responses_are_distinguished() {
 const ASSET: &str = "ktest-linux-x86_64";
 
 fn manifest(version: &str, sha256: &str, size: Option<u64>) -> Vec<u8> {
+    manifest_for("ktest", version, sha256, size)
+}
+
+fn manifest_for(distribution: &str, version: &str, sha256: &str, size: Option<u64>) -> Vec<u8> {
     let mut asset = serde_json::json!({ "sha256": sha256 });
     if let Some(size) = size {
         asset["size"] = size.into();
     }
     serde_json::to_vec(&serde_json::json!({
+        "manifest_schema": 1,
+        "distribution": distribution,
         "version": version,
         "assets": { ASSET: asset },
     }))
     .unwrap()
+}
+
+/// The release signing keys of these tests (a primary and a recovery key),
+/// generated once per test process.
+fn release_keys() -> &'static (TestKey, TestKey) {
+    static KEYS: std::sync::OnceLock<(TestKey, TestKey)> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| (TestKey::generate(), TestKey::generate()))
+}
+
+/// A fixed source on the loopback server that trusts `release_keys`.
+fn loopback_source(port: u16) -> &'static FixedUpdateSource {
+    let (primary, recovery) = release_keys();
+    Box::leak(Box::new(FixedUpdateSource {
+        manifest_url: String::leak(format!(
+            "http://127.0.0.1:{port}/releases/latest/download/manifest.json"
+        )),
+        asset_url_template: String::leak(format!(
+            "http://127.0.0.1:{port}/releases/download/v{{version}}/{{asset}}"
+        )),
+        hosts: &["127.0.0.1"],
+        distribution: "ktest",
+        signing_keys: leak_keys(&[primary, recovery]),
+    }))
 }
 
 fn release_bytes() -> Vec<u8> {
@@ -1247,8 +1312,7 @@ fn release_bytes() -> Vec<u8> {
 async fn fetch(port: u16, current_version: &str, current_sha256: &str) -> Result<FixedUpdate> {
     fetch_fixed_update(
         &loopback(port),
-        &format!("http://127.0.0.1:{port}/releases/latest/download/manifest.json"),
-        &format!("http://127.0.0.1:{port}/releases/download/v{{version}}/{{asset}}"),
+        loopback_source(port),
         ASSET,
         current_version,
         current_sha256,
@@ -1257,8 +1321,16 @@ async fn fetch(port: u16, current_version: &str, current_sha256: &str) -> Result
     .await
 }
 
+/// Release 9.9.9 with its manifest signed by the primary release key.
 fn release(manifest_body: Vec<u8>, asset: Vec<u8>) -> Routes {
-    Routes::from([
+    let signature = release_keys().0.sign(&manifest_body);
+    release_signed(manifest_body, Some(signature), asset)
+}
+
+/// Release 9.9.9 published like GitHub's (`latest` redirects to the
+/// versioned file), with `signature` as the manifest's signature file.
+fn release_signed(manifest_body: Vec<u8>, signature: Option<Vec<u8>>, asset: Vec<u8>) -> Routes {
+    let mut routes = Routes::from([
         (
             "/releases/latest/download/manifest.json".to_string(),
             redirect(302, "/releases/download/v9.9.9/manifest.json"),
@@ -1267,8 +1339,19 @@ fn release(manifest_body: Vec<u8>, asset: Vec<u8>) -> Routes {
             "/releases/download/v9.9.9/manifest.json".to_string(),
             ok(&manifest_body),
         ),
+        (
+            "/releases/latest/download/manifest.json.minisig".to_string(),
+            redirect(302, "/releases/download/v9.9.9/manifest.json.minisig"),
+        ),
         (format!("/releases/download/v9.9.9/{ASSET}"), ok(&asset)),
-    ])
+    ]);
+    if let Some(signature) = signature {
+        routes.insert(
+            "/releases/download/v9.9.9/manifest.json.minisig".to_string(),
+            ok(&signature),
+        );
+    }
+    routes
 }
 
 #[tokio::test]
@@ -1380,7 +1463,13 @@ async fn manifests_and_assets_that_do_not_verify_are_refused() {
         ),
         (
             "other asset",
-            serde_json::to_vec(&serde_json::json!({"version": "9.9.9", "assets": {}})).unwrap(),
+            serde_json::to_vec(&serde_json::json!({
+                "manifest_schema": 1,
+                "distribution": "ktest",
+                "version": "9.9.9",
+                "assets": {},
+            }))
+            .unwrap(),
             bytes.clone(),
             "does not include asset",
         ),
@@ -1392,10 +1481,15 @@ async fn manifests_and_assets_that_do_not_verify_are_refused() {
     }
     // The asset of another version is never used: the manifest names 9.9.9,
     // only 9.9.8's asset exists.
+    let body = manifest("9.9.9", &sha, size);
     let port = serve(Routes::from([
         (
             "/releases/latest/download/manifest.json".to_string(),
-            ok(&manifest("9.9.9", &sha, size)),
+            ok(&body),
+        ),
+        (
+            "/releases/latest/download/manifest.json.minisig".to_string(),
+            ok(&release_keys().0.sign(&body)),
         ),
         (format!("/releases/download/v9.9.8/{ASSET}"), ok(&bytes)),
     ]))
@@ -1405,4 +1499,183 @@ async fn manifests_and_assets_that_do_not_verify_are_refused() {
         format!("{error:#}").contains("is missing (HTTP 404"),
         "{error:#}"
     );
+}
+
+/// Nothing but the manifest and its signature was requested: no asset,
+/// so no candidate could have been written or run.
+fn assert_no_asset_requested(server: &Server) {
+    let requested = server.requested();
+    assert!(
+        requested
+            .iter()
+            .all(|target| target.contains("manifest.json")),
+        "{requested:?}"
+    );
+}
+
+/// A manifest whose signature is missing, by an unknown key, made with the
+/// wrong key, or broken in any way stops the update before anything else
+/// is read from the manifest or downloaded.
+#[tokio::test]
+async fn an_unsigned_or_badly_signed_manifest_stops_before_any_download() {
+    let bytes = release_bytes();
+    let body = manifest("9.9.9", &sha256_hex(&bytes), Some(bytes.len() as u64));
+    let (primary, _) = release_keys();
+    let stranger = TestKey::generate();
+    let signed = primary.sign(&body);
+    let mut tampered_manifest = body.clone();
+    let at = tampered_manifest.len() - 3;
+    tampered_manifest[at] ^= 1;
+    // (name, manifest, signature file, expected error)
+    type Case<'a> = (&'a str, Vec<u8>, Option<Vec<u8>>, &'a str);
+    let cases: Vec<Case> = vec![
+        ("missing", body.clone(), None, "has no signature (HTTP 404"),
+        (
+            "unknown key",
+            body.clone(),
+            Some(stranger.sign(&body)),
+            "which this program does not trust",
+        ),
+        (
+            "wrong key under a trusted id",
+            body.clone(),
+            Some(stranger.sign_with(&body, *b"Ed", primary.id, b"x")),
+            "does not verify with key",
+        ),
+        (
+            "tampered manifest",
+            tampered_manifest,
+            Some(signed.clone()),
+            "does not verify with key",
+        ),
+        (
+            "truncated signature",
+            body.clone(),
+            Some(signed[..signed.len() - 10].to_vec()),
+            "not canonical base64",
+        ),
+        (
+            "oversized signature",
+            body.clone(),
+            Some(vec![b'x'; 4097]),
+            "manifest.json.minisig is larger than 4096 bytes",
+        ),
+        ("empty signature", body.clone(), Some(Vec::new()), "1 lines"),
+    ];
+    for (name, manifest_body, signature, expected) in cases {
+        let server = serve_with(|_| release_signed(manifest_body, signature, bytes.clone())).await;
+        let error = fetch(server.port, "1.0.0", "0").await.err().unwrap();
+        let text = format!("{error:#}");
+        assert!(text.contains(expected), "{name}: {text}");
+        if !["missing", "oversized signature"].contains(&name) {
+            assert!(
+                text.contains("is not signed by a trusted key"),
+                "{name}: {text}"
+            );
+        }
+        assert_no_asset_requested(&server);
+    }
+}
+
+/// The recovery key is trusted like the primary key.
+#[tokio::test]
+async fn a_manifest_signed_by_the_recovery_key_updates() {
+    let bytes = release_bytes();
+    let body = manifest("9.9.9", &sha256_hex(&bytes), Some(bytes.len() as u64));
+    let signature = release_keys().1.sign(&body);
+    let port = serve(release_signed(body, Some(signature), bytes.clone())).await;
+    match fetch(port, "1.0.0", "0").await.unwrap() {
+        FixedUpdate::Download {
+            bytes: got,
+            version,
+        } => {
+            assert_eq!(version, "9.9.9");
+            assert_eq!(got, bytes);
+        }
+        FixedUpdate::Current(message) => panic!("{message}"),
+    }
+}
+
+/// A correctly signed manifest of another distribution, of another schema,
+/// or with fields this program does not know is refused.
+#[tokio::test]
+async fn a_signed_manifest_must_be_for_this_distribution_and_schema() {
+    let bytes = release_bytes();
+    let sha = sha256_hex(&bytes);
+    let size = bytes.len() as u64;
+    let mut other_schema: serde_json::Value =
+        serde_json::from_slice(&manifest("9.9.9", &sha, Some(size))).unwrap();
+    other_schema["manifest_schema"] = 2.into();
+    let mut unschemed = other_schema.clone();
+    unschemed.as_object_mut().unwrap().remove("manifest_schema");
+    let mut extra = other_schema.clone();
+    extra["manifest_schema"] = 1.into();
+    extra["channel"] = "beta".into();
+    for (name, body, expected) in [
+        (
+            "other distribution",
+            manifest_for("other", "9.9.9", &sha, Some(size)),
+            "not \"ktest\"",
+        ),
+        (
+            "schema 2",
+            serde_json::to_vec(&other_schema).unwrap(),
+            "schema 2",
+        ),
+        (
+            "no schema",
+            serde_json::to_vec(&unschemed).unwrap(),
+            "missing field `manifest_schema`",
+        ),
+        (
+            "unknown field",
+            serde_json::to_vec(&extra).unwrap(),
+            "unknown field `channel`",
+        ),
+        (
+            "upper-case sha256",
+            manifest("9.9.9", &sha.to_ascii_uppercase(), Some(size)),
+            "invalid sha256",
+        ),
+    ] {
+        let server = serve_with(|_| release(body, bytes.clone())).await;
+        let error = fetch(server.port, "1.0.0", "0").await.err().unwrap();
+        assert!(format!("{error:#}").contains(expected), "{name}: {error:#}");
+        assert_no_asset_requested(&server);
+    }
+}
+
+/// One version, one content: a published release of this very version
+/// with other bytes is refused, never installed over this program; an older
+/// release is not installed either.
+#[tokio::test]
+async fn a_release_of_the_same_version_with_other_content_is_refused() {
+    let bytes = release_bytes();
+    let sha = sha256_hex(&bytes);
+    let server = serve_with(|_| {
+        release(
+            manifest("9.9.9", &sha, Some(bytes.len() as u64)),
+            bytes.clone(),
+        )
+    })
+    .await;
+    let error = fetch(server.port, "9.9.9", &"0".repeat(64))
+        .await
+        .err()
+        .unwrap();
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("differs from the published ktest 9.9.9")
+            && text.contains("never replaced by other content of the same version"),
+        "{text}"
+    );
+    assert_no_asset_requested(&server);
+    match fetch(server.port, "10.0.0", "0").await.unwrap() {
+        FixedUpdate::Current(message) => assert!(
+            message.contains("Already current: ktest 10.0.0 (remote ktest 9.9.9)"),
+            "{message}"
+        ),
+        FixedUpdate::Download { .. } => panic!("an older release was downloaded"),
+    }
+    assert_no_asset_requested(&server);
 }

@@ -5,6 +5,7 @@
 //! limit, and the size and time limits, with the production code paths.
 
 use super::*;
+use crate::update_signature_tests::{TestKey, leak_keys};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::AsyncWriteExt;
@@ -246,18 +247,27 @@ fn release_bytes() -> Vec<u8> {
 
 /// A release published like GitHub's: `latest` and the versioned asset on
 /// github.com redirect to the asset host.
+/// The manifest and its signature are signed by `release_key`.
 fn github_release(port: u16, asset: &[u8]) -> Routes {
     let manifest = serde_json::to_vec(&serde_json::json!({
+        "manifest_schema": 1,
+        "distribution": "ktest",
         "version": "9.9.9",
         "assets": { ASSET: { "sha256": sha256_hex(asset), "size": asset.len() } },
     }))
     .unwrap();
+    let signature = release_key().sign(&manifest);
     Routes::from([
         (
             route(GITHUB, "/o/r/releases/latest/download/m.json"),
             redirect(302, url(ASSETS, port, "/m.json?sig=1")),
         ),
         (route(ASSETS, "/m.json?sig=1"), ok(&manifest)),
+        (
+            route(GITHUB, "/o/r/releases/latest/download/m.json.minisig"),
+            redirect(302, url(ASSETS, port, "/m.json.minisig?sig=3")),
+        ),
+        (route(ASSETS, "/m.json.minisig?sig=3"), ok(&signature)),
         (
             route(GITHUB, &format!("/o/r/releases/download/v9.9.9/{ASSET}")),
             redirect(302, url(ASSETS, port, "/asset?sig=2")),
@@ -266,12 +276,27 @@ fn github_release(port: u16, asset: &[u8]) -> Routes {
     ])
 }
 
+fn release_key() -> &'static TestKey {
+    static KEY: std::sync::OnceLock<TestKey> = std::sync::OnceLock::new();
+    KEY.get_or_init(TestKey::generate)
+}
+
 async fn fetch_release(server: &Server, ca_pem: Option<&str>) -> Result<FixedUpdate> {
     let port = server.port;
+    let source = Box::leak(Box::new(FixedUpdateSource {
+        manifest_url: String::leak(url(GITHUB, port, "/o/r/releases/latest/download/m.json")),
+        asset_url_template: String::leak(url(
+            GITHUB,
+            port,
+            "/o/r/releases/download/v{version}/{asset}",
+        )),
+        hosts: &[GITHUB, ASSETS, UNCERTIFIED],
+        distribution: "ktest",
+        signing_keys: leak_keys(&[release_key()]),
+    }));
     fetch_fixed_update(
         &policy(port),
-        &url(GITHUB, port, "/o/r/releases/latest/download/m.json"),
-        &url(GITHUB, port, "/o/r/releases/download/v{version}/{asset}"),
+        source,
         ASSET,
         "1.0.0",
         "0",
@@ -300,6 +325,8 @@ async fn an_https_release_downloads_across_allowed_hosts() {
         [
             format!("{GITHUB} /o/r/releases/latest/download/m.json"),
             format!("{ASSETS} /m.json?sig=1"),
+            format!("{GITHUB} /o/r/releases/latest/download/m.json.minisig"),
+            format!("{ASSETS} /m.json.minisig?sig=3"),
             format!("{GITHUB} /o/r/releases/download/v9.9.9/{ASSET}"),
             format!("{ASSETS} /asset?sig=2"),
         ]

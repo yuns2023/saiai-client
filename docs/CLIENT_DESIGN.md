@@ -963,14 +963,21 @@ wrapper、manifest 和六个平台二进制构成不可变 release bundle。Linu
   - 需要已初始化的配置。
   - 不跟随重定向。
   - manifest 返回 404 时，退回不校验 hash 的二进制下载。这是既有行为，保持不变。
-- `Fixed { manifest_url, asset_url_template, hosts }`（第二发行版 AITP 计划使用）：
+- `Fixed { manifest_url, asset_url_template, hosts, distribution, signing_keys }`（第二发行版 AITP 计划使用）：
   - **URL 规则**：
     - 每次请求和每一跳重定向都必须是 HTTPS、默认端口，主机与 `hosts` 精确匹配，且不含 userinfo 和 fragment；
     - 只跟随 301/302/303/307/308，最多 5 跳，相对 Location 按当前 URL 解析；
     - 每一跳按目标 URL 重新选择上游路由，代理不可用时不直连；
     - 整条链设总超时。
   - **TLS 信任**：与访问网关相同，即系统证书库、企业 CA、`SSL_CERT_FILE/DIR`，并排除本安装的 CA。
-  - **manifest 必须存在**：大小上限 1 MiB；版本必须是严格的 `X.Y.Z`；资产必须带 sha256 和 size（1–64 MiB）。
+  - **manifest 必须存在**：大小上限 1 MiB；版本必须是严格的 `X.Y.Z`；资产必须带 sha256（64 位小写十六进制）和 size（1–64 MiB）。
+  - **manifest 必须签名**（`kernel/src/update_signature.rs`，格式与维护者操作见下文"AITP 更新签名"）：
+    - 签名文件是 `<manifest_url>.minisig`（品牌校验要求 `manifest_url` 不带 query），与 manifest 同样的主机白名单、重定向和 HTTPS 规则，大小上限 4 KiB，独立 30 s；
+    - 下载 manifest 后先取签名、对 manifest 的**精确字节**验签，验签通过之前不解析 manifest 的任何字段，更不请求资产、不写候选、不执行候选；
+    - 缺签名（404）、签名文件格式不对、未知 key id、该 key id 对应的公钥验不过、trusted comment 的签名验不过，一律报错停止，不回退到无签名更新；
+    - 信任的公钥来自品牌 `signing_keys`（至少一把；key id 和公钥都不得重复；品牌安装时校验），任一把签的都接受（主钥或恢复钥），只用签名里 key id 指向的那把验证；
+    - 验签后 manifest 必须恰好有 `manifest_schema`（整数 1）、`distribution`（等于品牌的 `distribution`，防止把别的发行版签过的 manifest 拿来重放）、`version`、`assets` 四个字段，重复字段、重复资产名、未知字段都拒绝。
+  - **一个版本只有一种内容**：远端版本与本程序相同但 sha256 不同时报错，不安装（之前是"刷新"）；远端版本更低时提示已是最新、不安装；相同版本相同 hash 时不下载。不防"冻结"：攻击者能重放旧的已签 manifest，让客户端停在当前版本，但不能让它装旧版本。
   - **资产 URL**：用 manifest 中的版本填入模板，避免 latest 在两次请求之间切换。按 size 流式读取，长度和 sha256 必须一致。
   - **时间预算**：代理发现（如 macOS `scutil --proxy`）30 s，manifest 链 30 s，资产链 300 s，各自独立计时；超时后遗留的阻塞任务不会拖住命令退出。
   - **候选二进制**：
@@ -991,6 +998,7 @@ wrapper、manifest 和六个平台二进制构成不可变 release bundle。Linu
     - 互斥范围：程序文件（含主程序）的删除/替换与更新互斥。Windows 上每个目录的锁文件排在该目录程序文件之后删除，删除前只释放该目录的锁；此后的锁文件删除、空目录删除和 PATH 清理不在锁内。这部分与另一次更新或卸载并发时是安全的：锁文件被对方占用时保留并提示稍后重跑（不算失败、不阻止后续步骤）；空目录删除时目录已被删除记为已不存在，变为非空记为保留（检查与删除之间的变化也按此处理）。PATH 清理沿用原有的“值已变化则不改”检查，两个卸载同时改 PATH 时后者可能报告 PATH 已变化，这是既有行为。锁文件本身要被删除，所以无法把锁持有到最后；放到卸载不删的位置又会留下残留。
   - **不依赖 init**：没有配置时走默认 system 路由，信任系统证书库，此时没有安装 CA 需要排除；配置存在但读不出来时报错，不静默回退。仍受环境选择器约束：同时继承非默认的 `CLAUDE_CONFIG_DIR` 和 `CODEX_HOME` 时，须显式选择环境。
   - **manifest 404**：明确报错"manifest 不可用，可能尚未发布"，不做无校验下载。
+  - `latest` 在 manifest 与签名两次请求之间切换到新版本时，签名对不上，本次更新报错，重跑即可（不会退回无签名）。
 
 ### 第二发行版 AITP（计划）
 
@@ -1016,7 +1024,7 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
 - **任何对外发布**（D4，以及向 `2742zdz/AITP` 的任何推送）须同时满足：
   - D2 已完成；
   - 用户明确批准；
-  - 首次公开发布前完成 manifest 签名评估。
+  - 首次公开发布前完成 manifest 签名评估。（已完成并实现，见"AITP 更新签名"；首次发布前还须把品牌里的占位公钥换成维护者的真实公钥。）
 - **D4 前必须完成的跟进**（独立复核登记）：
   - ~~候选探测只回收直接子进程~~：已完成，进程组/Job Object，删除错误会报告；Windows 原生测试覆盖后代占住 stdout 时按时结束、候选可删除（见上文"候选二进制"）。
   - ~~受控 HTTPS 的 Fixed 下载测试~~：已完成（`kernel/src/update_fixed_https_tests.rs`）。本地 TLS 服务用测试 CA 签发，只有测试自己的客户端信任它（`Egress::test_ca_pem`，仅测试构建存在），系统和进程的信任不变；覆盖跨主机重定向、主机白名单（含已签证书但不在白名单的主机、白名单内但证书不含的主机）、降级 HTTP、换端口、userinfo、重定向 5 跳上限、大小上限（声明长度/流式）和总时限，并验证系统根和另一张 CA 都握手失败、请求到不了 HTTP 层。
@@ -1027,6 +1035,62 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
 - **D2 中改变 SAIAI 现有行为的修复**须满足：
   - 每个 PR 单列"SAIAI 用户可见的行为变化"，并说明只会少删或多拒绝；
   - 可能让现有 SAIAI 用户原地升级后功能失效的改动，先停下确认。
+
+### AITP 更新签名（维护者手册）
+
+**格式：minisign（0.10 及以上）的 legacy Ed25519 签名**，即 `minisign -S -l`：对 manifest 的精确字节做纯 Ed25519 签名。客户端用已编译进内核的 `ring` 验证，不新增依赖（Cargo.lock 只多了内核对 `ring` 的直接依赖一行，没有新包）。
+
+选它而不选"OpenSSL 裸 Ed25519"的理由：
+
+- 三个平台都有现成安装包（macOS `brew install minisign`；Windows `scoop install minisign` 或 `winget install jedisct1.minisign`；Linux 发行版包 `minisign`），一个小程序完成生成、签名和自检（`minisign -V`）；
+- 私钥文件默认用口令加密（scrypt），key id 写在公钥和签名里，不需要我们自定义封装格式；
+- macOS 自带的 `openssl` 是 LibreSSL，不支持 `pkeyutl -rawin` 的 Ed25519，维护者还得另装 OpenSSL 3，key id 和签名文件格式也得我们自己定义。
+
+只接受 legacy（算法 `Ed`）：minisign 默认的预哈希格式（`ED`，先做 BLAKE2b-512）需要 `ring` 没有的 BLAKE2b；忘了加 `-l` 时，客户端和上传前检查都会明确提示"用 `minisign -S -l` 重签"。签名文件里的 trusted comment 也会验签（与 `minisign -V` 一致），但内容不参与判断；版本和发行版只看 manifest 本身。
+
+**信任根**：品牌 `update.source = Fixed { distribution, signing_keys, … }`。AITP 是 `distribution: "aitp"`，`signing_keys` 是两把 minisign 公钥（`.pub` 文件第二行，56 个字符）：主钥和恢复钥。在维护者提供真实公钥之前是两把**明显的占位公钥**（文本含 `PLACEHOLDER`，其字节不是曲线上的点，任何签名都验不过）；`kernel/scripts/build-release.sh` 和 `verify-release.py --aitp-artifact` 都会拒绝含占位公钥的发布构建，只有从不发布的 CI 路径检查显式放行（`AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1` / `--allow-placeholder-signing-key`），另有对照步骤确认不放行时会失败。真实公钥由单独的 PR 填入（同时改 `aitp_values_are_frozen`）。SAIAI 走 `GatewayChannel`，没有这些字段，更新行为不变。
+
+**一次性准备（维护者自己的电脑，离线）**：
+
+1. 安装 minisign（见上）。在不联网的电脑或断网状态下生成两把钥，口令不同、都足够长：
+   ```sh
+   minisign -G -p aitp-release.pub  -s aitp-release.key
+   minisign -G -p aitp-recovery.pub -s aitp-recovery.key
+   ```
+2. 备份：两把私钥（`.key`）各自至少两份离线介质（例如两个加密 U 盘，分开存放）；恢复钥平时不和主钥放在一起；口令另行记录（纸质、分开保管）。私钥永远不放到开发机、CI、网盘或聊天里。
+3. 把两个 `.pub` 文件（只有公钥）交给开发者，填入 `kernel/src/bin/aitp/brand.rs` 的 `signing_keys`（主钥在前）。同时在 README / 发布说明里公布两把公钥的**完整文本**，供用户首次安装时通过独立渠道核对（key id 只有 64 位，不能代替完整公钥）。
+4. 恢复演练（首次发布前做一次，以后每年一次）：用恢复钥对一个测试 manifest 签名，按下面的"上传前检查"验证能通过，确认口令和备份介质都可用。
+
+**每次发布**：
+
+1. 开发侧在发布构建的产物目录 `dist/` 里放齐六个 `aitp-<平台>` 资产（签名、strip 等改动二进制的步骤都要在此之前完成），然后生成未签名的 manifest：
+   ```sh
+   python3 tools/saiai-cli/kernel/scripts/release_manifest.py generate --dist dist
+   ```
+   它写出 `dist/aitp-manifest.json`（规范 JSON：键排序、紧凑、末尾换行；版本默认取 `kernel/Cargo.toml`），并打印 manifest 的 sha256 和确切的签名命令。
+2. 维护者把 `aitp-manifest.json` 拷到签名电脑，先核对打印的 sha256（`shasum -a 256 aitp-manifest.json`，Windows `certutil -hashfile aitp-manifest.json SHA256`）以及这次要发布的源码提交，再执行打印的命令，例如：
+   ```sh
+   minisign -S -l -s aitp-release.key -p aitp-release.pub -m aitp-manifest.json -x aitp-manifest.json.minisig -t "aitp-manifest 0.2.0 sha256:<manifest sha256>"
+   minisign -V -p aitp-release.pub -m aitp-manifest.json   # 自检，应显示 Signature and comment signature verified
+   ```
+   只把 `aitp-manifest.json.minisig` 交回；manifest 不要在签名电脑上改动（改一个字节签名就作废）。
+3. 上传前检查（开发侧）：
+   ```sh
+   python3 scripts/saiai-cli/verify-release.py \
+     --aitp-artifact <各平台 aitp 程序> --build-dir <构建目录> \
+     --aitp-manifest dist/aitp-manifest.json --aitp-dist dist
+   ```
+   或只用公开内核里的工具：`release_manifest.py verify --manifest dist/aitp-manifest.json --dist dist --artifact <程序> …`。检查：签名用的是品牌信任的钥（非占位）、只接受 legacy 格式、trusted comment 签名正确；manifest 的 schema、发行版、版本（等于包版本）、资产集合（恰好六个）与 `dist/` 中每个文件的 size/sha256 一致；每个程序都内含品牌的全部公钥、不含占位公钥。这里的 Ed25519 验证是 RFC 8032 的独立 Python 实现（拒绝非规范编码、S ≥ L、小阶公钥和 R），与客户端用同一组真实 minisign 输出做测试。
+4. 草稿 release 里上传全部资产、`aitp-manifest.json` 和 `aitp-manifest.json.minisig` 后再发布（D4 工作流届时细化）。
+
+**轮换、丢失与泄露**（客户端接受 `signing_keys` 里任一把签的 manifest；一个已安装的版本只认它自己内置的那组公钥）：
+
+- **原则**：`latest` 必须始终由所有仍需自动更新的已安装版本都信任的钥签名。换掉一把钥之后，只信任旧钥组的老版本无法再验证新签名，只能手动重装。
+- **计划内轮换**（不建议无故轮换）：发布版本 N，把新公钥加入 `signing_keys`（同时保留旧主钥和恢复钥），N 及以后继续用旧主钥签；等确认需要支持的用户都已升到 N 以上，再改用新钥签名、在后续版本移除旧钥。跳过 N 的老版本此后无法自动更新，须在发布说明中提示手动安装。
+- **主钥丢失**（未泄露）：改用恢复钥签名——所有版本都信任它，自动更新不中断。下一个版本加入一把新的恢复钥；之后恢复钥成为事实上的主钥，按"计划内轮换"逐步更替。
+- **主钥泄露**：立即用恢复钥签发新版本，从 `signing_keys` 中删去泄露的钥并加入新钥；在 README / 发布说明公告泄露的 key id 和新公钥。**局限**：已安装的旧版本在升级前仍信任泄露的钥，攻击者若同时能改 GitHub release（或在用户信任的 CA 下做中间人），可以抢先推送恶意版本；客户端没有吊销列表。
+- **两把都丢失或都泄露**：客户端无法再被安全地自动更新。只能发布新公钥的新版本，公告用户手动重新安装并通过独立渠道核对公钥全文。
+- **重放与冻结**：攻击者可以一直提供某个旧的已签 manifest，让客户端停留在当前版本（低版本不会安装，同版本不同内容会报错）；签名不防冻结。
 
 ### 同机共存（D2，缩小范围）
 

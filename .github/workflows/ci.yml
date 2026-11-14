@@ -83,12 +83,14 @@ jobs:
           cargo test --locked --target-dir "$standalone/target"
           # The AITP program: its brand installs and renders its services
           # (contract entries), and a release build (paths remapped, as
-          # published) runs and names no build path.
+          # published) runs and names no build path. It is never published,
+          # so it may still carry the placeholder update signing keys.
           cargo test --locked --target-dir "$standalone/target" --features contract --bin aitp
-          aitp="$(CARGO_TARGET_DIR="$standalone/target" bash scripts/build-release.sh --locked)"
+          python3 scripts/test_release_manifest.py
+          aitp="$(CARGO_TARGET_DIR="$standalone/target" AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1 bash scripts/build-release.sh --locked)"
           "$aitp" --version
           python3 "$GITHUB_WORKSPACE/scripts/saiai-cli/verify-release.py" \
-            --aitp-artifact "$aitp" \
+            --aitp-artifact "$aitp" --allow-placeholder-signing-key \
             --build-dir "$standalone" --build-dir "$GITHUB_WORKSPACE"
 
       - name: Verify official Codex daemon initialization without model turns
@@ -115,6 +117,7 @@ jobs:
           node --test scripts/saiai-cli/test-vscode-certificates.js
           python3 scripts/saiai-cli/test-release-contract.py
           python3 scripts/saiai-cli/test-brand-contract.py
+          python3 tools/saiai-cli/kernel/scripts/test_release_manifest.py
           python3 scripts/saiai-cli/test-installed-codex-desktop-probe.py
           python3 scripts/saiai-cli/test-windows-self-update-polling.py
           bash scripts/saiai-cli/test-setup-wrappers.sh
@@ -147,15 +150,37 @@ jobs:
             *saiai*) ;;
             *) echo "::error::the checkout path no longer names the other distribution"; exit 1 ;;
           esac
-          aitp="$(bash tools/saiai-cli/kernel/scripts/build-release.sh --locked)"
+          # Never published: the placeholder signing keys are allowed here.
+          aitp="$(AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1 bash tools/saiai-cli/kernel/scripts/build-release.sh --locked)"
           "$aitp" --version
           echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"
 
       - name: Verify the AITP release names no build path
         run: >-
           python3 scripts/saiai-cli/verify-release.py
-          --aitp-artifact "$AITP_PROGRAM"
+          --aitp-artifact "$AITP_PROGRAM" --allow-placeholder-signing-key
           --build-dir "$GITHUB_WORKSPACE"
+
+      # Without the exception, both the build and the release check refuse
+      # a program that trusts the placeholder keys.
+      - name: Control - placeholder signing keys are refused for a release
+        run: |
+          if [ "$(python3 tools/saiai-cli/kernel/scripts/release_manifest.py keys | grep -c PLACEHOLDER)" = 0 ]; then
+            echo "the brand carries real signing keys; the placeholder control does not apply"
+            exit 0
+          fi
+          if bash tools/saiai-cli/kernel/scripts/build-release.sh --locked 2> "$RUNNER_TEMP/build.log"; then
+            echo "::error::the release build accepted placeholder signing keys"
+            exit 1
+          fi
+          grep "update signing keys are placeholders" "$RUNNER_TEMP/build.log"
+          if python3 scripts/saiai-cli/verify-release.py \
+              --aitp-artifact "$AITP_PROGRAM" \
+              --build-dir "$GITHUB_WORKSPACE" 2> "$RUNNER_TEMP/keys.log"; then
+            echo "::error::the release check accepted placeholder signing keys"
+            exit 1
+          fi
+          grep "still placeholders" "$RUNNER_TEMP/keys.log"
 
       - name: Control - an ordinary release build fails the check
         env:
@@ -164,7 +189,7 @@ jobs:
         run: |
           cargo build --locked --manifest-path tools/saiai-cli/kernel/Cargo.toml --release --bin aitp
           if python3 scripts/saiai-cli/verify-release.py \
-              --aitp-artifact "$CARGO_TARGET_DIR/release/aitp" \
+              --aitp-artifact "$CARGO_TARGET_DIR/release/aitp" --allow-placeholder-signing-key \
               --build-dir "$GITHUB_WORKSPACE" 2> "$RUNNER_TEMP/control.log"; then
             echo "::error::the path check accepted an ordinary release build"
             exit 1

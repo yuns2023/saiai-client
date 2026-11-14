@@ -185,9 +185,36 @@ pub(crate) fn validate_update_source(source: &UpdateSource) -> Result<()> {
                 );
             }
             let policy = crate::FixedUrlPolicy::https(fixed.hosts);
-            policy
+            let manifest = policy
                 .check(fixed.manifest_url)
                 .map_err(|error| anyhow::anyhow!("brand update manifest_url: {error:#}"))?;
+            // The signature URL is the manifest URL with a suffix.
+            if manifest.query().is_some() {
+                bail!(
+                    "brand update manifest_url must not carry a query: {:?}",
+                    fixed.manifest_url
+                );
+            }
+            policy
+                .check(&format!(
+                    "{}{}",
+                    fixed.manifest_url,
+                    crate::update_signature::SIGNATURE_SUFFIX
+                ))
+                .map_err(|error| anyhow::anyhow!("brand update signature URL: {error:#}"))?;
+            if fixed.distribution.is_empty()
+                || !fixed
+                    .distribution
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            {
+                bail!(
+                    "brand update distribution may only use plain name characters: {:?}",
+                    fixed.distribution
+                );
+            }
+            crate::update_signature::parse_trusted_keys(fixed.signing_keys)
+                .map_err(|error| anyhow::anyhow!("brand update signing_keys: {error:#}"))?;
             let template = fixed.asset_url_template;
             if template.matches("{version}").count() != 1
                 || template.matches("{asset}").count() != 1
@@ -458,18 +485,29 @@ pub enum UpdateSource {
 }
 
 /// A release channel at fixed HTTPS URLs (for example a GitHub repository's
-/// releases). The manifest is required and verified; the asset URL is pinned
-/// to the manifest's version, so a release published in between cannot mix
-/// one release's manifest with another's asset.
+/// releases). The manifest is required and must carry a signature by one of
+/// `signing_keys`, checked before anything else is read from it or
+/// downloaded; the asset URL is pinned to the manifest's version, so a
+/// release published in between cannot mix one release's manifest with
+/// another's asset.
 pub struct FixedUpdateSource {
-    /// Manifest of the latest release (`{"version": "X.Y.Z", "assets":
-    /// {"<asset>": {"sha256": …, "size": …}}}`).
+    /// Manifest of the latest release (`{"manifest_schema": 1,
+    /// "distribution": …, "version": "X.Y.Z", "assets": {"<asset>":
+    /// {"sha256": …, "size": …}}}`), without a query. Its signature is at
+    /// this URL plus `.minisig`.
     pub manifest_url: &'static str,
     /// Asset URL with `{version}` (the manifest's `X.Y.Z`) and `{asset}`.
     pub asset_url_template: &'static str,
     /// Hosts every request and redirect target must name exactly (HTTPS,
     /// port 443, no user information). Lowercase.
     pub hosts: &'static [&'static str],
+    /// The `distribution` a manifest must name, so a manifest signed for
+    /// another distribution is refused (`[a-z0-9-]+`).
+    pub distribution: &'static str,
+    /// Trusted manifest signing keys: minisign Ed25519 public keys (the
+    /// base64 line of a `.pub` file), for example a primary and a recovery
+    /// key. At least one; ids and keys distinct.
+    pub signing_keys: &'static [&'static str],
 }
 
 pub struct OwnershipMarkers {

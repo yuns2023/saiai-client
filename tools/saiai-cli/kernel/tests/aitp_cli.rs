@@ -1027,19 +1027,198 @@ fn tiny_linux_program(message: &str) -> Vec<u8> {
     program
 }
 
-/// A program for this platform that reports `aitp <this version>`: on
-/// Linux a minimal one, elsewhere the real program with trailing padding
-/// (so its hash differs from the installed copy).
-fn candidate_program(sandbox: &Sandbox) -> Vec<u8> {
+/// A release signing key generated for one test (its private half stays in
+/// the test process), signing as `minisign -S -l` does.
+struct ReleaseKey {
+    pair: ring::signature::Ed25519KeyPair,
+    id: [u8; 8],
+}
+
+impl ReleaseKey {
+    fn generate() -> Self {
+        use ring::rand::SecureRandom;
+        let random = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&random).unwrap();
+        let mut id = [0_u8; 8];
+        random.fill(&mut id).unwrap();
+        Self {
+            pair: ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap(),
+            id,
+        }
+    }
+
+    /// The minisign public key line.
+    fn public_text(&self) -> String {
+        use base64::Engine;
+        use ring::signature::KeyPair;
+        let mut raw = b"Ed".to_vec();
+        raw.extend(self.id);
+        raw.extend(self.pair.public_key().as_ref());
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    }
+
+    /// A minisign signature file over `message`.
+    fn sign(&self, message: &[u8]) -> Vec<u8> {
+        use base64::Engine;
+        let engine = &base64::engine::general_purpose::STANDARD;
+        let comment = b"aitp-manifest test";
+        let signature = self.pair.sign(message);
+        let mut envelope = b"Ed".to_vec();
+        envelope.extend(self.id);
+        envelope.extend(signature.as_ref());
+        let mut global = signature.as_ref().to_vec();
+        global.extend(comment);
+        let mut file = b"untrusted comment: signature from minisign secret key\n".to_vec();
+        file.extend(engine.encode(envelope).bytes());
+        file.extend(b"\ntrusted comment: ");
+        file.extend(comment);
+        file.push(b'\n');
+        file.extend(engine.encode(self.pair.sign(&global)).bytes());
+        file.push(b'\n');
+        file
+    }
+}
+
+/// The trusted update signing keys the AITP brand source declares, in
+/// order (placeholders or real keys alike).
+fn brand_signing_keys() -> Vec<String> {
+    let source = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/aitp/brand.rs"),
+    )
+    .unwrap();
+    let body = source.split("#[cfg(test)]").next().unwrap();
+    let list = body
+        .split("signing_keys: &[")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .expect("the brand declares its signing keys");
+    let keys: Vec<String> = list
+        .lines()
+        .map(|line| line.split("//").next().unwrap().trim())
+        .filter_map(|line| line.strip_prefix('"'))
+        .map(|line| line.trim_end_matches(',').trim_end_matches('"').to_string())
+        .collect();
+    assert!(
+        !keys.is_empty() && keys.iter().all(|key| key.len() == 56),
+        "{keys:?}"
+    );
+    keys
+}
+
+/// `program` with every occurrence of `from` replaced by `to` (same
+/// length); `expected` occurrences must be found.
+fn replace_bytes(program: &mut [u8], from: &[u8], to: &[u8], expected: Option<usize>) {
+    assert_eq!(from.len(), to.len());
+    let mut found = 0;
+    let mut at = 0;
+    // First-byte scan, then compare (fast enough for a debug build of a
+    // large program).
+    while let Some(offset) = program[at..].iter().position(|byte| *byte == from[0]) {
+        let start = at + offset;
+        if program[start..].starts_with(from) {
+            program[start..start + from.len()].copy_from_slice(to);
+            found += 1;
+            at = start + from.len();
+        } else {
+            at = start + 1;
+        }
+    }
+    assert!(found > 0, "{} not found", String::from_utf8_lossy(from));
+    if let Some(expected) = expected {
+        assert_eq!(found, expected, "{}", String::from_utf8_lossy(from));
+    }
+}
+
+/// Writes a changed program and (macOS) signs it ad hoc again, as the
+/// change invalidated the linker's signature.
+fn write_program(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).unwrap();
+    #[cfg(target_os = "macos")]
+    for args in [
+        &["--force", "--sign", "-"][..],
+        &["--verify", "--strict"][..],
+    ] {
+        let status = Command::new("codesign")
+            .args(args)
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "codesign {args:?} {}", path.display());
+    }
+}
+
+impl Sandbox {
+    /// The sandbox's program trusting `keys` instead of the brand's keys:
+    /// the brand's key texts in the copy are overwritten in place (each
+    /// exactly once). Nothing else changes; the production program has no
+    /// other way to trust a key.
+    fn trust(&self, keys: &[&ReleaseKey]) -> Vec<u8> {
+        let brand = brand_signing_keys();
+        assert!(keys.len() <= brand.len());
+        let mut program = std::fs::read(&self.program).unwrap();
+        for (index, from) in brand.iter().enumerate() {
+            // Unused brand slots get keys nobody holds.
+            let replacement;
+            let to = match keys.get(index) {
+                Some(key) => key.public_text(),
+                None => {
+                    replacement = ReleaseKey::generate();
+                    replacement.public_text()
+                }
+            };
+            replace_bytes(&mut program, from.as_bytes(), to.as_bytes(), Some(1));
+        }
+        write_program(&self.program, &program);
+        std::fs::read(&self.program).unwrap()
+    }
+
+    /// Installs a program `trust` produced for another sandbox.
+    fn install(&self, program: &[u8]) {
+        write_program(&self.program, program);
+    }
+}
+
+/// The next version with as many characters (so it can replace this one
+/// in a program).
+fn next_version() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let mut parts: Vec<u64> = version
+        .split('.')
+        .map(|part| part.parse().unwrap())
+        .collect();
+    parts[2] += 1;
+    let next = format!("{}.{}.{}", parts[0], parts[1], parts[2]);
+    assert_eq!(next.len(), version.len(), "pick another test version");
+    next
+}
+
+/// A program for this platform that reports `aitp <version>`: on Linux a
+/// minimal one; elsewhere the real program with its version text replaced
+/// (and checked by running it).
+fn candidate_program(sandbox: &Sandbox, version: &str) -> Vec<u8> {
     #[cfg(target_os = "linux")]
     {
         let _ = sandbox;
-        tiny_linux_program(&format!("aitp {}\n", env!("CARGO_PKG_VERSION")))
+        tiny_linux_program(&format!("aitp {version}\n"))
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let mut program = std::fs::read(&sandbox.program).unwrap();
-        program.extend([0_u8; 4096]);
+        let mut program = std::fs::read(BINARY).unwrap();
+        let current = env!("CARGO_PKG_VERSION");
+        if version != current {
+            replace_bytes(&mut program, current.as_bytes(), version.as_bytes(), None);
+        }
+        let path = sandbox
+            .root
+            .join(format!("candidate-check{}", std::env::consts::EXE_SUFFIX));
+        write_program(&path, &program);
+        let output = Command::new(&path).arg("--version").output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            format!("aitp {version}")
+        );
+        let program = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
         assert!(
             program.len() <= 64 * 1024 * 1024,
             "the test program ({} bytes) exceeds the 64 MiB release limit",
@@ -1049,41 +1228,70 @@ fn candidate_program(sandbox: &Sandbox) -> Vec<u8> {
     }
 }
 
+const RELEASES: &str = "/2742zdz/AITP/releases";
+
+fn sha256_text(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// An AITP manifest of `version` naming this platform's asset.
+fn release_manifest(distribution: &str, version: &str, sha256: &str, size: usize) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "manifest_schema": 1,
+        "distribution": distribution,
+        "version": version,
+        "assets": { asset_name(): { "sha256": sha256, "size": size } },
+    }))
+    .unwrap()
+}
+
 /// The release of `version` with `asset` for this platform, published like
-/// GitHub's: the versioned asset redirects to the asset host.
+/// GitHub's (the versioned asset redirects to the asset host), its manifest
+/// signed by `key`.
 fn release_routes(
     version: &str,
     asset: &[u8],
+    key: &ReleaseKey,
 ) -> std::collections::HashMap<String, (u16, String, Vec<u8>)> {
-    use sha2::Digest;
-    let sha256: String = sha2::Sha256::digest(asset)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let manifest = release_manifest("aitp", version, &sha256_text(asset), asset.len());
+    let signature = key.sign(&manifest);
+    let mut routes = published(manifest, Some(signature));
     let name = asset_name();
-    let manifest = serde_json::to_vec(&serde_json::json!({
-        "version": version,
-        "assets": { &name: { "sha256": sha256, "size": asset.len() } },
-    }))
-    .unwrap();
-    std::collections::HashMap::from([
+    routes.insert(
+        format!("{RELEASES}/download/v{version}/{name}"),
         (
-            "/2742zdz/AITP/releases/latest/download/aitp-manifest.json".to_string(),
-            (200, String::new(), manifest),
+            302,
+            "https://release-assets.githubusercontent.com/asset?sig=1".to_string(),
+            Vec::new(),
         ),
-        (
-            format!("/2742zdz/AITP/releases/download/v{version}/{name}"),
-            (
-                302,
-                "https://release-assets.githubusercontent.com/asset?sig=1".to_string(),
-                Vec::new(),
-            ),
-        ),
-        (
-            "/asset?sig=1".to_string(),
-            (200, String::new(), asset.to_vec()),
-        ),
-    ])
+    );
+    routes.insert(
+        "/asset?sig=1".to_string(),
+        (200, String::new(), asset.to_vec()),
+    );
+    routes
+}
+
+/// `manifest` and `signature` (if any) as the latest release's.
+fn published(
+    manifest: Vec<u8>,
+    signature: Option<Vec<u8>>,
+) -> std::collections::HashMap<String, (u16, String, Vec<u8>)> {
+    let mut routes = std::collections::HashMap::from([(
+        format!("{RELEASES}/latest/download/aitp-manifest.json"),
+        (200, String::new(), manifest),
+    )]);
+    if let Some(signature) = signature {
+        routes.insert(
+            format!("{RELEASES}/latest/download/aitp-manifest.json.minisig"),
+            (200, String::new(), signature),
+        );
+    }
+    routes
 }
 
 /// Runs `aitp update` against `routes` (no GitHub: the proxy plays it).
@@ -1121,39 +1329,40 @@ fn left_beside(sandbox: &Sandbox) -> Vec<String> {
     names
 }
 
-/// The whole `aitp update` over HTTPS: manifest, redirected asset, sha256
-/// and size checks, candidate probe, and replacement (on Windows by the
-/// replacement helper, which reports through its status file).
+/// The whole `aitp update` over HTTPS: signed manifest, redirected asset,
+/// sha256 and size checks, candidate probe, and replacement (on Windows by
+/// the replacement helper, which reports through its status file).
 #[test]
 fn update_downloads_probes_and_replaces_the_program() {
     let sandbox = Sandbox::new();
+    let key = ReleaseKey::generate();
+    sandbox.trust(&[&key]);
     let before = snapshot(&sandbox.program);
-    let candidate = candidate_program(&sandbox);
-    let version = env!("CARGO_PKG_VERSION");
-    let (success, text, requests) = update_from(&sandbox, release_routes(version, &candidate));
+    let next = next_version();
+    let candidate = candidate_program(&sandbox, &next);
+    let (success, text, requests) = update_from(&sandbox, release_routes(&next, &candidate, &key));
     assert!(success, "{text}\n{requests:?}");
     assert_eq!(
         requests,
         [
             "CONNECT github.com:443".to_string(),
-            "/2742zdz/AITP/releases/latest/download/aitp-manifest.json".to_string(),
+            format!("{RELEASES}/latest/download/aitp-manifest.json"),
             "CONNECT github.com:443".to_string(),
-            format!(
-                "/2742zdz/AITP/releases/download/v{version}/{}",
-                asset_name()
-            ),
+            format!("{RELEASES}/latest/download/aitp-manifest.json.minisig"),
+            "CONNECT github.com:443".to_string(),
+            format!("{RELEASES}/download/v{next}/{}", asset_name()),
             "CONNECT release-assets.githubusercontent.com:443".to_string(),
             "/asset?sig=1".to_string(),
         ],
         "{text}"
     );
     assert!(
-        text.contains("Same version but local binary hash differs"),
+        text.contains(&format!("Signed by: key {}", key_id_text(&key))),
         "{text}"
     );
     #[cfg(not(windows))]
     {
-        assert!(text.contains(&format!("Updated: aitp {version}")), "{text}");
+        assert!(text.contains(&format!("Updated: aitp {next}")), "{text}");
         assert_eq!(snapshot(&sandbox.program), candidate);
     }
     #[cfg(windows)]
@@ -1207,21 +1416,23 @@ fn update_downloads_probes_and_replaces_the_program() {
     assert!(!text.to_ascii_lowercase().contains(&other), "{text}");
 }
 
+/// minisign's key id text (upper-case hexadecimal, no leading zeros).
+fn key_id_text(key: &ReleaseKey) -> String {
+    format!("{:X}", u64::from_le_bytes(key.id))
+}
+
 /// A release whose program reports another version than its manifest is
 /// not installed: the program is unchanged and the candidate removed.
 #[test]
 fn update_refuses_a_program_that_reports_another_version() {
     let sandbox = Sandbox::new();
+    let key = ReleaseKey::generate();
+    sandbox.trust(&[&key]);
     let before = snapshot(&sandbox.program);
     // The candidate reports this version; the manifest names the next.
-    let candidate = candidate_program(&sandbox);
-    let mut parts: Vec<u64> = env!("CARGO_PKG_VERSION")
-        .split('.')
-        .map(|part| part.parse().unwrap())
-        .collect();
-    parts[2] += 1;
-    let next = format!("{}.{}.{}", parts[0], parts[1], parts[2]);
-    let (success, text, requests) = update_from(&sandbox, release_routes(&next, &candidate));
+    let candidate = candidate_program(&sandbox, env!("CARGO_PKG_VERSION"));
+    let next = next_version();
+    let (success, text, requests) = update_from(&sandbox, release_routes(&next, &candidate, &key));
     assert!(!success, "{text}");
     assert!(
         text.contains(&format!(
@@ -1237,4 +1448,111 @@ fn update_refuses_a_program_that_reports_another_version() {
     let left = left_beside(&sandbox);
     assert!(left.iter().all(|name| is_lock_file(name)), "{left:?}");
     sandbox.assert_only_aitp_names();
+}
+
+/// Nothing is downloaded, staged or run unless the manifest carries a
+/// valid signature by a key the program trusts: a missing signature, an
+/// unknown key, a changed manifest, a manifest of another distribution
+/// (correctly signed) and a release that republishes this version with
+/// other content all stop after the manifest and its signature.
+#[test]
+fn update_installs_nothing_without_a_trusted_signature() {
+    let key = ReleaseKey::generate();
+    let stranger = ReleaseKey::generate();
+    let next = next_version();
+    let current = env!("CARGO_PKG_VERSION");
+    let sha = "a".repeat(64);
+    let size = 2 * 1024 * 1024;
+    let manifest = release_manifest("aitp", &next, &sha, size);
+    let mut changed = manifest.clone();
+    let at = changed.len() - 4;
+    changed[at] ^= 1;
+    let other = release_manifest("other", &next, &sha, size);
+    let same = release_manifest("aitp", current, &sha, size);
+    let cases = [
+        (
+            "no signature",
+            manifest.clone(),
+            None,
+            "has no signature (HTTP 404",
+        ),
+        (
+            "unknown key",
+            manifest.clone(),
+            Some(stranger.sign(&manifest)),
+            "which this program does not trust",
+        ),
+        (
+            "changed manifest",
+            changed,
+            Some(key.sign(&manifest)),
+            "does not verify with key",
+        ),
+        (
+            "other distribution",
+            other.clone(),
+            Some(key.sign(&other)),
+            "is for distribution \"other\", not \"aitp\"",
+        ),
+        (
+            "same version, other content",
+            same.clone(),
+            Some(key.sign(&same)),
+            "never replaced by other content of the same version",
+        ),
+    ];
+    let mut trusting = None;
+    for (name, manifest, signature, expected) in cases {
+        let sandbox = Sandbox::new();
+        match &trusting {
+            None => trusting = Some(sandbox.trust(&[&key])),
+            Some(program) => sandbox.install(program),
+        }
+        let before = snapshot(&sandbox.program);
+        let mut routes = published(manifest, signature);
+        // The asset exists: refusing it is the program's decision.
+        let asset = asset_name();
+        for version in [current, next.as_str()] {
+            routes.insert(
+                format!("{RELEASES}/download/v{version}/{asset}"),
+                (200, String::new(), vec![0; size]),
+            );
+        }
+        let (success, text, requests) = update_from(&sandbox, routes);
+        assert!(!success, "{name}: {text}");
+        assert!(text.contains(expected), "{name}: {text}");
+        assert!(!text.contains("Downloading:"), "{name}: {text}");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.starts_with("CONNECT ") || request.contains("aitp-manifest")),
+            "{name}: {requests:?}"
+        );
+        assert_eq!(snapshot(&sandbox.program), before, "{name}");
+        let left = left_beside(&sandbox);
+        assert!(
+            left.iter().all(|name| is_lock_file(name)),
+            "{name}: {left:?}"
+        );
+    }
+}
+
+/// The recovery key is trusted like the primary key: a release it signed
+/// is read (here an older one, which is not installed).
+#[test]
+fn update_trusts_the_recovery_key() {
+    let primary = ReleaseKey::generate();
+    let recovery = ReleaseKey::generate();
+    let sandbox = Sandbox::new();
+    sandbox.trust(&[&primary, &recovery]);
+    let manifest = release_manifest("aitp", "0.0.1", &"a".repeat(64), 2 * 1024 * 1024);
+    let signature = recovery.sign(&manifest);
+    let (success, text, requests) = update_from(&sandbox, published(manifest, Some(signature)));
+    assert!(success, "{text}\n{requests:?}");
+    assert!(
+        text.contains(&format!("Signed by: key {}", key_id_text(&recovery))),
+        "{text}"
+    );
+    assert!(text.contains("(remote aitp 0.0.1)"), "{text}");
+    assert!(!text.contains("Downloading:"), "{text}");
 }

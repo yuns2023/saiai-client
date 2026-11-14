@@ -64,6 +64,16 @@ pub static AITP_BRAND: Brand = Brand {
                 "release-assets.githubusercontent.com",
                 "objects.githubusercontent.com",
             ],
+            distribution: "aitp",
+            // PLACEHOLDERS, not keys: their key bytes are no curve point, so
+            // nothing verifies with them. The maintainer's real primary and
+            // recovery public keys replace them before the first release;
+            // `scripts/release_manifest.py` and `scripts/build-release.sh`
+            // refuse a release while they are here.
+            signing_keys: &[
+                "RWQAITPxPRIMARYxPLACEHOLDERxKEYxNOTxFORxRELEASE222222222",
+                "RWQAITPxRECOVERYxPLACEHOLDERxKEYxNOTxFORxRELEASEXXXXXXXX",
+            ],
         }),
         asset_prefix: "aitp-",
         candidate_prefix: ".aitp-update-",
@@ -188,6 +198,14 @@ mod tests {
                 "github.com",
                 "release-assets.githubusercontent.com",
                 "objects.githubusercontent.com",
+            ]
+        );
+        assert_eq!(fixed.distribution, "aitp");
+        assert_eq!(
+            fixed.signing_keys,
+            [
+                "RWQAITPxPRIMARYxPLACEHOLDERxKEYxNOTxFORxRELEASE222222222",
+                "RWQAITPxRECOVERYxPLACEHOLDERxKEYxNOTxFORxRELEASEXXXXXXXX",
             ]
         );
         assert_eq!(update.asset_prefix, "aitp-");

@@ -55,6 +55,10 @@ mod uninstall;
 // The fixed-source update candidate: bounded probe, removal, directory lock.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod update_candidate;
+// Signed manifests of a fixed update source (minisign Ed25519).
+mod update_signature;
+#[cfg(test)]
+mod update_signature_tests;
 // Fixed-URL self-update: redirects, limits, manifest and asset checks.
 #[cfg(all(
     test,
@@ -5438,8 +5442,7 @@ fn run_update() -> Result<()> {
         UpdateOrigin::Fixed { source, cfg } => {
             match fixed_download(
                 &FixedUrlPolicy::https(source.hosts),
-                source.manifest_url,
-                source.asset_url_template,
+                source,
                 cfg,
                 &asset,
                 runtime::version(),
@@ -7518,11 +7521,9 @@ const EGRESS_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// (which may block on system proxy discovery, such as `scutil --proxy`)
 /// and the fetch each run within their time budgets.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-#[allow(clippy::too_many_arguments)]
 fn fixed_download(
     policy: &FixedUrlPolicy<'_>,
-    manifest_url: &str,
-    asset_url_template: &str,
+    source: &FixedUpdateSource,
     cfg: Option<AppConfig>,
     asset: &str,
     current_version: &str,
@@ -7543,8 +7544,7 @@ fn fixed_download(
         .context("proxy discovery failed")?;
         fetch_fixed_update(
             policy,
-            manifest_url,
-            asset_url_template,
+            source,
             asset,
             current_version,
             current_sha256,
@@ -7745,19 +7745,23 @@ enum FixedUpdate {
 }
 
 /// Fetches and verifies the update from a fixed source: the manifest is
-/// required (a missing one is an error, never an unverified download), its
-/// version must be `X.Y.Z`, and the asset of exactly that version must match
-/// the manifest's size and SHA-256.
+/// required (a missing one is an error, never an unverified download) and
+/// so is its signature by a trusted key, verified over the manifest's exact
+/// bytes before anything is read from it; the manifest must name this
+/// distribution and an `X.Y.Z` version, and the asset of exactly that
+/// version must match the manifest's size and SHA-256. A release is never
+/// replaced by one of the same version with other content, nor by an older
+/// one.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 async fn fetch_fixed_update(
     policy: &FixedUrlPolicy<'_>,
-    manifest_url: &str,
-    asset_url_template: &str,
+    source: &FixedUpdateSource,
     asset: &str,
     current_version: &str,
     current_sha256: &str,
     egress: &Egress,
 ) -> Result<FixedUpdate> {
+    let manifest_url = source.manifest_url;
     println!("Checking: {manifest_url}");
     let Some(raw) = fixed_get(
         policy,
@@ -7773,7 +7777,28 @@ async fn fetch_fixed_update(
             brand_product = BRAND.product_name
         );
     };
-    let manifest = serde_json::from_slice::<UpdateManifest>(&raw)
+    let signature_url = format!("{manifest_url}{}", update_signature::SIGNATURE_SUFFIX);
+    let Some(signature) = fixed_get(
+        policy,
+        &signature_url,
+        update_signature::SIGNATURE_LIMIT,
+        Duration::from_secs(30),
+        egress,
+    )
+    .await?
+    else {
+        bail!(
+            "the {brand_product} update manifest has no signature (HTTP 404 at {signature_url}); an unsigned update is never installed",
+            brand_product = BRAND.product_name
+        );
+    };
+    // Nothing in the manifest is used before its signature verifies.
+    let key =
+        update_signature::verify(&raw, &signature, source.signing_keys).with_context(|| {
+            format!("refusing the update: {manifest_url} is not signed by a trusted key")
+        })?;
+    println!("Signed by: key {key}");
+    let manifest = update_signature::parse_manifest(&raw, source.distribution)
         .with_context(|| format!("failed to parse {manifest_url}"))?;
     let version = manifest.version.as_str();
     if !is_release_version(version) {
@@ -7783,8 +7808,8 @@ async fn fetch_fixed_update(
         .assets
         .get(asset)
         .with_context(|| format!("manifest does not include asset {asset}"))?;
-    let expected = info.sha256.trim().to_ascii_lowercase();
-    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+    let expected = info.sha256.as_str();
+    if !update_signature::is_sha256_hex(expected) {
         bail!("manifest asset {asset} has invalid sha256 {expected:?}");
     }
     let size = info
@@ -7814,9 +7839,12 @@ async fn fetch_fixed_update(
         )));
     }
     if ordering == Ordering::Equal {
-        println!("Same version but local binary hash differs; refreshing {asset}");
+        bail!(
+            "this {brand_binary} {current_version} differs from the published {brand_binary} {version} (sha256 {current_sha256}, published {expected}); a release is never replaced by other content of the same version, so nothing is installed",
+            brand_binary = BRAND.binary_name
+        );
     }
-    let url = fixed_asset_url(asset_url_template, version, asset);
+    let url = fixed_asset_url(source.asset_url_template, version, asset);
     println!("Downloading: {url}");
     let bytes = fixed_get(policy, &url, size, Duration::from_secs(300), egress)
         .await?
