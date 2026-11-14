@@ -29,11 +29,25 @@ type Routes = HashMap<String, Reply>;
 /// absolute-form target means the request came through it as a proxy).
 struct Server {
     port: u16,
+    /// Request heads received, in order.
     requests: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Server {
+    /// Request targets received, in order.
     fn requested(&self) -> Vec<String> {
+        self.heads()
+            .iter()
+            .map(|head| {
+                head.split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn heads(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
     }
 }
@@ -69,7 +83,7 @@ async fn serve_with(routes: impl FnOnce(u16) -> Routes) -> Server {
                 }
                 let head = String::from_utf8_lossy(&head);
                 let target = head.split_whitespace().nth(1).unwrap_or("/").to_string();
-                log.lock().unwrap().push(target.clone());
+                log.lock().unwrap().push(head.to_string());
                 let path = match target.strip_prefix("http://") {
                     Some(rest) => rest
                         .find('/')
@@ -535,20 +549,252 @@ async fn every_hop_is_routed_for_its_own_target() {
         ]
     );
     assert_eq!(origin.requested(), vec!["/c".to_string()]);
-    // A proxy that cannot be reached fails the request.
-    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let closed_port = closed.local_addr().unwrap().port();
-    drop(closed);
+}
+
+/// A proxy that fails (accepts, then closes: deterministic, unlike a freed
+/// port another process may take) fails the request. The origin is a name
+/// only that proxy could reach, so there is no direct way to it; the proxy
+/// saw the one attempt.
+#[tokio::test]
+async fn a_failing_proxy_fails_the_request() {
+    let closing = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = closing.local_addr().unwrap().port();
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = Arc::clone(&attempts);
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = closing.accept().await {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(socket);
+        }
+    });
+    let egress = Egress {
+        installation_ca_pem: None,
+        upstream: upstream_proxy::UpstreamProxy::new(
+            Some(&format!("http://127.0.0.1:{port}")),
+            None,
+            Vec::new(),
+        )
+        .snapshot(),
+    };
+    let policy = FixedUrlPolicy {
+        hosts: &["updates.invalid"],
+        scheme: "http",
+        ports: &[8080],
+    };
     let error = fixed_get(
         &policy,
         "http://updates.invalid:8080/a",
         1024,
         Duration::from_secs(10),
-        &via(closed_port),
+        &egress,
     )
     .await
     .unwrap_err();
-    assert!(format!("{error:#}").contains("failed to GET"), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("failed to GET http://updates.invalid:8080/a"),
+        "{error:#}"
+    );
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// No hop carries credentials: no Authorization or Cookie anywhere, and the
+/// proxy's own credentials go only to the proxy, never to the next host.
+#[tokio::test]
+async fn requests_carry_no_credentials_across_hosts() {
+    let origin = serve_with(|_| Routes::from([("/c".to_string(), ok(b"body"))])).await;
+    let origin_port = origin.port;
+    let proxy = serve_with(move |_| {
+        Routes::from([(
+            "/a".to_string(),
+            redirect(302, &format!("http://127.0.0.1:{origin_port}/c")),
+        )])
+    })
+    .await;
+    let egress = Egress {
+        installation_ca_pem: None,
+        upstream: upstream_proxy::UpstreamProxy::new(
+            Some(&format!("http://user:secret@127.0.0.1:{}", proxy.port)),
+            None,
+            Vec::new(),
+        )
+        .snapshot(),
+    };
+    let policy = FixedUrlPolicy {
+        hosts: &["updates.invalid", "127.0.0.1"],
+        scheme: "http",
+        ports: Vec::leak(vec![8080, origin_port]),
+    };
+    fixed_get(
+        &policy,
+        "http://updates.invalid:8080/a",
+        1024,
+        Duration::from_secs(10),
+        &egress,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let lower = |heads: Vec<String>| heads.join("\n").to_ascii_lowercase();
+    let (proxy_heads, origin_heads) = (lower(proxy.heads()), lower(origin.heads()));
+    assert!(!proxy_heads.is_empty() && !origin_heads.is_empty());
+    for head in [&proxy_heads, &origin_heads] {
+        assert!(!head.contains("\nauthorization:"), "{head}");
+        assert!(!head.contains("\ncookie:"), "{head}");
+    }
+    assert!(
+        proxy_heads.contains("\nproxy-authorization:"),
+        "{proxy_heads}"
+    );
+    assert!(
+        !origin_heads.contains("proxy-authorization"),
+        "{origin_heads}"
+    );
+    assert!(!origin_heads.contains("secret"), "{origin_heads}");
+}
+
+#[tokio::test]
+async fn a_slow_body_runs_out_of_time() {
+    let port = serve(Routes::from([(
+        "/slow-body".to_string(),
+        Reply {
+            delay: Duration::from_secs(3),
+            ..ok(b"late")
+        },
+    )]))
+    .await;
+    let started = std::time::Instant::now();
+    let error = get_within(port, "/slow-body", 1024, Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("did not complete within 1s"),
+        "{error:#}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+/// The fixed-source download as `update` runs it, without a configuration
+/// (not initialized): it proceeds to a verified download.
+#[test]
+fn an_uninitialized_installation_downloads_through_the_default_route() {
+    let server = tokio::runtime::Runtime::new().unwrap();
+    let bytes = release_bytes();
+    let sha = sha256_hex(&bytes);
+    let port = server.block_on(serve(release(
+        manifest("9.9.9", &sha, Some(bytes.len() as u64)),
+        bytes.clone(),
+    )));
+    let policy = loopback(port);
+    let result = fixed_download(
+        &policy,
+        &format!("http://127.0.0.1:{port}/releases/latest/download/manifest.json"),
+        &format!("http://127.0.0.1:{port}/releases/download/v{{version}}/{{asset}}"),
+        None,
+        ASSET,
+        "1.0.0",
+        "0",
+    )
+    .unwrap();
+    assert!(matches!(result, FixedUpdate::Download { version, .. } if version == "9.9.9"));
+}
+
+/// A configuration that exists but cannot be read stops the update; only a
+/// missing one means "not initialized".
+#[test]
+fn only_a_missing_configuration_counts_as_uninitialized() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.json");
+    assert!(read_app_config_at_if_present(&path).unwrap().is_none());
+    fs::write(&path, b"{not json").unwrap();
+    let error = read_app_config_at_if_present(&path).err().unwrap();
+    assert!(
+        format!("{error:#}").contains("failed to parse"),
+        "{error:#}"
+    );
+    fs::write(&path, b"{}").unwrap();
+    assert!(read_app_config_at_if_present(&path).is_err());
+    #[cfg(unix)]
+    {
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(directory.path().join("gone"), &path).unwrap();
+        let error = read_app_config_at_if_present(&path).err().unwrap();
+        assert!(format!("{error:#}").contains("failed to read"), "{error:#}");
+    }
+}
+
+#[test]
+fn one_update_at_a_time_per_installation_directory() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let held = lock_update_directory(first.path()).unwrap();
+    let error = lock_update_directory(first.path()).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("another ktest update is running"),
+        "{error:#}"
+    );
+    let _other = lock_update_directory(second.path()).unwrap();
+    drop(held);
+    let _again = lock_update_directory(first.path()).unwrap();
+    assert!(first.path().join(".ktest-update-lock").is_file());
+}
+
+#[test]
+fn candidates_are_written_only_as_new_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join(".ktest-update-x");
+    write_new_update_candidate(&path, b"first").unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"first");
+    assert!(write_new_update_candidate(&path, b"second").is_err());
+    assert_eq!(fs::read(&path).unwrap(), b"first");
+    #[cfg(unix)]
+    {
+        let target = directory.path().join("target");
+        fs::write(&target, b"keep").unwrap();
+        let link = directory.path().join(".ktest-update-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(write_new_update_candidate(&link, b"replace").is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"keep");
+    }
+}
+
+/// Fake candidates (shell scripts): the probe reads a well-behaved one and
+/// stops, reaps and reports the others within its budget.
+#[cfg(unix)]
+#[test]
+fn candidate_probes_are_bounded() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let script = |name: &str, body: &str| {
+        let path = directory.path().join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    };
+    let budget = Duration::from_secs(1);
+    let good = script("good", "echo 'ktest 1.2.3'");
+    assert_eq!(
+        probe_candidate_version(&good, budget, 4096).unwrap(),
+        "ktest 1.2.3\n"
+    );
+    for (name, body, expected) in [
+        ("hangs", "exec sleep 30", "did not exit within 1s"),
+        ("floods", "exec yes", "printed more than 4096 bytes"),
+        ("fails", "echo 'ktest 1.2.3'; exit 3", "exited with"),
+        (
+            "lingers",
+            "echo 'ktest 1.2.3'; exec sleep 30 >&-",
+            "did not exit after printing",
+        ),
+    ] {
+        let started = std::time::Instant::now();
+        let error = probe_candidate_version(&script(name, body), budget, 4096).unwrap_err();
+        assert!(format!("{error:#}").contains(expected), "{name}: {error:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{name}: {:?}",
+            started.elapsed()
+        );
+    }
 }
 
 #[tokio::test]
@@ -733,6 +979,12 @@ async fn manifests_and_assets_that_do_not_verify_are_refused() {
         (
             "tiny size",
             manifest("9.9.9", &sha, Some(10)),
+            bytes.clone(),
+            "has no size",
+        ),
+        (
+            "huge size",
+            manifest("9.9.9", &sha, Some(64 * 1024 * 1024 + 1)),
             bytes.clone(),
             "has no size",
         ),

@@ -5020,6 +5020,13 @@ fn run_update() -> Result<()> {
             current_exe.display()
         );
     }
+    // One fixed-source update at a time per installation directory. The lock
+    // is held until this command returns; on Windows the replacement helper
+    // started at the end runs after that (it serializes on the executable).
+    let _update_lock = match &origin {
+        UpdateOrigin::Fixed { .. } => Some(lock_update_directory(parent)?),
+        UpdateOrigin::Gateway { .. } => None,
+    };
     let current_bytes = fs::read(&current_exe)
         .with_context(|| format!("failed to read {}", current_exe.display()))?;
     let current_sha256 = sha256_hex(&current_bytes);
@@ -5099,16 +5106,15 @@ fn run_update() -> Result<()> {
             (bytes, None)
         }
         UpdateOrigin::Fixed { source, cfg } => {
-            let egress = Egress::for_optional_config(cfg.as_ref());
-            match block_on_abandoning(fetch_fixed_update(
+            match fixed_download(
                 &FixedUrlPolicy::https(source.hosts),
                 source.manifest_url,
                 source.asset_url_template,
+                cfg,
                 &asset,
                 runtime::version(),
                 &current_sha256,
-                &egress,
-            ))?? {
+            )? {
                 FixedUpdate::Current(message) => {
                     println!("{message}");
                     return Ok(());
@@ -5126,11 +5132,29 @@ fn run_update() -> Result<()> {
     let backup_name = update_backup_name();
     let candidate_path = parent.join(candidate_name);
     let backup_path = parent.join(backup_name);
-    write_update_candidate(&candidate_path, &bytes)
-        .with_context(|| format!("failed to write {}", candidate_path.display()))?;
-
-    let candidate_raw = command_stdout_raw(&candidate_path, &["--version"])
-        .with_context(|| format!("failed to run {}", candidate_path.display()))?;
+    let candidate_raw = if expected_version.is_some() {
+        // Fixed source: a new file only, and a bounded probe; a candidate
+        // that cannot be probed is removed.
+        write_new_update_candidate(&candidate_path, &bytes)
+            .with_context(|| format!("failed to write {}", candidate_path.display()))?;
+        match probe_candidate_version(
+            &candidate_path,
+            CANDIDATE_PROBE_TIMEOUT,
+            CANDIDATE_PROBE_LIMIT,
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = fs::remove_file(&candidate_path);
+                return Err(error)
+                    .with_context(|| format!("failed to run {}", candidate_path.display()));
+            }
+        }
+    } else {
+        write_update_candidate(&candidate_path, &bytes)
+            .with_context(|| format!("failed to write {}", candidate_path.display()))?;
+        command_stdout_raw(&candidate_path, &["--version"])
+            .with_context(|| format!("failed to run {}", candidate_path.display()))?
+    };
     let candidate_version = candidate_raw.trim().to_string();
     if !candidate_version
         .trim_start()
@@ -7132,6 +7156,49 @@ async fn download_update_asset(url: &str, egress: &Egress) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const EGRESS_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The whole fixed-source download on an abandonable runtime: egress setup
+/// (which may block on system proxy discovery, such as `scutil --proxy`)
+/// and the fetch each run within their time budgets.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[allow(clippy::too_many_arguments)]
+fn fixed_download(
+    policy: &FixedUrlPolicy<'_>,
+    manifest_url: &str,
+    asset_url_template: &str,
+    cfg: Option<AppConfig>,
+    asset: &str,
+    current_version: &str,
+    current_sha256: &str,
+) -> Result<FixedUpdate> {
+    block_on_abandoning(async move {
+        let egress = tokio::time::timeout(
+            EGRESS_SETUP_TIMEOUT,
+            tokio::task::spawn_blocking(move || Egress::for_optional_config(cfg.as_ref())),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "proxy discovery did not complete within {}s",
+                EGRESS_SETUP_TIMEOUT.as_secs()
+            )
+        })?
+        .context("proxy discovery failed")?;
+        fetch_fixed_update(
+            policy,
+            manifest_url,
+            asset_url_template,
+            asset,
+            current_version,
+            current_sha256,
+            &egress,
+        )
+        .await
+    })?
+}
+
 /// Runs `future` on its own runtime and then shuts that runtime down without
 /// waiting for blocking work a timed-out future left behind (route
 /// selection stuck on proxy auto-configuration, for example): the command
@@ -7551,6 +7618,155 @@ fn validate_pe_asset(bytes: &[u8], asset: &str) -> Result<()> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+/// Like [`write_update_candidate`], but only as a new file (never through
+/// an existing file or link at that name).
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn write_new_update_candidate(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o755);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("failed to chmod {}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const CANDIDATE_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const CANDIDATE_PROBE_LIMIT: usize = 4096;
+
+/// `<candidate> --version` standard output, bounded: the candidate is killed
+/// and reaped when it runs past `timeout` or prints more than `limit` bytes,
+/// and a failed exit is an error.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn probe_candidate_version(path: &Path, timeout: Duration, limit: usize) -> Result<String> {
+    use std::io::Read;
+    let mut child = ProcessCommand::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to execute {}", path.display()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("candidate stdout is not captured")?;
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = stdout.take(limit as u64 + 1).read_to_end(&mut output);
+        output
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let stop = |child: &mut std::process::Child| {
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let status = loop {
+        if reader.is_finished() && child.try_wait()?.is_none() {
+            // The reader stops at the limit or at end of output; a child
+            // still running after printing too much is stopped now.
+            let output = reader.join().unwrap_or_default();
+            if output.len() > limit {
+                stop(&mut child);
+                bail!("{} printed more than {limit} bytes", path.display());
+            }
+            return finish_probe(path, &mut child, output, deadline, stop);
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            stop(&mut child);
+            bail!(
+                "{} did not exit within {}s",
+                path.display(),
+                timeout.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // Exited: the reader ends when the pipe closes (a descendant keeping it
+    // open is not waited for past the deadline).
+    while !reader.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            bail!("{} left its output open", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = reader.join().unwrap_or_default();
+    if output.len() > limit {
+        bail!("{} printed more than {limit} bytes", path.display());
+    }
+    if !status.success() {
+        bail!("{} exited with {status}", path.display());
+    }
+    Ok(String::from_utf8_lossy(&output).into_owned())
+}
+
+/// The child finished printing (within `limit`) but has not exited yet: wait
+/// for it until `deadline`.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn finish_probe(
+    path: &Path,
+    child: &mut std::process::Child,
+    output: Vec<u8>,
+    deadline: std::time::Instant,
+    stop: impl Fn(&mut std::process::Child),
+) -> Result<String> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                bail!("{} exited with {status}", path.display());
+            }
+            return Ok(String::from_utf8_lossy(&output).into_owned());
+        }
+        if std::time::Instant::now() >= deadline {
+            stop(child);
+            bail!("{} did not exit after printing its version", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Exclusive lock of an installation directory's update (`<candidate
+/// prefix>lock` next to the executable); a second update fails at once.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn lock_update_directory(directory: &Path) -> Result<fs::File> {
+    let path = directory.join(format!("{}lock", BRAND.update.candidate_prefix));
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => bail!(
+            "another {brand_binary} update is running in {}",
+            directory.display(),
+            brand_binary = BRAND.binary_name
+        ),
+        Err(fs::TryLockError::Error(error)) => {
+            Err(error).with_context(|| format!("failed to lock {}", path.display()))
+        }
+    }
+}
+
 fn write_update_candidate(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
     #[cfg(unix)]
@@ -9260,10 +9476,20 @@ fn write_app_config_at(path: &Path, config: &AppConfig) -> Result<()> {
 /// that exists but cannot be read or parsed is an error.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn read_app_config_if_present() -> Result<Option<AppConfig>> {
-    let path = app_config_path()?;
-    match fs::symlink_metadata(&path) {
+    read_app_config_at_if_present(&app_config_path()?)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn read_app_config_at_if_present(path: &Path) -> Result<Option<AppConfig>> {
+    match fs::symlink_metadata(path) {
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        _ => read_app_config().map(Some),
+        _ => {
+            let raw = fs::read_to_string(path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            serde_json::from_str(&raw)
+                .map(Some)
+                .with_context(|| format!("failed to parse {}", path.display()))
+        }
     }
 }
 
