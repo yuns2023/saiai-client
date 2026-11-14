@@ -91,7 +91,7 @@ done < <(printf '%s' "$mappings" | awk -F '\t' 'NF == 2 { print length($1) "\t" 
 separator=$'\x1f'
 encoded="${CARGO_ENCODED_RUSTFLAGS:-}"
 if [[ -z "$encoded" && -n "${RUSTFLAGS:-}" ]]; then
-  read -r -a existing <<<"$RUSTFLAGS"
+  read -r -d "" -a existing <<<"$RUSTFLAGS" || true
   encoded="$(IFS="$separator"; printf '%s' "${existing[*]}")"
 fi
 for flag in "${rust_flags[@]}"; do

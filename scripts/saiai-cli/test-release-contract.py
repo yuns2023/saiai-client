@@ -347,9 +347,22 @@ class AitpArtifactTests(unittest.TestCase):
             self.check(self.brand, build_dirs=[Path("relative/dir")])
 
     def test_never_treats_the_root_as_a_build_path(self) -> None:
-        paths = VERIFIER.build_machine_paths([Path("/")], {"HOME": "/"})
+        paths = VERIFIER.build_machine_paths([Path("/")], {"HOME": "/", "USERPROFILE": "C:\\"})
         self.assertNotIn("", paths)
         self.assertNotIn("/", paths)
+        self.assertNotIn("C:", paths)
+
+    def test_short_build_paths_are_checked(self) -> None:
+        self.ENVIRON = {"HOME": "/zz"}
+        for leak in (b"/x/src/lib.rs", b"/zz/private/file", b"/X"):
+            with self.subTest(leak=leak), self.assertRaisesRegex(AssertionError, "build machine paths"):
+                self.check(self.brand + b" " + leak, build_dirs=[Path("/x")])
+
+    def test_a_path_matches_only_as_a_whole_directory(self) -> None:
+        # The neutral prefixes do not count as a build directory that is
+        # a prefix of their name.
+        self.ENVIRON = {"HOME": "/ait"}
+        self.check(self.brand + b" /aitp/src/lib.rs /aitp/home", build_dirs=[Path("/aitp/s")])
 
     def test_ci_checks_the_remapped_release_and_saiai_release_does_not(self) -> None:
         def broken(path: str, old: str, new: str):

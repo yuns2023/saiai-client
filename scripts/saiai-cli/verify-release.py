@@ -838,9 +838,17 @@ def build_machine_paths(build_dirs: list[Path], environ) -> list[str]:
         for form in (candidate, os.path.realpath(candidate)):
             form = form.rstrip("/\\")
             # The file system root (or a bare drive) would match every path.
-            if len(form.replace("\\", "/").strip("/")) > 2 and form not in paths:
+            if re.fullmatch(r"(?:[A-Za-z]:)?", form) is None and form not in paths:
                 paths.append(form)
     return paths
+
+
+def names_path(view: bytes, path: str) -> bool:
+    """Whether `view` (see `path_view`) holds `path` as a whole directory:
+    not followed by another file name character, so `/build/ai` does not
+    match `/build/aitp`."""
+    pattern = re.escape(path_view(path.encode())) + rb"(?![a-z0-9._+~-])"
+    return re.search(pattern, view) is not None
 
 
 def path_view(data: bytes) -> bytes:
@@ -868,7 +876,7 @@ def verify_aitp_artifacts(artifacts: list[Path], build_dirs: list[Path], environ
             OTHER_DISTRIBUTION_NAME not in view,
             f"{artifact} names the other distribution",
         )
-        found = [path for path in paths if path_view(path.encode()) in view]
+        found = [path for path in paths if names_path(view, path)]
         require(not found, f"{artifact} carries build machine paths: {found}")
     print(f"{len(artifacts)} AITP artifact(s) carry AITP brand data and no build machine path")
 

@@ -502,6 +502,12 @@ fn only_the_known_build_paths_explain_the_name() {
             String::from_utf8_lossy(text)
         );
     }
+    // Known limit: matching is by bytes, so with the full ancestor set (as
+    // `build_paths_naming` lists it) text that starts with an ancestor is
+    // explained too, even past a directory boundary.
+    let ancestors = vec![paths[0].clone(), path_view(br"C:\Work\Other-Client")];
+    let view = path_view(b"C:/work/other-clients/tools");
+    assert!(unexplained_occurrences(&view, name, &ancestors).is_empty());
 }
 
 /// The program itself carries no other distribution's name, wherever it is
