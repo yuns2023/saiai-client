@@ -16,6 +16,8 @@ struct Reply {
     body: Vec<u8>,
     /// Send no Content-Length (the body ends when the connection closes).
     no_length: bool,
+    /// Pause before the head.
+    head_delay: Duration,
     /// Pause after the head, before the body.
     delay: Duration,
 }
@@ -91,6 +93,7 @@ async fn serve_with(routes: impl FnOnce(u16) -> Routes) -> Server {
                     response.extend(b"\r\n");
                 }
                 response.extend(b"\r\n");
+                tokio::time::sleep(reply.head_delay).await;
                 if stream.write_all(&response).await.is_err() {
                     return;
                 }
@@ -124,7 +127,7 @@ fn loopback(port: u16) -> FixedUrlPolicy<'static> {
     FixedUrlPolicy {
         hosts: &["127.0.0.1"],
         scheme: "http",
-        port: Some(port),
+        ports: Vec::leak(vec![port]),
     }
 }
 
@@ -136,11 +139,15 @@ fn direct() -> Egress {
 }
 
 async fn get(port: u16, path: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+    get_within(port, path, limit, Duration::from_secs(10)).await
+}
+
+async fn get_within(port: u16, path: &str, limit: u64, total: Duration) -> Result<Option<Vec<u8>>> {
     fixed_get(
         &loopback(port),
         &format!("http://127.0.0.1:{port}{path}"),
         limit,
-        Duration::from_secs(10),
+        total,
         &direct(),
     )
     .await
@@ -421,45 +428,77 @@ async fn bodies_without_a_length_are_limited_while_streaming() {
     assert_eq!(get(port, "/fits", 1024).await.unwrap().unwrap().len(), 1024);
 }
 
+/// Each hop alone fits in the budget; together they do not.
 #[tokio::test]
 async fn the_whole_chain_shares_one_deadline() {
+    let slow = Duration::from_millis(700);
     let port = serve(Routes::from([
-        ("/start".to_string(), redirect(302, "/slow")),
+        (
+            "/start".to_string(),
+            Reply {
+                head_delay: slow,
+                ..redirect(302, "/slow")
+            },
+        ),
         (
             "/slow".to_string(),
             Reply {
-                delay: Duration::from_secs(5),
+                head_delay: slow,
                 ..ok(b"late")
             },
         ),
     ]))
     .await;
-    let started = std::time::Instant::now();
-    let error = fixed_get(
-        &loopback(port),
-        &format!("http://127.0.0.1:{port}/start"),
-        1024,
-        Duration::from_secs(1),
-        &direct(),
-    )
-    .await
-    .unwrap_err();
+    let budget = Duration::from_secs(1);
+    // One slow hop alone completes.
+    assert_eq!(
+        get_within(port, "/slow", 1024, budget)
+            .await
+            .unwrap()
+            .unwrap(),
+        b"late"
+    );
+    let error = get_within(port, "/start", 1024, budget).await.unwrap_err();
     assert!(
         format!("{error:#}").contains("did not complete within 1s"),
         "{error:#}"
     );
-    assert!(started.elapsed() < Duration::from_secs(4));
 }
 
-/// Loopback targets always go direct, so the origin here is a name that only
-/// the proxy knows: every hop reaches it through the proxy.
+/// The command returns when the update future does, even if blocking work
+/// it started (route selection) is still running.
+#[test]
+fn a_timed_out_update_does_not_wait_for_its_blocking_work() {
+    let started = std::time::Instant::now();
+    let output = block_on_abandoning(async {
+        let stuck = tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_secs(5)));
+        tokio::time::timeout(Duration::from_millis(100), stuck)
+            .await
+            .is_err()
+    })
+    .unwrap();
+    assert!(output, "the future timed out");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// Loopback targets always go direct, so the first origin is a name only
+/// the proxy knows; it redirects to a loopback origin, which the next hop
+/// reaches directly: each hop is routed for its own target.
 #[tokio::test]
-async fn every_hop_goes_through_the_configured_proxy() {
-    // The proxy itself answers the absolute-form requests it receives.
-    let proxy = serve_with(|_| {
+async fn every_hop_is_routed_for_its_own_target() {
+    let origin = serve_with(|_| Routes::from([("/c".to_string(), ok(b"direct origin"))])).await;
+    let origin_port = origin.port;
+    let proxy = serve_with(move |_| {
         Routes::from([
             ("/a".to_string(), redirect(302, "/b")),
-            ("/b".to_string(), ok(b"via proxy")),
+            (
+                "/b".to_string(),
+                redirect(302, &format!("http://127.0.0.1:{origin_port}/c")),
+            ),
         ])
     })
     .await;
@@ -473,9 +512,9 @@ async fn every_hop_goes_through_the_configured_proxy() {
         .snapshot(),
     };
     let policy = FixedUrlPolicy {
-        hosts: &["updates.invalid"],
+        hosts: &["updates.invalid", "127.0.0.1"],
         scheme: "http",
-        port: Some(8080),
+        ports: Vec::leak(vec![8080, origin_port]),
     };
     let body = fixed_get(
         &policy,
@@ -487,7 +526,7 @@ async fn every_hop_goes_through_the_configured_proxy() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(body, b"via proxy");
+    assert_eq!(body, b"direct origin");
     assert_eq!(
         proxy.requested(),
         vec![
@@ -495,6 +534,7 @@ async fn every_hop_goes_through_the_configured_proxy() {
             "http://updates.invalid:8080/b".to_string(),
         ]
     );
+    assert_eq!(origin.requested(), vec!["/c".to_string()]);
     // A proxy that cannot be reached fails the request.
     let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let closed_port = closed.local_addr().unwrap().port();

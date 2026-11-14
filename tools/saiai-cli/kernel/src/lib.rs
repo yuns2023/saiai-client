@@ -5100,7 +5100,7 @@ fn run_update() -> Result<()> {
         }
         UpdateOrigin::Fixed { source, cfg } => {
             let egress = Egress::for_optional_config(cfg.as_ref());
-            match runtime.block_on(fetch_fixed_update(
+            match block_on_abandoning(fetch_fixed_update(
                 &FixedUrlPolicy::https(source.hosts),
                 source.manifest_url,
                 source.asset_url_template,
@@ -5108,7 +5108,7 @@ fn run_update() -> Result<()> {
                 runtime::version(),
                 &current_sha256,
                 &egress,
-            ))? {
+            ))?? {
                 FixedUpdate::Current(message) => {
                     println!("{message}");
                     return Ok(());
@@ -7132,13 +7132,28 @@ async fn download_update_asset(url: &str, egress: &Egress) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
+/// Runs `future` on its own runtime and then shuts that runtime down without
+/// waiting for blocking work a timed-out future left behind (route
+/// selection stuck on proxy auto-configuration, for example): the command
+/// returns when the future does. Such work ends with the process.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn block_on_abandoning<F: std::future::Future>(future: F) -> Result<F::Output> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to start async runtime")?;
+    let output = runtime.block_on(future);
+    runtime.shutdown_background();
+    Ok(output)
+}
+
 /// The URLs a fixed update source may request: exact hosts, a scheme and
 /// (for HTTPS) the default port only, no user information.
 pub(crate) struct FixedUrlPolicy<'a> {
     hosts: &'a [&'a str],
     scheme: &'static str,
-    /// `None`: the scheme's default port only.
-    port: Option<u16>,
+    /// Ports allowed besides none; empty: the scheme's default port only.
+    ports: &'a [u16],
 }
 
 impl<'a> FixedUrlPolicy<'a> {
@@ -7146,7 +7161,7 @@ impl<'a> FixedUrlPolicy<'a> {
         Self {
             hosts,
             scheme: "https",
-            port: None,
+            ports: &[],
         }
     }
 
@@ -7161,7 +7176,10 @@ impl<'a> FixedUrlPolicy<'a> {
         if parsed.fragment().is_some() {
             bail!("{url} carries a fragment");
         }
-        if parsed.port() != self.port {
+        if parsed
+            .port()
+            .is_some_and(|port| !self.ports.contains(&port))
+        {
             bail!("{url} names a port that is not allowed");
         }
         let host = parsed.host_str().unwrap_or_default();
@@ -7563,8 +7581,8 @@ fn command_stdout_raw(path: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Whether `--version` output is exactly `<binary> <version>` and one line
-/// ending (`\n` or `\r\n`), nothing else.
+/// Whether `--version` output is exactly `<binary> <version>`, optionally
+/// followed by one line ending (`\n` or `\r\n`), nothing else.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn reports_exact_version(output: &str, binary: &str, version: &str) -> bool {
     let line = output
