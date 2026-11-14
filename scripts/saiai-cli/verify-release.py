@@ -686,6 +686,7 @@ def verify_workflows_and_docs() -> None:
         "CARGO_ENCODED_RUSTFLAGS",
         "--bin aitp",
         "only Linux GNU targets are verified",
+        '--target "$triple"',
     ):
         require(required in remap, f"AITP release build script is missing {required!r}")
     for prefix in AITP_NEUTRAL_PREFIXES:
@@ -694,10 +695,11 @@ def verify_workflows_and_docs() -> None:
             f"AITP release build script does not map to {prefix}",
         )
     for required in (
-        'CARGO_TARGET_DIR="$standalone/target" bash scripts/build-release.sh --locked',
-        '--aitp-artifact "$standalone/target/release/aitp"',
-        "bash tools/saiai-cli/kernel/scripts/build-release.sh --locked",
-        "--aitp-artifact tools/saiai-cli/target/release/aitp",
+        'aitp="$(CARGO_TARGET_DIR="$standalone/target" bash scripts/build-release.sh --locked)"',
+        '--aitp-artifact "$aitp"',
+        'aitp="$(bash tools/saiai-cli/kernel/scripts/build-release.sh --locked)"',
+        'echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"',
+        '--aitp-artifact "$AITP_PROGRAM"',
         "the path check accepted an ordinary release build",
     ):
         require(required in ci, f"CI does not check the remapped AITP release: {required!r}")
@@ -867,23 +869,26 @@ def build_machine_paths(build_dirs: list[Path], environ) -> list[str]:
     return paths
 
 
-# A byte that continues a file name (ASCII), for the directory boundaries below.
-FILE_NAME_BYTE = rb"[a-z0-9._+~-]"
+# What may follow a whole neutral prefix: a separator, the NUL that ends a C
+# string, or the end of the data. Anything else (another file name byte, or
+# the first byte of a string stored right after it) makes the occurrence an
+# ordinary path, so a remapped directory that a following string happens to
+# abut is reported rather than excused (a conservative false positive).
+NEUTRAL_PREFIX_END = rb"(?=/|\x00|\Z)"
 
 
 def names_path(view: bytes, path: str) -> bool:
     """Whether `view` (see `path_view`) holds `path` anywhere, as a plain
     substring (strings in a program sit next to each other without a
     separator, so no boundary is required). Only an occurrence that lies
-    wholly inside a whole neutral prefix (one not continued by another file
-    name byte), such as `/src` or `/home` inside `/aitp/src/…` or
+    wholly inside a whole neutral prefix (see NEUTRAL_PREFIX_END), such as `/src` or `/home` inside `/aitp/src/…` or
     `/aitp/home/…`, is not counted: those bytes are the neutral prefix
     itself. `build_machine_paths` refuses build paths that could be mistaken
     for the prefixes (`/aitp/…`, `/ait`)."""
     neutral = {
         (match.start(), match.end())
         for prefix in AITP_NEUTRAL_PREFIXES
-        for match in re.finditer(re.escape(prefix.encode()) + rb"(?!" + FILE_NAME_BYTE + rb")", view)
+        for match in re.finditer(re.escape(prefix.encode()) + NEUTRAL_PREFIX_END, view)
     }
     needle = path_view(path.encode())
     start = view.find(needle)

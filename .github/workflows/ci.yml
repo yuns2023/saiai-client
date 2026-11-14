@@ -85,10 +85,10 @@ jobs:
           # (contract entries), and a release build (paths remapped, as
           # published) runs and names no build path.
           cargo test --locked --target-dir "$standalone/target" --features contract --bin aitp
-          CARGO_TARGET_DIR="$standalone/target" bash scripts/build-release.sh --locked
-          "$standalone/target/release/aitp" --version
+          aitp="$(CARGO_TARGET_DIR="$standalone/target" bash scripts/build-release.sh --locked)"
+          "$aitp" --version
           python3 "$GITHUB_WORKSPACE/scripts/saiai-cli/verify-release.py" \
-            --aitp-artifact "$standalone/target/release/aitp" \
+            --aitp-artifact "$aitp" \
             --build-dir "$standalone" --build-dir "$GITHUB_WORKSPACE"
 
       - name: Verify official Codex daemon initialization without model turns
@@ -147,13 +147,14 @@ jobs:
             *saiai*) ;;
             *) echo "::error::the checkout path no longer names the other distribution"; exit 1 ;;
           esac
-          bash tools/saiai-cli/kernel/scripts/build-release.sh --locked
-          tools/saiai-cli/target/release/aitp --version
+          aitp="$(bash tools/saiai-cli/kernel/scripts/build-release.sh --locked)"
+          "$aitp" --version
+          echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"
 
       - name: Verify the AITP release names no build path
         run: >-
           python3 scripts/saiai-cli/verify-release.py
-          --aitp-artifact tools/saiai-cli/target/release/aitp
+          --aitp-artifact "$AITP_PROGRAM"
           --build-dir "$GITHUB_WORKSPACE"
 
       - name: Control - an ordinary release build fails the check

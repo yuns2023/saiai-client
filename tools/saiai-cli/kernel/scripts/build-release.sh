@@ -13,8 +13,11 @@
 #
 # Usage: build-release.sh [cargo build arguments, e.g. --locked --target T]
 # The target directory is CARGO_TARGET_DIR or <workspace>/target; set
-# CARGO_TARGET_DIR instead of passing --target-dir. The program is written to
-# <target dir>[/<triple>]/release/aitp.
+# CARGO_TARGET_DIR instead of passing --target-dir. The build always names
+# its one target explicitly (so a `build.target` in a configuration file
+# cannot change it), and the program is written to
+# <target dir>/<triple>/release/aitp; that path is the script's only output
+# on stdout.
 #
 # The flags are passed through CARGO_ENCODED_RUSTFLAGS, which takes the place
 # of rustflags from Cargo configuration files; RUSTFLAGS or
@@ -34,16 +37,22 @@ fail() {
 # Only Linux GNU targets are verified: CARGO_ENCODED_RUSTFLAGS replaces the
 # rustflags of Cargo configuration files (the repository sets
 # `link-arg=/Brepro` for Windows MSVC), and other platforms embed paths
-# differently. Build targets come from --target or CARGO_BUILD_TARGET (a
-# `build.target` in a configuration file is not supported), else the host.
+# differently. The target comes from --target, else CARGO_BUILD_TARGET, else
+# the host; it is then passed to Cargo explicitly.
 targets=()
+cargo_arguments=()
 previous=""
 for argument in "$@"; do
-  case "$argument" in
-    --target-dir | --target-dir=*) fail "set CARGO_TARGET_DIR instead of $argument" ;;
-    --target=*) targets+=("${argument#--target=}") ;;
-  esac
-  [[ "$previous" == "--target" ]] && targets+=("$argument")
+  if [[ "$previous" == "--target" ]]; then
+    targets+=("$argument")
+  else
+    case "$argument" in
+      --target-dir | --target-dir=*) fail "set CARGO_TARGET_DIR instead of $argument" ;;
+      --target=*) targets+=("${argument#--target=}") ;;
+      --target) ;;
+      *) cargo_arguments+=("$argument") ;;
+    esac
+  fi
   previous="$argument"
 done
 [[ "$previous" == "--target" ]] && fail "--target needs a value"
@@ -56,12 +65,12 @@ if [[ ${#targets[@]} -eq 0 ]]; then
     targets=("$host")
   fi
 fi
-for target in "${targets[@]}"; do
-  case "$target" in
-    *-linux-gnu | *-linux-gnu?*) ;;
-    *) fail "only Linux GNU targets are verified for the remapped release build, not $target" ;;
-  esac
-done
+[[ ${#targets[@]} -eq 1 ]] || fail "build one target at a time, not ${targets[*]}"
+triple="${targets[0]}"
+case "$triple" in
+  *-linux-gnu | *-linux-gnu?*) ;;
+  *) fail "only Linux GNU targets are verified for the remapped release build, not $triple" ;;
+esac
 if env | grep -E '^(C|CXX)FLAGS_[^=]*-' >/dev/null; then
   fail "C flag variables named with a dash cannot be extended; use the underscore form"
 fi
@@ -134,4 +143,9 @@ while IFS= read -r name; do
   export "$name=${!name}$c_flags"
 done < <(compgen -e | grep -E '^((C|CXX)FLAGS_[A-Za-z0-9_]+|(TARGET|HOST)_(C|CXX)FLAGS)$' || true)
 
-cargo build --manifest-path "$manifest" --release --bin aitp "$@"
+# Cargo reports on stderr; stdout carries only the program's path.
+cargo build --manifest-path "$manifest" --release --bin aitp --target "$triple" \
+  ${cargo_arguments[@]+"${cargo_arguments[@]}"} >&2
+program="$target_dir/$triple/release/aitp"
+[[ -f "$program" ]] || fail "cargo did not write $program"
+printf '%s\n' "$program"
