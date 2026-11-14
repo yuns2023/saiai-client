@@ -2895,10 +2895,13 @@ struct LegacyWindowsPackagedProxyLeaseMarker {
 #[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct LeaseCertificates {
-    /// Their removal failed (the removal command failed, or the certificate
-    /// is confirmed still installed): a failure as before, and the lease
-    /// keeps them for a retry.
+    /// The removal command failed for the first of these; it and the ones
+    /// after it were not processed (as before, the first failure stops):
+    /// a failure, and the lease keeps them for a retry.
     pub(crate) pending: Vec<String>,
+    /// The removal command succeeded but the certificate is still listed:
+    /// reported only (removal was not checked before).
+    pub(crate) lingering: Vec<String>,
     /// Kept because they are another local proxy program's installation CA.
     pub(crate) foreign: Vec<String>,
 }
@@ -2907,9 +2910,9 @@ pub(crate) struct LeaseCertificates {
 /// another program's installation CA is kept; anything else is removed by
 /// thumbprint as before, including one whose identity cannot be read or
 /// parsed (`read` returns its DER, None when not installed). `remove`
-/// removes it: an error is a failed removal command, `false` a certificate
-/// confirmed still installed (both failures, as before); `true` is gone or
-/// not confirmable (no new failure).
+/// removes it: an error is a failed removal command, which stops the work
+/// as before (it and the rest stay pending); `Ok(false)` means the command
+/// succeeded but the certificate is still listed, which is only reported.
 #[cfg(any(target_os = "windows", test))]
 pub(crate) fn settle_lease_certificates(
     thumbprints: &[String],
@@ -2917,7 +2920,7 @@ pub(crate) fn settle_lease_certificates(
     remove: impl Fn(&str) -> Result<bool>,
 ) -> LeaseCertificates {
     let mut settled = LeaseCertificates::default();
-    for thumbprint in thumbprints {
+    for (index, thumbprint) in thumbprints.iter().enumerate() {
         let owner = read(thumbprint).and_then(|der| match der {
             None => Ok(None),
             Some(der) => coexistence::classify_certificate(&der).map(Some),
@@ -2928,11 +2931,14 @@ pub(crate) fn settle_lease_certificates(
                 settled.foreign.push(thumbprint.clone())
             }
             // Ours, unknown, or not identifiable: removed as before.
-            Ok(Some(_)) | Err(_) => {
-                if !matches!(remove(thumbprint), Ok(true)) {
-                    settled.pending.push(thumbprint.clone());
+            Ok(Some(_)) | Err(_) => match remove(thumbprint) {
+                Ok(true) => {}
+                Ok(false) => settled.lingering.push(thumbprint.clone()),
+                Err(_) => {
+                    settled.pending = thumbprints[index..].to_vec();
+                    return settled;
                 }
-            }
+            },
         }
     }
     settled
@@ -3016,6 +3022,11 @@ fn restore_lease_with(marker_path: &Path, system: &impl LeaseSystem) -> Result<L
         |thumbprint| system.certificate(thumbprint),
         |thumbprint| system.remove_certificate(thumbprint),
     );
+    for thumbprint in &settled.lingering {
+        eprintln!(
+            "warning: CA {thumbprint} is still listed in Windows CurrentUser\\Root after its removal"
+        );
+    }
     for thumbprint in &settled.foreign {
         eprintln!(
             "warning: kept CA {thumbprint} in Windows CurrentUser\\Root: it is another local proxy program's installation CA"
@@ -3061,8 +3072,8 @@ fn windows_root_ca_der(thumbprint: &str) -> Result<Option<Vec<u8>>> {
 #[cfg(target_os = "windows")]
 fn windows_remove_root_ca_checked(thumbprint: &str) -> Result<bool> {
     windows_remove_user_ca(Some(thumbprint))?;
-    // Only a certificate confirmed still installed is a failure; a check
-    // that cannot run is not (the removal was not checked before either).
+    // Reported when confirmed still listed; never a failure (the removal
+    // was not checked before).
     Ok(!matches!(windows_root_ca_der(thumbprint), Ok(Some(_))))
 }
 
@@ -11935,12 +11946,13 @@ HTTPS_PROXY="http://127.0.0.1:1111"
                     .then(|| self.der.clone()))
             }
             fn remove_certificate(&self, thumbprint: &str) -> Result<bool> {
-                if self.removable.get() {
-                    self.installed
-                        .borrow_mut()
-                        .retain(|installed| installed != thumbprint);
+                if !self.removable.get() {
+                    bail!("removal command failed");
                 }
-                Ok(self.removable.get())
+                self.installed
+                    .borrow_mut()
+                    .retain(|installed| installed != thumbprint);
+                Ok(true)
             }
         }
         let proxy = |enable: i32, server: &str| LegacyWindowsInternetProxySettings {
@@ -12274,8 +12286,9 @@ HTTPS_PROXY="http://127.0.0.1:1111"
 
     /// Lease certificates are decided one by one: only a confirmed foreign
     /// CA is kept; ours, unknown, unreadable and unparsable ones are removed
-    /// by thumbprint as before; a removal that fails (command error, or the
-    /// certificate confirmed still installed) is a failure, kept for retry.
+    /// by thumbprint as before; a failed removal command stops the work (it
+    /// and the rest stay for a retry), a certificate still listed after a
+    /// successful command is only reported.
     #[test]
     fn lease_certificates_are_settled_one_by_one() {
         use rcgen::{
@@ -12316,13 +12329,14 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             "GARBAGE",
             "STUCK",
             "BROKEN",
+            "AFTER",
         ]
         .map(String::from)
         .to_vec();
         let settled = settle_lease_certificates(
             &thumbprints,
             |thumbprint| match thumbprint {
-                "BROKEN" => Ok(Some(store["OURS"].clone().unwrap().unwrap())),
+                "BROKEN" | "AFTER" => Ok(Some(store["OURS"].clone().unwrap().unwrap())),
                 _ => store[thumbprint]
                     .clone()
                     .map_err(|()| anyhow::anyhow!("access denied")),
@@ -12339,11 +12353,14 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert_eq!(
             settled,
             LeaseCertificates {
-                pending: vec!["STUCK".to_string(), "BROKEN".to_string()],
+                // The first failed command stops the work, as before.
+                pending: vec!["BROKEN".to_string(), "AFTER".to_string()],
+                lingering: vec!["STUCK".to_string()],
                 foreign: vec!["FOREIGN".to_string()],
             }
         );
-        // Identity that cannot be read or parsed: removed as before.
+        // Identity that cannot be read or parsed: removed as before; nothing
+        // after the failed command is touched.
         assert_eq!(
             *removed.borrow(),
             ["OURS", "CORP", "UNREADABLE", "GARBAGE", "STUCK", "BROKEN"]
