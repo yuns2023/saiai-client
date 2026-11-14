@@ -267,6 +267,7 @@
 ["uninstall.rs","\"is a symbolic link; SAIAI does not follow it. Remove the link and rerun\""]
 ["uninstall.rs","\"is shared by several SAIAI configurations that would remove different values; clean it manually\""]
 ["uninstall.rs","\"its directory is a symbolic link; SAIAI does not follow it. Remove the link and rerun\""]
+["uninstall.rs","\"managed by another local proxy program ({reason}); not changed. If SAIAI settings are also in this file (for example its API key or proxy), remove them yourself once the other program no longer needs the file\""]
 ["uninstall.rs","\"managed for {proxy}, which is not a configured SAIAI proxy\""]
 ["uninstall.rs","\"no SAIAI configuration was found to verify that SAIAI wrote it\""]
 ["uninstall.rs","\"not a SAIAI configuration\""]

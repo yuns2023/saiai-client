@@ -902,7 +902,8 @@ fn plan_claude(discovery: &Discovery, product: &ProductDir, plan: &mut Plan) {
                         Area::Claude,
                         label.clone(),
                         Outcome::Kept(format!(
-                            "managed by another local proxy program ({reason}); not changed"
+                            "managed by another local proxy program ({reason}); not changed. If {brand_product} settings are also in this file (for example its API key or proxy), remove them yourself once the other program no longer needs the file",
+                            brand_product = BRAND.product_name
                         )),
                     );
                     return;
@@ -2195,11 +2196,15 @@ fn root_certificates(
 fn plan_root_certificates(output: &str, leased: &[String], plan: &mut Plan) {
     let (certificates, errors) = match root_certificates(output, leased) {
         Ok(found) => found,
+        // Reported, not failed: as before, an inspection that yields no
+        // certificate removes none and does not stop the uninstall.
         Err(error) => {
             plan.note(
                 Area::Certificates,
                 "Windows CurrentUser\\Root certificates",
-                Outcome::Failed(format!("could not inspect: {error}")),
+                Outcome::Kept(format!(
+                    "WARN could not read the inspection ({error}); no certificate is removed"
+                )),
             );
             return;
         }
@@ -2208,8 +2213,8 @@ fn plan_root_certificates(output: &str, leased: &[String], plan: &mut Plan) {
         plan.note(
             Area::Certificates,
             "CA file",
-            Outcome::Failed(format!(
-                "could not be read ({error}); its certificates are kept, rerun uninstall"
+            Outcome::Kept(format!(
+                "WARN could not be read ({error}); certificates it may hold are not removed"
             )),
         );
     }
@@ -2232,9 +2237,7 @@ fn plan_root_certificates(output: &str, leased: &[String], plan: &mut Plan) {
             RootCertificate::Unidentified(thumbprint, error) => plan.note(
                 Area::Certificates,
                 format!("CA {thumbprint} in Windows CurrentUser\\Root"),
-                Outcome::Failed(format!(
-                    "could not be identified ({error}); kept, rerun uninstall"
-                )),
+                Outcome::Kept(format!("WARN could not be identified ({error}); kept")),
             ),
         }
     }

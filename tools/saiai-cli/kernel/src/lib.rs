@@ -2868,7 +2868,7 @@ fn activate_windows_packaged_desktop(app_id: &str, arguments: &str) -> Result<u3
         .context("Windows package activation did not return a process ID")
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct LegacyWindowsInternetProxySettings {
     proxy_enable: Option<i32>,
@@ -2876,7 +2876,7 @@ struct LegacyWindowsInternetProxySettings {
     auto_config_url: Option<String>,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct LegacyWindowsPackagedProxyLeaseMarker {
     previous: LegacyWindowsInternetProxySettings,
@@ -2941,16 +2941,57 @@ fn restore_legacy_windows_packaged_proxy_lease() -> Result<LeaseCertificates> {
 /// certificates, which are decided one by one (`settle_lease_certificates`).
 /// Certificates kept for a retry keep the lease, rewritten with the proxy
 /// marked handled; otherwise the lease is removed.
+/// The system operations a lease restore needs (the real Windows proxy
+/// settings and certificate store, or a test double).
+#[cfg(any(target_os = "windows", test))]
+trait LeaseSystem {
+    fn read_proxy(&self) -> Result<LegacyWindowsInternetProxySettings>;
+    fn write_proxy(&self, settings: &LegacyWindowsInternetProxySettings) -> Result<()>;
+    fn certificate(&self, thumbprint: &str) -> Result<Option<Vec<u8>>>;
+    fn remove_certificate(&self, thumbprint: &str) -> Result<bool>;
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsLeaseSystem;
+
+#[cfg(target_os = "windows")]
+impl LeaseSystem for WindowsLeaseSystem {
+    fn read_proxy(&self) -> Result<LegacyWindowsInternetProxySettings> {
+        windows_read_internet_proxy()
+    }
+    fn write_proxy(&self, settings: &LegacyWindowsInternetProxySettings) -> Result<()> {
+        windows_write_internet_proxy(settings)
+    }
+    fn certificate(&self, thumbprint: &str) -> Result<Option<Vec<u8>>> {
+        windows_root_ca_der(thumbprint)
+    }
+    fn remove_certificate(&self, thumbprint: &str) -> Result<bool> {
+        windows_remove_root_ca_checked(thumbprint)
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn restore_legacy_windows_packaged_proxy_lease_at(marker_path: &Path) -> Result<LeaseCertificates> {
+    restore_lease_with(marker_path, &WindowsLeaseSystem)
+}
+
+/// Restores a legacy Desktop lease: the system proxy by its own rule (only
+/// while it is still the lease's managed proxy), independently of the
+/// certificates, which are decided one by one (`settle_lease_certificates`).
+/// Certificates kept for a retry keep the lease, rewritten with the proxy
+/// marked handled, so a retry touches certificates only; otherwise the lease
+/// is removed. A crash between restoring the proxy and rewriting the lease
+/// can make the next run look at the proxy again (no exactly-once promise).
+#[cfg(any(target_os = "windows", test))]
+fn restore_lease_with(marker_path: &Path, system: &impl LeaseSystem) -> Result<LeaseCertificates> {
     let Some(mut marker) = read_legacy_windows_packaged_proxy_lease_marker(marker_path)? else {
         return Ok(LeaseCertificates::default());
     };
 
     if !marker.proxy_handled {
-        let current = windows_read_internet_proxy()?;
+        let current = system.read_proxy()?;
         if windows_proxy_matches_managed(&current, &marker.managed_server) {
-            windows_write_internet_proxy(&marker.previous)?;
+            system.write_proxy(&marker.previous)?;
             println!(
                 "Restored the Windows proxy left by a legacy {brand_product} Desktop lease.",
                 brand_product = BRAND.product_name
@@ -2965,8 +3006,8 @@ fn restore_legacy_windows_packaged_proxy_lease_at(marker_path: &Path) -> Result<
     }
     let settled = settle_lease_certificates(
         &marker.added_ca_thumbprints,
-        windows_root_ca_der,
-        windows_remove_root_ca_checked,
+        |thumbprint| system.certificate(thumbprint),
+        |thumbprint| system.remove_certificate(thumbprint),
     );
     for thumbprint in &settled.foreign {
         eprintln!(
@@ -3023,7 +3064,7 @@ fn windows_packaged_proxy_lease_marker_path() -> Result<PathBuf> {
         .join(WINDOWS_PACKAGED_PROXY_LEASE_FILENAME))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn read_legacy_windows_packaged_proxy_lease_marker(
     path: &Path,
 ) -> Result<Option<LegacyWindowsPackagedProxyLeaseMarker>> {
@@ -3039,7 +3080,7 @@ fn read_legacy_windows_packaged_proxy_lease_marker(
         .with_context(|| format!("failed to parse {}", path.display()))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn remove_windows_packaged_proxy_lease_marker(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -3080,7 +3121,7 @@ fn windows_read_internet_proxy() -> Result<LegacyWindowsInternetProxySettings> {
     serde_json::from_str(&output).context("failed to parse Windows Internet proxy settings")
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn windows_proxy_matches_managed(
     settings: &LegacyWindowsInternetProxySettings,
     managed: &str,
@@ -9651,8 +9692,9 @@ fn migrate_legacy_codex_system_proxy(
 ) -> Result<()> {
     let env = fs::read_to_string(codex_dir.join(".env")).unwrap_or_default();
     if !env.contains(merge_codex_ide_env("", listen, ca_cert_path).trim())
-        // Also another local proxy program's block in the same file.
-        || coexistence::codex_env_evidence(&env).is_some()
+        // Also a profile another local proxy program manages (its block,
+        // its CA, or its placeholder login).
+        || coexistence::codex_profile_evidence(codex_dir).is_some()
     {
         return Ok(());
     }
@@ -11818,6 +11860,141 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             "{first:?}"
         );
         assert_ne!(Some(first), common_name(&second));
+    }
+
+    /// The Codex migration also leaves a profile alone that another local
+    /// proxy program signed in to, even with this listener's block.
+    #[test]
+    fn the_codex_migration_skips_a_profile_with_another_programs_login() {
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        let listen = "127.0.0.1:19908";
+        let legacy = "[features]\nrespect_system_proxy = true\n";
+        fs::write(dir.path().join("config.toml"), legacy).unwrap();
+        fs::write(
+            dir.path().join(".env"),
+            merge_codex_ide_env("", listen, "/ca.pem"),
+        )
+        .unwrap();
+        let encode = |text: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text);
+        let token = format!(
+            "{}.{}.{}",
+            encode(r#"{"alg":"none","typ":"JWT"}"#),
+            encode(
+                r#"{"email":"other-local-proxy@invalid","https://api.openai.com/auth":{"chatgpt_account_id":"other-local-proxy-account"}}"#
+            ),
+            encode("other-local-proxy")
+        );
+        fs::write(
+            dir.path().join("auth.json"),
+            serde_json::to_vec(&serde_json::json!({"tokens": {"access_token": token}})).unwrap(),
+        )
+        .unwrap();
+        migrate_legacy_codex_system_proxy(dir.path(), listen, "/ca.pem").unwrap();
+        assert_eq!(read_str(&dir.path().join("config.toml")), legacy);
+    }
+
+    /// A lease retry touches certificates only: the first run restores the
+    /// proxy and keeps a certificate it cannot read; after the user sets a
+    /// proxy of their own, the second run removes the certificate and leaves
+    /// the user's proxy as it is.
+    #[test]
+    fn a_lease_retry_settles_certificates_without_touching_the_proxy_again() {
+        use std::cell::{Cell, RefCell};
+        struct Fake {
+            proxy: RefCell<LegacyWindowsInternetProxySettings>,
+            proxy_writes: Cell<usize>,
+            readable: Cell<bool>,
+            installed: RefCell<Vec<String>>,
+            der: Vec<u8>,
+        }
+        impl LeaseSystem for Fake {
+            fn read_proxy(&self) -> Result<LegacyWindowsInternetProxySettings> {
+                Ok(self.proxy.borrow().clone())
+            }
+            fn write_proxy(&self, settings: &LegacyWindowsInternetProxySettings) -> Result<()> {
+                self.proxy_writes.set(self.proxy_writes.get() + 1);
+                *self.proxy.borrow_mut() = settings.clone();
+                Ok(())
+            }
+            fn certificate(&self, thumbprint: &str) -> Result<Option<Vec<u8>>> {
+                if !self.readable.get() {
+                    bail!("access denied");
+                }
+                Ok(self
+                    .installed
+                    .borrow()
+                    .iter()
+                    .any(|installed| installed == thumbprint)
+                    .then(|| self.der.clone()))
+            }
+            fn remove_certificate(&self, thumbprint: &str) -> Result<bool> {
+                self.installed
+                    .borrow_mut()
+                    .retain(|installed| installed != thumbprint);
+                Ok(true)
+            }
+        }
+        let proxy = |enable: i32, server: &str| LegacyWindowsInternetProxySettings {
+            proxy_enable: Some(enable),
+            proxy_server: Some(server.to_string()),
+            auto_config_url: None,
+        };
+        let der = {
+            use rcgen::{
+                BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
+            };
+            let key = KeyPair::generate().unwrap();
+            let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let mut name = DistinguishedName::new();
+            name.push(DnType::CommonName, "KTEST local installation CA");
+            name.push(DnType::OrganizationName, "KTEST");
+            params.distinguished_name = name;
+            params.self_signed(&key).unwrap().der().to_vec()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("lease.json");
+        fs::write(
+            &marker,
+            serde_json::to_vec(&serde_json::json!({
+                "previous": {"proxy_enable": 0, "proxy_server": null, "auto_config_url": null},
+                "managed_server": "127.0.0.1:64196",
+                "added_ca_thumbprints": ["AA"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let system = Fake {
+            proxy: RefCell::new(proxy(1, "127.0.0.1:64196")),
+            proxy_writes: Cell::new(0),
+            readable: Cell::new(false),
+            installed: RefCell::new(vec!["AA".to_string()]),
+            der,
+        };
+
+        let first = restore_lease_with(&marker, &system).unwrap();
+        assert_eq!(first.pending, ["AA"]);
+        assert_eq!(system.proxy_writes.get(), 1);
+        assert_eq!(system.proxy.borrow().proxy_enable, Some(0));
+        let kept = read_legacy_windows_packaged_proxy_lease_marker(&marker)
+            .unwrap()
+            .unwrap();
+        assert!(kept.proxy_handled);
+        assert_eq!(kept.added_ca_thumbprints, ["AA"]);
+
+        // The user sets their own proxy; the certificate becomes readable.
+        *system.proxy.borrow_mut() = proxy(1, "corp.example:8080");
+        system.readable.set(true);
+        let second = restore_lease_with(&marker, &system).unwrap();
+        assert_eq!(second, LeaseCertificates::default());
+        assert_eq!(system.proxy_writes.get(), 1);
+        assert_eq!(
+            system.proxy.borrow().proxy_server.as_deref(),
+            Some("corp.example:8080")
+        );
+        assert!(system.installed.borrow().is_empty());
+        assert!(!marker.exists());
     }
 
     #[test]

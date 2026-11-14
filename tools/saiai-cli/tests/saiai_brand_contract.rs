@@ -1093,3 +1093,40 @@ fn saiai_vscode_keeps_its_behavior_with_another_programs_editor_proxy() {
     );
     assert_eq!(std::fs::read(&editor).unwrap(), before);
 }
+
+/// Mixed settings (SAIAI's key and proxy, another program's CA): uninstall
+/// leaves the whole file and tells the user to check for SAIAI's values.
+#[test]
+fn uninstall_leaves_mixed_settings_and_says_what_to_check() {
+    let sandbox = Sandbox::new();
+    sandbox.run(&mut sandbox.command(&[
+        "init",
+        "--base-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "TEST_ONLY_CONTRACT_KEY",
+    ]));
+    let settings = sandbox.home.join(".claude").join("settings.json");
+    let mut value = read_json(&settings);
+    let ca = sandbox.home.join("other").join("aitp-ca.crt");
+    std::fs::create_dir_all(ca.parent().unwrap()).unwrap();
+    std::fs::write(
+        &ca,
+        installation_ca("AITP local installation CA 0123abcd", "AITP").0,
+    )
+    .unwrap();
+    value["env"]["NODE_EXTRA_CA_CERTS"] = serde_json::json!(ca);
+    std::fs::write(&settings, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let before = std::fs::read(&settings).unwrap();
+    let plan = sandbox.run(&mut sandbox.command(&["uninstall", "--dry-run"]));
+    assert!(
+        plan.contains("managed by another local proxy program"),
+        "{plan}"
+    );
+    assert!(
+        plan.contains("If SAIAI settings are also in this file"),
+        "{plan}"
+    );
+    assert!(!plan.contains("env.https_proxy"), "{plan}");
+    assert_eq!(std::fs::read(&settings).unwrap(), before);
+}
