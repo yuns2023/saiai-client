@@ -351,7 +351,7 @@ pub(crate) fn run(args: Args) -> Result<()> {
     }
     // No update (or Windows replacement helper) may change an installation
     // directory while this runs; nothing has changed yet if one does.
-    let mut locks = match lock_install_dirs(&discovery) {
+    let mut locks = match lock_install_dirs(&plan) {
         Ok(locks) => locks,
         Err(error) => {
             #[cfg(windows)]
@@ -1693,23 +1693,30 @@ fn install_lock_files(discovery: &Discovery) -> Vec<PathBuf> {
     Vec::new()
 }
 
-/// Locks every existing installation directory against updates, when this
-/// brand serializes installation changes; fails, before any change, while
-/// one is held.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 type InstallLocks = Vec<crate::InstallationLock>;
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 type InstallLocks = Vec<()>;
 
+/// Locks, against updates, every installation directory the plan removes
+/// program files (and so, on Windows, the lock files) from, when this brand
+/// serializes installation changes; fails, before any change, while one is
+/// held. The plan names every lock file this creates.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn lock_install_dirs(discovery: &Discovery) -> Result<InstallLocks> {
+fn lock_install_dirs(plan: &Plan) -> Result<InstallLocks> {
     if !crate::serializes_installation_changes() {
         return Ok(Vec::new());
     }
-    discovery
-        .install_dirs
-        .iter()
-        .filter(|dir| dir.is_dir())
+    let mut dirs: Vec<&Path> = Vec::new();
+    for item in &plan.items {
+        if let (Area::Program, Action::RemoveFile(path)) = (item.area, &item.action)
+            && let Some(dir) = path.parent()
+            && !dirs.contains(&dir)
+        {
+            dirs.push(dir);
+        }
+    }
+    dirs.into_iter()
         .map(|dir| {
             crate::lock_installation(dir, BRAND.update.candidate_prefix, BRAND.binary_name)
                 .context("uninstall did not change anything")
@@ -1718,7 +1725,7 @@ fn lock_install_dirs(discovery: &Discovery) -> Result<InstallLocks> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn lock_install_dirs(_discovery: &Discovery) -> Result<InstallLocks> {
+fn lock_install_dirs(_plan: &Plan) -> Result<InstallLocks> {
     Ok(Vec::new())
 }
 
@@ -1741,10 +1748,18 @@ fn plan_program(discovery: &Discovery, plan: &mut Plan) -> Result<()> {
     // the lock creates them.
     let lock_files = install_lock_files(discovery);
     files.retain(|path| !lock_files.contains(path));
-    // Only where there is an installation to lock (or a lock file).
+    // Only where there is an installation to lock (a program file or a lock
+    // file): all of that directory's lock files, since locking it (see
+    // `lock_install_dirs`) creates any that are missing.
     let lock_files: Vec<_> = lock_files
-        .into_iter()
-        .filter(|lock| lock.exists() || files.iter().any(|file| file.parent() == lock.parent()))
+        .iter()
+        .filter(|lock| {
+            lock_files
+                .iter()
+                .chain(&files)
+                .any(|other| other.parent() == lock.parent() && other.exists())
+        })
+        .cloned()
         .collect();
     let (main, auxiliary): (Vec<_>, Vec<_>) =
         files.into_iter().partition(|path| is_main_program(path));

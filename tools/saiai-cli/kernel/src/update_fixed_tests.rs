@@ -791,6 +791,27 @@ fn a_held_helper_lock_keeps_the_installation_locked() {
     assert!(!lock.holds(&directory.path().join(".ktest-update-x")));
 }
 
+/// Windows: a helper that never takes the helper lock is reported (the
+/// caller stops it), and the lock is not kept open while waiting.
+#[cfg(windows)]
+#[test]
+fn a_helper_that_does_not_take_over_is_reported() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut lock = lock_update_directory(directory.path()).unwrap();
+    let started = std::time::Instant::now();
+    let (mut child, handed_over) = lock
+        .hand_over_to_helper(Duration::from_secs(1), || {
+            Ok(ProcessCommand::new("cmd")
+                .args(["/c", "ping -n 30 127.0.0.1 >nul"])
+                .spawn()?)
+        })
+        .unwrap();
+    assert!(!handed_over);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Windows: the real replacement helper takes the helper lock before the
 /// updater lets go, and holds it until it has replaced the program; only
 /// then can the next update or uninstall lock the directory.
@@ -799,9 +820,17 @@ fn a_held_helper_lock_keeps_the_installation_locked() {
 fn the_windows_replacement_helper_holds_the_installation_until_done() {
     let directory = tempfile::tempdir().unwrap();
     let dir = directory.path();
-    // The "installed program": its `stop` takes about two seconds.
+    // The "installed program": its `stop` waits until the test lets it go.
     let current = dir.join("current.cmd");
-    fs::write(&current, "@ping -n 3 127.0.0.1 >nul\r\n@exit /b 0\r\n").unwrap();
+    let release = dir.join("release");
+    fs::write(
+        &current,
+        format!(
+            "@echo off\r\n:wait\r\nif exist \"{}\" exit /b 0\r\nping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n",
+            release.display()
+        ),
+    )
+    .unwrap();
     let new_program = b"@exit /b 0\r\n".to_vec();
     let candidate = dir.join(".ktest-update-1.exe");
     fs::write(&candidate, &new_program).unwrap();
@@ -849,6 +878,7 @@ fn the_windows_replacement_helper_holds_the_installation_until_done() {
         format!("{error:#}").contains("still being installed"),
         "{error:#}"
     );
+    fs::write(&release, b"").unwrap();
     let status = helper.unwrap().wait().unwrap();
     let _ = updater.wait();
     let report = fs::read_to_string(&status_path).unwrap();

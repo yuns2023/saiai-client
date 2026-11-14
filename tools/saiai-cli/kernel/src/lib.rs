@@ -7978,11 +7978,13 @@ fn write_new_update_candidate(path: &Path, bytes: &[u8]) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))
             .with_context(|| format!("failed to chmod {}", path.display()))
     });
-    if written.is_err() {
-        drop(file);
-        let _ = fs::remove_file(path);
+    match written {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            drop(file);
+            Err(discard_candidate(path, error))
+        }
     }
-    written
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -8129,8 +8131,8 @@ fn finalize_update(
     )?;
     fs::write(&script_path, script)
         .with_context(|| format!("failed to write {}", script_path.display()))?;
-    let start_helper = || -> Result<()> {
-        if let Err(err) = ProcessCommand::new("powershell")
+    let start_helper = || -> Result<std::process::Child> {
+        match ProcessCommand::new("powershell")
             .env(BRAND.env.home, app_config_dir()?)
             .env_remove("CLAUDE_CONFIG_DIR")
             .env_remove("CODEX_HOME")
@@ -8144,27 +8146,39 @@ fn finalize_update(
             .stderr(Stdio::null())
             .spawn()
         {
-            let _ = fs::write(
-                &status_path,
-                format!("failed: could not start update helper: {err}\n"),
-            );
-            return Err(err).context("failed to start Windows update helper");
+            Ok(child) => Ok(child),
+            Err(err) => {
+                let _ = fs::write(
+                    &status_path,
+                    format!("failed: could not start update helper: {err}\n"),
+                );
+                Err(err).context("failed to start Windows update helper")
+            }
         }
-        Ok(())
     };
     match lock {
         // The helper takes over the installation lock before this command
         // exits (its script takes the helper lock first).
         Some(lock) => {
-            let ((), handed_over) =
-                lock.hand_over_to_helper(Duration::from_secs(30), start_helper)?;
+            let (mut helper, handed_over) =
+                lock.hand_over_to_helper(WINDOWS_HELPER_HANDOVER, start_helper)?;
             if !handed_over {
-                eprintln!(
-                    "WARN the Windows update helper has not locked the installation directory yet; it does so before replacing anything"
+                // It has done nothing yet (it waits for this command to
+                // exit): stop it rather than leave it running unlocked.
+                let _ = helper.kill();
+                let _ = helper.wait();
+                let message = format!(
+                    "the Windows update helper did not lock the installation directory within {}s; nothing was replaced",
+                    WINDOWS_HELPER_HANDOVER.as_secs()
                 );
+                let _ = fs::write(&status_path, format!("failed: {message}\n"));
+                let _ = fs::remove_file(&script_path);
+                return Err(discard_candidate(candidate_path, anyhow::anyhow!(message)));
             }
         }
-        None => start_helper()?,
+        None => {
+            start_helper()?;
+        }
     }
     println!(
         "Windows update helper started; replacement result: {}",
@@ -8172,6 +8186,11 @@ fn finalize_update(
     );
     Ok(())
 }
+
+/// How long a fixed-source update waits for its Windows replacement helper
+/// to take over the installation lock.
+#[cfg(target_os = "windows")]
+const WINDOWS_HELPER_HANDOVER: Duration = Duration::from_secs(60);
 
 #[cfg(target_os = "windows")]
 fn render_windows_update_script(
@@ -8304,7 +8323,7 @@ try {{\r\n\
     let take_lock = format!(
         "$helperLockPath = {}\r\n\
 $helperLock = $null\r\n\
-foreach ($attempt in 1..300) {{\r\n\
+foreach ($attempt in 1..600) {{\r\n\
     try {{ $helperLock = [IO.File]::Open($helperLockPath, 'OpenOrCreate', 'ReadWrite', 'None'); break }}\r\n\
     catch {{ Start-Sleep -Milliseconds 100 }}\r\n\
 }}\r\n\

@@ -545,8 +545,8 @@ impl InstallationLock {
     /// Windows: releases the helper lock, runs `start` (which starts the
     /// replacement helper), and waits up to `wait` until the helper holds it,
     /// so no update or uninstall can slip in between this command's exit
-    /// and the helper's work. `Ok(false)`: the helper did not take it in
-    /// time (it still takes it before changing anything).
+    /// and the helper's work. `Ok((_, false))`: the helper did not take it
+    /// in time; the caller must stop that helper before letting go.
     #[cfg(windows)]
     pub(crate) fn hand_over_to_helper<T>(
         &mut self,
@@ -563,12 +563,14 @@ impl InstallationLock {
         loop {
             match open_exclusive(&path) {
                 Ok(None) => return Ok((started, true)),
-                // Free (released at once: the helper retries) or unreadable.
-                Ok(Some(_)) | Err(_) if Instant::now() < until => {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                Ok(Some(_)) | Err(_) => return Ok((started, false)),
+                // Free: closed at once, before waiting (the helper retries).
+                Ok(Some(file)) => drop(file),
+                Err(_) => {}
             }
+            if Instant::now() >= until {
+                return Ok((started, false));
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 }
