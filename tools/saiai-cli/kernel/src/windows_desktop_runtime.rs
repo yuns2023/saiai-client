@@ -1254,7 +1254,7 @@ mod tests {
         altered.codex_home = "inherited-but-not-native-profile".into();
         assert!(decide(&altered, &profile, Some(&receipt)).is_err());
         for address in [
-            "http://192.168.1.1:19908",
+            "http://10.0.0.1:19908",
             "http://localhost:19908",
             "http://user:secret@127.0.0.1:19908",
             "http://127.0.0.1:19908/path",

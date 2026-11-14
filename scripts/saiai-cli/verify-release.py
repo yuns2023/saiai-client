@@ -638,6 +638,28 @@ def verify_workflows_and_docs() -> None:
             "python3 scripts/saiai-cli/test-release-contract.py" in text(path),
             f"{path} does not run the optional Claude contract regressions",
         )
+    # The kernel's tests name this distribution only through the
+    # environment, and the kernel source is scanned for its names.
+    require(
+        re.search(r"^env:\n(?:  .*\n|#.*\n)*  AITP_TEST_FOREIGN_NAMES: saiai$", ci, re.MULTILINE)
+        is not None,
+        "CI does not name SAIAI to the kernel's tests for the whole workflow",
+    )
+    require(
+        "AITP_TEST_FOREIGN_NAMES: saiai" in release,
+        "the release workflow does not name SAIAI to the kernel's tests",
+    )
+    pre_push = text("scripts/git-hooks/pre-push")
+    require(
+        "AITP_TEST_FOREIGN_NAMES=saiai" in pre_push,
+        "the pre-push hook does not name SAIAI to the kernel's tests",
+    )
+    for path, workflow in (("ci.yml", ci), ("pre-push", pre_push)):
+        require(
+            "python3 scripts/saiai-cli/test-scan-kernel-names.py" in workflow
+            and "python3 scripts/saiai-cli/scan-kernel-names.py tools/saiai-cli/kernel" in workflow,
+            f"{path} does not scan the kernel for distribution names",
+        )
     for asset in ASSETS:
         require(asset in release, f"release workflow omits {asset}")
     for required in (

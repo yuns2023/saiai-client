@@ -10,6 +10,12 @@ on:
 permissions:
   contents: read
 
+# The kernel's tests refuse a neutral test brand in everything `aitp`
+# prints, writes and carries; this distribution adds its own name here, so
+# the public kernel source never spells it.
+env:
+  AITP_TEST_FOREIGN_NAMES: saiai
+
 concurrency:
   group: client-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -34,6 +40,13 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           workspaces: tools/saiai-cli -> target
+
+      # The kernel becomes a public repository: no spelling, encoding or
+      # internal detail of this distribution may appear in it.
+      - name: Scan the kernel for distribution names
+        run: |
+          python3 scripts/saiai-cli/test-scan-kernel-names.py
+          python3 scripts/saiai-cli/scan-kernel-names.py tools/saiai-cli/kernel
 
       - name: Format
         run: cargo fmt --manifest-path tools/saiai-cli/Cargo.toml --all --check

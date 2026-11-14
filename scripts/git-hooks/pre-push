@@ -14,8 +14,12 @@ fi
 echo "[pre-push] client: cargo fmt"
 cargo fmt --manifest-path "$repo_root/tools/saiai-cli/Cargo.toml" --check
 
+echo "[pre-push] client: kernel name scan"
+(cd "$repo_root" && python3 scripts/saiai-cli/test-scan-kernel-names.py)
+(cd "$repo_root" && python3 scripts/saiai-cli/scan-kernel-names.py tools/saiai-cli/kernel)
+
 echo "[pre-push] client: cargo test"
-CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" \
+AITP_TEST_FOREIGN_NAMES=saiai CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" \
   cargo test --locked --manifest-path "$repo_root/tools/saiai-cli/Cargo.toml"
 
 echo "[pre-push] client: release contract"

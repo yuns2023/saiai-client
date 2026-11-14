@@ -14,9 +14,79 @@ const BINARY: &str = env!("CARGO_BIN_EXE_aitp");
 const MANIFEST_URL: &str =
     "https://github.com/2742zdz/AITP/releases/latest/download/aitp-manifest.json";
 
-/// The other distribution's name, assembled so this file never spells it.
-fn other_brand() -> String {
-    ["s", "a", "i", "a", "i"].concat()
+/// The variable through which a distribution built on this kernel names
+/// itself (comma-separated, any case) for the checks below, which then
+/// also refuse it. It starts with `AITP_`, so the program never sees it.
+const FOREIGN_NAMES_VARIABLE: &str = "AITP_TEST_FOREIGN_NAMES";
+
+/// The names of other distributions built on this kernel, lower case, that
+/// nothing `aitp` prints, writes or carries may contain: always the neutral
+/// test brand, plus each name in `AITP_TEST_FOREIGN_NAMES`. A set variable
+/// that names nothing, or a name shorter than three letters or digits, is a
+/// misconfiguration and fails the test instead of weakening the check.
+fn foreign_names() -> Vec<String> {
+    let value = std::env::var_os(FOREIGN_NAMES_VARIABLE).map(|value| {
+        value
+            .into_string()
+            .unwrap_or_else(|value| panic!("{FOREIGN_NAMES_VARIABLE} is not UTF-8: {value:?}"))
+    });
+    parse_foreign_names(value.as_deref())
+}
+
+fn parse_foreign_names(value: Option<&str>) -> Vec<String> {
+    let mut names = vec!["ktest".to_string()];
+    for name in value.into_iter().flat_map(|value| value.split(',')) {
+        let name = name.trim();
+        assert!(
+            name.len() >= 3 && name.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+            "{FOREIGN_NAMES_VARIABLE}={value:?}: {name:?} is not a name of at least three \
+             letters or digits"
+        );
+        let name = name.to_ascii_lowercase();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// The neutral test brand is always refused; a set variable adds names and
+/// never empties or weakens the list.
+#[test]
+fn foreign_names_always_include_the_test_brand() {
+    assert_eq!(parse_foreign_names(None), ["ktest"]);
+    assert_eq!(
+        parse_foreign_names(Some(" Other ,KTEST,other2")),
+        ["ktest", "other", "other2"]
+    );
+    for value in [
+        "",
+        " ",
+        "other,",
+        ",other",
+        "other,,more",
+        "ab",
+        "o-ther",
+        "ot her",
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| parse_foreign_names(Some(value))).is_err(),
+            "{value:?}"
+        );
+    }
+    // Whatever the environment says, the list is never empty and holds no
+    // empty name (which every text would contain).
+    let names = foreign_names();
+    assert!(names.contains(&"ktest".to_string()));
+    assert!(names.iter().all(|name| name.len() >= 3));
+}
+
+/// The first foreign name `text` contains, in any case.
+fn foreign_name_in(text: &str) -> Option<String> {
+    let text = text.to_ascii_lowercase();
+    foreign_names()
+        .into_iter()
+        .find(|name| text.contains(name.as_str()))
 }
 
 /// Environment variables of any distribution or client location that a
@@ -24,7 +94,9 @@ fn other_brand() -> String {
 fn foreign_variable(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     upper.starts_with("AITP_")
-        || upper.starts_with(&format!("{}_", other_brand().to_ascii_uppercase()))
+        || foreign_names()
+            .iter()
+            .any(|other| upper.starts_with(&format!("{}_", other.to_ascii_uppercase())))
         || [
             "CLAUDE_CONFIG_DIR",
             // Claude settings a shell may export; status warns about them.
@@ -140,20 +212,20 @@ impl Sandbox {
 
     /// Neither the files the program wrote anywhere in the sandbox (names
     /// and contents; links are reported, not followed) nor any output names
-    /// the other distribution. The copied program itself is checked
-    /// separately (`the_program_carries_no_other_distribution_name`).
+    /// another distribution (`foreign_names`). The copied program itself is
+    /// checked separately (`the_program_carries_no_other_distribution_name`).
     fn assert_only_aitp_names(&self) {
-        let other = other_brand();
         for text in self.printed.lock().unwrap().iter() {
-            assert!(!text.to_ascii_lowercase().contains(&other), "{text}");
+            assert_eq!(foreign_name_in(text), None, "{text}");
         }
         let mut pending = vec![self.root.clone()];
         let mut files = 0;
         while let Some(dir) = pending.pop() {
             for entry in std::fs::read_dir(&dir).unwrap() {
                 let path = entry.unwrap().path();
-                assert!(
-                    !path.to_string_lossy().to_ascii_lowercase().contains(&other),
+                assert_eq!(
+                    foreign_name_in(&path.to_string_lossy()),
+                    None,
                     "{}",
                     path.display()
                 );
@@ -163,11 +235,9 @@ impl Sandbox {
                 }
                 if kind.is_symlink() {
                     let target = std::fs::read_link(&path).unwrap();
-                    assert!(
-                        !target
-                            .to_string_lossy()
-                            .to_ascii_lowercase()
-                            .contains(&other),
+                    assert_eq!(
+                        foreign_name_in(&target.to_string_lossy()),
+                        None,
                         "{} -> {}",
                         path.display(),
                         target.display()
@@ -177,11 +247,10 @@ impl Sandbox {
                 } else if kind.is_file() {
                     files += 1;
                     let bytes = std::fs::read(&path).unwrap();
-                    assert!(
-                        !String::from_utf8_lossy(&bytes)
-                            .to_ascii_lowercase()
-                            .contains(&other),
-                        "{} names the other distribution",
+                    assert_eq!(
+                        foreign_name_in(&String::from_utf8_lossy(&bytes)),
+                        None,
+                        "{} names another distribution",
                         path.display()
                     );
                 }
@@ -389,8 +458,7 @@ fn update_asks_the_release_channel_without_initialization() {
         })
         .collect();
     assert!(staged.is_empty(), "{staged:?}");
-    let other = other_brand();
-    assert!(!text.to_ascii_lowercase().contains(&other), "{text}");
+    assert_eq!(foreign_name_in(&text), None, "{text}");
 }
 
 /// A configuration that exists but cannot be read stops `update` before
@@ -510,36 +578,37 @@ fn only_the_known_build_paths_explain_the_name() {
     assert!(unexplained_occurrences(&view, name, &ancestors).is_empty());
 }
 
-/// The program itself carries no other distribution's name, wherever it is
-/// built. A build below a directory that spells the name (as the workspace's
+/// The program itself carries no other distribution's name
+/// (`foreign_names`), wherever it is built. A build below a directory that spells the name (as the workspace's
 /// CI checkout does) embeds that directory in debug information, so exactly
 /// those build paths are set aside; every other occurrence, in any case,
 /// fails the test.
 #[test]
 fn the_program_carries_no_other_distribution_name() {
-    let other = other_brand();
     let bytes = std::fs::read(BINARY).unwrap();
     assert!(contains(&bytes, b"AITP local installation CA"));
     let view = path_view(&bytes);
-    let paths = build_paths_naming(&other);
-    let unexplained = unexplained_occurrences(&view, other.as_bytes(), &paths);
-    let context: Vec<String> = unexplained
-        .iter()
-        .take(5)
-        .map(|&at| {
-            let around = &bytes[at.saturating_sub(60)..(at + 60).min(bytes.len())];
-            String::from_utf8_lossy(around).escape_debug().to_string()
-        })
-        .collect();
-    assert!(
-        unexplained.is_empty(),
-        "{} occurrence(s) outside the build paths {:?}: {context:#?}",
-        unexplained.len(),
-        paths
+    for other in foreign_names() {
+        let paths = build_paths_naming(&other);
+        let unexplained = unexplained_occurrences(&view, other.as_bytes(), &paths);
+        let context: Vec<String> = unexplained
             .iter()
-            .map(|path| String::from_utf8_lossy(path).into_owned())
-            .collect::<Vec<_>>()
-    );
+            .take(5)
+            .map(|&at| {
+                let around = &bytes[at.saturating_sub(60)..(at + 60).min(bytes.len())];
+                String::from_utf8_lossy(around).escape_debug().to_string()
+            })
+            .collect();
+        assert!(
+            unexplained.is_empty(),
+            "{} occurrence(s) of {other:?} outside the build paths {:?}: {context:#?}",
+            unexplained.len(),
+            paths
+                .iter()
+                .map(|path| String::from_utf8_lossy(path).into_owned())
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 /// An installation CA of another program built on this kernel ("OTHER"),
@@ -1524,8 +1593,7 @@ fn update_downloads_probes_and_replaces_the_program() {
     );
     // (The backup is a copy of the test build, which may carry its build
     // path; only the output is checked here.)
-    let other = other_brand();
-    assert!(!text.to_ascii_lowercase().contains(&other), "{text}");
+    assert_eq!(foreign_name_in(&text), None, "{text}");
 }
 
 /// minisign's key id text (upper-case hexadecimal, no leading zeros).

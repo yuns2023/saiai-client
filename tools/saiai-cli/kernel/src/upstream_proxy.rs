@@ -1862,13 +1862,13 @@ mod tests {
 
     #[test]
     fn macos_scutil_output() {
-        let clash = "<dictionary> {\n  ExceptionsList : <array> {\n    0 : 192.168.0.0/16\n    1 : *.local\n    2 : 169.254/16\n    3 : example.com\n  }\n  ExcludeSimpleHostnames : 1\n  HTTPEnable : 1\n  HTTPPort : 7890\n  HTTPProxy : 127.0.0.1\n  HTTPSEnable : 1\n  HTTPSPort : 7890\n  HTTPSProxy : 127.0.0.1\n  SOCKSEnable : 1\n  SOCKSPort : 7891\n  SOCKSProxy : 127.0.0.1\n}\n";
+        let clash = "<dictionary> {\n  ExceptionsList : <array> {\n    0 : 172.16.0.0/12\n    1 : *.local\n    2 : 169.254/16\n    3 : example.com\n  }\n  ExcludeSimpleHostnames : 1\n  HTTPEnable : 1\n  HTTPPort : 7890\n  HTTPProxy : 127.0.0.1\n  HTTPSEnable : 1\n  HTTPSPort : 7890\n  HTTPSProxy : 127.0.0.1\n  SOCKSEnable : 1\n  SOCKSPort : 7891\n  SOCKSProxy : 127.0.0.1\n}\n";
         let (policy, _) = macos_policy(clash, listen());
         assert_eq!(
             route(&policy, true, "api.ktest.test"),
             proxy("127.0.0.1:7890")
         );
-        assert_eq!(route(&policy, true, "192.168.1.5"), Route::Direct);
+        assert_eq!(route(&policy, true, "172.20.1.5"), Route::Direct);
         assert_eq!(route(&policy, true, "169.254.1.1"), Route::Direct);
         assert_eq!(route(&policy, true, "printer.local"), Route::Direct);
         assert_eq!(route(&policy, true, "printer"), Route::Direct);

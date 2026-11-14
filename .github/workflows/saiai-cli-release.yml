@@ -41,6 +41,9 @@ jobs:
 
       - name: Test
         run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace
+        env:
+          # The kernel's tests also refuse this distribution's name (see ci.yml).
+          AITP_TEST_FOREIGN_NAMES: saiai
 
       - name: Test contract entries
         run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test contract_entry --test saiai_render_contract --test kernel_consumer
