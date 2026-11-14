@@ -917,6 +917,13 @@ PWSH_MASKS = re.compile(
 )
 
 
+def segment_heads(command: str) -> list[str]:
+    """The first word of every command in `command` (after ;, &&, ||, |, &,
+    parentheses, braces, then, do or else)."""
+    segments = re.split(r"\|\||&&|[|;&(){}]|\bthen\b|\bdo\b|\belse\b", command)
+    return [segment.split()[0] for segment in segments if segment.split()]
+
+
 def bash_masks(command: str) -> bool:
     if BASH_MASKS.search(command):
         return True
@@ -1119,7 +1126,7 @@ def check_workflow_basics(relative: str, workflow: dict) -> None:
                 # The one directory change: into the stand-alone kernel copy.
                 moves = [
                     command for command, _ in logical_commands(script, "bash")
-                    if re.search(r"(?:^|[;&|(]\s*)(?:cd|pushd|popd)\b", command)
+                    if any(word in ("cd", "pushd", "popd") for word in segment_heads(command))
                 ]
                 require(
                     not moves or (relative == CI_WORKFLOW and job_id == "client-linux" and moves == [STANDALONE_KERNEL_CD]),

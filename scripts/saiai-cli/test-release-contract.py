@@ -687,6 +687,11 @@ class WorkflowStructureTests(unittest.TestCase):
 
     def test_standalone_kernel_runs_in_its_copy(self) -> None:
         self.rejects(CI, '          cd "$standalone/kernel"\n', '          cd "$GITHUB_WORKSPACE/tools/saiai-cli/kernel"\n', "changes directory")
+        self.rejects(
+            CI, '          cd "$standalone/kernel"\n',
+            '          cd "$standalone/kernel"\n          if [ -d "$GITHUB_WORKSPACE/tools/saiai-cli/kernel" ]; then cd "$GITHUB_WORKSPACE/tools/saiai-cli/kernel"; fi\n',
+            "changes directory",
+        )
         self.rejects(CI, CARGO_TEST, "        run: |\n          cd tools && cd ..\n          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace\n", "changes directory")
 
     def test_expression_reader(self) -> None:
