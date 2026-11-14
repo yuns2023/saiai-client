@@ -722,6 +722,8 @@ fn update_and_uninstall_wait_for_a_held_installation() {
         .unwrap_or_default();
     assert!(left.is_empty(), "{left:?}\n{text}");
     assert!(!config.exists(), "{text}");
+    sandbox.assert_only_aitp_names();
+}
 
 // ------------------------------------------------- Full update, no GitHub
 
