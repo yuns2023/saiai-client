@@ -373,6 +373,8 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: release-assets
+          # The six programs only (not a bundle or digests of an earlier attempt).
+          pattern: saiai-[lmw]*
 
       - name: Install the workflow parser
         run: python3 -m pip install --disable-pip-version-check --no-deps --only-binary pyyaml --require-hashes -r scripts/saiai-cli/requirements-verify.txt
@@ -428,6 +430,8 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: release-assets
+          # The six programs only (not a bundle or digests of an earlier attempt).
+          pattern: saiai-[lmw]*
 
       - name: Verify tag and assemble release
         shell: bash
@@ -543,7 +547,7 @@ jobs:
           name: release-digests
           path: release-digests.sha256
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90
 
   publish:
     name: Publish the verified draft

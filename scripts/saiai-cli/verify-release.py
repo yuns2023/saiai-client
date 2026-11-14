@@ -929,15 +929,57 @@ def bash_masks(command: str) -> bool:
 NATIVE_FAILURES_STOP = "$PSNativeCommandUseErrorActionPreference = $true"
 
 
+def strip_comment(line: str, quotes: tuple[str, ...], shell: str) -> tuple[str, tuple[str, ...]]:
+    """`line` without its trailing comment, and the quoting still open at its
+    end (a string may span lines). `quotes` is a stack of open quotes and
+    command substitutions (`$(` inside a double-quoted string)."""
+    escape = "`" if shell == "pwsh" else "\\"
+    stack = list(quotes)
+    index = 0
+    while index < len(line):
+        char = line[index]
+        top = stack[-1] if stack else None
+        if top == "'":
+            if char == "'":
+                stack.pop()
+        elif char == escape:
+            index += 2
+            continue
+        elif top == '"':
+            if char == '"':
+                stack.pop()
+            elif line.startswith("$(", index):
+                stack.append("(")
+                index += 2
+                continue
+        else:
+            if char in "'\"":
+                stack.append(char)
+            elif line.startswith("$(", index):
+                stack.append("(")
+                index += 2
+                continue
+            elif char == "(" and top == "(":
+                stack.append("(")
+            elif char == ")" and top == "(":
+                stack.pop()
+            elif char == "#" and (index == 0 or line[index - 1].isspace()):
+                return line[:index], tuple(stack)
+        index += 1
+    return line, tuple(stack)
+
+
 def logical_commands(script: str, shell: str) -> list[tuple[str, int]]:
     """(command, nesting depth) of every logical line of a run script:
-    continuation lines joined, comments, blank lines and heredoc bodies
-    dropped, whitespace collapsed. Unbalanced nesting is refused."""
+    continuation lines and multi-line strings joined, comments, blank lines
+    and heredoc bodies dropped, whitespace collapsed. Unbalanced nesting is
+    refused."""
     continuation = "`" if shell == "pwsh" else "\\"
     lines = script.split("\n")
     commands = []
     depth = 0
     pending = ""
+    quote: tuple[str, ...] = ()
     heredoc = None
     for line in lines:
         if heredoc is not None:
@@ -945,13 +987,20 @@ def logical_commands(script: str, shell: str) -> list[tuple[str, int]]:
                 heredoc = None
             continue
         stripped = line.strip()
-        if not pending and (not stripped or stripped.startswith("#")):
+        if not quote and not pending and (not stripped or stripped.startswith("#")):
             continue
-        if stripped.endswith(continuation):
-            pending += stripped[:-1] + " "
+        code, quote = strip_comment(stripped, quote, shell)
+        code = code.rstrip()
+        if quote:
+            pending += code + " "
             continue
-        command = re.sub(r"\s+", " ", (pending + stripped).strip())
+        if code.endswith(continuation):
+            pending += code[:-1] + " "
+            continue
+        command = re.sub(r"\s+", " ", (pending + code).strip())
         pending = ""
+        if not command:
+            continue
         commands.append((command, depth))
         if shell != "pwsh":
             marker = re.search(r"<<-?\s*(['\"]?)([^\s'\"<>|;&]+)\1", command)
@@ -965,7 +1014,7 @@ def logical_commands(script: str, shell: str) -> list[tuple[str, int]]:
             plain = re.sub(r"'[^']*'|\"(?:[^\"`]|`.)*\"", "", command)
             depth += plain.count("{") - plain.count("}")
         require(depth >= 0, f"unbalanced run script near {command!r}")
-    require(not pending and heredoc is None and depth == 0, "unbalanced run script")
+    require(not pending and not quote and heredoc is None and depth == 0, "unbalanced run script")
     return commands
 
 
@@ -1192,6 +1241,69 @@ def verify_ci_workflow() -> None:
             check("static-linux", command, "the static Linux client checks")
 
 
+RELEASE_DIGESTS = "$RUNNER_TEMP/release-digests/release-digests.sha256"
+DIGEST_CHECKS = (
+    f'[ "$(wc -l <"{RELEASE_DIGESTS}")" -eq 10 ]',
+    f'sha256sum --check --strict "{RELEASE_DIGESTS}"',
+)
+
+
+def single_step(job: dict, predicate, what: str) -> int:
+    found = [index for index, step in enumerate(job["steps"]) if predicate(step)]
+    require(len(found) == 1, f"expected exactly one step that {what}, found {len(found)}")
+    return found[0]
+
+
+def verify_publication_order(relative: str, jobs: dict) -> None:
+    """The draft records its digests before keeping them; the publish run
+    fetches the tag run's release, downloads that run's digests, checks the
+    assets against them and only then publishes. Nothing else writes the
+    digests."""
+    draft = jobs["draft"]
+    record = single_step(draft, lambda step: "release-digests.sha256" in str(step.get("run", "")), "records the digests")
+    keep = single_step(draft, lambda step: step.get("with", {}).get("name") == "release-digests", "keeps the digests")
+    upload = single_step(draft, lambda step: str(step.get("uses", "")).startswith("softprops/action-gh-release@"), "uploads the draft")
+    require(upload < record < keep, f"{relative} draft job must upload, then record, then keep the digests")
+    commands = logical_commands(draft["steps"][record]["run"], "bash")
+    require(
+        [command for command, _ in commands if "release-digests" in command]
+        == ["sha256sum " + " ".join(f"dist/{name}" for name in sorted(ASSETS + WRAPPERS + ("manifest.json",))) + " > release-digests.sha256"],
+        f"{relative} draft job writes the digests some other way",
+    )
+
+    publish = jobs["publish"]
+    fetch = single_step(publish, lambda step: step.get("id") == "fetch" and "fetch-github-release.py" in str(step.get("run", "")), "fetches the release")
+    download = single_step(publish, lambda step: str(step.get("uses", "")).startswith("actions/download-artifact@"), "downloads the digests")
+    require(
+        "if" not in publish["steps"][download]
+        and publish["steps"][download].get("with") == {
+            "name": "release-digests",
+            "path": "${{ runner.temp }}/release-digests",
+            "run-id": "${{ steps.fetch.outputs.run_id }}",
+            "github-token": "${{ github.token }}",
+        },
+        f"{relative} publish job must download the digests of the tag run it fetched",
+    )
+    check = single_step(
+        publish,
+        lambda step: "if" not in step and DIGEST_CHECKS[1] in effective_commands(step, "Linux", {}),
+        "checks the digests",
+    )
+    patch = single_step(publish, lambda step: "--method PATCH" in str(step.get("run", "")), "publishes")
+    require(fetch < download < check < patch, f"{relative} publish job must fetch, download the digests and check before it publishes")
+    checked = effective_commands(publish["steps"][check], "Linux", {})
+    for required in DIGEST_CHECKS + ('cmp "$RUNNER_TEMP/manifest.json" dist/manifest.json',):
+        require(required in checked, f"{relative} publish job does not check {required!r} before publishing")
+    for step in publish["steps"]:
+        script = step.get("run")
+        if isinstance(script, str):
+            for command, _ in logical_commands(script, "bash"):
+                require(
+                    "release-digests" not in command or command in DIGEST_CHECKS,
+                    f"{relative} publish job touches the downloaded digests: {command!r}",
+                )
+
+
 def verify_release_workflow() -> None:
     relative = RELEASE_WORKFLOW
     workflow = load_workflow(relative)
@@ -1396,6 +1508,7 @@ def verify_release_workflow() -> None:
         "python3 scripts/saiai-cli/test-release-bundle.py --bundle dist --setup-sh dist/setup.sh",
     ):
         runs_command(relative, workflow, "package-preview", command, base=preview, purpose="the six-platform validation bundle")
+    verify_publication_order(relative, jobs)
     publish = {"needs.mode.outputs.mode": "publish", "steps.fetch.outputs.state": "draft"}
     for command in (
         'sha256sum --check --strict "$RUNNER_TEMP/release-digests/release-digests.sha256"',

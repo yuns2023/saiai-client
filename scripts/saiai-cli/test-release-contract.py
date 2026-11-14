@@ -602,7 +602,7 @@ class WorkflowStructureTests(unittest.TestCase):
         )
         self.rejects(
             RELEASE, '          sha256sum --check --strict "$RUNNER_TEMP/release-digests/release-digests.sha256"\n', "",
-            "published release check",
+            "checks the digests",
         )
         self.rejects(
             RELEASE, "          name: release-digests\n          path: release-digests.sha256\n",
@@ -617,6 +617,41 @@ class WorkflowStructureTests(unittest.TestCase):
             RELEASE, "  build:\n    needs: verify\n",
             "  build:\n    needs: mode\n    if: needs.mode.outputs.mode != 'publish'\n", "must need",
         )
+
+    def test_second_review_bypasses_are_refused(self) -> None:
+        c = "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace"
+        for script in (
+            f"true || # optional check\n          {c}",
+            f"printf '%s\\n' '\n          {c}\n          '",
+        ):
+            with self.subTest(script=script):
+                self.rejects(CI, CARGO_TEST, f"        run: |\n          {script}\n", "does not run|unbalanced")
+        release = ORIGINAL_TEXT(RELEASE)
+        start = release.index("      - name: Publish immutable release\n")
+        publish_step = release[start:].rstrip("\n") + "\n\n"
+        moved = release[:start].rstrip("\n") + "\n"
+        fetch_end = moved.index("      - name: Download the digests the tag run recorded\n")
+        moved = moved[:fetch_end] + publish_step + moved[fetch_end:]
+        self.rejects(RELEASE, release, moved, "before it publishes")
+        self.rejects(
+            RELEASE, "      - name: Download the digests the tag run recorded\n        uses:",
+            "      - name: Download the digests the tag run recorded\n        if: false\n        uses:",
+            "tag run it fetched",
+        )
+        self.rejects(RELEASE, "          run-id: ${{ steps.fetch.outputs.run_id }}\n", "          run-id: ${{ github.run_id }}\n", "tag run it fetched")
+        self.rejects(
+            RELEASE, '          sha256sum --check --strict "$RUNNER_TEMP/release-digests/release-digests.sha256"\n',
+            '          sha256sum dist/* > "$RUNNER_TEMP/release-digests/release-digests.sha256"\n          sha256sum --check --strict "$RUNNER_TEMP/release-digests/release-digests.sha256"\n',
+            "rewrites|touches the downloaded digests",
+        )
+        start = release.index("      - name: Download the digests the tag run recorded\n")
+        end = release.index("      # The downloaded draft is this tag's release")
+        self.rejects(RELEASE, release[start:end], "", "downloads the digests")
+        record = release.index("      # The publish run accepts only assets with exactly these digests.\n")
+        keep = release.index("      - name: Upload the release digests\n")
+        keep_end = release.index("  publish:\n")
+        swapped = release[:record] + release[keep:keep_end].rstrip("\n") + "\n\n" + release[record:keep] + release[keep_end:]
+        self.rejects(RELEASE, release, swapped.replace("\n\n\n", "\n\n"), "then keep the digests")
 
     def test_expression_reader(self) -> None:
         context = {"runner.os": "macOS", "matrix.target": "aarch64-apple-darwin"}
