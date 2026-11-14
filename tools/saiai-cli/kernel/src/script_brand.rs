@@ -136,14 +136,14 @@ mod tests {
         assert!(valid_env_prefix("KTEST_"));
         assert!(valid_identifier("Ktest"));
         assert!(valid_plain_name("KTEST"));
-        for value in ["", "KTEST", "ktest_", "SA$AI_", "SA'_", "SA`_", "SA I_"] {
+        for value in ["", "KTEST", "ktest_", "KT$ST_", "KT'_", "KT`_", "KT S_"] {
             assert!(!valid_env_prefix(value), "{value:?}");
         }
-        for value in ["", "ktest", "Sai-ai", "Sai.ai", "Sai'ai", "Sai$x"] {
+        for value in ["", "ktest", "Kt-est", "Kt.est", "Kt'est", "Kt$x"] {
             assert!(!valid_identifier(value), "{value:?}");
         }
         for value in [
-            "", " KTEST", "SA'AI", "SA$AI", "SA`AI", "SA\\AI", "SA.AI", "SA(AI)", "SA|AI", "SA;AI",
+            "", " KTEST", "KT'ST", "KT$ST", "KT`ST", "KT\\ST", "KT.ST", "KT(ST)", "KT|ST", "KT;ST",
         ] {
             assert!(!valid_plain_name(value), "{value:?}");
         }

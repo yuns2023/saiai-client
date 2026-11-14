@@ -588,7 +588,7 @@ mod tests {
         };
         static BAD_PREFIX: Brand = Brand {
             scripts: ScriptNames {
-                env_prefix: "SA$AI_",
+                env_prefix: "KT$ST_",
                 identifier_prefix: "Ktest",
             },
             ..KTEST_VALUES
