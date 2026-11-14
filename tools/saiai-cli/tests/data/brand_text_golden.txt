@@ -210,7 +210,6 @@
 ["lib.rs","\"saiai stop currently supports Linux, macOS, and Windows only\""]
 ["lib.rs","\"saiai update currently supports Linux, macOS, and Windows assets only\""]
 ["lib.rs","\"saiai updates from fixed URLs, not below a Gateway base URL\""]
-["lib.rs","\"saiai {version}\""]
 ["lib.rs","\"stale managed background state for pid {}; run `saiai start`\""]
 ["lib.rs","\"systemd and managed background instances are both active; run `saiai restart`\""]
 ["lib.rs","\"the ChatGPT access token in {} expired at {}; Codex shows its sign-in page if the login can no longer be refreshed. Quit Codex and run `saiai init-codex` to switch to the SAIAI local-proxy login.\""]

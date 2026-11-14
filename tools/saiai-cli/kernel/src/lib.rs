@@ -4280,8 +4280,11 @@ fn run_upstream_proxy_command(value: Option<String>) -> Result<()> {
 
 /// HTTP egress for one-shot CLI requests (health check, self-update), routed
 /// like the local proxy's own Gateway traffic.
+#[derive(Clone)]
 struct Egress {
-    installation_ca_pem: String,
+    /// `None`: not installed (no configuration), so no installation CA is
+    /// excluded from the system roots.
+    installation_ca_pem: Option<String>,
     upstream: Arc<upstream_proxy::Snapshot>,
 }
 
@@ -4293,7 +4296,7 @@ impl Egress {
         match cfg {
             Some(cfg) => Self::for_config(cfg),
             None => Self {
-                installation_ca_pem: String::new(),
+                installation_ca_pem: None,
                 upstream: upstream_proxy::UpstreamProxy::new(None, None, Vec::new()).snapshot(),
             },
         }
@@ -4306,7 +4309,7 @@ impl Egress {
             Vec::new(),
         );
         Self {
-            installation_ca_pem: installation_ca_pem(cfg),
+            installation_ca_pem: Some(installation_ca_pem(cfg)),
             upstream: upstream.snapshot(),
         }
     }
@@ -4316,10 +4319,11 @@ impl Egress {
     /// proxy cannot be used.
     fn client_builder(&self, url: &str) -> Result<reqwest::ClientBuilder> {
         let route = upstream_proxy::route_for_url_blocking(&self.upstream, url)?;
-        upstream_proxy::client_builder_for_route(
-            upstream_tls::upstream_http_client_builder(&self.installation_ca_pem),
-            &route,
-        )
+        let builder = match &self.installation_ca_pem {
+            Some(pem) => upstream_tls::upstream_http_client_builder(pem),
+            None => upstream_tls::uninstalled_http_client_builder(),
+        };
+        upstream_proxy::client_builder_for_route(builder, &route)
     }
 }
 
@@ -5125,15 +5129,15 @@ fn run_update() -> Result<()> {
     write_update_candidate(&candidate_path, &bytes)
         .with_context(|| format!("failed to write {}", candidate_path.display()))?;
 
-    let candidate_version = command_stdout(&candidate_path, &["--version"])
+    let candidate_raw = command_stdout_raw(&candidate_path, &["--version"])
         .with_context(|| format!("failed to run {}", candidate_path.display()))?;
-    let reported = candidate_version.trim_end_matches(['\r', '\n']);
+    let candidate_version = candidate_raw.trim().to_string();
     if !candidate_version
         .trim_start()
         .strip_prefix(BRAND.binary_name)
         .is_some_and(|rest| rest.starts_with(' '))
         || expected_version.as_ref().is_some_and(|version| {
-            reported != format!("{brand_binary} {version}", brand_binary = BRAND.binary_name)
+            !reports_exact_version(&candidate_raw, BRAND.binary_name, version)
         })
     {
         let _ = fs::remove_file(&candidate_path);
@@ -7214,20 +7218,31 @@ async fn fixed_get(
     let deadline = tokio::time::Instant::now() + total;
     let mut current = policy.check(url)?;
     let mut redirects = 0;
+    let expired = || anyhow::anyhow!("GET {url} did not complete within {}s", total.as_secs());
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            bail!("GET {url} did not complete within {}s", total.as_secs());
-        }
-        let response = egress
-            .client_builder(current.as_str())?
-            .timeout(remaining)
+        // Route selection (which may block on proxy auto-configuration) and
+        // the request both count against the chain's deadline.
+        let builder = {
+            let egress = egress.clone();
+            let target = current.to_string();
+            tokio::time::timeout_at(
+                deadline,
+                tokio::task::spawn_blocking(move || egress.client_builder(&target)),
+            )
+            .await
+            .map_err(|_| expired())?
+            .context("update route selection failed")??
+        };
+        // The deadline below bounds connect, response head and body alike.
+        let request = builder
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("failed to build update HTTP client")?
             .get(current.as_str())
-            .send()
+            .send();
+        let response = tokio::time::timeout_at(deadline, request)
             .await
+            .map_err(|_| expired())?
             .with_context(|| format!("failed to GET {current}"))?;
         let status = response.status();
         if matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308) {
@@ -7238,8 +7253,13 @@ async fn fixed_get(
             let location = response
                 .headers()
                 .get(reqwest::header::LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .with_context(|| format!("GET {current} returned {status} without a Location"))?;
+                .with_context(|| format!("GET {current} returned {status} without a Location"))?
+                .to_str()
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "GET {current} returned {status} with a Location that is not plain ASCII"
+                    )
+                })?;
             let next = current
                 .join(location)
                 .with_context(|| format!("GET {current} redirected to an invalid Location"))?;
@@ -7264,7 +7284,7 @@ async fn fixed_get(
         let mut body = Vec::new();
         while let Some(chunk) = tokio::time::timeout_at(deadline, response.chunk())
             .await
-            .map_err(|_| anyhow::anyhow!("GET {url} did not complete within {}s", total.as_secs()))?
+            .map_err(|_| expired())?
             .with_context(|| format!("failed to read {current}"))?
         {
             if body.len() as u64 + chunk.len() as u64 > limit {
@@ -7525,7 +7545,8 @@ fn write_update_candidate(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn command_stdout(path: &Path, args: &[&str]) -> Result<String> {
+/// Standard output of a successful run, as printed (lossy UTF-8).
+fn command_stdout_raw(path: &Path, args: &[&str]) -> Result<String> {
     let output = ProcessCommand::new(path)
         .args(args)
         .stdin(Stdio::null())
@@ -7539,7 +7560,18 @@ fn command_stdout(path: &Path, args: &[&str]) -> Result<String> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Whether `--version` output is exactly `<binary> <version>` and one line
+/// ending (`\n` or `\r\n`), nothing else.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn reports_exact_version(output: &str, binary: &str, version: &str) -> bool {
+    let line = output
+        .strip_suffix("\r\n")
+        .or_else(|| output.strip_suffix('\n'))
+        .unwrap_or(output);
+    line == format!("{binary} {version}")
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -11162,7 +11194,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             .block_on(check_gateway_health(
                 &format!("http://127.0.0.1:{port}"),
                 &Egress {
-                    installation_ca_pem: String::new(),
+                    installation_ca_pem: Some(String::new()),
                     upstream: upstream_proxy::Snapshot::direct_for_tests(),
                 },
             ))

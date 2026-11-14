@@ -8,26 +8,54 @@ use std::collections::HashMap;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 
-/// One canned response per path: status line, extra headers, body.
-type Routes = HashMap<String, (u16, Vec<(String, String)>, Vec<u8>)>;
+/// A canned response.
+#[derive(Clone, Default)]
+struct Reply {
+    status: u16,
+    headers: Vec<(String, Vec<u8>)>,
+    body: Vec<u8>,
+    /// Send no Content-Length (the body ends when the connection closes).
+    no_length: bool,
+    /// Pause after the head, before the body.
+    delay: Duration,
+}
 
-/// Serves `routes` on a loopback port until the test ends; returns the
-/// port. Unknown paths answer 404.
+/// One canned response per path (query included).
+type Routes = HashMap<String, Reply>;
+
+/// A loopback server: its port and every request target it received (an
+/// absolute-form target means the request came through it as a proxy).
+struct Server {
+    port: u16,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Server {
+    fn requested(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+/// Serves `routes` on a loopback port until the test ends; unknown paths
+/// answer 404. Absolute-form targets (proxy requests) are answered by path.
 async fn serve(routes: Routes) -> u16 {
-    serve_with(move |_| routes).await
+    serve_with(move |_| routes).await.port
 }
 
 /// Like `serve`, with routes that may name the server's own port.
-async fn serve_with(routes: impl FnOnce(u16) -> Routes) -> u16 {
+async fn serve_with(routes: impl FnOnce(u16) -> Routes) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let routes = Arc::new(routes(port));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = Arc::clone(&requests);
     tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
                 return;
             };
             let routes = Arc::clone(&routes);
+            let log = Arc::clone(&log);
             tokio::spawn(async move {
                 let mut head = Vec::new();
                 let mut byte = [0_u8; 1];
@@ -38,38 +66,57 @@ async fn serve_with(routes: impl FnOnce(u16) -> Routes) -> u16 {
                     head.push(byte[0]);
                 }
                 let head = String::from_utf8_lossy(&head);
-                let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
-                let (status, headers, body) =
-                    routes
-                        .get(&path)
-                        .cloned()
-                        .unwrap_or((404, Vec::new(), b"missing".to_vec()));
-                let mut response = format!(
-                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n",
-                    body.len()
-                );
-                for (name, value) in headers {
-                    response.push_str(&format!("{name}: {value}\r\n"));
+                let target = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+                log.lock().unwrap().push(target.clone());
+                let path = match target.strip_prefix("http://") {
+                    Some(rest) => rest
+                        .find('/')
+                        .map_or("/".to_string(), |at| rest[at..].to_string()),
+                    None => target,
+                };
+                let reply = routes.get(&path).cloned().unwrap_or(Reply {
+                    status: 404,
+                    body: b"missing".to_vec(),
+                    ..Reply::default()
+                });
+                let mut response =
+                    format!("HTTP/1.1 {} X\r\nConnection: close\r\n", reply.status).into_bytes();
+                if !reply.no_length {
+                    response.extend(format!("Content-Length: {}\r\n", reply.body.len()).bytes());
                 }
-                response.push_str("\r\n");
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.write_all(&body).await;
+                for (name, value) in reply.headers {
+                    response.extend(name.bytes());
+                    response.extend(b": ");
+                    response.extend(value);
+                    response.extend(b"\r\n");
+                }
+                response.extend(b"\r\n");
+                if stream.write_all(&response).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(reply.delay).await;
+                let _ = stream.write_all(&reply.body).await;
+                let _ = stream.shutdown().await;
             });
         }
     });
-    port
+    Server { port, requests }
 }
 
-fn ok(body: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
-    (200, Vec::new(), body.to_vec())
+fn ok(body: &[u8]) -> Reply {
+    Reply {
+        status: 200,
+        body: body.to_vec(),
+        ..Reply::default()
+    }
 }
 
-fn redirect(status: u16, location: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
-    (
+fn redirect(status: u16, location: &str) -> Reply {
+    Reply {
         status,
-        vec![("Location".to_string(), location.to_string())],
-        Vec::new(),
-    )
+        headers: vec![("Location".to_string(), location.as_bytes().to_vec())],
+        ..Reply::default()
+    }
 }
 
 /// The loopback server's policy: plain HTTP, `127.0.0.1` only, its port.
@@ -83,7 +130,7 @@ fn loopback(port: u16) -> FixedUrlPolicy<'static> {
 
 fn direct() -> Egress {
     Egress {
-        installation_ca_pem: String::new(),
+        installation_ca_pem: None,
         upstream: upstream_proxy::UpstreamProxy::new(Some("direct"), None, Vec::new()).snapshot(),
     }
 }
@@ -248,7 +295,8 @@ async fn redirects_are_followed_within_the_policy() {
             ("/final".to_string(), ok(b"body")),
         ])
     })
-    .await;
+    .await
+    .port;
     assert_eq!(get(port, "/latest", 1024).await.unwrap().unwrap(), b"body");
 }
 
@@ -265,46 +313,254 @@ async fn a_relative_redirect_chain_reaches_the_body() {
     assert_eq!(get(port, "/a", 1024).await.unwrap().unwrap(), b"done");
 }
 
+/// Each redirect changes one thing the policy forbids; the request fails
+/// for that reason and the forbidden target is never requested.
 #[tokio::test]
-async fn redirects_leaving_the_policy_or_looping_are_refused() {
+async fn redirects_leaving_the_policy_are_refused_before_they_are_followed() {
+    let server = serve_with(|port| {
+        Routes::from([
+            (
+                "/host".to_string(),
+                redirect(302, &format!("http://localhost:{port}/forbidden")),
+            ),
+            (
+                "/scheme".to_string(),
+                redirect(302, &format!("https://127.0.0.1:{port}/forbidden")),
+            ),
+            (
+                "/userinfo".to_string(),
+                redirect(302, &format!("http://user@127.0.0.1:{port}/forbidden")),
+            ),
+            (
+                "/port".to_string(),
+                redirect(302, &format!("http://127.0.0.1:{}/forbidden", port + 1)),
+            ),
+            ("/fragment".to_string(), redirect(302, "/forbidden#part")),
+            (
+                "/no-location".to_string(),
+                Reply {
+                    status: 302,
+                    ..Reply::default()
+                },
+            ),
+            (
+                "/binary-location".to_string(),
+                Reply {
+                    status: 302,
+                    headers: vec![("Location".to_string(), b"/forbidden\xff".to_vec())],
+                    ..Reply::default()
+                },
+            ),
+            ("/forbidden".to_string(), ok(b"must not be reached")),
+        ])
+    })
+    .await;
+    let port = server.port;
+    for (path, reason) in [
+        ("/host", "is not on an allowed update host"),
+        ("/scheme", "does not use http"),
+        ("/userinfo", "carries user information"),
+        ("/port", "names a port that is not allowed"),
+        ("/fragment", "carries a fragment"),
+        ("/no-location", "without a Location"),
+        ("/binary-location", "Location that is not plain ASCII"),
+    ] {
+        let error = format!("{:#}", get(port, path, 1024).await.unwrap_err());
+        assert!(error.contains(reason), "{path}: {error}");
+    }
+    assert!(
+        !server
+            .requested()
+            .iter()
+            .any(|target| target.contains("forbidden")),
+        "{:?}",
+        server.requested()
+    );
+}
+
+#[tokio::test]
+async fn five_redirects_are_followed_and_a_sixth_is_refused() {
+    let mut routes = Routes::new();
+    for hop in 0..6 {
+        routes.insert(format!("/r{hop}"), redirect(302, &format!("/r{}", hop + 1)));
+    }
+    routes.insert("/r6".to_string(), ok(b"six"));
+    routes.insert("/s5".to_string(), redirect(302, "/r6"));
+    for hop in 0..5 {
+        routes.insert(format!("/s{hop}"), redirect(302, &format!("/s{}", hop + 1)));
+    }
+    let port = serve(routes).await;
+    // /s0 -> s1 -> s2 -> s3 -> s4 -> s5 -> r6: six redirects.
+    let error = format!("{:#}", get(port, "/s0", 1024).await.unwrap_err());
+    assert!(error.contains("redirected more than 5 times"), "{error}");
+    // /r1 -> r2 -> r3 -> r4 -> r5 -> r6: five redirects.
+    assert_eq!(get(port, "/r1", 1024).await.unwrap().unwrap(), b"six");
+}
+
+#[tokio::test]
+async fn bodies_without_a_length_are_limited_while_streaming() {
     let port = serve(Routes::from([
         (
-            "/other-host".to_string(),
-            redirect(302, "http://localhost/x"),
+            "/unbounded".to_string(),
+            Reply {
+                no_length: true,
+                ..ok(&[b'x'; 4096])
+            },
         ),
-        ("/https".to_string(), redirect(302, "https://127.0.0.1/x")),
         (
-            "/userinfo".to_string(),
-            redirect(302, "http://user@127.0.0.1/x"),
+            "/fits".to_string(),
+            Reply {
+                no_length: true,
+                ..ok(&[b'x'; 1024])
+            },
         ),
-        ("/no-location".to_string(), (302, Vec::new(), Vec::new())),
-        ("/loop".to_string(), redirect(302, "/loop")),
     ]))
     .await;
-    for path in [
-        "/other-host",
-        "/https",
-        "/userinfo",
-        "/no-location",
-        "/loop",
-    ] {
-        let error = get(port, path, 1024).await.unwrap_err();
+    let error = format!("{:#}", get(port, "/unbounded", 1024).await.unwrap_err());
+    assert!(error.contains("larger than 1024"), "{error}");
+    assert_eq!(get(port, "/fits", 1024).await.unwrap().unwrap().len(), 1024);
+}
+
+#[tokio::test]
+async fn the_whole_chain_shares_one_deadline() {
+    let port = serve(Routes::from([
+        ("/start".to_string(), redirect(302, "/slow")),
+        (
+            "/slow".to_string(),
+            Reply {
+                delay: Duration::from_secs(5),
+                ..ok(b"late")
+            },
+        ),
+    ]))
+    .await;
+    let started = std::time::Instant::now();
+    let error = fixed_get(
+        &loopback(port),
+        &format!("http://127.0.0.1:{port}/start"),
+        1024,
+        Duration::from_secs(1),
+        &direct(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("did not complete within 1s"),
+        "{error:#}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(4));
+}
+
+/// Loopback targets always go direct, so the origin here is a name that only
+/// the proxy knows: every hop reaches it through the proxy.
+#[tokio::test]
+async fn every_hop_goes_through_the_configured_proxy() {
+    // The proxy itself answers the absolute-form requests it receives.
+    let proxy = serve_with(|_| {
+        Routes::from([
+            ("/a".to_string(), redirect(302, "/b")),
+            ("/b".to_string(), ok(b"via proxy")),
+        ])
+    })
+    .await;
+    let via = |port: u16| Egress {
+        installation_ca_pem: None,
+        upstream: upstream_proxy::UpstreamProxy::new(
+            Some(&format!("http://127.0.0.1:{port}")),
+            None,
+            Vec::new(),
+        )
+        .snapshot(),
+    };
+    let policy = FixedUrlPolicy {
+        hosts: &["updates.invalid"],
+        scheme: "http",
+        port: Some(8080),
+    };
+    let body = fixed_get(
+        &policy,
+        "http://updates.invalid:8080/a",
+        1024,
+        Duration::from_secs(10),
+        &via(proxy.port),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(body, b"via proxy");
+    assert_eq!(
+        proxy.requested(),
+        vec![
+            "http://updates.invalid:8080/a".to_string(),
+            "http://updates.invalid:8080/b".to_string(),
+        ]
+    );
+    // A proxy that cannot be reached fails the request.
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let error = fixed_get(
+        &policy,
+        "http://updates.invalid:8080/a",
+        1024,
+        Duration::from_secs(10),
+        &via(closed_port),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("failed to GET"), "{error:#}");
+}
+
+#[tokio::test]
+async fn a_redirect_loop_stops_at_the_limit() {
+    let port = serve(Routes::from([(
+        "/loop".to_string(),
+        redirect(302, "/loop"),
+    )]))
+    .await;
+    let error = format!("{:#}", get(port, "/loop", 1024).await.unwrap_err());
+    assert!(error.contains("redirected more than 5 times"), "{error}");
+}
+
+#[test]
+fn candidates_must_report_exactly_the_release_version() {
+    for output in ["ktest 1.2.3", "ktest 1.2.3\n", "ktest 1.2.3\r\n"] {
         assert!(
-            format!("{error:#}").contains("not allowed")
-                || format!("{error:#}").contains("Location")
-                || format!("{error:#}").contains("redirected more than"),
-            "{path}: {error:#}"
+            reports_exact_version(output, "ktest", "1.2.3"),
+            "{output:?}"
         );
     }
-    let error = get(port, "/loop", 1024).await.unwrap_err();
-    assert!(format!("{error:#}").contains("more than 5"), "{error:#}");
+    for output in [
+        "ktest 1.2.4\n",
+        " ktest 1.2.3\n",
+        "ktest 1.2.3 \n",
+        "ktest  1.2.3\n",
+        "ktest 1.2.3\t\n",
+        "ktest 1.2.3\n\n",
+        "ktest 1.2.3\nextra\n",
+        "other 1.2.3\n",
+        "ktest v1.2.3\n",
+        "",
+    ] {
+        assert!(
+            !reports_exact_version(output, "ktest", "1.2.3"),
+            "{output:?}"
+        );
+    }
 }
 
 #[tokio::test]
 async fn missing_large_and_failed_responses_are_distinguished() {
     let port = serve(Routes::from([
         ("/large".to_string(), ok(&[b'x'; 2048])),
-        ("/error".to_string(), (500, Vec::new(), b"no".to_vec())),
+        (
+            "/error".to_string(),
+            Reply {
+                status: 500,
+                body: b"no".to_vec(),
+                ..Reply::default()
+            },
+        ),
         ("/exact".to_string(), ok(&[b'x'; 1024])),
     ]))
     .await;

@@ -165,19 +165,27 @@ fn installation_ca_ders(installation_ca_pem: &str) -> Option<Vec<CertificateDer<
     (!ders.is_empty()).then_some(ders)
 }
 
+/// `installation_ca_pem`: the installation CA to exclude, or `None` when
+/// there is no installation (nothing to exclude, so system roots are kept).
 fn build_root_store(
     native: &[CertificateDer<'static>],
-    installation_ca_pem: &str,
+    installation_ca_pem: Option<&str>,
 ) -> RootCertStore {
     let mut roots = RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
-    let Some(excluded) = installation_ca_ders(installation_ca_pem) else {
-        eprintln!(
-            "warning: {brand_product} installation CA is unreadable; trusting only bundled root certificates",
-            brand_product = BRAND.product_name
-        );
-        return roots;
+    let excluded = match installation_ca_pem {
+        None => Vec::new(),
+        Some(pem) => match installation_ca_ders(pem) {
+            Some(ders) => ders,
+            None => {
+                eprintln!(
+                    "warning: {brand_product} installation CA is unreadable; trusting only bundled root certificates",
+                    brand_product = BRAND.product_name
+                );
+                return roots;
+            }
+        },
     };
     roots.add_parsable_certificates(
         native
@@ -191,7 +199,7 @@ fn build_root_store(
 /// `installation_ca_pem` is the installation CA certificate PEM. If it holds no
 /// certificate, system roots are skipped rather than risk trusting that CA.
 pub(crate) fn upstream_root_store(installation_ca_pem: &str) -> RootCertStore {
-    build_root_store(native_roots(), installation_ca_pem)
+    build_root_store(native_roots(), Some(installation_ca_pem))
 }
 
 fn provider() -> Arc<CryptoProvider> {
@@ -226,6 +234,19 @@ pub(crate) fn upstream_http_client_builder(installation_ca_pem: &str) -> reqwest
     reqwest::Client::builder().use_preconfigured_tls(upstream_http_tls_config(installation_ca_pem))
 }
 
+/// Like [`upstream_http_client_builder`] for a program that is not installed
+/// yet (no configuration): there is no installation CA to exclude, so the
+/// system roots (including enterprise CAs) are trusted as for the Gateway.
+pub(crate) fn uninstalled_http_client_builder() -> reqwest::ClientBuilder {
+    let mut config = ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(rustls::ALL_VERSIONS)
+        .expect("default TLS versions are supported by every rustls provider")
+        .with_root_certificates(build_root_store(native_roots(), None))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    reqwest::Client::builder().use_preconfigured_tls(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,7 +277,7 @@ mod tests {
         let (_, corporate) = self_signed_ca("Corporate Inspection CA");
         let (ktest_pem, ktest) = self_signed_ca("KTEST Local CA");
 
-        let roots = build_root_store(&[corporate.clone(), ktest.clone()], &ktest_pem);
+        let roots = build_root_store(&[corporate.clone(), ktest.clone()], Some(&ktest_pem));
 
         let mut expected = bundled_roots();
         expected.push(anchor(&corporate));
@@ -270,9 +291,20 @@ mod tests {
 
         let invalid_der = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
         for unreadable in ["", "not a certificate", invalid_der] {
-            let roots = build_root_store(std::slice::from_ref(&corporate), unreadable);
+            let roots = build_root_store(std::slice::from_ref(&corporate), Some(unreadable));
             assert_eq!(roots.roots, bundled_roots());
         }
+    }
+
+    #[test]
+    fn root_store_without_an_installation_trusts_every_system_root() {
+        let (_, corporate) = self_signed_ca("Corporate Inspection CA");
+
+        let roots = build_root_store(std::slice::from_ref(&corporate), None);
+
+        let mut expected = bundled_roots();
+        expected.push(anchor(&corporate));
+        assert_eq!(roots.roots, expected);
     }
 
     #[test]
@@ -280,7 +312,7 @@ mod tests {
         let (ktest_pem, _) = self_signed_ca("KTEST Local CA");
         let garbage = CertificateDer::from(vec![0x30, 0x03, 0x01, 0x02, 0x03]);
 
-        let roots = build_root_store(&[garbage], &ktest_pem);
+        let roots = build_root_store(&[garbage], Some(&ktest_pem));
 
         assert_eq!(roots.roots, bundled_roots());
     }

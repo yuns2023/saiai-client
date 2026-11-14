@@ -973,7 +973,7 @@ wrapper、manifest 和六个平台二进制构成不可变 release bundle。Linu
   - **manifest 必须存在**：大小上限 1 MiB；版本必须是严格的 `X.Y.Z`；资产必须带 sha256 和 size（1–64 MiB）。
   - **资产 URL**：用 manifest 中的版本填入模板，避免 latest 在两次请求之间切换。按 size 流式读取，长度和 sha256 必须一致。
   - **候选二进制**：`--version` 的输出必须恰好是 `<binary> X.Y.Z`。
-  - **不依赖 init**：没有配置时走默认 system 路由；配置存在但读不出来时报错，不静默回退。
+  - **不依赖 init**：没有配置时走默认 system 路由，信任系统证书库，此时没有安装 CA 需要排除；配置存在但读不出来时报错，不静默回退。仍受环境选择器约束：同时继承非默认的 `CLAUDE_CONFIG_DIR` 和 `CODEX_HOME` 时，须显式选择环境。
   - **manifest 404**：明确报错"manifest 不可用，可能尚未发布"，不做无校验下载。
 
 ### 第二发行版 AITP（计划）
