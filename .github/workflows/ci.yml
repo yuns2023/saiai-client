@@ -248,9 +248,11 @@ jobs:
         run: |
           & "$env:WINDIR/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -File scripts/saiai-cli/test-setup-environments.ps1 -WrapperPath "$PWD/scripts/saiai-cli/setup.ps1"
 
+      # The manifest generator's exit status counts, not only the smoke's.
       - name: Smoke-test Windows PowerShell 5.1 setup wrapper
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           New-Item -ItemType Directory -Path dist -Force | Out-Null
           Copy-Item "$PWD/tools/saiai-cli/target/debug/saiai.exe" "$PWD/dist/saiai-windows-x86_64.exe"
           Copy-Item "$PWD/scripts/saiai-cli/setup.sh", "$PWD/scripts/saiai-cli/setup.ps1", "$PWD/scripts/saiai-cli/setup.cmd" "$PWD/dist/"

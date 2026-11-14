@@ -535,19 +535,42 @@ class WorkflowStructureTests(unittest.TestCase):
         start, end = ci.index("  client-windows:\n"), ci.index("  client-macos:\n")
         self.rejects(CI, ci[start:end], "", "jobs differ")
 
+    def rejects_in_job(self, job: str, old: str, new: str, message: str) -> None:
+        """Changes `old` to `new` inside one CI job only."""
+        ci = ORIGINAL_TEXT(CI)
+        start = ci.index(f"  {job}:\n")
+        following = [ci.index(f"  {other}:\n") for other in VERIFIER.CI_JOBS if ci.index(f"  {other}:\n") > start]
+        section = ci[start:min(following, default=len(ci))]
+        self.assertEqual(section.count(old), 1, old)
+        self.rejects(CI, section, section.replace(old, new), f"job {job} does not run {message}")
+
     def test_everyday_ci_keeps_the_native_checks(self) -> None:
-        for old, new, message in (
-            ("          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai\n", "", "native (Windows|macOS) SAIAI tests"),
-            ("          python3 scripts/saiai-cli/test-macos-environments.py\n", "          echo\n", "macOS environment isolation"),
-            ("          python3 scripts/saiai-cli/test-macos-service.py\n", "          echo\n", "macOS LaunchAgent"),
-            ("        if: matrix.arch == 'arm64'\n", "        if: matrix.arch == 'x86_64'\n", "official macOS Codex capture"),
-            ("        run: python scripts/saiai-cli/test-windows-environments.py", "        run: echo skipped #", "Windows environment isolation"),
-            ("        run: python scripts/saiai-cli/test-windows-self-update.py", "        run: echo skipped #", "Windows self-update"),
-            ("          $PSNativeCommandUseErrorActionPreference = $true\n", "", "official Windows Codex 0.146.0 capture"),
-            ("        run: python scripts/saiai-cli/verify-windows-reproducibility.py", "        run: echo skipped #", "reproducible Windows image"),
+        shell_test = "          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai\n"
+        contract = "          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test contract_entry --test saiai_render_contract --test kernel_consumer\n"
+        for job, system in (("client-windows", "Windows"), ("client-macos", "macOS")):
+            for old in (shell_test, contract):
+                with self.subTest(job=job, old=old):
+                    self.rejects_in_job(job, old, "", f"the native {system} SAIAI tests")
+        for job, old, new, message in (
+            ("client-macos", "          python3 scripts/saiai-cli/test-macos-environments.py\n", "          echo\n", "the macOS environment isolation"),
+            ("client-macos", "          python3 scripts/saiai-cli/test-macos-service.py\n", "          echo\n", "the macOS LaunchAgent"),
+            ("client-macos", "        if: matrix.arch == 'arm64'\n", "        if: matrix.arch == 'x86_64'\n", "the official macOS Codex capture"),
+            ("client-windows", "        run: python scripts/saiai-cli/test-windows-environments.py", "        run: echo skipped #", "the Windows environment isolation"),
+            ("client-windows", "        run: python scripts/saiai-cli/test-windows-self-update.py", "        run: echo skipped #", "the Windows self-update"),
+            ("client-windows", "        run: python scripts/saiai-cli/verify-windows-reproducibility.py", "        run: echo skipped #", "the reproducible Windows image"),
+            (
+                "client-windows",
+                "          $PSNativeCommandUseErrorActionPreference = $true\n          npm install",
+                "          npm install", "the official Windows Codex 0.146.0 capture",
+            ),
+            (
+                "client-windows",
+                "          $PSNativeCommandUseErrorActionPreference = $true\n          New-Item",
+                "          New-Item", "the Windows wrapper smoke's manifest",
+            ),
         ):
-            with self.subTest(old=old):
-                self.rejects(CI, old, new, message, count=ORIGINAL_TEXT(CI).count(old) or 1)
+            with self.subTest(job=job, old=old):
+                self.rejects_in_job(job, old, new, message)
         self.rejects(CI, "  pull_request:\n    branches: [main]\n", "  pull_request:\n    branches: [main]\n    paths: [tools/**]\n", "every pull request")
         self.rejects(CI, "name: Client CI\n", "name: Client checks\n", "named 'Client CI'")
 

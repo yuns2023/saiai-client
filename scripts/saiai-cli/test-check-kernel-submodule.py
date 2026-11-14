@@ -160,14 +160,68 @@ class KernelSubmoduleTests(unittest.TestCase):
         git(self.root, "commit", "--quiet", "-m", "plain directory")
         self.assertFinds("is not a submodule in the commit", offline=True)
 
+    def write_workspace_lock(self, text: str) -> None:
+        (self.root / "tools/saiai-cli/Cargo.lock").write_text(text, encoding="utf-8")
+
     def test_rejects_other_kernel_package_versions(self) -> None:
-        (self.root / "tools/saiai-cli/Cargo.lock").write_text(WORKSPACE_LOCK.format(checksum="bb"), encoding="utf-8")
-        self.assertFinds("does not lock these kernel packages as AITP does", offline=True)
-        (self.root / "tools/saiai-cli/Cargo.lock").write_text(
+        self.write_workspace_lock(WORKSPACE_LOCK.format(checksum="bb"))
+        self.assertFinds("does not resolve the kernel's dependencies as AITP's lock does", offline=True)
+        self.write_workspace_lock(
             WORKSPACE_LOCK.format(checksum="aa").replace('version = "1.0.0"\nsource', 'version = "1.0.1"\nsource'),
-            encoding="utf-8",
         )
         self.assertFinds("tokio 1.0.0", offline=True)
+
+    def test_rejects_the_kernel_moved_to_another_version_kept_for_others(self) -> None:
+        # tokio 1.0.0 stays locked (for another package), but the kernel
+        # itself resolves to 1.0.1.
+        moved = WORKSPACE_LOCK.format(checksum="aa").replace(' "tokio",\n', ' "tokio 1.0.1",\n') + (
+            '\n[[package]]\nname = "tokio"\nversion = "1.0.1"\n'
+            'source = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "cc"\n'
+            '\n[[package]]\nname = "other"\nversion = "1.0.0"\ndependencies = [\n "tokio 1.0.0",\n]\n'
+        )
+        self.write_workspace_lock(moved)
+        self.assertFinds("does not resolve the kernel's dependencies", offline=True)
+
+    def test_accepts_packages_only_the_program_uses(self) -> None:
+        self.write_workspace_lock(
+            WORKSPACE_LOCK.format(checksum="aa")
+            + '\n[[package]]\nname = "serde"\nversion = "1.0.0"\n'
+            'source = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "dd"\n'
+        )
+        self.assertEqual(self.findings(offline=True), [])
+
+    def test_rejects_an_unresolvable_or_missing_kernel_package(self) -> None:
+        self.write_workspace_lock(WORKSPACE_LOCK.format(checksum="aa").replace('name = "proxy-cli"', 'name = "renamed"'))
+        self.assertFinds("does not lock the kernel package proxy-cli", offline=True)
+        self.write_workspace_lock(WORKSPACE_LOCK.format(checksum="aa").replace(' "tokio",\n', ' "tokio 9.9.9",\n'))
+        self.assertFinds("which names 0 packages", offline=True)
+
+    def test_rejects_repeated_gitmodules_keys(self) -> None:
+        for gitmodules in (
+            f'[submodule "{KERNEL}"]\n\tpath = {KERNEL}\n\turl = https://example.invalid/x\n\turl = {CHECK.AITP_URL}\n',
+            GITMODULES + GITMODULES,
+        ):
+            with self.subTest(gitmodules=gitmodules):
+                self.pin(self.on_main, gitmodules)
+                self.assertFinds(".gitmodules repeats", offline=True)
+
+    def test_rejects_a_staged_gitmodules_change(self) -> None:
+        (self.root / ".gitmodules").write_text(GITMODULES.replace("AITP", "Other"), encoding="utf-8")
+        git(self.root, "add", ".gitmodules")
+        (self.root / ".gitmodules").write_text(GITMODULES, encoding="utf-8")
+        self.assertFinds(".gitmodules in the index differs from the commit", offline=True)
+
+    def test_accepts_ignored_build_output_in_the_kernel(self) -> None:
+        info = self.root / KERNEL / ".git" / "info"
+        info.mkdir(exist_ok=True)
+        (info / "exclude").write_text("target/\n", encoding="utf-8")
+        (self.root / KERNEL / "target").mkdir()
+        (self.root / KERNEL / "target" / "out").write_text("x\n", encoding="utf-8")
+        self.assertEqual(self.findings(offline=True), [])
+        # A file that is not ignored, even in a new directory, is a change.
+        (self.root / KERNEL / "new").mkdir()
+        (self.root / KERNEL / "new" / "src.rs").write_text("\n", encoding="utf-8")
+        self.assertFinds("has local changes", offline=True)
 
     def test_the_real_constants(self) -> None:
         self.assertEqual(CHECK.KERNEL_PATH, "tools/saiai-cli/kernel")

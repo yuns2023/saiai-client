@@ -10,9 +10,10 @@ This fails unless
   public URL, with no other settings;
 * the commit being checked pins the kernel (a gitlink), and the checked-out
   kernel is that commit, with no local change;
-* AITP's lock file pins every third-party package exactly as this
-  workspace's lock file does (a kernel dependency is updated in AITP first,
-  then the submodule moves);
+* the kernel package resolves to the same packages (name, version, source,
+  checksum), with the same dependency edges, in AITP's lock file and in
+  this workspace's (a kernel dependency is updated in AITP first, then the
+  submodule moves);
 * unless --offline: the pinned commit is on AITP's main branch, fetched
   afresh (a commit never pushed there, or force-pushed away, could not be
   rebuilt). Only commits are fetched, into a temporary repository.
@@ -35,30 +36,38 @@ AITP_URL = "https://github.com/2742zdz/AITP"
 AITP_BRANCH = "main"
 WORKSPACE_LOCK = "tools/saiai-cli/Cargo.lock"
 COMMIT = re.compile(r"[0-9a-f]{40}")
+FETCH_TIMEOUT = 180
 
 
-def git(*arguments: str, cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
+def git(*arguments: str, cwd: Path, check: bool = True, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *arguments],
         cwd=cwd,
         check=check,
         text=True,
         capture_output=True,
+        timeout=timeout,
     )
 
 
 def submodule_settings(root: Path) -> tuple[dict[str, dict[str, str]], list[str]]:
     """Each submodule's settings as .gitmodules (in the commit) lists them."""
     found: dict[str, dict[str, str]] = {}
-    listed = git("config", "--blob", "HEAD:.gitmodules", "--list", cwd=root, check=False)
+    listed = git("config", "-z", "--blob", "HEAD:.gitmodules", "--list", cwd=root, check=False)
     if listed.returncode != 0:
         return found, [".gitmodules is missing from the commit or unreadable"]
-    for line in listed.stdout.splitlines():
-        key, _, value = line.partition("=")
+    for record in listed.stdout.split("\0"):
+        if not record:
+            continue
+        key, _, value = record.partition("\n")
         match = re.fullmatch(r"submodule\.(.+)\.([^.]+)", key)
         if match is None:
-            return found, [f".gitmodules has an unexpected entry: {key}"]
-        found.setdefault(match.group(1), {})[match.group(2)] = value
+            return found, [f".gitmodules has an unexpected entry: {key!r}"]
+        section = found.setdefault(match.group(1), {})
+        # A repeated key is refused, not resolved (git readers differ).
+        if match.group(2) in section:
+            return found, [f".gitmodules repeats {key!r}"]
+        section[match.group(2)] = value
     return found, []
 
 
@@ -74,6 +83,15 @@ def check_structure(root: Path) -> tuple[str | None, list[str]]:
     committed = git("show", "HEAD:.gitmodules", cwd=root).stdout
     if not working.is_file() or working.read_text(encoding="utf-8") != committed:
         findings.append(".gitmodules differs from the commit")
+    staged_gitmodules = git("show", ":.gitmodules", cwd=root, check=False)
+    if staged_gitmodules.returncode != 0 or staged_gitmodules.stdout != committed:
+        findings.append(".gitmodules in the index differs from the commit")
+    committed_links = [
+        line for line in git("ls-tree", "-r", "HEAD", cwd=root).stdout.splitlines()
+        if line.startswith("160000 ") and not line.endswith("\t" + KERNEL_PATH)
+    ]
+    if committed_links:
+        findings.append(f"other submodules in the commit: {committed_links}")
 
     entries = git("ls-tree", "-z", "HEAD", "--", KERNEL_PATH, cwd=root).stdout.split("\0")
     entries = [entry for entry in entries if entry]
@@ -105,38 +123,97 @@ def check_structure(root: Path) -> tuple[str | None, list[str]]:
     top = git("rev-parse", "--show-toplevel", cwd=kernel, check=False).stdout.strip()
     if not top or Path(top).resolve() != kernel.resolve():
         findings.append(f"{KERNEL_PATH} is not its own git checkout")
-    changes = git("status", "--porcelain", cwd=kernel, check=False)
+    # Tracked changes and untracked files that are not ignored (a build
+    # directory such as target/ is ignored by AITP's .gitignore).
+    changes = git("status", "--porcelain", "--untracked-files=all", cwd=kernel, check=False)
     if changes.returncode != 0 or changes.stdout.strip():
         findings.append(f"{KERNEL_PATH} has local changes: {changes.stdout.strip() or changes.stderr.strip()}")
     return pinned, findings
 
 
-def locked_packages(text: str) -> dict[tuple[str, str], tuple[str, str | None]]:
-    """Third-party packages of a Cargo.lock: (name, version) -> (source, checksum)."""
-    found = {}
+KERNEL_PACKAGE = "proxy-cli"
+Package = tuple[str, str, str | None, str | None]  # name, version, source, checksum
+
+
+def lock_graph(text: str, label: str) -> tuple[dict[Package, set[Package]], list[str]]:
+    """The dependency graph of a Cargo.lock (version 3/4 layout): each
+    package with the packages its `dependencies` entries resolve to."""
+    packages: list[tuple[Package, list[str]]] = []
     for block in text.split("[[package]]")[1:]:
+        # Without a trailing table such as [metadata] (older lock files).
+        block = block.split("\n[", 1)[0]
+
         def field(name: str) -> str | None:
             match = re.search(rf'^{name} = "([^"]*)"', block, re.MULTILINE)
             return match.group(1) if match else None
 
-        if field("source"):
-            found[(field("name"), field("version"))] = (field("source"), field("checksum"))
-    return found
+        listed = re.search(r"^dependencies = \[\n(.*?)^\]", block, re.MULTILINE | re.DOTALL)
+        dependencies = re.findall(r'^ "([^"]*)",$', listed.group(1), re.MULTILINE) if listed else []
+        packages.append(((field("name"), field("version"), field("source"), field("checksum")), dependencies))
+    findings = []
+    graph: dict[Package, set[Package]] = {}
+    for package, dependencies in packages:
+        edges = set()
+        for dependency in dependencies:
+            # "name", "name version" or "name version (source)".
+            match = re.fullmatch(r"(\S+)(?: (\S+))?(?: \((.+)\))?", dependency)
+            candidates = [
+                other for other, _ in packages
+                if match and other[0] == match.group(1)
+                and (match.group(2) is None or other[1] == match.group(2))
+                and (match.group(3) is None or other[2] == match.group(3))
+            ]
+            if len(candidates) != 1:
+                findings.append(f"{label}: {package[0]} {package[1]} depends on {dependency!r}, which names {len(candidates)} packages")
+                continue
+            edges.add(candidates[0])
+        if package in graph:
+            findings.append(f"{label}: {package[0]} {package[1]} is listed twice")
+        graph[package] = edges
+    return graph, findings
+
+
+def kernel_closure(graph: dict[Package, set[Package]], label: str) -> tuple[dict[Package, set[Package]], list[str]]:
+    """The kernel package and everything it depends on, with their edges."""
+    roots = [package for package in graph if package[0] == KERNEL_PACKAGE and package[2] is None]
+    if len(roots) != 1:
+        return {}, [f"{label} does not lock the kernel package {KERNEL_PACKAGE} exactly once"]
+    closure: dict[Package, set[Package]] = {}
+    pending = roots
+    while pending:
+        package = pending.pop()
+        if package not in closure:
+            closure[package] = graph[package]
+            pending.extend(graph[package])
+    return closure, []
 
 
 def check_locks(root: Path) -> list[str]:
+    """The kernel resolves to the same packages, with the same edges, in
+    AITP's lock file and in this workspace's (the workspace may lock more
+    for the SAIAI program)."""
     kernel_lock = root / KERNEL_PATH / "Cargo.lock"
     if not kernel_lock.is_file():
         return [f"{KERNEL_PATH}/Cargo.lock is missing"]
-    kernel = locked_packages(kernel_lock.read_text(encoding="utf-8"))
-    workspace = locked_packages((root / WORKSPACE_LOCK).read_text(encoding="utf-8"))
-    if not kernel:
-        return [f"{KERNEL_PATH}/Cargo.lock locks no third-party package"]
-    differ = sorted(f"{name} {version}" for (name, version), value in kernel.items() if workspace.get((name, version)) != value)
-    if differ:
+    closures = []
+    findings = []
+    for label, path in ((f"{KERNEL_PATH}/Cargo.lock", kernel_lock), (WORKSPACE_LOCK, root / WORKSPACE_LOCK)):
+        graph, problems = lock_graph(path.read_text(encoding="utf-8"), label)
+        closure, missing = kernel_closure(graph, label)
+        findings += problems + missing
+        closures.append(closure)
+    if findings:
+        return findings
+    aitp, workspace = closures
+    if aitp != workspace:
+        name = lambda package: f"{package[0]} {package[1]}"
+        only_aitp = sorted(name(package) for package in set(aitp) - set(workspace))
+        only_workspace = sorted(name(package) for package in set(workspace) - set(aitp))
+        edges = sorted(name(package) for package in set(aitp) & set(workspace) if aitp[package] != workspace[package])
         return [
-            f"{WORKSPACE_LOCK} does not lock these kernel packages as AITP does "
-            f"(update kernel dependencies in AITP, then move the submodule): {', '.join(differ)}"
+            f"{WORKSPACE_LOCK} does not resolve the kernel's dependencies as AITP's lock does "
+            f"(update kernel dependencies in AITP, then move the submodule): only in AITP's lock {only_aitp}, "
+            f"only in the workspace's {only_workspace}, other dependencies of {edges}"
         ]
     return []
 
@@ -145,11 +222,14 @@ def check_on_main(pinned: str, url: str = AITP_URL, branch: str = AITP_BRANCH) -
     with tempfile.TemporaryDirectory(prefix="kernel-main-") as scratch:
         mirror = Path(scratch)
         git("init", "--quiet", "--bare", cwd=mirror)
-        fetched = git(
-            "-c", "protocol.version=2", "fetch", "--quiet", "--no-tags", "--filter=tree:0",
-            url, f"+refs/heads/{branch}:refs/heads/{branch}",
-            cwd=mirror, check=False,
-        )
+        try:
+            fetched = git(
+                "-c", "protocol.version=2", "fetch", "--quiet", "--no-tags", "--filter=tree:0",
+                url, f"+refs/heads/{branch}:refs/heads/{branch}",
+                cwd=mirror, check=False, timeout=FETCH_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return [f"fetching {branch} of {url} took longer than {FETCH_TIMEOUT} s"]
         if fetched.returncode != 0:
             return [f"cannot fetch {branch} of {url}: {fetched.stderr.strip()}"]
         if git("cat-file", "-e", f"{pinned}^{{commit}}", cwd=mirror, check=False).returncode != 0:

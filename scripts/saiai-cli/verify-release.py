@@ -1330,6 +1330,10 @@ def verify_ci_workflow() -> None:
                 "the Windows installer environment routing",
             ),
             (
+                "python scripts/saiai-cli/generate-manifest.py --dist dist --cargo-toml tools/saiai-cli/Cargo.toml --asset saiai-windows-x86_64.exe --wrappers-dir dist --output dist/manifest.json",
+                "the Windows wrapper smoke's manifest",
+            ),
+            (
                 '& "$PWD/scripts/saiai-cli/test-windows-release.ps1" -BundleDir dist -SetupPs1 dist/setup.ps1 -SetupCmd dist/setup.cmd -AssetName saiai-windows-x86_64.exe',
                 "the Windows PowerShell 5.1 wrapper smoke",
             ),
