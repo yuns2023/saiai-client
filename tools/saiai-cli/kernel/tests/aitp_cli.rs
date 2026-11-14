@@ -123,14 +123,16 @@ impl Sandbox {
         text
     }
 
-    /// Neither the files below the sandbox (names and contents) nor any
-    /// output names the other distribution.
+    /// Neither the files the program wrote anywhere in the sandbox (names
+    /// and contents; links are reported, not followed) nor any output names
+    /// the other distribution. The copied program itself is checked
+    /// separately (`the_program_carries_no_other_distribution_name`).
     fn assert_only_aitp_names(&self) {
         let other = other_brand();
         for text in self.printed.lock().unwrap().iter() {
             assert!(!text.to_ascii_lowercase().contains(&other), "{text}");
         }
-        let mut pending = vec![self.home.clone()];
+        let mut pending = vec![self.root.clone()];
         let mut files = 0;
         while let Some(dir) = pending.pop() {
             for entry in std::fs::read_dir(&dir).unwrap() {
@@ -141,7 +143,21 @@ impl Sandbox {
                     path.display()
                 );
                 let kind = std::fs::symlink_metadata(&path).unwrap().file_type();
-                if kind.is_dir() {
+                if path == self.program {
+                    continue;
+                }
+                if kind.is_symlink() {
+                    let target = std::fs::read_link(&path).unwrap();
+                    assert!(
+                        !target
+                            .to_string_lossy()
+                            .to_ascii_lowercase()
+                            .contains(&other),
+                        "{} -> {}",
+                        path.display(),
+                        target.display()
+                    );
+                } else if kind.is_dir() {
                     pending.push(path);
                 } else if kind.is_file() {
                     files += 1;
@@ -191,6 +207,22 @@ fn certificate_der(path: &Path) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
         .decode(body)
         .unwrap()
+}
+
+/// The string value of the first X.501 attribute with object identifier
+/// `oid` (DER: `06 03 <oid>` then a string of one length byte).
+fn attribute(der: &[u8], oid: &[u8; 3]) -> Option<String> {
+    let mut pattern = vec![0x06, 0x03];
+    pattern.extend_from_slice(oid);
+    let at = der
+        .windows(pattern.len())
+        .position(|window| window == pattern)?
+        + pattern.len();
+    let (tag, length) = (*der.get(at)?, usize::from(*der.get(at + 1)?));
+    if !matches!(tag, 0x0c | 0x13) || length >= 0x80 {
+        return None;
+    }
+    String::from_utf8(der.get(at + 2..at + 2 + length)?.to_vec()).ok()
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -255,8 +287,16 @@ fn initialization_writes_only_aitp_names() {
     let ca = PathBuf::from(config["ca_cert_path"].as_str().unwrap());
     assert_eq!(ca, sandbox.home.join(".claude/aitp-ca.crt"));
     let der = certificate_der(&ca);
-    assert!(contains(&der, b"AITP local installation CA"));
-    assert!(contains(&der, b"AITP"));
+    // Subject (and issuer: self-signed) common name and organization.
+    let common_name = attribute(&der, &[0x55, 0x04, 0x03]).unwrap();
+    assert!(
+        common_name.starts_with("AITP local installation CA "),
+        "{common_name}"
+    );
+    assert_eq!(
+        attribute(&der, &[0x55, 0x04, 0x0a]).as_deref(),
+        Some("AITP")
+    );
     let settings = read_json(&sandbox.home.join(".claude/settings.json"));
     let env = &settings["env"];
     assert_eq!(
@@ -280,9 +320,16 @@ fn initialization_writes_only_aitp_names() {
     let codex_config = std::fs::read_to_string(sandbox.home.join(".codex/config.toml")).unwrap();
     assert!(!codex_config.is_empty());
 
-    let (_, status) = sandbox.output(&mut sandbox.command(&["status"]));
+    // Not started (AITP_SKIP_START): status reads the configuration and
+    // succeeds.
+    let status = sandbox.run(&["status"]);
+    let config_path = sandbox.home.join(".aitp/config.json");
     assert!(
-        status.contains("aitp") || status.contains("AITP"),
+        status.starts_with(&format!(
+            "aitp {}\nconfig: {}\nbase_url: {gateway}\n",
+            env!("CARGO_PKG_VERSION"),
+            config_path.display()
+        )),
         "{status}"
     );
     sandbox.assert_only_aitp_names();

@@ -770,6 +770,11 @@ def aitp_brand_markers() -> list[bytes]:
             if len(value) >= 10 and re.search(r"aitp|2742zdz", value, re.IGNORECASE)
         }
     )
+    # Values are compared as raw bytes: escapes would not match the binary.
+    require(
+        not any("\\" in marker for marker in markers),
+        f"AITP brand markers with escape sequences are not supported: {AITP_BRAND_SOURCE}",
+    )
     require(len(markers) >= 10, f"too few AITP brand markers found in {AITP_BRAND_SOURCE}")
     require(
         "AITP local installation CA" in markers

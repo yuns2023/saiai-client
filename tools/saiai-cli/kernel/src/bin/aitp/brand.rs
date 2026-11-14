@@ -208,6 +208,10 @@ mod tests {
         let placeholders = &brand.placeholders;
         assert_eq!(placeholders.codex_account_id, "aitp-local-proxy-account");
         assert_eq!(
+            placeholders.codex_token,
+            "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6ImFpdHAtbG9jYWwtcHJveHlAaW52YWxpZCIsImV4cCI6NDEwMjQ0NDgwMCwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfcGxhbl90eXBlIjoicGx1cyIsImNoYXRncHRfdXNlcl9pZCI6ImFpdHAtbG9jYWwtcHJveHktdXNlciIsImNoYXRncHRfYWNjb3VudF9pZCI6ImFpdHAtbG9jYWwtcHJveHktYWNjb3VudCJ9fQ.YWl0cC1sb2NhbC1wcm94eQ"
+        );
+        assert_eq!(
             placeholders.legacy_codex_token_prefix,
             "aitp-local-proxy-placeholder-"
         );

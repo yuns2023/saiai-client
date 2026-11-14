@@ -219,6 +219,8 @@ jobs:
           # Platform-specific SAIAI goldens (LaunchAgent plist, Windows update
           # helper) run through the contract entries on this platform.
           cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test saiai_render_contract --test kernel_consumer
+          # The AITP brand installs and renders its services on this platform.
+          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p proxy-cli --features contract --bin aitp
           cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --bin saiai
 
       - name: Smoke-test Windows configuration
@@ -310,6 +312,8 @@ jobs:
           # Platform-specific SAIAI goldens (LaunchAgent plist, Windows update
           # helper) run through the contract entries on this platform.
           cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test saiai_render_contract --test kernel_consumer
+          # The AITP brand installs and renders its services on this platform.
+          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p proxy-cli --features contract --bin aitp
           cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --bin saiai
 
       - name: Verify provider and project configuration isolation
