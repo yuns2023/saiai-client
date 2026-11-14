@@ -134,6 +134,20 @@ fn validate(brand: &Brand) -> Result<()> {
         }
     }
     validate_update_source(&brand.update.source)?;
+    // The installation CA naming every distribution shares (`coexistence`).
+    if !brand
+        .certificates
+        .ca_common_name_prefix
+        .ends_with(crate::coexistence::INSTALLATION_CA_SUFFIX)
+        || brand.certificates.ca_common_name_prefix.len()
+            == crate::coexistence::INSTALLATION_CA_SUFFIX.len()
+    {
+        bail!(
+            "brand certificates.ca_common_name_prefix must end with {:?}: {:?}",
+            crate::coexistence::INSTALLATION_CA_SUFFIX,
+            brand.certificates.ca_common_name_prefix
+        );
+    }
     if brand.update.windows_setup_command.is_none() && brand.update.release_page.is_none() {
         bail!("brand update needs a windows_setup_command or a release_page");
     }
@@ -341,6 +355,10 @@ pub struct Brand {
     pub winhttp_agent: &'static str,
     /// `clientInfo.name` of the read-only Codex daemon initialization check.
     pub codex_daemon_client_name: &'static str,
+    /// Refuse to take over a Claude/Codex/editor configuration, or to use a
+    /// CA, that another local proxy program built on this kernel manages
+    /// (see `coexistence`). Off keeps the earlier behavior.
+    pub refuse_foreign_profiles: bool,
 }
 
 impl Brand {
@@ -571,6 +589,21 @@ mod tests {
             product_name: "",
             ..KTEST_VALUES
         };
+        // The installation CA naming every distribution shares.
+        static BAD_CA_NAME: Brand = Brand {
+            certificates: CertificateNames {
+                ca_common_name_prefix: "KTEST local CA",
+                ..KTEST_VALUES.certificates
+            },
+            ..KTEST_VALUES
+        };
+        static BARE_CA_NAME: Brand = Brand {
+            certificates: CertificateNames {
+                ca_common_name_prefix: " local installation CA",
+                ..KTEST_VALUES.certificates
+            },
+            ..KTEST_VALUES
+        };
         for brand in [
             &BAD_DIRECTORY,
             &BAD_PREFIX,
@@ -580,6 +613,8 @@ mod tests {
             &BAD_SYNTHETIC,
             &EMPTY_PRODUCT,
             &DIGIT_TYPE_NAME,
+            &BAD_CA_NAME,
+            &BARE_CA_NAME,
         ] {
             let slot = OnceLock::new();
             assert!(install_into(&slot, brand).is_err());

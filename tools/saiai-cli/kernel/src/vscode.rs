@@ -460,6 +460,27 @@ fn validate_no_proxy(parsed: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Evidence (E5) that the editor proxy belongs to another local proxy
+/// program: an actual comment (not text inside a JSON string) spelling
+/// `// <NAME> managed VSCode proxy: <loopback URL>` for another NAME, whose
+/// URL is the current `http.proxy`.
+pub(crate) fn foreign_proxy_evidence(raw: &str) -> Option<String> {
+    let document = parse_document(raw).ok()?;
+    let current = document.parsed.get("http.proxy")?.as_str()?.trim();
+    document.comments.iter().find_map(|span| {
+        let comment = raw[span.clone()].trim();
+        let (name, url) = comment
+            .strip_prefix("// ")?
+            .split_once(" managed VSCode proxy: ")?;
+        let url = url.trim();
+        (!name.is_empty()
+            && format!("// {name} managed VSCode proxy: ") != MARKER.get()
+            && crate::coexistence::is_loopback_proxy(url)
+            && url == current)
+            .then(|| format!("its http.proxy is managed by \"{name}\""))
+    })
+}
+
 pub fn merge_settings(raw: &str, listen: &str) -> Result<String> {
     let document = parse_document(raw)?;
     let proxy = proxy_url(listen)?;
@@ -1219,6 +1240,26 @@ mod tests {
         }
     }
 }
+#[test]
+fn another_programs_editor_proxy_is_recognized_only_from_a_live_comment() {
+    let other = "{\n // OTHER managed VSCode proxy: http://127.0.0.1:4000\n \"http.proxy\": \"http://127.0.0.1:4000\"\n}\n";
+    assert!(foreign_proxy_evidence(other).unwrap().contains("\"OTHER\""));
+    for raw in [
+        // Ours.
+        "{\n // KTEST managed VSCode proxy: http://127.0.0.1:4000\n \"http.proxy\": \"http://127.0.0.1:4000\"\n}\n",
+        // A stale marker: the proxy is something else now, or gone.
+        "{\n // OTHER managed VSCode proxy: http://127.0.0.1:4000\n \"http.proxy\": \"http://127.0.0.1:5000\"\n}\n",
+        "{\n // OTHER managed VSCode proxy: http://127.0.0.1:4000\n}\n",
+        // Inside a JSON string, not a comment.
+        "{\"description\": \"// OTHER managed VSCode proxy: http://127.0.0.1:4000\", \"http.proxy\": \"http://127.0.0.1:4000\"}",
+        // Not a local proxy, or no name.
+        "{\n // OTHER managed VSCode proxy: http://10.0.0.1:4000\n \"http.proxy\": \"http://10.0.0.1:4000\"\n}\n",
+        "{\n //  managed VSCode proxy: http://127.0.0.1:4000\n \"http.proxy\": \"http://127.0.0.1:4000\"\n}\n",
+    ] {
+        assert!(foreign_proxy_evidence(raw).is_none(), "{raw}");
+    }
+}
+
 #[test]
 fn editor_diagnostics_require_an_actual_managed_proxy_marker() {
     assert!(!has_managed_proxy(

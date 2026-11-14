@@ -933,3 +933,200 @@ fn claude_desktop_listener_answers_are_byte_identical() {
         "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 104\r\nContent-Type: application/json\r\n\r\n{\"error\":\"desktop_identity_missing\",\"message\":\"Run saiai desktop claude to initialize this environment\"}"
     );
 }
+
+/// A self-signed installation CA (CA certificate and key PEM) with this
+/// subject.
+fn installation_ca(common_name: &str, organization: &str) -> (String, String) {
+    use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let mut name = DistinguishedName::new();
+    name.push(DnType::CommonName, common_name);
+    name.push(DnType::OrganizationName, organization);
+    params.distinguished_name = name;
+    (params.self_signed(&key).unwrap().pem(), key.serialize_pem())
+}
+
+/// Claude settings another program on this kernel (AITP) manages: its local
+/// proxy and its installation CA.
+fn aitp_managed_claude_settings(sandbox: &Sandbox) -> PathBuf {
+    let ca = sandbox.home.join(".claude").join("aitp-ca.crt");
+    std::fs::create_dir_all(ca.parent().unwrap()).unwrap();
+    std::fs::write(
+        &ca,
+        installation_ca("AITP local installation CA 0123abcd", "AITP").0,
+    )
+    .unwrap();
+    let settings = sandbox.home.join(".claude").join("settings.json");
+    std::fs::write(
+        &settings,
+        serde_json::to_vec_pretty(&serde_json::json!({"env": {
+            "https_proxy": "http://127.0.0.1:4000",
+            "http_proxy": "http://127.0.0.1:4000",
+            "no_proxy": "localhost,127.0.0.1",
+            "CLAUDE_CODE_OAUTH_TOKEN": "TEST_ONLY_SHARED_KEY",
+            "NODE_EXTRA_CA_CERTS": ca,
+        }}))
+        .unwrap(),
+    )
+    .unwrap();
+    settings
+}
+
+/// SAIAI keeps its behavior with another program's remains (no refusal:
+/// its brand leaves `refuse_foreign_profiles` off), but its uninstall does
+/// not edit settings that program manages.
+#[test]
+fn saiai_keeps_initializing_and_uninstall_leaves_another_programs_settings() {
+    let sandbox = Sandbox::new();
+    let settings = aitp_managed_claude_settings(&sandbox);
+    let before = std::fs::read(&settings).unwrap();
+    let plan = sandbox.run(&mut sandbox.command(&["uninstall", "--dry-run"]));
+    assert!(
+        plan.contains("managed by another local proxy program"),
+        "{plan}"
+    );
+    assert_eq!(std::fs::read(&settings).unwrap(), before);
+
+    // Initialization takes the settings over, as before.
+    sandbox.run(&mut sandbox.command(&[
+        "init",
+        "--base-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "TEST_ONLY_CONTRACT_KEY",
+    ]));
+    let after = read_json(&settings);
+    assert_eq!(
+        after["env"]["NODE_EXTRA_CA_CERTS"],
+        sandbox
+            .home
+            .join(".claude")
+            .join("saiai-ca.crt")
+            .to_string_lossy()
+            .as_ref()
+    );
+    // Codex too: another program's managed block does not stop init-codex.
+    let env = sandbox.home.join(".codex").join(".env");
+    std::fs::create_dir_all(env.parent().unwrap()).unwrap();
+    std::fs::write(
+        &env,
+        "# BEGIN AITP CODEX IDE (managed)\nHTTPS_PROXY=\"http://127.0.0.1:4000\"\nhttps_proxy=\"http://127.0.0.1:4000\"\n# END AITP CODEX IDE (managed)\n",
+    )
+    .unwrap();
+    sandbox.run(&mut sandbox.command(&[
+        "init-codex",
+        "--base-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "TEST_ONLY_CONTRACT_KEY",
+    ]));
+}
+
+/// An existing SAIAI installation (no ownership record) is never taken for
+/// another program's, including one still on a CA from before the common
+/// name carried a suffix: re-initialization works and uninstall plans to
+/// remove SAIAI's own settings.
+#[test]
+fn existing_saiai_state_is_never_another_programs() {
+    let sandbox = Sandbox::new();
+    let init = |sandbox: &Sandbox| {
+        sandbox.run(&mut sandbox.command(&[
+            "init",
+            "--base-url",
+            "http://127.0.0.1:9",
+            "--api-key",
+            "TEST_ONLY_CONTRACT_KEY",
+        ]))
+    };
+    init(&sandbox);
+    let config = read_json(&sandbox.home.join(".saiai/config.json"));
+    let (cert, key) = installation_ca("SAIAI local installation CA", "SAIAI");
+    std::fs::write(config["ca_cert_path"].as_str().unwrap(), cert).unwrap();
+    std::fs::write(config["ca_key_path"].as_str().unwrap(), key).unwrap();
+    init(&sandbox);
+    let plan = sandbox.run(&mut sandbox.command(&["uninstall", "--dry-run"]));
+    assert!(
+        !plan.contains("managed by another local proxy program"),
+        "{plan}"
+    );
+    assert!(plan.contains("env.https_proxy"), "{plan}");
+}
+
+/// SAIAI's `vscode` keeps its behavior with another program's editor proxy
+/// (no new refusal): it stops at the different explicit proxy, as before.
+#[test]
+fn saiai_vscode_keeps_its_behavior_with_another_programs_editor_proxy() {
+    let sandbox = Sandbox::new();
+    sandbox.run(&mut sandbox.command(&[
+        "init",
+        "--base-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "TEST_ONLY_CONTRACT_KEY",
+    ]));
+    let portable = sandbox.home.with_file_name("vscode-portable");
+    let editor = portable.join("user-data/User/settings.json");
+    std::fs::create_dir_all(editor.parent().unwrap()).unwrap();
+    std::fs::write(
+        &editor,
+        "{\n // AITP managed VSCode proxy: http://127.0.0.1:4000\n \"http.proxy\": \"http://127.0.0.1:4000\"\n}\n",
+    )
+    .unwrap();
+    let before = std::fs::read(&editor).unwrap();
+    let output = sandbox
+        .command(&["vscode"])
+        .env("VSCODE_PORTABLE", &portable)
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("different explicit http.proxy"), "{text}");
+    assert!(
+        !text.contains("managed by another local proxy program"),
+        "{text}"
+    );
+    assert_eq!(std::fs::read(&editor).unwrap(), before);
+}
+
+/// Mixed settings (SAIAI's key and proxy, another program's CA): uninstall
+/// leaves the whole file and tells the user to check for SAIAI's values.
+#[test]
+fn uninstall_leaves_mixed_settings_and_says_what_to_check() {
+    let sandbox = Sandbox::new();
+    sandbox.run(&mut sandbox.command(&[
+        "init",
+        "--base-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "TEST_ONLY_CONTRACT_KEY",
+    ]));
+    let settings = sandbox.home.join(".claude").join("settings.json");
+    let mut value = read_json(&settings);
+    let ca = sandbox.home.join("other").join("aitp-ca.crt");
+    std::fs::create_dir_all(ca.parent().unwrap()).unwrap();
+    std::fs::write(
+        &ca,
+        installation_ca("AITP local installation CA 0123abcd", "AITP").0,
+    )
+    .unwrap();
+    value["env"]["NODE_EXTRA_CA_CERTS"] = serde_json::json!(ca);
+    std::fs::write(&settings, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let before = std::fs::read(&settings).unwrap();
+    let plan = sandbox.run(&mut sandbox.command(&["uninstall", "--dry-run"]));
+    assert!(
+        plan.contains("managed by another local proxy program"),
+        "{plan}"
+    );
+    assert!(
+        plan.contains("If SAIAI settings are also in this file"),
+        "{plan}"
+    );
+    assert!(!plan.contains("env.https_proxy"), "{plan}");
+    assert_eq!(std::fs::read(&settings).unwrap(), before);
+}

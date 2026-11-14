@@ -38,6 +38,7 @@ mod claude_desktop_fixtures;
 mod claude_launcher;
 mod codex_daemon;
 mod codex_diagnostics;
+mod coexistence;
 #[cfg(any(test, feature = "contract"))]
 #[doc(hidden)]
 pub mod contract;
@@ -320,6 +321,8 @@ pub fn run(distribution: &'static Brand, context: RuntimeContext) -> Result<()> 
         );
     }
     environment_scope::initialize(&command, selector)?;
+    // Before anything is written (the product directory record included).
+    refuse_foreign_targets(&command)?;
     match &command {
         Command::Init(_) | Command::InitCodex(_) => environment_scope::record_product_dir(true)?,
         Command::Start | Command::Restart => environment_scope::record_product_dir(false)?,
@@ -656,6 +659,8 @@ fn validate_api_key(api_key: &str) -> Result<()> {
 }
 
 fn ensure_installation_ca(cert_path: &Path, key_path: &Path, timestamp: &str) -> Result<bool> {
+    // Never reuse another program's CA (also checked before any write).
+    refuse_foreign_ca_file(cert_path)?;
     if let (Ok(cert_pem), Ok(key_pem)) =
         (fs::read_to_string(cert_path), fs::read_to_string(key_path))
         && local_proxy::validate_tls_config(&cert_pem, &key_pem).is_ok()
@@ -839,6 +844,98 @@ fn init_claude(args: InitArgs) -> Result<()> {
     start_managed_service_after_initialization(app_config.changed || ca_changed)?;
 
     Ok(())
+}
+
+/// Brands with `refuse_foreign_profiles` do not take over a configuration
+/// that another local proxy program built on this kernel manages, nor use
+/// its CA (see `coexistence`): checked before the command writes anything.
+/// Other brands keep their behavior; nothing is read for this.
+fn refuse_foreign_targets(command: &Command) -> Result<()> {
+    if !BRAND.refuse_foreign_profiles {
+        return Ok(());
+    }
+    // The editor is configured when asked to, or (Windows) to trust the CA.
+    let (claude, codex, editor) = match command {
+        Command::Init(args) => (
+            true,
+            false,
+            args.configure_vscode_editor || args.trust_vscode_ca,
+        ),
+        Command::InitCodex(args) => (
+            false,
+            true,
+            args.configure_vscode_editor || args.trust_vscode_ca,
+        ),
+        Command::VSCode => (false, true, true),
+        _ => return Ok(()),
+    };
+    // Every CA the command could reuse: the configured one and the default
+    // locations (program home; Claude directory for the default profile).
+    refuse_foreign_configured_ca()?;
+    refuse_foreign_ca_file(&app_config_dir()?.join(CA_FILENAME.get()))?;
+    if claude {
+        refuse_foreign_ca_file(
+            &resolve_claude_config_paths()?
+                .config_dir
+                .join(CA_FILENAME.get()),
+        )?;
+    }
+    if claude {
+        let paths = resolve_claude_config_paths()?;
+        if let Some(reason) = coexistence::claude_profile_evidence(&paths.settings_path) {
+            return Err(coexistence::refusal(&paths.settings_path, &reason));
+        }
+    }
+    if codex {
+        refuse_foreign_codex_profile(&codex_config_dir()?)?;
+    }
+    if editor && let Some(home) = home_dir() {
+        for path in vscode::settings_paths(&home) {
+            if let Some(reason) = fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| vscode::foreign_proxy_evidence(&raw))
+            {
+                return Err(coexistence::refusal(&path, &reason));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// See [`refuse_foreign_targets`]: a Codex profile (`.env`, `auth.json`).
+fn refuse_foreign_codex_profile(codex_dir: &Path) -> Result<()> {
+    if !BRAND.refuse_foreign_profiles {
+        return Ok(());
+    }
+    match coexistence::codex_profile_evidence(codex_dir) {
+        Some((path, reason)) => Err(coexistence::refusal(&path, &reason)),
+        None => Ok(()),
+    }
+}
+
+/// See [`refuse_foreign_targets`]: the CA the configuration names.
+fn refuse_foreign_configured_ca() -> Result<()> {
+    let Ok(raw) = fs::read_to_string(app_config_path()?) else {
+        return Ok(());
+    };
+    let Ok(config) = serde_json::from_str::<AppConfig>(&raw) else {
+        return Ok(());
+    };
+    refuse_foreign_ca_file(Path::new(&config.ca_cert_path))
+}
+
+fn refuse_foreign_ca_file(path: &Path) -> Result<()> {
+    if !BRAND.refuse_foreign_profiles || path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    match coexistence::classify_ca_file(path) {
+        coexistence::CertificateOwner::Foreign(organization) => bail!(
+            "{} is the installation CA of \"{organization}\", another local proxy program; {brand_product} does not use it. Use a separate {brand_product} home, or remove that configuration after confirming it is no longer used",
+            path.display(),
+            brand_product = BRAND.product_name
+        ),
+        _ => Ok(()),
+    }
 }
 
 fn init_codex(args: InitArgs) -> Result<()> {
@@ -2539,7 +2636,7 @@ fn run_windows_packaged_desktop(
         bail!("Desktop certificate binding changed; use normal File > Quit and retry");
     }
     if matches!(decision, windows_desktop_runtime::Decision::Cold) {
-        restore_legacy_windows_packaged_proxy_lease()?;
+        lease_launch_result(&restore_legacy_windows_packaged_proxy_lease()?)?;
     }
 
     // Toast replies and other shell activations carry no launcher arguments.
@@ -2764,51 +2861,238 @@ fn activate_windows_packaged_desktop(app_id: &str, arguments: &str) -> Result<u3
         .context("Windows package activation did not return a process ID")
 }
 
-#[cfg(target_os = "windows")]
-#[derive(Debug, Clone, Deserialize)]
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct LegacyWindowsInternetProxySettings {
     proxy_enable: Option<i32>,
     proxy_server: Option<String>,
     auto_config_url: Option<String>,
 }
 
-#[cfg(target_os = "windows")]
-#[derive(Debug, Clone, Deserialize)]
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct LegacyWindowsPackagedProxyLeaseMarker {
     previous: LegacyWindowsInternetProxySettings,
     managed_server: String,
     #[serde(default)]
     added_ca_thumbprints: Vec<String>,
+    /// The proxy was restored, or left alone because it had been changed
+    /// since; only certificates remain to be retried. (Absent in markers
+    /// written before: false.)
+    #[serde(default)]
+    proxy_handled: bool,
+}
+/// The result of removing one certificate: a failed removal command is an
+/// error (as before); otherwise `false` only when the follow-up check
+/// confirms the certificate is still listed (reported, not a failure), and
+/// `true` when it is gone or the check cannot run (the removal was not
+/// checked before). The check runs only after a successful command.
+#[cfg(any(target_os = "windows", test))]
+fn removal_result(
+    removed: Result<()>,
+    check: impl FnOnce() -> Result<Option<Vec<u8>>>,
+) -> Result<bool> {
+    removed?;
+    Ok(!matches!(check(), Ok(Some(_))))
+}
+
+/// A Desktop launch after a lease restore: a failed removal stops it, as
+/// before (the lease keeps the certificates for the next attempt); a
+/// certificate still listed after its removal does not.
+#[cfg(any(target_os = "windows", test))]
+fn lease_launch_result(settled: &LeaseCertificates) -> Result<()> {
+    if !settled.pending.is_empty() {
+        bail!(
+            "could not remove CA(s) {} of a legacy {brand_product} Desktop lease from Windows CurrentUser\\Root; retry the launch",
+            settled.pending.join(", "),
+            brand_product = BRAND.product_name
+        );
+    }
+    Ok(())
+}
+
+/// What became of a lease's certificates.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct LeaseCertificates {
+    /// The removal command failed for the first of these; it and the ones
+    /// after it were not processed (as before, the first failure stops):
+    /// a failure, and the lease keeps them for a retry.
+    pub(crate) pending: Vec<String>,
+    /// The removal command succeeded but the certificate is still listed:
+    /// reported only (removal was not checked before).
+    pub(crate) lingering: Vec<String>,
+    /// Kept because they are another local proxy program's installation CA.
+    pub(crate) foreign: Vec<String>,
+}
+
+/// Decides each certificate on its own. Only a certificate confirmed to be
+/// another program's installation CA is kept; anything else is removed by
+/// thumbprint as before, including one whose identity cannot be read or
+/// parsed (`read` returns its DER, None when not installed). `remove`
+/// removes it: an error is a failed removal command, which stops the work
+/// as before (it and the rest stay pending); `Ok(false)` means the command
+/// succeeded but the certificate is still listed, which is only reported.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn settle_lease_certificates(
+    thumbprints: &[String],
+    read: impl Fn(&str) -> Result<Option<Vec<u8>>>,
+    remove: impl Fn(&str) -> Result<bool>,
+) -> LeaseCertificates {
+    let mut settled = LeaseCertificates::default();
+    for (index, thumbprint) in thumbprints.iter().enumerate() {
+        let owner = read(thumbprint).and_then(|der| match der {
+            None => Ok(None),
+            Some(der) => coexistence::classify_certificate(&der).map(Some),
+        });
+        match owner {
+            Ok(None) => {}
+            Ok(Some(coexistence::CertificateOwner::Foreign(_))) => {
+                settled.foreign.push(thumbprint.clone())
+            }
+            // Ours, unknown, or not identifiable: removed as before.
+            Ok(Some(_)) | Err(_) => match remove(thumbprint) {
+                Ok(true) => {}
+                Ok(false) => settled.lingering.push(thumbprint.clone()),
+                Err(_) => {
+                    settled.pending = thumbprints[index..].to_vec();
+                    return settled;
+                }
+            },
+        }
+    }
+    settled
 }
 
 #[cfg(target_os = "windows")]
-fn restore_legacy_windows_packaged_proxy_lease() -> Result<()> {
+fn restore_legacy_windows_packaged_proxy_lease() -> Result<LeaseCertificates> {
     restore_legacy_windows_packaged_proxy_lease_at(&windows_packaged_proxy_lease_marker_path()?)
 }
 
+/// Restores a legacy Desktop lease: the system proxy by its own rule (only
+/// while it is still the lease's managed proxy), independently of the
+/// certificates, which are decided one by one (`settle_lease_certificates`).
+/// Certificates kept for a retry keep the lease, rewritten with the proxy
+/// marked handled; otherwise the lease is removed.
+/// The system operations a lease restore needs (the real Windows proxy
+/// settings and certificate store, or a test double).
+#[cfg(any(target_os = "windows", test))]
+trait LeaseSystem {
+    fn read_proxy(&self) -> Result<LegacyWindowsInternetProxySettings>;
+    fn write_proxy(&self, settings: &LegacyWindowsInternetProxySettings) -> Result<()>;
+    fn certificate(&self, thumbprint: &str) -> Result<Option<Vec<u8>>>;
+    fn remove_certificate(&self, thumbprint: &str) -> Result<bool>;
+}
+
 #[cfg(target_os = "windows")]
-fn restore_legacy_windows_packaged_proxy_lease_at(marker_path: &Path) -> Result<()> {
-    let Some(marker) = read_legacy_windows_packaged_proxy_lease_marker(marker_path)? else {
-        return Ok(());
+struct WindowsLeaseSystem;
+
+#[cfg(target_os = "windows")]
+impl LeaseSystem for WindowsLeaseSystem {
+    fn read_proxy(&self) -> Result<LegacyWindowsInternetProxySettings> {
+        windows_read_internet_proxy()
+    }
+    fn write_proxy(&self, settings: &LegacyWindowsInternetProxySettings) -> Result<()> {
+        windows_write_internet_proxy(settings)
+    }
+    fn certificate(&self, thumbprint: &str) -> Result<Option<Vec<u8>>> {
+        windows_root_ca_der(thumbprint)
+    }
+    fn remove_certificate(&self, thumbprint: &str) -> Result<bool> {
+        windows_remove_root_ca_checked(thumbprint)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn restore_legacy_windows_packaged_proxy_lease_at(marker_path: &Path) -> Result<LeaseCertificates> {
+    restore_lease_with(marker_path, &WindowsLeaseSystem)
+}
+
+/// Restores a legacy Desktop lease: the system proxy by its own rule (only
+/// while it is still the lease's managed proxy), independently of the
+/// certificates, which are decided one by one (`settle_lease_certificates`).
+/// Certificates kept for a retry keep the lease, rewritten with the proxy
+/// marked handled, so a retry touches certificates only; otherwise the lease
+/// is removed. A crash between restoring the proxy and rewriting the lease
+/// can make the next run look at the proxy again (no exactly-once promise).
+#[cfg(any(target_os = "windows", test))]
+fn restore_lease_with(marker_path: &Path, system: &impl LeaseSystem) -> Result<LeaseCertificates> {
+    let Some(mut marker) = read_legacy_windows_packaged_proxy_lease_marker(marker_path)? else {
+        return Ok(LeaseCertificates::default());
     };
 
-    let current = windows_read_internet_proxy()?;
-    if windows_proxy_matches_managed(&current, &marker.managed_server) {
-        windows_write_internet_proxy(&marker.previous)?;
-        println!(
-            "Restored the Windows proxy left by a legacy {brand_product} Desktop lease.",
-            brand_product = BRAND.product_name
-        );
-    } else {
+    if !marker.proxy_handled {
+        let current = system.read_proxy()?;
+        if windows_proxy_matches_managed(&current, &marker.managed_server) {
+            system.write_proxy(&marker.previous)?;
+            println!(
+                "Restored the Windows proxy left by a legacy {brand_product} Desktop lease.",
+                brand_product = BRAND.product_name
+            );
+        } else {
+            eprintln!(
+                "warning: legacy {brand_product} Desktop lease found, but the current Windows proxy was changed externally; preserving the current proxy",
+                brand_product = BRAND.product_name
+            );
+        }
+        marker.proxy_handled = true;
+    }
+    let settled = settle_lease_certificates(
+        &marker.added_ca_thumbprints,
+        |thumbprint| system.certificate(thumbprint),
+        |thumbprint| system.remove_certificate(thumbprint),
+    );
+    for thumbprint in &settled.lingering {
         eprintln!(
-            "warning: legacy {brand_product} Desktop lease found, but the current Windows proxy was changed externally; preserving the current proxy",
-            brand_product = BRAND.product_name
+            "warning: CA {thumbprint} is still listed in Windows CurrentUser\\Root after its removal"
         );
     }
-    for thumbprint in &marker.added_ca_thumbprints {
-        windows_remove_user_ca(Some(thumbprint))?;
+    for thumbprint in &settled.foreign {
+        eprintln!(
+            "warning: kept CA {thumbprint} in Windows CurrentUser\\Root: it is another local proxy program's installation CA"
+        );
     }
-    remove_windows_packaged_proxy_lease_marker(marker_path)
+    if settled.pending.is_empty() {
+        remove_windows_packaged_proxy_lease_marker(marker_path)?;
+    } else {
+        marker.added_ca_thumbprints = settled.pending.clone();
+        write_bytes_atomic(marker_path, &serde_json::to_vec_pretty(&marker)?, 0o600)
+            .with_context(|| format!("failed to update {}", marker_path.display()))?;
+    }
+    Ok(settled)
+}
+
+/// The DER of a CurrentUser\Root certificate, None when it is not there.
+#[cfg(target_os = "windows")]
+fn windows_root_ca_der(thumbprint: &str) -> Result<Option<Vec<u8>>> {
+    if thumbprint.len() != 40 || !thumbprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid certificate thumbprint {thumbprint:?}");
+    }
+    let output = command_output(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "& { param($thumb) $ErrorActionPreference='Stop'; $p=\"Cert:\\CurrentUser\\Root\\$thumb\"; if(Test-Path -LiteralPath $p){ [Convert]::ToBase64String((Get-Item -LiteralPath $p).RawData) } }",
+            thumbprint,
+        ],
+    )?;
+    let encoded = output.trim();
+    if encoded.is_empty() {
+        return Ok(None);
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map(Some)
+        .context("certificate store returned an unreadable certificate")
+}
+
+/// Removes a CurrentUser\Root certificate; true when it is gone after.
+#[cfg(target_os = "windows")]
+fn windows_remove_root_ca_checked(thumbprint: &str) -> Result<bool> {
+    let removed = windows_remove_user_ca(Some(thumbprint));
+    removal_result(removed, || windows_root_ca_der(thumbprint))
 }
 
 #[cfg(target_os = "windows")]
@@ -2818,7 +3102,7 @@ fn windows_packaged_proxy_lease_marker_path() -> Result<PathBuf> {
         .join(WINDOWS_PACKAGED_PROXY_LEASE_FILENAME))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn read_legacy_windows_packaged_proxy_lease_marker(
     path: &Path,
 ) -> Result<Option<LegacyWindowsPackagedProxyLeaseMarker>> {
@@ -2834,7 +3118,7 @@ fn read_legacy_windows_packaged_proxy_lease_marker(
         .with_context(|| format!("failed to parse {}", path.display()))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn remove_windows_packaged_proxy_lease_marker(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -2875,7 +3159,7 @@ fn windows_read_internet_proxy() -> Result<LegacyWindowsInternetProxySettings> {
     serde_json::from_str(&output).context("failed to parse Windows Internet proxy settings")
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn windows_proxy_matches_managed(
     settings: &LegacyWindowsInternetProxySettings,
     managed: &str,
@@ -3324,6 +3608,8 @@ fn check_desktop_permission_visibility(report: &mut DoctorReport) {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn prepare_isolated_desktop_state(desktop_root: &Path, desktop_codex: &Path) -> Result<()> {
+    // Before the first copy or replacement below.
+    refuse_foreign_codex_profile(desktop_codex)?;
     let auth_path = desktop_codex.join("auth.json");
     let source_auth_path = codex_config_dir()?.join("auth.json");
     if !copy_real_codex_oauth_auth(&source_auth_path, &auth_path)?
@@ -3455,6 +3741,7 @@ fn validate_codex_oauth_auth(path: &Path) -> Result<()> {
 }
 
 fn prepare_codex_oauth_files(codex_dir: &Path, persist_system_proxy: bool) -> Result<Vec<PathBuf>> {
+    refuse_foreign_codex_profile(codex_dir)?;
     let config_path = codex_dir.join("config.toml");
     let auth_path = codex_dir.join("auth.json");
     let mut documents = Vec::new();
@@ -4370,6 +4657,7 @@ fn read_runtime_ca(cfg: &AppConfig) -> Result<(String, String)> {
     })?;
     local_proxy::validate_tls_config(&cert_pem, &key_pem)
         .with_context(|| format!("{brand_product} installation CA is invalid; rerun the one-command {brand_product} setup", brand_product = BRAND.product_name))?;
+    refuse_foreign_ca_file(Path::new(&cfg.ca_cert_path))?;
     Ok((cert_pem, key_pem))
 }
 
@@ -5381,6 +5669,20 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
         );
         if let Some(message) = egress.upstream.unavailable() {
             report.error("upstream proxy", message);
+        }
+        // A loopback upstream may be another local proxy (possibly one that
+        // routes back here) or a local tunnel: worth a look, not an error.
+        if let Ok(upstream_proxy::Route::Proxy(endpoint)) =
+            upstream_proxy::route_for_url_blocking(&egress.upstream, health_base)
+            && let Some(address) = endpoint.loopback_address()
+        {
+            report.warn(
+                "upstream proxy",
+                format!(
+                    "{brand_product} egress goes through a proxy on this machine ({address}); make sure it is not this program itself or a local proxy that routes back here",
+                    brand_product = BRAND.product_name
+                ),
+            );
         }
         for (label, url) in [
             (
@@ -9374,6 +9676,10 @@ fn migrate_legacy_claude_no_proxy_for_instance(listen: &str) -> Result<()> {
 fn migrate_legacy_claude_no_proxy(settings_path: &Path, listen: &str) -> Result<()> {
     let original = fs::read(settings_path).ok();
     let mut settings = load_json_object(settings_path)?;
+    // Settings another local proxy program manages are not ours to rewrite.
+    if coexistence::claude_settings_evidence(&settings).is_some() {
+        return Ok(());
+    }
     let Some(env) = settings.get_mut("env").and_then(Value::as_object_mut) else {
         return Ok(());
     };
@@ -9423,7 +9729,11 @@ fn migrate_legacy_codex_system_proxy(
     ca_cert_path: &str,
 ) -> Result<()> {
     let env = fs::read_to_string(codex_dir.join(".env")).unwrap_or_default();
-    if !env.contains(merge_codex_ide_env("", listen, ca_cert_path).trim()) {
+    if !env.contains(merge_codex_ide_env("", listen, ca_cert_path).trim())
+        // Also a profile another local proxy program manages (its block,
+        // its CA, or its placeholder login).
+        || coexistence::codex_profile_evidence(codex_dir).is_some()
+    {
         return Ok(());
     }
     let path = codex_dir.join("config.toml");
@@ -11590,6 +11900,182 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert_ne!(Some(first), common_name(&second));
     }
 
+    /// The Codex migration also leaves a profile alone that another local
+    /// proxy program signed in to, even with this listener's block.
+    #[test]
+    fn the_codex_migration_skips_a_profile_with_another_programs_login() {
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        let listen = "127.0.0.1:19908";
+        let legacy = "[features]\nrespect_system_proxy = true\n";
+        fs::write(dir.path().join("config.toml"), legacy).unwrap();
+        fs::write(
+            dir.path().join(".env"),
+            merge_codex_ide_env("", listen, "/ca.pem"),
+        )
+        .unwrap();
+        let encode = |text: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text);
+        let token = format!(
+            "{}.{}.{}",
+            encode(r#"{"alg":"none","typ":"JWT"}"#),
+            encode(
+                r#"{"email":"other-local-proxy@invalid","https://api.openai.com/auth":{"chatgpt_account_id":"other-local-proxy-account"}}"#
+            ),
+            encode("other-local-proxy")
+        );
+        fs::write(
+            dir.path().join("auth.json"),
+            serde_json::to_vec(&serde_json::json!({"tokens": {"access_token": token}})).unwrap(),
+        )
+        .unwrap();
+        migrate_legacy_codex_system_proxy(dir.path(), listen, "/ca.pem").unwrap();
+        assert_eq!(read_str(&dir.path().join("config.toml")), legacy);
+    }
+
+    /// One removal: a failed command is an error (and the store is not
+    /// checked); a check that confirms the certificate still listed gives
+    /// false; a check that finds nothing or cannot run gives true.
+    #[test]
+    fn a_removal_fails_only_when_its_command_fails() {
+        let checked = std::cell::Cell::new(false);
+        let error = removal_result(Err(anyhow::anyhow!("removal command failed")), || {
+            checked.set(true);
+            Ok(None)
+        });
+        assert!(error.is_err());
+        assert!(!checked.get());
+        assert!(!removal_result(Ok(()), || Ok(Some(vec![1]))).unwrap());
+        assert!(removal_result(Ok(()), || Ok(None)).unwrap());
+        assert!(removal_result(Ok(()), || Err(anyhow::anyhow!("query failed"))).unwrap());
+    }
+
+    /// A Desktop launch stops on a failed removal only, not on a
+    /// certificate still listed or another program's CA kept.
+    #[test]
+    fn the_desktop_launch_stops_only_on_a_failed_removal() {
+        assert!(lease_launch_result(&LeaseCertificates::default()).is_ok());
+        assert!(
+            lease_launch_result(&LeaseCertificates {
+                lingering: vec!["AA".to_string()],
+                foreign: vec!["BB".to_string()],
+                ..LeaseCertificates::default()
+            })
+            .is_ok()
+        );
+        let error = lease_launch_result(&LeaseCertificates {
+            pending: vec!["AA".to_string(), "BB".to_string()],
+            ..LeaseCertificates::default()
+        })
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("could not remove CA(s) AA, BB"),
+            "{error:#}"
+        );
+    }
+
+    /// A lease retry touches certificates only: the first run restores the
+    /// proxy and keeps a certificate it fails to remove; after the user sets a
+    /// proxy of their own, the second run removes the certificate and leaves
+    /// the user's proxy as it is.
+    #[test]
+    fn a_lease_retry_settles_certificates_without_touching_the_proxy_again() {
+        use std::cell::{Cell, RefCell};
+        struct Fake {
+            proxy: RefCell<LegacyWindowsInternetProxySettings>,
+            proxy_writes: Cell<usize>,
+            removable: Cell<bool>,
+            installed: RefCell<Vec<String>>,
+            der: Vec<u8>,
+        }
+        impl LeaseSystem for Fake {
+            fn read_proxy(&self) -> Result<LegacyWindowsInternetProxySettings> {
+                Ok(self.proxy.borrow().clone())
+            }
+            fn write_proxy(&self, settings: &LegacyWindowsInternetProxySettings) -> Result<()> {
+                self.proxy_writes.set(self.proxy_writes.get() + 1);
+                *self.proxy.borrow_mut() = settings.clone();
+                Ok(())
+            }
+            fn certificate(&self, thumbprint: &str) -> Result<Option<Vec<u8>>> {
+                Ok(self
+                    .installed
+                    .borrow()
+                    .iter()
+                    .any(|installed| installed == thumbprint)
+                    .then(|| self.der.clone()))
+            }
+            fn remove_certificate(&self, thumbprint: &str) -> Result<bool> {
+                if !self.removable.get() {
+                    bail!("removal command failed");
+                }
+                self.installed
+                    .borrow_mut()
+                    .retain(|installed| installed != thumbprint);
+                Ok(true)
+            }
+        }
+        let proxy = |enable: i32, server: &str| LegacyWindowsInternetProxySettings {
+            proxy_enable: Some(enable),
+            proxy_server: Some(server.to_string()),
+            auto_config_url: None,
+        };
+        let der = {
+            use rcgen::{
+                BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
+            };
+            let key = KeyPair::generate().unwrap();
+            let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let mut name = DistinguishedName::new();
+            name.push(DnType::CommonName, "KTEST local installation CA");
+            name.push(DnType::OrganizationName, "KTEST");
+            params.distinguished_name = name;
+            params.self_signed(&key).unwrap().der().to_vec()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("lease.json");
+        fs::write(
+            &marker,
+            serde_json::to_vec(&serde_json::json!({
+                "previous": {"proxy_enable": 0, "proxy_server": null, "auto_config_url": null},
+                "managed_server": "127.0.0.1:64196",
+                "added_ca_thumbprints": ["AA"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let system = Fake {
+            proxy: RefCell::new(proxy(1, "127.0.0.1:64196")),
+            proxy_writes: Cell::new(0),
+            removable: Cell::new(false),
+            installed: RefCell::new(vec!["AA".to_string()]),
+            der,
+        };
+
+        let first = restore_lease_with(&marker, &system).unwrap();
+        assert_eq!(first.pending, ["AA"]);
+        assert_eq!(system.proxy_writes.get(), 1);
+        assert_eq!(system.proxy.borrow().proxy_enable, Some(0));
+        let kept = read_legacy_windows_packaged_proxy_lease_marker(&marker)
+            .unwrap()
+            .unwrap();
+        assert!(kept.proxy_handled);
+        assert_eq!(kept.added_ca_thumbprints, ["AA"]);
+
+        // The user sets their own proxy; the certificate can be removed now.
+        *system.proxy.borrow_mut() = proxy(1, "corp.example:8080");
+        system.removable.set(true);
+        let second = restore_lease_with(&marker, &system).unwrap();
+        assert_eq!(second, LeaseCertificates::default());
+        assert_eq!(system.proxy_writes.get(), 1);
+        assert_eq!(
+            system.proxy.borrow().proxy_server.as_deref(),
+            Some("corp.example:8080")
+        );
+        assert!(system.installed.borrow().is_empty());
+        assert!(!marker.exists());
+    }
+
     #[test]
     fn migrates_legacy_codex_system_proxy_only_in_this_listeners_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -11688,6 +12174,37 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         fs::remove_file(&path).unwrap();
         migrate_legacy_claude_no_proxy(&path, "127.0.0.1:19908").unwrap();
         assert!(!path.exists());
+    }
+
+    /// Settings another local proxy program manages (a local proxy and its
+    /// installation CA) are left alone, even on this listener's address.
+    #[test]
+    fn the_no_proxy_migration_skips_settings_another_program_manages() {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let mut name = DistinguishedName::new();
+        name.push(DnType::CommonName, "OTHER local installation CA");
+        name.push(DnType::OrganizationName, "OTHER");
+        params.distinguished_name = name;
+        let ca = dir.path().join("other-ca.crt");
+        fs::write(&ca, params.self_signed(&key).unwrap().pem()).unwrap();
+        let path = dir.path().join("settings.json");
+        let settings = serde_json::json!({"env": {
+            "no_proxy": LEGACY_DEFAULT_NO_PROXY,
+            "https_proxy": "http://127.0.0.1:19908",
+            "NODE_EXTRA_CA_CERTS": ca,
+        }});
+        fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
+        migrate_legacy_claude_no_proxy(&path, "127.0.0.1:19908").unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+            settings
+        );
     }
 
     #[test]
@@ -11826,6 +12343,109 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert!(branch.contains("target.as_deref()"));
     }
 
+    /// Lease certificates are decided one by one: only a confirmed foreign
+    /// CA is kept; ours, unknown, unreadable and unparsable ones are removed
+    /// by thumbprint as before; a failed removal command stops the work (it
+    /// and the rest stay for a retry), a certificate still listed after a
+    /// successful command is only reported.
+    #[test]
+    fn lease_certificates_are_settled_one_by_one() {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
+        };
+        let ca = |common_name: &str, organization: &str| {
+            let key = KeyPair::generate().unwrap();
+            let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            let mut name = DistinguishedName::new();
+            name.push(DnType::CommonName, common_name);
+            name.push(DnType::OrganizationName, organization);
+            params.distinguished_name = name;
+            params.self_signed(&key).unwrap().der().to_vec()
+        };
+        let store: HashMap<&str, Result<Option<Vec<u8>>, ()>> = HashMap::from([
+            ("OURS", Ok(Some(ca("KTEST local installation CA", "KTEST")))),
+            (
+                "FOREIGN",
+                Ok(Some(ca("OTHER local installation CA", "OTHER"))),
+            ),
+            ("CORP", Ok(Some(ca("Corporate Inspection CA", "Corp")))),
+            ("GONE", Ok(None)),
+            ("UNREADABLE", Err(())),
+            ("GARBAGE", Ok(Some(b"not a certificate".to_vec()))),
+            (
+                "STUCK",
+                Ok(Some(ca("KTEST local installation CA 0123abcd", "KTEST"))),
+            ),
+        ]);
+        let removed = std::cell::RefCell::new(Vec::new());
+        let thumbprints: Vec<String> = [
+            "OURS",
+            "FOREIGN",
+            "CORP",
+            "GONE",
+            "UNREADABLE",
+            "GARBAGE",
+            "STUCK",
+            "BROKEN",
+            "AFTER",
+        ]
+        .map(String::from)
+        .to_vec();
+        let settled = settle_lease_certificates(
+            &thumbprints,
+            |thumbprint| match thumbprint {
+                "BROKEN" | "AFTER" => Ok(Some(store["OURS"].clone().unwrap().unwrap())),
+                _ => store[thumbprint]
+                    .clone()
+                    .map_err(|()| anyhow::anyhow!("access denied")),
+            },
+            |thumbprint| {
+                removed.borrow_mut().push(thumbprint.to_string());
+                match thumbprint {
+                    "STUCK" => Ok(false),
+                    "BROKEN" => bail!("removal command failed"),
+                    _ => Ok(true),
+                }
+            },
+        );
+        assert_eq!(
+            settled,
+            LeaseCertificates {
+                // The first failed command stops the work, as before.
+                pending: vec!["BROKEN".to_string(), "AFTER".to_string()],
+                lingering: vec!["STUCK".to_string()],
+                foreign: vec!["FOREIGN".to_string()],
+            }
+        );
+        // Identity that cannot be read or parsed: removed as before; nothing
+        // after the failed command is touched.
+        assert_eq!(
+            *removed.borrow(),
+            ["OURS", "CORP", "UNREADABLE", "GARBAGE", "STUCK", "BROKEN"]
+        );
+    }
+
+    /// Leases written before `proxy_handled` read as not handled; a lease
+    /// rewritten for a retry keeps everything else.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn lease_markers_without_proxy_handled_still_read_and_round_trip() {
+        let old: LegacyWindowsPackagedProxyLeaseMarker = serde_json::from_str(
+            r#"{"previous":{"proxy_enable":0,"proxy_server":null,"auto_config_url":null},"managed_server":"127.0.0.1:64196","added_ca_thumbprints":["AA"]}"#,
+        )
+        .unwrap();
+        assert!(!old.proxy_handled);
+        let mut retry = old.clone();
+        retry.proxy_handled = true;
+        let again: LegacyWindowsPackagedProxyLeaseMarker =
+            serde_json::from_slice(&serde_json::to_vec(&retry).unwrap()).unwrap();
+        assert!(again.proxy_handled);
+        assert_eq!(again.managed_server, "127.0.0.1:64196");
+        assert_eq!(again.added_ca_thumbprints, ["AA"]);
+        assert_eq!(again.previous.proxy_enable, Some(0));
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn recognizes_a_legacy_packaged_proxy_lease_for_cleanup() {
@@ -11838,6 +12458,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             previous: original.clone(),
             managed_server: "127.0.0.1:64196".to_string(),
             added_ca_thumbprints: vec!["TEST-CA".to_string()],
+            proxy_handled: false,
         };
         let active = LegacyWindowsInternetProxySettings {
             proxy_enable: Some(1),

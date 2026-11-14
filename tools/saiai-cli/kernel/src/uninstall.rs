@@ -894,6 +894,20 @@ fn plan_claude(discovery: &Discovery, product: &ProductDir, plan: &mut Plan) {
                 Outcome::Failed("could not be parsed as a JSON object; not changed".into()),
             ),
             Some(settings) => {
+                // Another local proxy program manages these settings: none
+                // of their values is removed, ours included (they would be
+                // indistinguishable from its own, e.g. the same API key).
+                if let Some(reason) = crate::coexistence::claude_settings_evidence(&settings) {
+                    plan.note(
+                        Area::Claude,
+                        label.clone(),
+                        Outcome::Kept(format!(
+                            "managed by another local proxy program ({reason}); not changed. If {brand_product} settings are also in this file (for example its API key or proxy), remove them yourself once the other program no longer needs the file",
+                            brand_product = BRAND.product_name
+                        )),
+                    );
+                    return;
+                }
                 let removal = claude_settings_removal(&settings, &owned);
                 let modified_reason = if product.candidates.is_empty() {
                     format!(
@@ -1997,6 +2011,7 @@ fn plan_windows_certificates(
     files: &[PathBuf],
     plan: &mut Plan,
 ) -> Result<()> {
+    // Certificates a lease lists are decided by its Lease action alone.
     let mut thumbprints = Vec::new();
     for instance in &discovery.instances {
         for lease in [
@@ -2050,41 +2065,47 @@ fn plan_windows_certificates(
             }
         }
     }
+    // Each installed certificate from the instances' CA files, with its own
+    // DER (the file's copy), so it is decided by its own identity. A file
+    // that exists but cannot be read, or a certificate block that does not
+    // decode, is reported (`errors`), never skipped silently.
     const SCRIPT: &str = r#"
 $ErrorActionPreference='Stop'
-$found=New-Object System.Collections.Generic.List[string]
+$found=@{}
+$errors=New-Object System.Collections.Generic.List[string]
 foreach($file in ($env:@@ENV@@CA_FILES -split "`n")){
   if([string]::IsNullOrWhiteSpace($file)){continue}
+  if(-not (Test-Path -LiteralPath $file -PathType Leaf)){continue}
+  try{ $pem=[IO.File]::ReadAllText($file) }catch{ $errors.Add("${file}: $($_.Exception.Message)"); continue }
+  # A file with any problem contributes no certificate and is reported
+  # (main stopped reading such a file at its first failure but kept what
+  # it had collected; dropping the whole file removes at most less).
+  $blocks=[regex]::Matches($pem,'-----BEGIN CERTIFICATE-----(?<der>.*?)-----END CERTIFICATE-----',[Text.RegularExpressions.RegexOptions]::Singleline)
+  if(([regex]::Matches($pem,'-----BEGIN CERTIFICATE-----')).Count -ne $blocks.Count){ $errors.Add("${file}: unterminated certificate block"); continue }
+  $mine=@{}
   try{
-    $pem=[IO.File]::ReadAllText($file)
-    foreach($m in [regex]::Matches($pem,'-----BEGIN CERTIFICATE-----(?<der>[A-Za-z0-9+/=\s]+)-----END CERTIFICATE-----')){
-      $c=[Security.Cryptography.X509Certificates.X509Certificate2]::new([Convert]::FromBase64String($m.Groups['der'].Value))
-      $found.Add($c.Thumbprint.ToUpperInvariant()); $c.Dispose()
+    foreach($m in $blocks){
+      $raw=[Convert]::FromBase64String($m.Groups['der'].Value)
+      $c=[Security.Cryptography.X509Certificates.X509Certificate2]::new($raw)
+      $mine[$c.Thumbprint.ToUpperInvariant()]=[Convert]::ToBase64String($raw); $c.Dispose()
     }
-  }catch{}
+  }catch{ $errors.Add("${file}: $($_.Exception.Message)"); continue }
+  foreach($k in $mine.Keys){ $found[$k]=$mine[$k] }
 }
-foreach($t in ($env:@@ENV@@CA_THUMBPRINTS -split "`n")){ $t=$t.Trim(); if($t -match '^[0-9A-Fa-f]{40}$'){ $found.Add($t.ToUpperInvariant()) } }
-$present=@($found | Sort-Object -Unique | Where-Object { Test-Path -LiteralPath ('Cert:\CurrentUser\Root\'+$_) })
-ConvertTo-Json -Compress -InputObject $present
+$present=@($found.Keys | Sort-Object | Where-Object { Test-Path -LiteralPath ('Cert:\CurrentUser\Root\'+$_) } | ForEach-Object { [pscustomobject]@{t=$_;der=$found[$_]} })
+ConvertTo-Json -Compress -Depth 3 -InputObject ([pscustomobject]@{present=$present;errors=@($errors)})
 "#;
     let files = files
         .iter()
         .map(|path| path.to_string_lossy().to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    let thumbprints = thumbprints.join("\n");
     let output = match powershell(
         &crate::script_brand::render(SCRIPT),
-        &[
-            (
-                crate::script_brand::env("CA_FILES").as_str(),
-                std::ffi::OsStr::new(&files),
-            ),
-            (
-                crate::script_brand::env("CA_THUMBPRINTS").as_str(),
-                std::ffi::OsStr::new(&thumbprints),
-            ),
-        ],
+        &[(
+            crate::script_brand::env("CA_FILES").as_str(),
+            std::ffi::OsStr::new(&files),
+        )],
         Duration::from_secs(60),
     ) {
         Ok(output) => output,
@@ -2097,21 +2118,160 @@ ConvertTo-Json -Compress -InputObject $present
             return Ok(());
         }
     };
-    let present = match serde_json::from_str::<Value>(&output) {
-        Ok(Value::Array(values)) => values,
-        Ok(Value::String(value)) => vec![Value::String(value)],
-        _ => Vec::new(),
+    plan_root_certificates(&output, &thumbprints, plan);
+    Ok(())
+}
+
+/// One CurrentUser\Root certificate the inspection found, and its owner.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq)]
+enum RootCertificate {
+    Remove(String),
+    Foreign(String, String),
+}
+
+/// Reads the inspection script's output: installed certificates of the
+/// instances' CA files (each decided by its own DER; those a lease lists
+/// are left to the lease) and the errors met. Output that is not the
+/// expected shape is an error.
+#[cfg(any(windows, test))]
+fn root_certificates(
+    output: &str,
+    leased: &[String],
+) -> std::result::Result<(Vec<RootCertificate>, Vec<String>), String> {
+    let leased: std::collections::HashSet<String> = leased
+        .iter()
+        .map(|thumbprint| thumbprint.to_ascii_uppercase())
+        .collect();
+    let value: Value = serde_json::from_str(output.trim())
+        .map_err(|error| format!("unexpected inspection output: {error}"))?;
+    if !value.is_object() {
+        return Err(format!("unexpected inspection output: {value}"));
+    }
+    let list = |key: &str| -> std::result::Result<Vec<Value>, String> {
+        match value.get(key) {
+            Some(Value::Array(values)) => Ok(values.clone()),
+            Some(Value::Null) => Ok(Vec::new()),
+            None => Err(format!("inspection output without {key}")),
+            Some(single @ (Value::Object(_) | Value::String(_))) => Ok(vec![single.clone()]),
+            Some(other) => Err(format!("unexpected inspection {key}: {other}")),
+        }
     };
-    for thumbprint in present.iter().filter_map(Value::as_str) {
-        plan.act(
+    let errors = list("errors")?
+        .iter()
+        .map(|error| {
+            error
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| error.to_string())
+        })
+        .collect();
+    let mut certificates = Vec::new();
+    for item in list("present")? {
+        let thumbprint = item
+            .get("t")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("inspection entry without a thumbprint: {item}"))?
+            .to_string();
+        if leased.contains(&thumbprint.to_ascii_uppercase()) {
+            continue;
+        }
+        let owner = item
+            .get("der")
+            .and_then(Value::as_str)
+            .and_then(|der| {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.decode(der).ok()
+            })
+            .context("certificate data is missing")
+            .and_then(|der| crate::coexistence::classify_certificate(&der));
+        // Only a confirmed foreign CA is kept; ours, unknown and
+        // unidentifiable ones are removed by thumbprint as before.
+        certificates.push(match owner {
+            Ok(crate::coexistence::CertificateOwner::Foreign(organization)) => {
+                RootCertificate::Foreign(thumbprint, organization)
+            }
+            Ok(_) | Err(_) => RootCertificate::Remove(thumbprint),
+        });
+    }
+    Ok((certificates, errors))
+}
+
+#[cfg(windows)]
+fn plan_root_certificates(output: &str, leased: &[String], plan: &mut Plan) {
+    let (certificates, errors) = match root_certificates(output, leased) {
+        Ok(found) => found,
+        // Reported, not failed: as before, an inspection that yields no
+        // certificate removes none and does not stop the uninstall.
+        Err(error) => {
+            plan.note(
+                Area::Certificates,
+                "Windows CurrentUser\\Root certificates",
+                Outcome::Kept(format!(
+                    "WARN could not read the inspection ({error}); no certificate is removed"
+                )),
+            );
+            return;
+        }
+    };
+    for error in errors {
+        plan.note(
             Area::Certificates,
-            format!(
-                "remove {brand_product} CA {thumbprint} from Windows CurrentUser\\Root (Windows may ask you to confirm)", brand_product = BRAND.product_name
-            ),
-            Action::RootCa(thumbprint.to_string()),
+            "CA file",
+            Outcome::Kept(format!(
+                "WARN could not be read ({error}); certificates it may hold are not removed"
+            )),
         );
     }
-    Ok(())
+    for certificate in certificates {
+        match certificate {
+            RootCertificate::Remove(thumbprint) => plan.act(
+                Area::Certificates,
+                format!(
+                    "remove {brand_product} CA {thumbprint} from Windows CurrentUser\\Root (Windows may ask you to confirm)", brand_product = BRAND.product_name
+                ),
+                Action::RootCa(thumbprint),
+            ),
+            RootCertificate::Foreign(thumbprint, organization) => plan.note(
+                Area::Certificates,
+                format!("CA {thumbprint} in Windows CurrentUser\\Root"),
+                Outcome::Kept(format!(
+                    "installation CA of \"{organization}\", another local proxy program"
+                )),
+            ),
+        }
+    }
+}
+
+/// The uninstall outcome of a lease restore: a failed removal fails the
+/// step, as before (the gate keeps data and program; the lease keeps the
+/// certificates for a rerun); another program's CA kept and a certificate
+/// still listed after its removal do not.
+#[cfg(any(windows, test))]
+fn lease_outcome(settled: &crate::LeaseCertificates) -> Outcome {
+    if !settled.pending.is_empty() {
+        Outcome::Failed(format!(
+            "CA(s) {} could not be removed; they and the lease are kept, rerun uninstall",
+            settled.pending.join(", ")
+        ))
+    } else if !settled.foreign.is_empty() || !settled.lingering.is_empty() {
+        let mut notes = Vec::new();
+        if !settled.foreign.is_empty() {
+            notes.push(format!(
+                "CA(s) {} belong to another local proxy program and are kept",
+                settled.foreign.join(", ")
+            ));
+        }
+        if !settled.lingering.is_empty() {
+            notes.push(format!(
+                "CA(s) {} are still listed after their removal; remove them in certmgr.msc if needed",
+                settled.lingering.join(", ")
+            ));
+        }
+        Outcome::Kept(format!("lease settled; {}", notes.join("; ")))
+    } else {
+        Outcome::Done
+    }
 }
 
 #[cfg(any(windows, test))]
@@ -2626,10 +2786,9 @@ fn execute_item(action: &Action, args: &Args) -> Result<Outcome> {
         #[cfg(target_os = "macos")]
         Action::Launchd { target, plist } => execute_launchd(target, plist),
         #[cfg(windows)]
-        Action::Lease(path) => {
-            crate::restore_legacy_windows_packaged_proxy_lease_at(path)?;
-            Ok(Outcome::Done)
-        }
+        Action::Lease(path) => Ok(lease_outcome(
+            &crate::restore_legacy_windows_packaged_proxy_lease_at(path)?,
+        )),
         #[cfg(windows)]
         Action::RootCa(thumbprint) => {
             execute_root_ca(thumbprint)?;
@@ -2856,6 +3015,97 @@ fn open_terminal() -> std::io::Result<fs::File> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn installation_ca_der(common_name: &str, organization: &str) -> String {
+        use base64::Engine;
+        use rcgen::{
+            BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
+        };
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let mut name = DistinguishedName::new();
+        name.push(DnType::CommonName, common_name);
+        name.push(DnType::OrganizationName, organization);
+        params.distinguished_name = name;
+        base64::engine::general_purpose::STANDARD.encode(params.self_signed(&key).unwrap().der())
+    }
+
+    #[test]
+    fn lease_outcomes_fail_only_on_a_failed_removal() {
+        use crate::LeaseCertificates;
+        assert_eq!(lease_outcome(&LeaseCertificates::default()), Outcome::Done);
+        let kept = lease_outcome(&LeaseCertificates {
+            lingering: vec!["AA".to_string()],
+            foreign: vec!["BB".to_string()],
+            ..LeaseCertificates::default()
+        });
+        assert!(kept.succeeded(), "{kept:?}");
+        assert!(matches!(&kept, Outcome::Kept(text) if text.contains("AA") && text.contains("BB")));
+        let failed = lease_outcome(&LeaseCertificates {
+            pending: vec!["AA".to_string()],
+            lingering: vec!["CC".to_string()],
+            ..LeaseCertificates::default()
+        });
+        assert!(!failed.succeeded());
+        assert!(matches!(failed, Outcome::Failed(_)));
+    }
+
+    /// The Windows root-certificate inspection: each certificate decided by
+    /// its own DER, leased ones (any case) left to the lease, errors and
+    /// unexpected output reported instead of read as "nothing installed".
+    #[test]
+    fn root_certificate_inspection_decides_each_certificate_and_reports_errors() {
+        let ours = installation_ca_der("KTEST local installation CA", "KTEST");
+        let other = installation_ca_der("OTHER local installation CA", "OTHER");
+        let output = json!({
+            "present": [
+                {"t": "AAAA", "der": ours},
+                {"t": "BBBB", "der": other},
+                {"t": "CCCC", "der": "bm90IGEgY2VydGlmaWNhdGU="},
+                {"t": "DDDD", "der": ours},
+            ],
+            "errors": ["C:\\x\\ktest-ca.crt: access denied"],
+        })
+        .to_string();
+        let (certificates, errors) = root_certificates(&output, &["dddd".to_string()]).unwrap();
+        assert_eq!(errors, ["C:\\x\\ktest-ca.crt: access denied"]);
+        assert_eq!(certificates.len(), 3);
+        assert_eq!(certificates[0], RootCertificate::Remove("AAAA".to_string()));
+        assert_eq!(
+            certificates[1],
+            RootCertificate::Foreign("BBBB".to_string(), "OTHER".to_string())
+        );
+        // Not identifiable: removed by thumbprint, as before.
+        assert_eq!(certificates[2], RootCertificate::Remove("CCCC".to_string()));
+        // PowerShell collapses one-element arrays and empty ones.
+        let single = json!({"present": {"t": "AAAA", "der": ours}, "errors": null}).to_string();
+        assert_eq!(
+            root_certificates(&single, &[]).unwrap(),
+            (
+                vec![RootCertificate::Remove("AAAA".to_string())],
+                Vec::new()
+            )
+        );
+        let empty = json!({"present": [], "errors": []}).to_string();
+        assert_eq!(
+            root_certificates(&empty, &[]).unwrap(),
+            (Vec::new(), Vec::new())
+        );
+        // Not the expected shape: an error, not "nothing installed".
+        for output in [
+            "",
+            "not json",
+            "[]",
+            "{}",
+            r#"{"unexpected": true}"#,
+            r#"{"present": []}"#,
+            r#"{"present": 3, "errors": []}"#,
+            r#"{"present": [{"der": "x"}], "errors": []}"#,
+        ] {
+            assert!(root_certificates(output, &[]).is_err(), "{output}");
+        }
+    }
 
     fn owned() -> ClaudeOwned {
         ClaudeOwned {

@@ -938,7 +938,6 @@ fn helper_environment_variables_are_written_and_read() {
     let expected: &[(&str, &[&str])] = &[
         ("SAIAI_CA_FILES", &["uninstall.rs"]),
         ("SAIAI_CA_THUMBPRINT", &["uninstall.rs"]),
-        ("SAIAI_CA_THUMBPRINTS", &["uninstall.rs"]),
         ("SAIAI_CHECK_EXE", &["lib.rs"]),
         ("SAIAI_CHECK_PID", &["lib.rs"]),
         ("SAIAI_CLEANUP_DIR", &["uninstall.rs"]),
