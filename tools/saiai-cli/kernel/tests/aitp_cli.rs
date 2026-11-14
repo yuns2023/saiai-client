@@ -992,6 +992,11 @@ fn update_from(
     (success, text, requests)
 }
 
+/// An installation-directory lock file (Windows), which stays.
+fn is_lock_file(name: &str) -> bool {
+    name.starts_with(".aitp-update-") && name.ends_with("lock")
+}
+
 /// Files the update left next to the program, other than the program.
 fn left_beside(sandbox: &Sandbox) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(sandbox.program.parent().unwrap())
@@ -1079,7 +1084,7 @@ fn update_downloads_probes_and_replaces_the_program() {
     assert_eq!(snapshot(&backup), before);
     assert!(
         left.iter().all(|name| name.starts_with("aitp.bak-")
-            || name == ".aitp-update-lock"
+            || is_lock_file(name)
             || name == ".aitp-update-status.txt"),
         "{left:?}"
     );
@@ -1117,9 +1122,6 @@ fn update_refuses_a_program_that_reports_another_version() {
     );
     assert_eq!(snapshot(&sandbox.program), before);
     let left = left_beside(&sandbox);
-    assert!(
-        left.iter().all(|name| name == ".aitp-update-lock"),
-        "{left:?}"
-    );
+    assert!(left.iter().all(|name| is_lock_file(name)), "{left:?}");
     sandbox.assert_only_aitp_names();
 }
