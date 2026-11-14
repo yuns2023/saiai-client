@@ -174,6 +174,17 @@ def main() -> int:
         )
         if clean.returncode != 0 or clean.stdout or clean.stderr:
             failures.append(f"clean tree: status {clean.returncode}, {clean.stdout!r} {clean.stderr!r}")
+    with tempfile.TemporaryDirectory() as directory:
+        # A submodule that is not checked out: only its git metadata, or
+        # nothing at all, must not pass as a clean kernel.
+        for metadata in (False, True):
+            if metadata:
+                Path(directory, ".git").write_text("gitdir: ../x\n")
+            empty = subprocess.run(
+                [sys.executable, str(SCRIPT), directory], capture_output=True, text=True
+            )
+            if empty.returncode != 1 or "no files to scan" not in empty.stdout:
+                failures.append(f"an empty directory passed: {empty.returncode} {empty.stdout!r}")
     missing = subprocess.run(
         [sys.executable, str(SCRIPT), str(ROOT / "no-such-directory")],
         capture_output=True,

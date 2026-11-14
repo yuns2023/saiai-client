@@ -29,9 +29,23 @@ cargo test --manifest-path $M -p saiai --features contract --lib \
   --test contract_entry --test saiai_render_contract --test kernel_consumer
 ```
 
-`tools/saiai-cli/kernel/` 是与发行版无关的内核，可以单独构建和测试
-（`cd tools/saiai-cli/kernel && cargo test`）。内核目录中不得出现 SAIAI 名字，
-也不得引用内核目录以外的文件（由 `saiai_source_contract` 检查）；SAIAI 的取值
+`tools/saiai-cli/kernel/` 是与发行版无关的内核，即公开仓库
+[AITP](https://github.com/2742zdz/AITP) 的 git 子模块。克隆或新建 worktree 后先取内核：
+
+```bash
+git submodule update --init
+python3 scripts/saiai-cli/check-kernel-submodule.py   # 钉住的提交已检出、在 AITP main 上、两份 lock 一致
+```
+
+内核改动（含内核依赖升级）先在 AITP 提 PR、合进 AITP 的 main 并通过其 CI，
+再在本仓库把子模块移到 main 上的新提交（`git -C tools/saiai-cli/kernel fetch origin main`、
+`git -C tools/saiai-cli/kernel checkout <提交>`、`git add tools/saiai-cli/kernel`），
+需要时同步 `tools/saiai-cli/Cargo.lock`。不能钉到不在 AITP main 上的提交
+（CI、发版和 pre-push 都会拒绝），AITP main 也不得强推。内核的单独构建、各平台
+测试和 AITP 发布构建由 AITP 自己的 CI 负责。
+
+内核目录中不得出现 SAIAI 名字（`scan-kernel-names.py` 与 `saiai_source_contract`
+检查子模块内容，只跳过其 git 元数据），也不得引用内核目录以外的文件；SAIAI 的取值
 只放在 `tools/saiai-cli/src/brand_saiai.rs`，由薄壳测试冻结。
 
 内核文件引用扫描是保守的（按 token 检查，宁可误拒）：

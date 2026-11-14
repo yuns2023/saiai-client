@@ -10,10 +10,13 @@ on:
 permissions:
   contents: read
 
-# Everyday CI runs on Linux only, including the kernel on its own and its
-# AITP release build (the kernel source still lives here). The native macOS
-# and Windows checks run in "SAIAI CLI Release" (every preview and every
-# release tag). verify-release.py holds this division of work.
+# The kernel is the public AITP repository, checked out as the submodule
+# tools/saiai-cli/kernel: its own CI tests it on its own (Linux, macOS,
+# Windows) and builds its releases. Everyday CI here tests this distribution:
+# the workspace and the SAIAI goldens on Linux, the static Linux client, and
+# the program's native macOS and Windows checks. Every preview and release
+# tag ("SAIAI CLI Release") also runs the whole workspace natively.
+# verify-release.py holds this division of work.
 
 # The kernel's tests refuse a neutral test brand in everything `aitp`
 # prints, writes and carries; this distribution adds its own name here, so
@@ -32,6 +35,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -46,7 +51,19 @@ jobs:
         with:
           workspaces: tools/saiai-cli -> target
 
-      # The kernel becomes a public repository: no spelling, encoding or
+      # The pinned kernel commit is the one checked out, and it is on AITP's
+      # main (a commit that was never pushed there, or was force-pushed
+      # away, could not be rebuilt). AITP's lock file pins the same
+      # third-party packages as this workspace's.
+      - name: Check the kernel submodule
+        env:
+          # Reads AITP's public CI runs (avoids the anonymous rate limit).
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/saiai-cli/test-check-kernel-submodule.py
+          python3 scripts/saiai-cli/check-kernel-submodule.py
+
+      # The kernel is a public repository: no spelling, encoding or
       # internal detail of this distribution may appear in it.
       - name: Scan the kernel for distribution names
         run: |
@@ -72,47 +89,6 @@ jobs:
 
       - name: Install the workflow parser
         run: python3 -m pip install --disable-pip-version-check --no-deps --only-binary pyyaml --require-hashes -r scripts/saiai-cli/requirements-verify.txt
-
-      # The kernel package (kernel/ alone, as a public repository would hold
-      # it) lints with and without the contract entries and passes its own
-      # tests outside this workspace, on the workspace's locked dependencies.
-      - name: Test the kernel on its own
-        run: |
-          standalone="$(mktemp -d)"
-          cp -R tools/saiai-cli/kernel "$standalone/kernel"
-          cp tools/saiai-cli/Cargo.lock "$standalone/kernel/Cargo.lock"
-          # Drops the workspace-only entries from the copied lock file ...
-          cargo metadata --format-version 1 --manifest-path "$standalone/kernel/Cargo.toml" > /dev/null
-          # ... without changing any locked third-party package.
-          python3 - "$standalone/kernel/Cargo.lock" tools/saiai-cli/Cargo.lock <<'PY'
-          import re, sys
-          def packages(path):
-              found = {}
-              for block in open(path, encoding="utf-8").read().split("[[package]]")[1:]:
-                  field = lambda name: (re.search(rf'^{name} = "([^"]*)"', block, re.M) or [None, None])[1]
-                  if field("source"):
-                      found[(field("name"), field("version"))] = (field("source"), field("checksum"))
-              return found
-          standalone, workspace = packages(sys.argv[1]), packages(sys.argv[2])
-          changed = sorted(key for key, value in standalone.items() if workspace.get(key) != value)
-          assert not changed, f"standalone kernel resolves other packages: {changed}"
-          print(f"standalone kernel locks {len(standalone)} workspace packages unchanged")
-          PY
-          cd "$standalone/kernel"
-          cargo clippy --locked --target-dir "$standalone/target" --all-targets -- -D warnings
-          cargo clippy --locked --target-dir "$standalone/target" --all-targets --features contract -- -D warnings
-          cargo test --locked --target-dir "$standalone/target"
-          # The AITP program: its brand installs and renders its services
-          # (contract entries), and a release build (paths remapped, as
-          # published) runs, names no build path and carries the brand's
-          # real update signing keys.
-          cargo test --locked --target-dir "$standalone/target" --features contract --bin aitp
-          python3 scripts/test_release_manifest.py
-          aitp="$(CARGO_TARGET_DIR="$standalone/target" bash scripts/build-release.sh --locked)"
-          "$aitp" --version
-          python3 "$GITHUB_WORKSPACE/scripts/saiai-cli/verify-release.py" \
-            --aitp-artifact "$aitp" \
-            --build-dir "$standalone" --build-dir "$GITHUB_WORKSPACE"
 
       - name: Verify official Codex daemon initialization without model turns
         env:
@@ -146,102 +122,6 @@ jobs:
           bash scripts/saiai-cli/test-setup-wrappers.sh
           python3 scripts/saiai-cli/verify-release.py
 
-  # The AITP release build in the workspace checkout, whose path spells the
-  # other distribution's name: with the paths remapped the program carries
-  # neither that name nor any build machine path, and an ordinary release
-  # build (the control) is caught by the same check.
-  aitp-release-linux:
-    name: AITP release paths
-    runs-on: ubuntu-22.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
-
-      # rust-toolchain.toml asks for clippy and rustfmt: installing them here
-      # avoids rustup adding rustfmt later over the runner's own cargo-fmt.
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
-        with:
-          toolchain: '1.97.0'
-          components: clippy, rustfmt
-
-      - name: Install the workflow parser
-        run: python3 -m pip install --disable-pip-version-check --no-deps --only-binary pyyaml --require-hashes -r scripts/saiai-cli/requirements-verify.txt
-
-      - name: Build the AITP release with remapped paths
-        env:
-          CARGO_BUILD_JOBS: 2
-        run: |
-          case "$GITHUB_WORKSPACE" in
-            *saiai*) ;;
-            *) echo "::error::the checkout path no longer names the other distribution"; exit 1 ;;
-          esac
-          aitp="$(bash tools/saiai-cli/kernel/scripts/build-release.sh --locked)"
-          "$aitp" --version
-          echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"
-
-      - name: Verify the AITP release names no build path
-        run: >-
-          python3 scripts/saiai-cli/verify-release.py
-          --aitp-artifact "$AITP_PROGRAM"
-          --build-dir "$GITHUB_WORKSPACE"
-
-      # The build and the release check refuse placeholder keys: a kernel
-      # copy whose brand carries the placeholders does not build, and a
-      # program that carries one fails the check.
-      - name: Control - placeholder signing keys are refused for a release
-        run: |
-          copy="$RUNNER_TEMP/placeholder-kernel"
-          cp -R tools/saiai-cli/kernel "$copy"
-          python3 - "$copy" <<'PY'
-          import importlib.util, pathlib, sys
-          sys.dont_write_bytecode = True
-          copy = pathlib.Path(sys.argv[1])
-          spec = importlib.util.spec_from_file_location("rm", copy / "scripts/release_manifest.py")
-          rm = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(rm)
-          brand = copy / "src/bin/aitp/brand.rs"
-          text = brand.read_text(encoding="utf-8")
-          keys = rm.brand_keys(text)
-          assert len(keys) == len(rm.PLACEHOLDER_KEYS), keys
-          for key, placeholder in zip(keys, rm.PLACEHOLDER_KEYS):
-              assert text.count(key) >= 1, key
-              text = text.replace(key, placeholder)
-          brand.write_text(text, encoding="utf-8")
-          PY
-          if bash "$copy/scripts/build-release.sh" --locked 2> "$RUNNER_TEMP/build.log"; then
-            echo "::error::the release build accepted placeholder signing keys"
-            exit 1
-          fi
-          grep "update signing keys are placeholders" "$RUNNER_TEMP/build.log"
-          cp "$AITP_PROGRAM" "$RUNNER_TEMP/aitp-placeholder"
-          printf '%s' RWQAITPxPRIMARYxPLACEHOLDERxKEYxNOTxFORxRELEASE222222222 >> "$RUNNER_TEMP/aitp-placeholder"
-          if python3 scripts/saiai-cli/verify-release.py \
-              --aitp-artifact "$RUNNER_TEMP/aitp-placeholder" \
-              --build-dir "$GITHUB_WORKSPACE" 2> "$RUNNER_TEMP/keys.log"; then
-            echo "::error::the release check accepted placeholder signing keys"
-            exit 1
-          fi
-          grep "carries placeholder signing keys" "$RUNNER_TEMP/keys.log"
-
-      - name: Control - an ordinary release build fails the check
-        env:
-          CARGO_BUILD_JOBS: 2
-          CARGO_TARGET_DIR: ${{ runner.temp }}/aitp-plain
-        run: |
-          cargo build --locked --manifest-path tools/saiai-cli/kernel/Cargo.toml --release --bin aitp
-          if python3 scripts/saiai-cli/verify-release.py \
-              --aitp-artifact "$CARGO_TARGET_DIR/release/aitp" \
-              --build-dir "$GITHUB_WORKSPACE" 2> "$RUNNER_TEMP/control.log"; then
-            echo "::error::the path check accepted an ordinary release build"
-            exit 1
-          fi
-          cat "$RUNNER_TEMP/control.log"
-          grep -E "carries build machine paths|names the other distribution" "$RUNNER_TEMP/control.log"
-
   static-linux:
     name: Static Linux client (${{ matrix.asset }})
     runs-on: ${{ matrix.os }}
@@ -257,6 +137,8 @@ jobs:
           # and release build ("SAIAI CLI Release").
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -315,3 +197,154 @@ jobs:
         run: >-
           python3 scripts/saiai-cli/test-uninstall.py
           --binary dist/${{ matrix.asset }}
+
+  # This distribution's own native checks (the kernel's native tests run in
+  # AITP's CI): the SAIAI program's tests and platform goldens (LaunchAgent
+  # plist, Windows update helper), and the built program on the platform.
+  client-windows:
+    name: Native Windows config client
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Verify read-only Windows certificate inventory
+        run: >-
+          python -c "import runpy; runpy.run_path('scripts/saiai-cli/test-initialization-scope.py')['windows_roots'](); print('Windows Root inventory read passed')"
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: '1.97.0'
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: tools/saiai-cli -> target
+
+      - name: Test and build native Windows client
+        shell: bash
+        run: |
+          node --test scripts/saiai-cli/test-vscode-certificates.js
+          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai
+          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test contract_entry --test saiai_render_contract --test kernel_consumer
+          cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --bin saiai
+
+      - name: Smoke-test Windows configuration
+        shell: pwsh
+        run: |
+          & "$PWD/scripts/saiai-cli/test-windows-runtime.ps1" `
+            -BinaryPath "$PWD/tools/saiai-cli/target/debug/saiai.exe"
+
+      - name: Verify Windows UTF-8 log reading
+        run: python scripts/saiai-cli/test-windows-log-encoding.py --binary tools/saiai-cli/target/debug/saiai.exe
+
+      - name: Verify reproducible Windows image
+        run: python scripts/saiai-cli/verify-windows-reproducibility.py tools/saiai-cli/target/debug/saiai.exe
+
+      - name: Verify provider initialization preserves editor and certificate stores
+        run: python scripts/saiai-cli/test-initialization-scope.py --binary tools/saiai-cli/target/debug/saiai.exe
+
+      - name: Verify native Windows environment lifecycle isolation
+        timeout-minutes: 5
+        run: python scripts/saiai-cli/test-windows-environments.py --binary tools/saiai-cli/target/debug/saiai.exe
+
+      - name: Verify Windows installer environment routing
+        shell: pwsh
+        run: |
+          & "$env:WINDIR/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -File scripts/saiai-cli/test-setup-environments.ps1 -WrapperPath "$PWD/scripts/saiai-cli/setup.ps1"
+
+      # The manifest generator's exit status counts, not only the smoke's.
+      - name: Smoke-test Windows PowerShell 5.1 setup wrapper
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item "$PWD/tools/saiai-cli/target/debug/saiai.exe" "$PWD/dist/saiai-windows-x86_64.exe"
+          Copy-Item "$PWD/scripts/saiai-cli/setup.sh", "$PWD/scripts/saiai-cli/setup.ps1", "$PWD/scripts/saiai-cli/setup.cmd" "$PWD/dist/"
+          python scripts/saiai-cli/generate-manifest.py `
+            --dist dist `
+            --cargo-toml tools/saiai-cli/Cargo.toml `
+            --asset saiai-windows-x86_64.exe `
+            --wrappers-dir dist `
+            --output dist/manifest.json
+          & "$PWD/scripts/saiai-cli/test-windows-release.ps1" `
+            -BundleDir dist `
+            -SetupPs1 dist/setup.ps1 `
+            -SetupCmd dist/setup.cmd `
+            -AssetName saiai-windows-x86_64.exe
+
+      - name: Smoke-test native Windows self-update with active proxy
+        shell: pwsh
+        run: python scripts/saiai-cli/test-windows-self-update.py --binary dist/saiai-windows-x86_64.exe
+
+      # Each native command's exit status counts, not only the last one.
+      - name: Capture official Windows Codex through local proxy
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm install --global --prefix "$env:RUNNER_TEMP/codex-0.146.0" "@openai/codex@0.146.0"
+          python scripts/saiai-cli/test-windows-codex-proxy.py --saiai tools/saiai-cli/target/debug/saiai.exe --codex-prefix "$env:RUNNER_TEMP/codex-0.146.0" --codex-version 0.146.0
+          npm install --global --prefix "$env:RUNNER_TEMP/codex-0.153.4" "@openai/codex@0.153.4"
+          python scripts/saiai-cli/test-windows-codex-proxy.py --saiai tools/saiai-cli/target/debug/saiai.exe --codex-prefix "$env:RUNNER_TEMP/codex-0.153.4" --codex-version 0.153.4
+
+  client-macos:
+    name: Native macOS local proxy (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            arch: x86_64
+          - os: macos-15
+            arch: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: '1.97.0'
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: tools/saiai-cli -> target
+
+      - name: Test and build native macOS client
+        run: |
+          node --test scripts/saiai-cli/test-vscode-certificates.js
+          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai
+          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test contract_entry --test saiai_render_contract --test kernel_consumer
+          cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --bin saiai
+
+      - name: Verify provider and project configuration isolation
+        run: >-
+          python3 scripts/saiai-cli/test-initialization-scope.py
+          --binary tools/saiai-cli/target/debug/saiai
+
+      - name: Smoke-test macOS LaunchAgent lifecycle
+        run: >-
+          python3 scripts/saiai-cli/test-macos-service.py
+          --binary tools/saiai-cli/target/debug/saiai
+
+      - name: Verify native macOS environment lifecycle isolation
+        run: >-
+          python3 scripts/saiai-cli/test-macos-environments.py
+          --binary tools/saiai-cli/target/debug/saiai
+
+      - name: Capture official macOS Codex through local proxy
+        if: matrix.arch == 'arm64'
+        run: |
+          prefix="$RUNNER_TEMP/codex-0.153.4"
+          npm install --global --prefix "$prefix" @openai/codex@0.153.4
+          python3 scripts/saiai-cli/test-windows-codex-proxy.py \
+            --saiai tools/saiai-cli/target/debug/saiai \
+            --codex-prefix "$prefix/bin" \
+            --codex-version 0.153.4

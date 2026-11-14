@@ -1,0 +1,3 @@
+[submodule "tools/saiai-cli/kernel"]
+	path = tools/saiai-cli/kernel
+	url = https://github.com/2742zdz/AITP

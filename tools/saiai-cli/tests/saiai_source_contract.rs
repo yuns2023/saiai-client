@@ -814,7 +814,9 @@ fn only_the_extension_side_uses_the_client_proof_protocol() {
 }
 
 /// Every file below `kernel/`, recursively, and every symbolic link found
-/// there (not followed). A local build directory `kernel/target` is skipped.
+/// there (not followed). A local build directory `kernel/target` and the
+/// submodule's git metadata (`kernel/.git`, a file or a directory, which
+/// names this checkout's path) are skipped.
 fn kernel_tree() -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
     fn walk(
         dir: &Path,
@@ -824,6 +826,9 @@ fn kernel_tree() -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
     ) {
         for entry in fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
+            if top && path.file_name().is_some_and(|name| name == ".git") {
+                continue;
+            }
             let kind = fs::symlink_metadata(&path).unwrap().file_type();
             if kind.is_symlink() {
                 links.push(path);
@@ -854,8 +859,8 @@ const KERNEL_SAIAI_EXCEPTIONS: &[(&str, &str)] = &[];
 /// and Gateway extension the program passes in.
 ///
 /// Hidden files are scanned like any other: they ship with the directory.
-/// If `kernel/` later becomes a git submodule, skip only its git metadata
-/// (the `.git` file or directory), never hidden files in general.
+/// `kernel/` is a git submodule: only its git metadata (the top-level
+/// `.git` file or directory) is skipped, never hidden files in general.
 #[test]
 fn the_kernel_directory_never_names_saiai() {
     let kernel = Path::new(env!("CARGO_MANIFEST_DIR")).join("kernel");

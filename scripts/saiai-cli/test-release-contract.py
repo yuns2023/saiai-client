@@ -399,14 +399,18 @@ class AitpArtifactTests(unittest.TestCase):
                 return contents
             return read
 
+        verify = "          python3 scripts/saiai-cli/verify-release.py\n"
+        check = "          python3 scripts/saiai-cli/check-kernel-submodule.py\n"
         for path, old, new, message in (
-            (VERIFIER.AITP_RELEASE_BUILD, '--target "$triple"', "", "build script is missing"),
-            (".github/workflows/saiai-cli-release.yml", "          python3 scripts/saiai-cli/verify-release.py\n", "          bash tools/saiai-cli/kernel/scripts/build-release.sh\n          python3 scripts/saiai-cli/verify-release.py\n", "must not use"),
-            (".github/workflows/ci.yml", '          echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"\n', "", "AITP release hand-over|GITHUB_ENV outside"),
-            (".github/workflows/ci.yml", '          --aitp-artifact "$AITP_PROGRAM"\n', "", "AITP release path check"),
-            (".github/workflows/ci.yml", "          cargo test --locked --target-dir \"$standalone/target\"\n", "", "stand-alone kernel tests"),
-            (VERIFIER.AITP_RELEASE_BUILD, "--remap-path-prefix=", "--no-remap=", "build script is missing"),
-            (VERIFIER.AITP_RELEASE_BUILD, 'add_mapping "$home" /aitp/home\n', "", "does not map to /aitp/home"),
+            (".github/workflows/saiai-cli-release.yml", verify, "          bash tools/saiai-cli/kernel/scripts/build-release.sh\n" + verify, "must not use"),
+            (".github/workflows/ci.yml", verify, "          bash tools/saiai-cli/kernel/scripts/build-release.sh\n" + verify, "must not use"),
+            (".github/workflows/ci.yml", verify, '          python3 scripts/saiai-cli/verify-release.py --aitp-artifact /tmp/aitp --build-dir "$GITHUB_WORKSPACE"\n' + verify, "must not use"),
+            # The pinned kernel commit is checked in everyday CI, in every
+            # release run and before every push.
+            (".github/workflows/ci.yml", check, "", "kernel submodule check"),
+            (".github/workflows/ci.yml", "          python3 scripts/saiai-cli/test-check-kernel-submodule.py\n", "", "kernel submodule check tests"),
+            (".github/workflows/saiai-cli-release.yml", "        run: python3 scripts/saiai-cli/check-kernel-submodule.py\n", "        run: python3 scripts/saiai-cli/check-kernel-submodule.py --offline\n", "kernel submodule check"),
+            ("scripts/git-hooks/pre-push", "(cd \"$repo_root\" && python3 scripts/saiai-cli/check-kernel-submodule.py)\n", "", "does not run"),
         ):
             with self.subTest(path=path, old=old), patch.object(VERIFIER, "text", side_effect=broken(path, old, new)):
                 with self.assertRaisesRegex(AssertionError, message):
@@ -504,8 +508,8 @@ class WorkflowStructureTests(unittest.TestCase):
         self.rejects(CI, CARGO_TEST, CARGO_TEST + "        continue-on-error: true\n", "continues on error")
         self.rejects(CI, CARGO_TEST, CARGO_TEST + "        shell: bash {0}\n", "uses the shell")
         self.rejects(CI, CARGO_TEST, CARGO_TEST + "        working-directory: tools\n", "working directory")
-        self.rejects(CI, "    timeout-minutes: 30\n", "    timeout-minutes: 30\n    continue-on-error: true\n", "continues on error", count=2)
-        self.rejects(CI, "    timeout-minutes: 30\n", "    timeout-minutes: 30\n    defaults:\n      run:\n        shell: sh\n", "defaults", count=2)
+        self.rejects(CI, "    timeout-minutes: 30\n", "    timeout-minutes: 30\n    continue-on-error: true\n", "continues on error")
+        self.rejects(CI, "    timeout-minutes: 30\n", "    timeout-minutes: 30\n    defaults:\n      run:\n        shell: sh\n", "defaults")
 
     def test_windows_native_failures_stop_the_step(self) -> None:
         stop = "          $PSNativeCommandUseErrorActionPreference = $true\n"
@@ -517,13 +521,57 @@ class WorkflowStructureTests(unittest.TestCase):
             "official Windows Codex",
         )
 
-    def test_everyday_ci_stays_on_linux(self) -> None:
+    def test_everyday_ci_runs_each_job_on_its_system(self) -> None:
         for runner in ("macos-15", "windows-latest"):
             with self.subTest(runner=runner):
-                self.rejects(CI, "    runs-on: ubuntu-22.04\n", f"    runs-on: {runner}\n", "leaves Linux", count=2)
+                self.rejects(CI, "    runs-on: ubuntu-22.04\n", f"    runs-on: {runner}\n", "must run on Linux")
+        self.rejects(CI, "          - os: ubuntu-22.04\n", "          - os: macos-15\n", "must run on Linux")
+        self.rejects(CI, "    runs-on: windows-latest\n", "    runs-on: ubuntu-22.04\n", "must run on Windows")
+        self.rejects(CI, "          - os: macos-15-intel\n", "          - os: windows-latest\n", "must run on macOS")
         self.rejects(
-            CI, "          - os: ubuntu-22.04\n", "          - os: macos-15\n", "leaves Linux",
+            CI, "          - os: macos-15-intel\n            arch: x86_64\n", "", "native macOS matrix differs",
         )
+        ci = ORIGINAL_TEXT(CI)
+        start, end = ci.index("  client-windows:\n"), ci.index("  client-macos:\n")
+        self.rejects(CI, ci[start:end], "", "jobs differ")
+
+    def rejects_in_job(self, job: str, old: str, new: str, message: str) -> None:
+        """Changes `old` to `new` inside one CI job only."""
+        ci = ORIGINAL_TEXT(CI)
+        start = ci.index(f"  {job}:\n")
+        following = [ci.index(f"  {other}:\n") for other in VERIFIER.CI_JOBS if ci.index(f"  {other}:\n") > start]
+        section = ci[start:min(following, default=len(ci))]
+        self.assertEqual(section.count(old), 1, old)
+        self.rejects(CI, section, section.replace(old, new), f"job {job} does not run {message}")
+
+    def test_everyday_ci_keeps_the_native_checks(self) -> None:
+        shell_test = "          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai\n"
+        contract = "          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test contract_entry --test saiai_render_contract --test kernel_consumer\n"
+        for job, system in (("client-windows", "Windows"), ("client-macos", "macOS")):
+            for old in (shell_test, contract):
+                with self.subTest(job=job, old=old):
+                    self.rejects_in_job(job, old, "", f"the native {system} SAIAI tests")
+        for job, old, new, message in (
+            ("client-macos", "          python3 scripts/saiai-cli/test-macos-environments.py\n", "          echo\n", "the macOS environment isolation"),
+            ("client-macos", "          python3 scripts/saiai-cli/test-macos-service.py\n", "          echo\n", "the macOS LaunchAgent"),
+            ("client-macos", "        if: matrix.arch == 'arm64'\n", "        if: matrix.arch == 'x86_64'\n", "the official macOS Codex capture"),
+            ("client-windows", "        run: python scripts/saiai-cli/test-windows-environments.py", "        run: echo skipped #", "the Windows environment isolation"),
+            ("client-windows", "        run: python scripts/saiai-cli/test-windows-self-update.py", "        run: echo skipped #", "the Windows self-update"),
+            ("client-windows", "        run: python scripts/saiai-cli/verify-windows-reproducibility.py", "        run: echo skipped #", "the reproducible Windows image"),
+            ("client-windows", "        run: python scripts/saiai-cli/test-windows-log-encoding.py", "        run: echo skipped #", "the Windows log encoding"),
+            (
+                "client-windows",
+                "          $PSNativeCommandUseErrorActionPreference = $true\n          npm install",
+                "          npm install", "the official Windows Codex 0.146.0 capture",
+            ),
+            (
+                "client-windows",
+                "          $PSNativeCommandUseErrorActionPreference = $true\n          New-Item",
+                "          New-Item", "the Windows wrapper smoke's manifest",
+            ),
+        ):
+            with self.subTest(job=job, old=old):
+                self.rejects_in_job(job, old, new, message)
         self.rejects(CI, "  pull_request:\n    branches: [main]\n", "  pull_request:\n    branches: [main]\n    paths: [tools/**]\n", "every pull request")
         self.rejects(CI, "name: Client CI\n", "name: Client checks\n", "named 'Client CI'")
 
@@ -563,7 +611,7 @@ class WorkflowStructureTests(unittest.TestCase):
 
     def test_yaml_tricks_are_refused(self) -> None:
         self.rejects(CI, CARGO_TEST, CARGO_TEST + "        run: echo skipped\n", "repeats the key")
-        self.rejects(CI, "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n", "      - uses: actions/checkout@v7\n", "not pinned", count=3)
+        self.rejects(CI, "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n", "      - uses: actions/checkout@v7\n", "not pinned", count=4)
 
     def test_review_bypasses_are_refused(self) -> None:
         c = "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace"
@@ -614,11 +662,17 @@ class WorkflowStructureTests(unittest.TestCase):
             RELEASE, "          name: release-digests\n          path: release-digests.sha256\n",
             "          name: release-digests\n          path: dist/manifest.json\n", "keep the draft's digests",
         )
-        self.rejects(
-            CI, "    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n",
-            "    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          ref: main\n",
-            "check out the commit", count=3,
-        )
+        submodules = "        with:\n          submodules: true\n"
+        for path, count in ((CI, 4), (RELEASE, 5)):
+            for new in (
+                submodules + "          ref: main\n",
+                "",
+                "        with:\n          submodules: recursive\n",
+                "        with:\n          submodules: false\n",
+                submodules + "          fetch-depth: 0\n",
+            ):
+                with self.subTest(path=path, new=new):
+                    self.rejects(path, submodules, new, "check out the commit that started the run, with the kernel submodule", count=count)
         self.rejects(
             RELEASE, "  build:\n    needs: verify\n",
             "  build:\n    needs: mode\n    if: needs.mode.outputs.mode != 'publish'\n", "must need",
@@ -685,14 +739,17 @@ class WorkflowStructureTests(unittest.TestCase):
         moved = release[:start] + release[end:tail_end] + release[start:end] + release[tail_end:]
         self.rejects(RELEASE, release, moved, "re-check the release right before publishing")
 
-    def test_standalone_kernel_runs_in_its_copy(self) -> None:
-        self.rejects(CI, '          cd "$standalone/kernel"\n', '          cd "$GITHUB_WORKSPACE/tools/saiai-cli/kernel"\n', "changes directory")
+    def test_no_step_changes_directory(self) -> None:
+        # Not even into the kernel submodule (cargo would read its own
+        # .cargo/config.toml and rust-toolchain.toml there).
+        self.rejects(CI, CARGO_TEST, "        run: |\n          cd tools/saiai-cli/kernel\n          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace\n", "changes directory")
         self.rejects(
-            CI, '          cd "$standalone/kernel"\n',
-            '          cd "$standalone/kernel"\n          if [ -d "$GITHUB_WORKSPACE/tools/saiai-cli/kernel" ]; then cd "$GITHUB_WORKSPACE/tools/saiai-cli/kernel"; fi\n',
+            CI, CARGO_TEST,
+            '        run: |\n          if [ -d tools/saiai-cli/kernel ]; then cd tools/saiai-cli/kernel; fi\n          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace\n',
             "changes directory",
         )
         self.rejects(CI, CARGO_TEST, "        run: |\n          cd tools && cd ..\n          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace\n", "changes directory")
+        self.rejects(RELEASE, "        run: python3 scripts/saiai-cli/check-kernel-submodule.py\n", "        run: |\n          pushd tools\n          python3 scripts/saiai-cli/check-kernel-submodule.py\n", "changes directory")
 
     def test_quoted_shell_words_are_read_as_the_shell_reads_them(self) -> None:
         c = "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace"
@@ -700,16 +757,16 @@ class WorkflowStructureTests(unittest.TestCase):
             with self.subTest(script=script):
                 self.rejects(CI, CARGO_TEST, f"        run: |\n          {script}\n", "does not run")
         self.rejects(CI, CARGO_TEST, f'        run: |\n          "cd" /tmp\n          {c}\n', "changes directory")
-        # The exceptions belong to one step each, once per workflow.
+        # No step changes directory or hands environment to the next.
         self.rejects(
             CI, "      - name: Format\n",
-            '      - name: Kernel again\n        run: |\n          standalone="$(mktemp -d)"\n          cd "$standalone/kernel"\n\n      - name: Format\n',
-            "changes directory outside the stand-alone kernel step",
+            '      - name: Kernel copy\n        run: |\n          standalone="$(mktemp -d)"\n          cd "$standalone/kernel"\n\n      - name: Format\n',
+            "changes directory",
         )
         self.rejects(
-            CI, "      - name: Verify the AITP release names no build path\n",
-            '      - name: Hand over again\n        run: |\n          aitp=/bin/true\n          echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"\n\n      - name: Verify the AITP release names no build path\n',
-            "GITHUB_ENV outside the AITP release build",
+            CI, "      - name: Format\n",
+            '      - name: Hand over\n        run: |\n          aitp=/bin/true\n          echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"\n\n      - name: Format\n',
+            "touches GITHUB_ENV",
         )
 
     def test_expression_reader(self) -> None:
