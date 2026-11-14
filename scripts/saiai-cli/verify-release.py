@@ -683,7 +683,10 @@ def verify_workflows_and_docs() -> None:
     for required in ("--remap-path-prefix=", "-ffile-prefix-map=", "CARGO_ENCODED_RUSTFLAGS", "--bin aitp"):
         require(required in remap, f"AITP release build script is missing {required!r}")
     for prefix in AITP_NEUTRAL_PREFIXES:
-        require(f" {prefix}\n" in remap, f"AITP release build script does not map to {prefix}")
+        require(
+            re.search(r'^add_mapping "\$\w+" ' + re.escape(prefix) + r"$", remap, re.MULTILINE) is not None,
+            f"AITP release build script does not map to {prefix}",
+        )
     for required in (
         'CARGO_TARGET_DIR="$standalone/target" bash scripts/build-release.sh --locked',
         '--aitp-artifact "$standalone/target/release/aitp"',
@@ -852,12 +855,22 @@ AITP_NEUTRAL_PREFIXES = ("/aitp/home", "/aitp/rustup", "/aitp/cargo", "/aitp/src
 def names_path(view: bytes, path: str) -> bool:
     """Whether `view` (see `path_view`) holds `path` anywhere, as a plain
     substring (strings in a program sit next to each other without a
-    separator, so no boundary is required). Only the neutral prefixes are
-    blanked out first, so a build path that happens to be a prefix of one
-    (`HOME=/ait` against `/aitp/src`) is not reported for them."""
-    for prefix in AITP_NEUTRAL_PREFIXES:
-        view = view.replace(prefix.encode(), b"\0" * len(prefix))
-    return path_view(path.encode()) in view
+    separator, so no boundary is required). An occurrence that lies wholly
+    inside one of the neutral prefixes (`HOME=/aitp/hom` inside `/aitp/home`)
+    does not count; one that only overlaps a neutral prefix does."""
+    neutral = [
+        (match.start(), match.end())
+        for prefix in AITP_NEUTRAL_PREFIXES
+        for match in re.finditer(re.escape(prefix.encode()), view)
+    ]
+    needle = path_view(path.encode())
+    start = view.find(needle)
+    while start >= 0:
+        end = start + len(needle)
+        if not any(low <= start and end <= high for low, high in neutral):
+            return True
+        start = view.find(needle, start + 1)
+    return False
 
 
 def path_view(data: bytes) -> bytes:

@@ -366,6 +366,10 @@ class AitpArtifactTests(unittest.TestCase):
         for leak in (b"/aitp/hom/x", b"/aitp/srx"):
             with self.subTest(leak=leak), self.assertRaisesRegex(AssertionError, "build machine paths"):
                 self.check(self.brand + b" /aitp/src/lib.rs " + leak, build_dirs=[Path("/aitp/sr")])
+        # A build path that holds a neutral prefix is found in full.
+        for build, leak in (("/opt/aitp/src/build", b"\0/opt/aitp/src/build/lib.rs\0"), ("/aitp/src-real", b"/aitp/src-real/lib.rs")):
+            with self.subTest(build=build), self.assertRaisesRegex(AssertionError, "build machine paths"):
+                self.check(self.brand + leak, build_dirs=[Path(build)])
 
     def test_a_build_path_next_to_another_string_is_found(self) -> None:
         for data in (b"\0/home/builder/work/clientNextString\0", b"/home/builder/work/client@x"):
@@ -384,6 +388,7 @@ class AitpArtifactTests(unittest.TestCase):
             (".github/workflows/ci.yml", "bash scripts/build-release.sh --locked", "cargo build --release --bin aitp", "does not check the remapped"),
             (".github/workflows/saiai-cli-release.yml", "python3 scripts/saiai-cli/verify-release.py \\", "bash tools/saiai-cli/kernel/scripts/build-release.sh\n          python3 scripts/saiai-cli/verify-release.py \\", "must not use"),
             (VERIFIER.AITP_RELEASE_BUILD, "--remap-path-prefix=", "--no-remap=", "build script is missing"),
+            (VERIFIER.AITP_RELEASE_BUILD, 'add_mapping "$home" /aitp/home\n', "", "does not map to /aitp/home"),
         ):
             with self.subTest(path=path, old=old), patch.object(VERIFIER, "text", side_effect=broken(path, old, new)):
                 with self.assertRaisesRegex(AssertionError, message):
