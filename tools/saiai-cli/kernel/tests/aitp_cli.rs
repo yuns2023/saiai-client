@@ -412,23 +412,134 @@ fn update_refuses_an_unreadable_configuration() {
     assert!(seen.lock().unwrap().is_empty());
 }
 
-/// The program itself carries no other distribution's name. Only checked
-/// when the kernel is built outside such a directory (its build path ends
-/// up in debug information), as in the stand-alone kernel CI.
+/// `bytes` lower-cased with both path separators as `/`, so a path matches
+/// in any case and with either separator.
+fn path_view(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .iter()
+        .map(|byte| match byte {
+            b'\\' => b'/',
+            other => other.to_ascii_lowercase(),
+        })
+        .collect()
+}
+
+/// The absolute build paths that spell `name` and that this build may embed
+/// in the program (debug information, build script outputs, crate sources):
+/// each ancestor of the package directory, of the program (its target
+/// directory) and of the Cargo, rustup and user homes, also canonicalized,
+/// in `path_view` form. A path that does not spell the name is not listed.
+fn build_paths_naming(name: &str) -> Vec<Vec<u8>> {
+    let mut roots = vec![
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        PathBuf::from(BINARY),
+    ];
+    for variable in ["CARGO_HOME", "RUSTUP_HOME", "HOME", "USERPROFILE"] {
+        if let Some(value) = std::env::var_os(variable) {
+            roots.push(PathBuf::from(value));
+        }
+    }
+    let mut paths: Vec<Vec<u8>> = Vec::new();
+    for root in roots {
+        let resolved = std::fs::canonicalize(&root).ok();
+        for form in std::iter::once(root).chain(resolved) {
+            for ancestor in form.ancestors().filter(|path| path.is_absolute()) {
+                let text = ancestor.to_string_lossy();
+                let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+                let path = path_view(text.as_bytes());
+                if contains(&path, name.as_bytes()) && !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    paths
+}
+
+/// Offsets of each occurrence of `name` in `view` that no occurrence of one
+/// of `paths` covers: the name as the program spells it, not as part of a
+/// build path.
+fn unexplained_occurrences(view: &[u8], name: &[u8], paths: &[Vec<u8>]) -> Vec<usize> {
+    let covered = |at: usize| {
+        paths.iter().any(|path| {
+            path.windows(name.len())
+                .enumerate()
+                .filter(|(_, window)| *window == name)
+                .any(|(offset, _)| {
+                    at >= offset
+                        && view
+                            .get(at - offset..at - offset + path.len())
+                            .is_some_and(|found| found == path.as_slice())
+                })
+        })
+    };
+    view.windows(name.len())
+        .enumerate()
+        .filter(|(at, window)| *window == name && !covered(*at))
+        .map(|(at, _)| at)
+        .collect()
+}
+
+#[test]
+fn only_the_known_build_paths_explain_the_name() {
+    let name = b"other";
+    let paths = vec![path_view(br"C:\Work\Other-Client\tools")];
+    let view = path_view(
+        br"x C:\work\other-client\tools\k.rs y c:/WORK/OTHER-CLIENT/TOOLS/t \\?\C:\Work\Other-Client\tools z",
+    );
+    assert!(unexplained_occurrences(&view, name, &paths).is_empty());
+    // The bare name, a different directory, or a shorter prefix of the path
+    // are the program's own text.
+    for text in [
+        &b"an Other name"[..],
+        b"C:/work/other-clients/tools",
+        b"C:/work/other-client/",
+        b"/work/other-client/tools other",
+    ] {
+        assert!(
+            !unexplained_occurrences(&path_view(text), name, &paths).is_empty(),
+            "{}",
+            String::from_utf8_lossy(text)
+        );
+    }
+    // Known limit: matching is by bytes, so with the full ancestor set (as
+    // `build_paths_naming` lists it) text that starts with an ancestor is
+    // explained too, even past a directory boundary.
+    let ancestors = vec![paths[0].clone(), path_view(br"C:\Work\Other-Client")];
+    let view = path_view(b"C:/work/other-clients/tools");
+    assert!(unexplained_occurrences(&view, name, &ancestors).is_empty());
+}
+
+/// The program itself carries no other distribution's name, wherever it is
+/// built. A build below a directory that spells the name (as the workspace's
+/// CI checkout does) embeds that directory in debug information, so exactly
+/// those build paths are set aside; every other occurrence, in any case,
+/// fails the test.
 #[test]
 fn the_program_carries_no_other_distribution_name() {
     let other = other_brand();
-    if env!("CARGO_MANIFEST_DIR")
-        .to_ascii_lowercase()
-        .contains(&other)
-    {
-        eprintln!("skipped: built below a directory with the other name");
-        return;
-    }
     let bytes = std::fs::read(BINARY).unwrap();
-    let lower: Vec<u8> = bytes.iter().map(u8::to_ascii_lowercase).collect();
-    assert!(!contains(&lower, other.as_bytes()));
     assert!(contains(&bytes, b"AITP local installation CA"));
+    let view = path_view(&bytes);
+    let paths = build_paths_naming(&other);
+    let unexplained = unexplained_occurrences(&view, other.as_bytes(), &paths);
+    let context: Vec<String> = unexplained
+        .iter()
+        .take(5)
+        .map(|&at| {
+            let around = &bytes[at.saturating_sub(60)..(at + 60).min(bytes.len())];
+            String::from_utf8_lossy(around).escape_debug().to_string()
+        })
+        .collect();
+    assert!(
+        unexplained.is_empty(),
+        "{} occurrence(s) outside the build paths {:?}: {context:#?}",
+        unexplained.len(),
+        paths
+            .iter()
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect::<Vec<_>>()
+    );
 }
 
 /// An installation CA of another program built on this kernel ("OTHER"),

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 import re
 import sys
 import tempfile
@@ -675,6 +676,35 @@ def verify_workflows_and_docs() -> None:
         "test-windows-self-update.py" in ci and "test-windows-self-update.py" in release,
         "Windows self-update smoke must run in source CI and release workflow",
     )
+    # AITP release builds remap the build machine's paths and are checked
+    # with --aitp-artifact, both stand-alone and in this checkout (whose path
+    # names SAIAI); SAIAI release builds stay as they are.
+    remap = text(AITP_RELEASE_BUILD)
+    for required in (
+        "--remap-path-prefix=",
+        "-ffile-prefix-map=",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "--bin aitp",
+        "only Linux GNU targets are verified",
+        '--target "$triple"',
+    ):
+        require(required in remap, f"AITP release build script is missing {required!r}")
+    for prefix in AITP_NEUTRAL_PREFIXES:
+        require(
+            re.search(r'^add_mapping "\$\w+" ' + re.escape(prefix) + r"$", remap, re.MULTILINE) is not None,
+            f"AITP release build script does not map to {prefix}",
+        )
+    for required in (
+        'aitp="$(CARGO_TARGET_DIR="$standalone/target" bash scripts/build-release.sh --locked)"',
+        '--aitp-artifact "$aitp"',
+        'aitp="$(bash tools/saiai-cli/kernel/scripts/build-release.sh --locked)"',
+        'echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"',
+        '--aitp-artifact "$AITP_PROGRAM"',
+        "the path check accepted an ordinary release build",
+    ):
+        require(required in ci, f"CI does not check the remapped AITP release: {required!r}")
+    for forbidden in ("build-release.sh", "remap-path-prefix", "--aitp-artifact"):
+        require(forbidden not in release, f"SAIAI release workflow must not use {forbidden!r}")
     linux_service = text("scripts/saiai-cli/test-linux-service.py")
     for required in (
         "test-forced headless mode",
@@ -756,6 +786,7 @@ def verify_no_non_test_credentials() -> None:
 
 
 AITP_BRAND_SOURCE = "tools/saiai-cli/kernel/src/bin/aitp/brand.rs"
+AITP_RELEASE_BUILD = "tools/saiai-cli/kernel/scripts/build-release.sh"
 
 
 def aitp_brand_markers() -> list[bytes]:
@@ -796,6 +827,109 @@ def verify_artifacts_carry_no_aitp_brand(artifacts: list[Path]) -> None:
         print(f"{len(artifacts)} release artifact(s) carry no AITP brand data")
 
 
+OTHER_DISTRIBUTION_NAME = b"saiai"
+
+
+# The neutral prefixes build-release.sh maps the build machine's paths to.
+AITP_NEUTRAL_PREFIXES = ("/aitp/home", "/aitp/rustup", "/aitp/cargo", "/aitp/src", "/aitp/target")
+
+
+def build_machine_paths(build_dirs: list[Path], environ) -> list[str]:
+    """Absolute paths of the build machine that an AITP release program must
+    not carry: the given build directories and the HOME, CARGO_HOME and
+    RUSTUP_HOME (default under HOME) of the environment that built it, each
+    also in its resolved form."""
+    for directory in build_dirs:
+        require(directory.is_absolute(), f"build directory is not absolute: {directory}")
+    home = environ.get("HOME", "")
+    candidates = [str(directory) for directory in build_dirs] + [
+        home,
+        environ.get("USERPROFILE", ""),
+        environ.get("CARGO_HOME") or (home and str(Path(home) / ".cargo")),
+        environ.get("RUSTUP_HOME") or (home and str(Path(home) / ".rustup")),
+    ]
+    paths = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        for form in (candidate, os.path.realpath(candidate)):
+            form = form.rstrip("/\\")
+            # The file system root (or a bare drive) would match every path.
+            if re.fullmatch(r"(?:[A-Za-z]:)?", form) is None and form not in paths:
+                paths.append(form)
+    for path in paths:
+        # A build path at or below /aitp, or a leading part of a neutral
+        # prefix, cannot be told apart from the remapped paths.
+        view = path_view(path.encode()).decode(errors="replace")
+        require(
+            not (view == "/aitp" or view.startswith("/aitp/"))
+            and not any(prefix.startswith(view) for prefix in AITP_NEUTRAL_PREFIXES),
+            f"build machine path {path} overlaps the neutral prefixes {AITP_NEUTRAL_PREFIXES}",
+        )
+    return paths
+
+
+# What may follow a whole neutral prefix: a separator, the NUL that ends a C
+# string, or the end of the data. Anything else (another file name byte, or
+# the first byte of a string stored right after it) makes the occurrence an
+# ordinary path, so a remapped directory that a following string happens to
+# abut is reported rather than excused (a conservative false positive).
+NEUTRAL_PREFIX_END = rb"(?=/|\x00|\Z)"
+
+
+def names_path(view: bytes, path: str) -> bool:
+    """Whether `view` (see `path_view`) holds `path` anywhere, as a plain
+    substring (strings in a program sit next to each other without a
+    separator, so no boundary is required). Only an occurrence that lies
+    wholly inside a whole neutral prefix (see NEUTRAL_PREFIX_END), such as `/src` or `/home` inside `/aitp/src/…` or
+    `/aitp/home/…`, is not counted: those bytes are the neutral prefix
+    itself. `build_machine_paths` refuses build paths that could be mistaken
+    for the prefixes (`/aitp/…`, `/ait`)."""
+    neutral = {
+        (match.start(), match.end())
+        for prefix in AITP_NEUTRAL_PREFIXES
+        for match in re.finditer(re.escape(prefix.encode()) + NEUTRAL_PREFIX_END, view)
+    }
+    needle = path_view(path.encode())
+    start = view.find(needle)
+    while start >= 0:
+        end = start + len(needle)
+        if not any(low <= start and end <= high for low, high in neutral):
+            return True
+        start = view.find(needle, start + 1)
+    return False
+
+
+def path_view(data: bytes) -> bytes:
+    """`data` lower-cased with both path separators as `/`, so a path matches
+    in any case and with either separator (Windows drive letters and
+    extended-length prefixes included)."""
+    return data.lower().replace(b"\\", b"/")
+
+
+def verify_aitp_artifacts(artifacts: list[Path], build_dirs: list[Path], environ=os.environ) -> None:
+    """Built AITP release programs carry the AITP brand data, never the other
+    distribution's name, and no path of the machine that built them."""
+    if not artifacts:
+        return
+    require(bool(build_dirs), "--aitp-artifact needs at least one --build-dir")
+    markers = aitp_brand_markers()
+    paths = build_machine_paths(build_dirs, environ)
+    for artifact in artifacts:
+        require(artifact.is_file(), f"AITP artifact is missing: {artifact}")
+        data = artifact.read_bytes()
+        missing = [marker.decode() for marker in markers if marker not in data]
+        require(not missing, f"{artifact} lacks AITP brand data: {missing}")
+        view = path_view(data)
+        require(
+            OTHER_DISTRIBUTION_NAME not in view,
+            f"{artifact} names the other distribution",
+        )
+        found = [path for path in paths if names_path(view, path)]
+        require(not found, f"{artifact} carries build machine paths: {found}")
+    print(f"{len(artifacts)} AITP artifact(s) carry AITP brand data and no build machine path")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -805,12 +939,29 @@ def main() -> int:
         type=Path,
         help="built SAIAI program that must not carry AITP brand data (repeatable)",
     )
+    parser.add_argument(
+        "--aitp-artifact",
+        action="append",
+        default=[],
+        type=Path,
+        help="built AITP release program to check (repeatable; needs --build-dir)",
+    )
+    parser.add_argument(
+        "--build-dir",
+        action="append",
+        default=[],
+        type=Path,
+        help="absolute build directory the AITP artifacts must not name (repeatable)",
+    )
     arguments = parser.parse_args()
+    if arguments.build_dir and not arguments.aitp_artifact:
+        parser.error("--build-dir is only used with --aitp-artifact")
     verify_cli()
     verify_manifest_and_wrappers()
     verify_workflows_and_docs()
     verify_no_non_test_credentials()
     verify_artifacts_carry_no_aitp_brand(arguments.artifact)
+    verify_aitp_artifacts(arguments.aitp_artifact, arguments.build_dir)
     print("SAIAI local-proxy public release contract verified")
     return 0
 
