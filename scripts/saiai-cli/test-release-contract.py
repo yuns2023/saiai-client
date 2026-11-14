@@ -685,6 +685,10 @@ class WorkflowStructureTests(unittest.TestCase):
         moved = release[:start] + release[end:tail_end] + release[start:end] + release[tail_end:]
         self.rejects(RELEASE, release, moved, "re-check the release right before publishing")
 
+    def test_standalone_kernel_runs_in_its_copy(self) -> None:
+        self.rejects(CI, '          cd "$standalone/kernel"\n', '          cd "$GITHUB_WORKSPACE/tools/saiai-cli/kernel"\n', "changes directory")
+        self.rejects(CI, CARGO_TEST, "        run: |\n          cd tools && cd ..\n          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace\n", "changes directory")
+
     def test_expression_reader(self) -> None:
         context = {"runner.os": "macOS", "matrix.target": "aarch64-apple-darwin"}
         for expression, expected in (

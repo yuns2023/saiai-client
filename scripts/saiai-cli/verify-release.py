@@ -664,6 +664,7 @@ ALLOWED_ACTIONS = frozenset(
 )
 # The only environment file write: the AITP release check passes the built
 # program's path to the next steps.
+STANDALONE_KERNEL_CD = 'cd "$standalone/kernel"'
 AITP_PROGRAM_ENV_WRITE = 'echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"'
 RUNNER_SYSTEMS = (("ubuntu-", "Linux"), ("macos-", "macOS"), ("windows-", "Windows"))
 STATIC_LINUX_MATRIX = (
@@ -1115,6 +1116,15 @@ def check_workflow_basics(relative: str, workflow: dict) -> None:
             if isinstance(script, str):
                 for forbidden in (FOREIGN_NAMES_ENV, "GITHUB_PATH"):
                     require(forbidden not in script, f"{label} touches {forbidden}")
+                # The one directory change: into the stand-alone kernel copy.
+                moves = [
+                    command for command, _ in logical_commands(script, "bash")
+                    if re.search(r"(?:^|[;&|(]\s*)(?:cd|pushd|popd)\b", command)
+                ]
+                require(
+                    not moves or (relative == CI_WORKFLOW and job_id == "client-linux" and moves == [STANDALONE_KERNEL_CD]),
+                    f"{label} changes directory: {moves}",
+                )
                 if "GITHUB_ENV" in script:
                     writes = [command for command, _ in logical_commands(script, "bash") if "GITHUB_ENV" in command]
                     require(
@@ -1242,6 +1252,7 @@ def verify_ci_workflow() -> None:
         for command, purpose, options in (
             ('cargo clippy --locked --target-dir "$standalone/target" --all-targets -- -D warnings', "the stand-alone kernel lint", {}),
             ('cargo clippy --locked --target-dir "$standalone/target" --all-targets --features contract -- -D warnings', "the stand-alone kernel lint", {}),
+            (STANDALONE_KERNEL_CD, "the stand-alone kernel copy", {}),
             ('cargo test --locked --target-dir "$standalone/target"', "the stand-alone kernel tests", {"foreign_names": True}),
             ('cargo test --locked --target-dir "$standalone/target" --features contract --bin aitp', "the stand-alone AITP program tests", {}),
             ("python3 scripts/test_release_manifest.py", "the stand-alone release manifest tests", {}),
