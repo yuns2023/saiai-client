@@ -51,6 +51,12 @@ mod local_proxy;
 mod runtime;
 mod script_brand;
 mod uninstall;
+// Fixed-URL self-update: redirects, limits, manifest and asset checks.
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+mod update_fixed_tests;
 mod upstream_proxy;
 mod upstream_tls;
 mod vscode;
@@ -61,8 +67,8 @@ mod windows_desktop_runtime;
 
 use brand::{BRAND, BrandText, BrandValue};
 pub use brand::{
-    Brand, CertificateNames, ConfigNames, EnvironmentNames, OwnershipMarkers,
-    PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
+    Brand, CertificateNames, ConfigNames, EnvironmentNames, FixedUpdateSource, OwnershipMarkers,
+    PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames, UpdateSource,
 };
 use desktop_product::DesktopProduct;
 pub use gateway::{
@@ -4280,6 +4286,19 @@ struct Egress {
 }
 
 impl Egress {
+    /// Egress of an uninitialized installation: the default (system) route
+    /// and no installation CA to exclude.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn for_optional_config(cfg: Option<&AppConfig>) -> Self {
+        match cfg {
+            Some(cfg) => Self::for_config(cfg),
+            None => Self {
+                installation_ca_pem: String::new(),
+                upstream: upstream_proxy::UpstreamProxy::new(None, None, Vec::new()).snapshot(),
+            },
+        }
+    }
+
     fn for_config(cfg: &AppConfig) -> Self {
         let upstream = upstream_proxy::UpstreamProxy::new(
             cfg.upstream_proxy.as_deref(),
@@ -4920,23 +4939,67 @@ fn start_managed_service_after_initialization(config_changed: bool) -> Result<()
     Ok(())
 }
 
-/// Manifest and asset URLs of the update channel below a Gateway base URL.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn update_urls(base_url: &str, asset: &str) -> (String, String) {
+/// Manifest and asset URLs of a Gateway update channel below a Gateway
+/// base URL; an error for a brand that updates from fixed URLs.
+#[cfg(any(test, feature = "contract"))]
+fn update_urls(base_url: &str, asset: &str) -> Result<(String, String)> {
+    match &BRAND.update.source {
+        UpdateSource::GatewayChannel { channel_path } => {
+            Ok(gateway_update_urls(channel_path, base_url, asset))
+        }
+        UpdateSource::Fixed(_) => bail!(
+            "{brand_binary} updates from fixed URLs, not below a Gateway base URL",
+            brand_binary = BRAND.binary_name
+        ),
+    }
+}
+
+fn gateway_update_urls(channel: &str, base_url: &str, asset: &str) -> (String, String) {
     let base = base_url.trim().trim_end_matches('/');
-    let channel = BRAND.update.channel_path;
     (
         format!("{base}/{channel}/manifest.json"),
         format!("{base}/{channel}/{asset}"),
     )
 }
 
+/// Where this run downloads its update from.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+enum UpdateOrigin {
+    Gateway {
+        cfg: AppConfig,
+        manifest_url: String,
+        url: String,
+    },
+    Fixed {
+        source: &'static FixedUpdateSource,
+        cfg: Option<AppConfig>,
+    },
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn run_update() -> Result<()> {
     let service_was_active = managed_service_is_active();
-    let cfg = read_app_config()?;
-    let asset = current_platform_asset_name()?;
-    let (manifest_url, url) = update_urls(&cfg.base_url, &asset);
+    let (origin, asset) = match &BRAND.update.source {
+        UpdateSource::GatewayChannel { channel_path } => {
+            let cfg = read_app_config()?;
+            let asset = current_platform_asset_name()?;
+            let (manifest_url, url) = gateway_update_urls(channel_path, &cfg.base_url, &asset);
+            let origin = UpdateOrigin::Gateway {
+                cfg,
+                manifest_url,
+                url,
+            };
+            (origin, asset)
+        }
+        // Fixed URLs need no Gateway: an uninitialized installation updates
+        // through the default (system) route, but a configuration that
+        // exists and cannot be read is an error, not a silent default.
+        UpdateSource::Fixed(source) => {
+            let cfg = read_app_config_if_present()?;
+            let asset = current_platform_asset_name()?;
+            (UpdateOrigin::Fixed { source, cfg }, asset)
+        }
+    };
     let current_exe = env::current_exe().with_context(|| {
         format!(
             "failed to resolve current {brand_binary} executable",
@@ -4967,60 +5030,92 @@ fn run_update() -> Result<()> {
         .build()
         .context("failed to start async runtime")?;
 
-    println!("Checking: {manifest_url}");
-    let egress = Egress::for_config(&cfg);
-    let manifest = runtime.block_on(download_update_manifest(&manifest_url, &egress))?;
-    let expected_sha256 = if let Some(manifest) = manifest {
-        let remote_version = manifest.version.trim();
-        let ordering = compare_versions(remote_version, runtime::version())
-            .with_context(|| format!("failed to compare remote version {remote_version:?}"))?;
-        let asset_info = manifest
-            .assets
-            .get(&asset)
-            .with_context(|| format!("manifest does not include asset {asset}"))?;
-        let expected = asset_info.sha256.trim().to_ascii_lowercase();
-        if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
-            bail!("manifest asset {asset} has invalid sha256 {expected:?}");
-        }
+    let (bytes, expected_version) = match origin {
+        UpdateOrigin::Gateway {
+            cfg,
+            manifest_url,
+            url,
+        } => {
+            println!("Checking: {manifest_url}");
+            let egress = Egress::for_config(&cfg);
+            let manifest = runtime.block_on(download_update_manifest(&manifest_url, &egress))?;
+            let expected_sha256 = if let Some(manifest) = manifest {
+                let remote_version = manifest.version.trim();
+                let ordering =
+                    compare_versions(remote_version, runtime::version()).with_context(|| {
+                        format!("failed to compare remote version {remote_version:?}")
+                    })?;
+                let asset_info = manifest
+                    .assets
+                    .get(&asset)
+                    .with_context(|| format!("manifest does not include asset {asset}"))?;
+                let expected = asset_info.sha256.trim().to_ascii_lowercase();
+                if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+                    bail!("manifest asset {asset} has invalid sha256 {expected:?}");
+                }
 
-        println!(
-            "Latest: {brand_binary} {remote_version}",
-            brand_binary = BRAND.binary_name
-        );
-        if ordering == Ordering::Less {
-            println!(
-                "Already current: {brand_binary} {} (remote {brand_binary} {remote_version})",
+                println!(
+                    "Latest: {brand_binary} {remote_version}",
+                    brand_binary = BRAND.binary_name
+                );
+                if ordering == Ordering::Less {
+                    println!(
+                        "Already current: {brand_binary} {} (remote {brand_binary} {remote_version})",
+                        runtime::version(),
+                        brand_binary = BRAND.binary_name
+                    );
+                    return Ok(());
+                }
+                if ordering == Ordering::Equal && current_sha256 == expected {
+                    println!(
+                        "Already current: {brand_binary} {}",
+                        runtime::version(),
+                        brand_binary = BRAND.binary_name
+                    );
+                    return Ok(());
+                }
+                if ordering == Ordering::Equal {
+                    println!("Same version but local binary hash differs; refreshing {asset}");
+                }
+                Some(expected)
+            } else {
+                println!("Manifest unavailable; falling back to binary download.");
+                None
+            };
+
+            println!("Downloading: {url}");
+            let bytes = runtime.block_on(download_update_asset(&url, &egress))?;
+            validate_update_asset(&bytes, &asset)?;
+            if let Some(expected) = &expected_sha256 {
+                let actual = sha256_hex(&bytes);
+                if actual != *expected {
+                    bail!("downloaded {asset} sha256 mismatch: expected {expected}, got {actual}");
+                }
+            }
+            (bytes, None)
+        }
+        UpdateOrigin::Fixed { source, cfg } => {
+            let egress = Egress::for_optional_config(cfg.as_ref());
+            match runtime.block_on(fetch_fixed_update(
+                &FixedUrlPolicy::https(source.hosts),
+                source.manifest_url,
+                source.asset_url_template,
+                &asset,
                 runtime::version(),
-                brand_binary = BRAND.binary_name
-            );
-            return Ok(());
+                &current_sha256,
+                &egress,
+            ))? {
+                FixedUpdate::Current(message) => {
+                    println!("{message}");
+                    return Ok(());
+                }
+                FixedUpdate::Download { bytes, version } => {
+                    validate_update_asset(&bytes, &asset)?;
+                    (bytes, Some(version))
+                }
+            }
         }
-        if ordering == Ordering::Equal && current_sha256 == expected {
-            println!(
-                "Already current: {brand_binary} {}",
-                runtime::version(),
-                brand_binary = BRAND.binary_name
-            );
-            return Ok(());
-        }
-        if ordering == Ordering::Equal {
-            println!("Same version but local binary hash differs; refreshing {asset}");
-        }
-        Some(expected)
-    } else {
-        println!("Manifest unavailable; falling back to binary download.");
-        None
     };
-
-    println!("Downloading: {url}");
-    let bytes = runtime.block_on(download_update_asset(&url, &egress))?;
-    validate_update_asset(&bytes, &asset)?;
-    if let Some(expected) = &expected_sha256 {
-        let actual = sha256_hex(&bytes);
-        if actual != *expected {
-            bail!("downloaded {asset} sha256 mismatch: expected {expected}, got {actual}");
-        }
-    }
 
     let unique = update_suffix();
     let candidate_name = update_candidate_name(&unique);
@@ -5032,10 +5127,14 @@ fn run_update() -> Result<()> {
 
     let candidate_version = command_stdout(&candidate_path, &["--version"])
         .with_context(|| format!("failed to run {}", candidate_path.display()))?;
+    let reported = candidate_version.trim_end_matches(['\r', '\n']);
     if !candidate_version
         .trim_start()
         .strip_prefix(BRAND.binary_name)
         .is_some_and(|rest| rest.starts_with(' '))
+        || expected_version.as_ref().is_some_and(|version| {
+            reported != format!("{brand_binary} {version}", brand_binary = BRAND.binary_name)
+        })
     {
         let _ = fs::remove_file(&candidate_path);
         bail!(
@@ -7029,6 +7128,257 @@ async fn download_update_asset(url: &str, egress: &Egress) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
+/// The URLs a fixed update source may request: exact hosts, a scheme and
+/// (for HTTPS) the default port only, no user information.
+pub(crate) struct FixedUrlPolicy<'a> {
+    hosts: &'a [&'a str],
+    scheme: &'static str,
+    /// `None`: the scheme's default port only.
+    port: Option<u16>,
+}
+
+impl<'a> FixedUrlPolicy<'a> {
+    pub(crate) fn https(hosts: &'a [&'a str]) -> Self {
+        Self {
+            hosts,
+            scheme: "https",
+            port: None,
+        }
+    }
+
+    pub(crate) fn check(&self, url: &str) -> Result<url::Url> {
+        let parsed = url::Url::parse(url).with_context(|| format!("invalid URL {url:?}"))?;
+        if parsed.scheme() != self.scheme {
+            bail!("{url} does not use {}", self.scheme);
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            bail!("{url} carries user information");
+        }
+        if parsed.fragment().is_some() {
+            bail!("{url} carries a fragment");
+        }
+        if parsed.port() != self.port {
+            bail!("{url} names a port that is not allowed");
+        }
+        let host = parsed.host_str().unwrap_or_default();
+        if !self.hosts.contains(&host) {
+            bail!("{url} is not on an allowed update host");
+        }
+        Ok(parsed)
+    }
+}
+
+/// The asset URL of a fixed source for one release `version` (`X.Y.Z`).
+pub(crate) fn fixed_asset_url(template: &str, version: &str, asset: &str) -> String {
+    template
+        .replace("{version}", version)
+        .replace("{asset}", asset)
+}
+
+/// `X.Y.Z`, three decimal numbers without signs, spaces, prefixes or
+/// suffixes (leading zeros only for a lone `0`).
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn is_release_version(version: &str) -> bool {
+    let parts: Vec<_> = version.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.len() <= 9
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && (part.len() == 1 || !part.starts_with('0'))
+        })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const FIXED_MANIFEST_LIMIT: u64 = 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const FIXED_ASSET_MIN: u64 = 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const FIXED_ASSET_MAX: u64 = 64 * 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const FIXED_MAX_REDIRECTS: usize = 5;
+
+/// Body of a fixed-source GET, or `None` for 404 at the end of the chain.
+/// Each hop is checked against `policy` and routed for its own URL (a proxy
+/// that cannot be used fails the request instead of going direct); only
+/// 301/302/303/307/308 are followed, at most `FIXED_MAX_REDIRECTS` times,
+/// within `total` for the whole chain; the body is read up to `limit` bytes.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+async fn fixed_get(
+    policy: &FixedUrlPolicy<'_>,
+    url: &str,
+    limit: u64,
+    total: Duration,
+    egress: &Egress,
+) -> Result<Option<Vec<u8>>> {
+    let deadline = tokio::time::Instant::now() + total;
+    let mut current = policy.check(url)?;
+    let mut redirects = 0;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("GET {url} did not complete within {}s", total.as_secs());
+        }
+        let response = egress
+            .client_builder(current.as_str())?
+            .timeout(remaining)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("failed to build update HTTP client")?
+            .get(current.as_str())
+            .send()
+            .await
+            .with_context(|| format!("failed to GET {current}"))?;
+        let status = response.status();
+        if matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308) {
+            redirects += 1;
+            if redirects > FIXED_MAX_REDIRECTS {
+                bail!("GET {url} redirected more than {FIXED_MAX_REDIRECTS} times");
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .with_context(|| format!("GET {current} returned {status} without a Location"))?;
+            let next = current
+                .join(location)
+                .with_context(|| format!("GET {current} redirected to an invalid Location"))?;
+            current = policy.check(next.as_str()).with_context(|| {
+                format!("GET {current} redirected to a URL that is not allowed")
+            })?;
+            continue;
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            bail!("GET {current} returned {status}");
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit)
+        {
+            bail!("GET {current} is larger than {limit} bytes");
+        }
+        let mut response = response;
+        let mut body = Vec::new();
+        while let Some(chunk) = tokio::time::timeout_at(deadline, response.chunk())
+            .await
+            .map_err(|_| anyhow::anyhow!("GET {url} did not complete within {}s", total.as_secs()))?
+            .with_context(|| format!("failed to read {current}"))?
+        {
+            if body.len() as u64 + chunk.len() as u64 > limit {
+                bail!("GET {current} is larger than {limit} bytes");
+            }
+            body.extend_from_slice(&chunk);
+        }
+        return Ok(Some(body));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+enum FixedUpdate {
+    /// Nothing to download; the message says why.
+    Current(String),
+    /// The verified asset of release `version`.
+    Download { bytes: Vec<u8>, version: String },
+}
+
+/// Fetches and verifies the update from a fixed source: the manifest is
+/// required (a missing one is an error, never an unverified download), its
+/// version must be `X.Y.Z`, and the asset of exactly that version must match
+/// the manifest's size and SHA-256.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+async fn fetch_fixed_update(
+    policy: &FixedUrlPolicy<'_>,
+    manifest_url: &str,
+    asset_url_template: &str,
+    asset: &str,
+    current_version: &str,
+    current_sha256: &str,
+    egress: &Egress,
+) -> Result<FixedUpdate> {
+    println!("Checking: {manifest_url}");
+    let Some(raw) = fixed_get(
+        policy,
+        manifest_url,
+        FIXED_MANIFEST_LIMIT,
+        Duration::from_secs(30),
+        egress,
+    )
+    .await?
+    else {
+        bail!(
+            "the {brand_product} update manifest is unavailable (HTTP 404 at {manifest_url}); no release may have been published yet",
+            brand_product = BRAND.product_name
+        );
+    };
+    let manifest = serde_json::from_slice::<UpdateManifest>(&raw)
+        .with_context(|| format!("failed to parse {manifest_url}"))?;
+    let version = manifest.version.as_str();
+    if !is_release_version(version) {
+        bail!("{manifest_url} names version {version:?}, not X.Y.Z");
+    }
+    let info = manifest
+        .assets
+        .get(asset)
+        .with_context(|| format!("manifest does not include asset {asset}"))?;
+    let expected = info.sha256.trim().to_ascii_lowercase();
+    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("manifest asset {asset} has invalid sha256 {expected:?}");
+    }
+    let size = info
+        .size
+        .filter(|size| (FIXED_ASSET_MIN..=FIXED_ASSET_MAX).contains(size))
+        .with_context(|| {
+            format!(
+                "manifest asset {asset} has no size between {FIXED_ASSET_MIN} and {FIXED_ASSET_MAX} bytes"
+            )
+        })?;
+    println!(
+        "Latest: {brand_binary} {version}",
+        brand_binary = BRAND.binary_name
+    );
+    let ordering = compare_versions(version, current_version)
+        .with_context(|| format!("failed to compare remote version {version:?}"))?;
+    if ordering == Ordering::Less {
+        return Ok(FixedUpdate::Current(format!(
+            "Already current: {brand_binary} {current_version} (remote {brand_binary} {version})",
+            brand_binary = BRAND.binary_name
+        )));
+    }
+    if ordering == Ordering::Equal && current_sha256 == expected {
+        return Ok(FixedUpdate::Current(format!(
+            "Already current: {brand_binary} {current_version}",
+            brand_binary = BRAND.binary_name
+        )));
+    }
+    if ordering == Ordering::Equal {
+        println!("Same version but local binary hash differs; refreshing {asset}");
+    }
+    let url = fixed_asset_url(asset_url_template, version, asset);
+    println!("Downloading: {url}");
+    let bytes = fixed_get(policy, &url, size, Duration::from_secs(300), egress)
+        .await?
+        .with_context(|| {
+            format!("release asset {asset} of {version} is missing (HTTP 404 at {url})")
+        })?;
+    if bytes.len() as u64 != size {
+        bail!(
+            "downloaded {asset} has {} bytes, the manifest says {size}",
+            bytes.len()
+        );
+    }
+    let actual = sha256_hex(&bytes);
+    if actual != expected {
+        bail!("downloaded {asset} sha256 mismatch: expected {expected}, got {actual}");
+    }
+    Ok(FixedUpdate::Download {
+        bytes,
+        version: version.to_string(),
+    })
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn compare_versions(left: &str, right: &str) -> Result<Ordering> {
     let left = parse_version_parts(left)?;
@@ -8854,6 +9204,17 @@ fn write_app_config_at(path: &Path, config: &AppConfig) -> Result<()> {
         )
     })?;
     write_json_object(path, value)
+}
+
+/// The configuration, or `None` when none was written yet; a configuration
+/// that exists but cannot be read or parsed is an error.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn read_app_config_if_present() -> Result<Option<AppConfig>> {
+    let path = app_config_path()?;
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        _ => read_app_config().map(Some),
+    }
 }
 
 fn read_app_config() -> Result<AppConfig> {

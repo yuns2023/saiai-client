@@ -954,6 +954,53 @@ wrapper、manifest 和六个平台二进制构成不可变 release bundle。Linu
 静态 musl，避免旧发行版和树莓派上的 GLIBC 版本依赖。Gateway 只从当前激活目录
 提供这一完整 bundle，默认下载源由可信公开 origin 动态渲染。
 
+### 更新来源（内核 `UpdateSource`）
+
+内核的品牌字段 `update.source` 决定 `<binary> update` 从哪里取更新：
+
+- `GatewayChannel { channel_path }`（SAIAI，`saiai-cli`）：
+  `<配置的 base_url>/<channel_path>/manifest.json` 和 `/<资产名>`。
+  - 需要已初始化的配置。
+  - 不跟随重定向。
+  - manifest 返回 404 时，退回不校验 hash 的二进制下载。这是既有行为，保持不变。
+- `Fixed { manifest_url, asset_url_template, hosts }`（第二发行版 AITP 计划使用）：
+  - **URL 规则**：
+    - 每次请求和每一跳重定向都必须是 HTTPS、默认端口，主机与 `hosts` 精确匹配，且不含 userinfo 和 fragment；
+    - 只跟随 301/302/303/307/308，最多 5 跳，相对 Location 按当前 URL 解析；
+    - 每一跳按目标 URL 重新选择上游路由，代理不可用时不直连；
+    - 整条链设总超时。
+  - **TLS 信任**：与访问网关相同，即系统证书库、企业 CA、`SSL_CERT_FILE/DIR`，并排除本安装的 CA。
+  - **manifest 必须存在**：大小上限 1 MiB；版本必须是严格的 `X.Y.Z`；资产必须带 sha256 和 size（1–64 MiB）。
+  - **资产 URL**：用 manifest 中的版本填入模板，避免 latest 在两次请求之间切换。按 size 流式读取，长度和 sha256 必须一致。
+  - **候选二进制**：`--version` 的输出必须恰好是 `<binary> X.Y.Z`。
+  - **不依赖 init**：没有配置时走默认 system 路由；配置存在但读不出来时报错，不静默回退。
+  - **manifest 404**：明确报错"manifest 不可用，可能尚未发布"，不做无校验下载。
+
+### 第二发行版 AITP（计划）
+
+AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：`aitp` 二进制、
+`NoGatewayExtension`、用户自行配置任意中转网关，从 GitHub Releases
+（`2742zdz/AITP`）通过 `Fixed` 来源更新。
+
+实施顺序：
+
+| 阶段 | 内容 |
+|---|---|
+| D1 | 更新来源抽象与 `Fixed` 实现 |
+| D3 | `aitp` 二进制、品牌和黑盒测试（含 macOS launchd 实机加载） |
+| D2 | 同机共存安全（保守方案） |
+| D4 | AITP 仓库的发布工作流 |
+
+硬性前置：
+
+- **任何对外发布**（D4，以及向 `2742zdz/AITP` 的任何推送）须同时满足：
+  - D2 已完成；
+  - 用户明确批准；
+  - 首次公开发布前完成 manifest 签名评估。
+- **D2 中改变 SAIAI 现有行为的修复**须满足：
+  - 每个 PR 单列"SAIAI 用户可见的行为变化"，并说明只会少删或多拒绝；
+  - 可能让现有 SAIAI 用户原地升级后功能失效的改动，先停下确认。
+
 ### Linux 随机数兼容性
 
 Linux musl 资产通过 `scripts/saiai-cli/build-linux.sh` 构建。构建机需安装

@@ -11,7 +11,7 @@ use proxy_cli::contract::{
 };
 use proxy_cli::{
     Brand, CertificateNames, ConfigNames, EnvironmentNames, NoGatewayExtension, OwnershipMarkers,
-    PlaceholderIdentities, RuntimeContext, ScriptNames, ServiceNames, UpdateNames,
+    PlaceholderIdentities, RuntimeContext, ScriptNames, ServiceNames, UpdateNames, UpdateSource,
 };
 use std::path::Path;
 
@@ -64,7 +64,9 @@ const KTEST_VALUES: Brand = Brand {
         log_filename: "ktest.log",
     },
     update: UpdateNames {
-        channel_path: "ktest-channel",
+        source: UpdateSource::GatewayChannel {
+            channel_path: "ktest-channel",
+        },
         asset_prefix: "ktest-",
         candidate_prefix: ".ktest-update-",
         backup_prefix: "ktest.bak-",

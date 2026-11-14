@@ -20,7 +20,7 @@ use proxy_cli::{
     Brand, CertificateNames, ConfigNames, ConfiguredRoute, EnvironmentNames, GatewayExtension,
     GatewayHttp, GatewaySession, GatewayStart, NativeChatProtocol, OwnershipMarkers,
     PlaceholderIdentities, ScriptNames, ServiceNames, SignInput, StateFile, UpdateNames,
-    write_file_atomically,
+    UpdateSource, write_file_atomically,
 };
 #[cfg(all(test, feature = "contract"))]
 use proxy_cli::{RuntimeContext, Transport, contract};

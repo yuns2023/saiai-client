@@ -133,6 +133,61 @@ fn validate(brand: &Brand) -> Result<()> {
             bail!("brand {field} is not a portable environment variable name: {name:?}");
         }
     }
+    validate_update_source(&brand.update.source)?;
+    Ok(())
+}
+
+pub(crate) fn validate_update_source(source: &UpdateSource) -> Result<()> {
+    match source {
+        UpdateSource::GatewayChannel { channel_path } => {
+            let valid = !channel_path.is_empty()
+                && !channel_path.starts_with('/')
+                && !channel_path.ends_with('/')
+                && !channel_path.contains("//")
+                && channel_path.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/')
+                });
+            if !valid {
+                bail!("brand update channel_path is not a plain URL path: {channel_path:?}");
+            }
+        }
+        UpdateSource::Fixed(fixed) => {
+            if fixed.hosts.is_empty()
+                || fixed.hosts.iter().any(|host| {
+                    host.is_empty()
+                        || !host.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_digit()
+                                || matches!(byte, b'-' | b'.')
+                        })
+                })
+            {
+                bail!(
+                    "brand update hosts must be lowercase host names: {:?}",
+                    fixed.hosts
+                );
+            }
+            let policy = crate::FixedUrlPolicy::https(fixed.hosts);
+            policy
+                .check(fixed.manifest_url)
+                .map_err(|error| anyhow::anyhow!("brand update manifest_url: {error:#}"))?;
+            let template = fixed.asset_url_template;
+            if template.matches("{version}").count() != 1
+                || template.matches("{asset}").count() != 1
+            {
+                bail!(
+                    "brand update asset_url_template needs exactly one {{version}} and one {{asset}}: {template:?}"
+                );
+            }
+            policy
+                .check(&crate::fixed_asset_url(
+                    template,
+                    "1.2.3",
+                    "asset-linux-x86_64",
+                ))
+                .map_err(|error| anyhow::anyhow!("brand update asset_url_template: {error:#}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -351,8 +406,8 @@ pub struct ServiceNames {
 }
 
 pub struct UpdateNames {
-    /// Path segment below the Gateway base URL serving manifest and assets.
-    pub channel_path: &'static str,
+    /// Where the update manifest and release assets are downloaded from.
+    pub source: UpdateSource,
     /// Release asset prefix (`<prefix>linux-x86_64`, …).
     pub asset_prefix: &'static str,
     /// Staged replacement executable (`<prefix><unique>[.exe]`).
@@ -364,6 +419,32 @@ pub struct UpdateNames {
     /// PowerShell command that downloads and loads the public setup script,
     /// shown in messages; append a subcommand (`… uninstall`) to run it.
     pub windows_setup_command: &'static str,
+}
+
+/// Origin of the update manifest and release assets.
+pub enum UpdateSource {
+    /// `<configured Gateway base URL>/<channel_path>/manifest.json` and
+    /// `/<asset>`. Requires an initialized configuration; a missing manifest
+    /// (404) falls back to an unverified asset download, as earlier releases
+    /// did. `channel_path`: unreserved URL characters and inner `/`.
+    GatewayChannel { channel_path: &'static str },
+    /// Fixed HTTPS locations independent of the configured Gateway.
+    Fixed(FixedUpdateSource),
+}
+
+/// A release channel at fixed HTTPS URLs (for example a GitHub repository's
+/// releases). The manifest is required and verified; the asset URL is pinned
+/// to the manifest's version, so a release published in between cannot mix
+/// one release's manifest with another's asset.
+pub struct FixedUpdateSource {
+    /// Manifest of the latest release (`{"version": "X.Y.Z", "assets":
+    /// {"<asset>": {"sha256": …, "size": …}}}`).
+    pub manifest_url: &'static str,
+    /// Asset URL with `{version}` (the manifest's `X.Y.Z`) and `{asset}`.
+    pub asset_url_template: &'static str,
+    /// Hosts every request and redirect target must name exactly (HTTPS,
+    /// port 443, no user information). Lowercase.
+    pub hosts: &'static [&'static str],
 }
 
 pub struct OwnershipMarkers {

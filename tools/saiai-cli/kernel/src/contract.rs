@@ -191,7 +191,8 @@ pub mod certificates {
 pub mod update {
     use super::*;
 
-    /// Update coordinates for a Gateway base URL and a release asset.
+    /// Update coordinates for a Gateway base URL and a release asset (a
+    /// brand with a Gateway update channel; an error for fixed URLs).
     #[derive(Debug, PartialEq)]
     pub struct Names {
         pub manifest_url: String,
@@ -211,7 +212,7 @@ pub mod update {
         unique: &str,
     ) -> Result<Names> {
         installed(brand)?;
-        let (manifest_url, asset_url) = crate::update_urls(base_url, asset);
+        let (manifest_url, asset_url) = crate::update_urls(base_url, asset)?;
         Ok(Names {
             manifest_url,
             asset_url,

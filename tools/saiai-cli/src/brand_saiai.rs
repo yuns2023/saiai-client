@@ -6,7 +6,7 @@
 
 use super::{
     Brand, CertificateNames, ConfigNames, EnvironmentNames, OwnershipMarkers,
-    PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
+    PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames, UpdateSource,
 };
 
 /// The single SAIAI brand instance (a `static`, so every reference has the
@@ -59,7 +59,9 @@ pub const SAIAI_VALUES: Brand = Brand {
         log_filename: "saiai.log",
     },
     update: UpdateNames {
-        channel_path: "saiai-cli",
+        source: UpdateSource::GatewayChannel {
+            channel_path: "saiai-cli",
+        },
         asset_prefix: "saiai-",
         candidate_prefix: ".saiai-update-",
         backup_prefix: "saiai.bak-",

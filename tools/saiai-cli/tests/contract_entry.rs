@@ -4,7 +4,7 @@
 
 use proxy_cli::{
     Brand, CertificateNames, ConfigNames, EnvironmentNames, OwnershipMarkers,
-    PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames,
+    PlaceholderIdentities, ScriptNames, ServiceNames, UpdateNames, UpdateSource,
 };
 
 #[path = "../src/brand_saiai.rs"]
