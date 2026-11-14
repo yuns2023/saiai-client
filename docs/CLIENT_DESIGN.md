@@ -975,18 +975,22 @@ wrapper、manifest 和六个平台二进制构成不可变 release bundle。Linu
   - **时间预算**：代理发现（如 macOS `scutil --proxy`）30 s，manifest 链 30 s，资产链 300 s，各自独立计时；超时后遗留的阻塞任务不会拖住命令退出。
   - **候选二进制**：
     - 以新文件方式写入，写入失败即删除；
-    - `--version` 探测限时 15 s、输出上限 4 KiB；超时、输出超限，或打印后仍不退出时，终止并回收直接子进程（失败后另有最多 2 s 的回收确认），同时删除候选；
+    - `--version` 探测在候选成功启动后限时 15 s（这是探测期限，不是整个更新的硬性总时限），输出上限 4 KiB；超时、输出超限，或打印后仍不退出时，终止并回收直接子进程（失败后另有最多 2 s 的回收确认），同时删除候选；
     - 输出必须恰好是 `<binary> X.Y.Z`；
     - 不追踪候选的后代进程：后代占着输出时，探测在截止时间失败。
-  - **并发**：同一安装目录一次只允许一个更新。Unix 锁安装目录本身；Windows 以不共享方式打开 `<candidate_prefix>lock`，期间 uninstall 也无法删除它。锁只覆盖本命令，Windows 下命令结束后才执行的替换助手不在保护范围内；uninstall 目前不参与此锁（D2 处理更新与卸载的互斥）。
+  - **并发**：同一安装目录一次只允许一个更新。Unix 锁安装目录本身（flock，只对本地文件系统可靠，NFS 等网络文件系统不保证）；Windows 以不共享方式打开 `<candidate_prefix>lock`，期间 uninstall 也无法删除它。锁只覆盖本命令，Windows 下命令结束后才执行的替换助手不在保护范围内；uninstall 目前不参与此锁（D2 处理更新与卸载的互斥）。
   - **不依赖 init**：没有配置时走默认 system 路由，信任系统证书库，此时没有安装 CA 需要排除；配置存在但读不出来时报错，不静默回退。仍受环境选择器约束：同时继承非默认的 `CLAUDE_CONFIG_DIR` 和 `CODEX_HOME` 时，须显式选择环境。
   - **manifest 404**：明确报错"manifest 不可用，可能尚未发布"，不做无校验下载。
 
 ### 第二发行版 AITP（计划）
 
-AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：`aitp` 二进制、
-`NoGatewayExtension`、用户自行配置任意中转网关，从 GitHub Releases
-（`2742zdz/AITP`）通过 `Fixed` 来源更新。
+AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
+`kernel/src/bin/aitp/`（`main.rs` 入口，`brand.rs` 品牌取值并逐字冻结），
+`NoGatewayExtension`，用户用 `aitp init --base-url … --api-key …` 自行配置任意
+中转网关，从 GitHub Releases（`2742zdz/AITP`）通过 `Fixed` 来源更新。版本号即
+`kernel/Cargo.toml` 的包版本。没有托管的安装脚本，`windows_setup_command` 为空，
+提示中改用 `release_page`。SAIAI 发布构建（`-p saiai --bin saiai`）不包含 AITP
+数据，`verify-release.py --artifact` 对构建产物逐个检查。
 
 实施顺序：
 
@@ -1003,6 +1007,13 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：`a
   - D2 已完成；
   - 用户明确批准；
   - 首次公开发布前完成 manifest 签名评估。
+- **D4 前必须完成的跟进**（独立复核登记）：
+  - 候选探测只回收直接子进程：后代进程占住 stdout 时，读取线程和管道会遗留；Windows 杀父进程时不会杀后代，候选删除可能失败（删除错误目前被忽略）。须在 Windows 上用 Job Object 约束候选及其后代，并补 Windows 原生测试（后代退出、候选可删除）；Unix 改用进程组。当前探测失败会提前返回、不做替换，因此不阻塞 D3。
+  - 受控 HTTPS 的 Fixed 下载测试：向单个客户端注入测试 CA。
+  - 真实 `aitp update` 的完整黑盒（不访问 GitHub）：成功下载、候选探测、manifest 版本与候选 `--version` 不一致时拒绝替换，以及最终替换（D3 只覆盖到"未 init 也会请求正确渠道"和"配置损坏时在请求前失败"）。
+  - 独立内核 CI 中"二进制不含其他发行版名字"的测试不得跳过：在工作区内，构建路径含该名字时会跳过。
+  - uninstall 与更新的互斥（D2）。
+  - AITP 发布构建对路径前缀做 remap，并核对产物不含构建目录名。
 - **D2 中改变 SAIAI 现有行为的修复**须满足：
   - 每个 PR 单列"SAIAI 用户可见的行为变化"，并说明只会少删或多拒绝；
   - 可能让现有 SAIAI 用户原地升级后功能失效的改动，先停下确认。

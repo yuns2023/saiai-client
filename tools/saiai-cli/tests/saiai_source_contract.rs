@@ -102,8 +102,9 @@ fn saiai_brand_values_are_frozen() {
     assert_eq!(update.status_filename, ".saiai-update-status.txt");
     assert_eq!(
         update.windows_setup_command,
-        "irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai"
+        Some("irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai")
     );
+    assert_eq!(update.release_page, None);
     let markers = &brand.markers;
     assert_eq!(
         markers.codex_ide_env_begin,
@@ -348,6 +349,11 @@ fn inline_contract_literals_are_present() {
         (
             "lib.rs",
             "!candidate_version\n        .trim_start()\n        .strip_prefix(BRAND.binary_name)\n        .is_some_and(|rest| rest.starts_with(' '))",
+        ),
+        // The Windows uninstall retry hint names the brand's setup command.
+        (
+            "uninstall.rs",
+            "match BRAND.update.windows_setup_command {\n            Some(setup) => format!(",
         ),
         // Service identities: the start side and the uninstall discovery.
         (
@@ -684,7 +690,8 @@ fn brand_environment_call_sites_are_pinned() {
 }
 
 /// The library never reports its own package metadata as the program's: a
-/// distribution binary supplies the release facts through `RuntimeContext`.
+/// distribution binary (the SAIAI `main.rs`, the kernel's AITP entry
+/// `bin/aitp/main.rs`) supplies the release facts through `RuntimeContext`.
 #[test]
 fn library_takes_release_facts_from_the_entry_point() {
     let sources = cli_sources();
@@ -694,7 +701,7 @@ fn library_takes_release_facts_from_the_entry_point() {
         // Raw strings (`env!(r"CARGO_…")`) and `concat!`-built names are
         // not detected.
         let compact = text.split_whitespace().collect::<String>();
-        if file != "main.rs" {
+        if !matches!(file.as_str(), "main.rs" | "bin/aitp/main.rs") {
             assert!(
                 !compact.contains("env!(\"CARGO_"),
                 "{file} reads compile-time Cargo metadata"
@@ -1282,7 +1289,9 @@ const BRAND_TEXT_TOKENS: [(&str, &str, &str); 6] = [
     (
         "{brand_windows_setup}",
         "irm https://api.saiai.top/saiai-cli/setup.ps1 | iex; Invoke-Saiai",
-        "brand_windows_setup = BRAND.update.windows_setup_command",
+        // Bound to the brand's setup command in `execute_user_path`
+        // (pinned in `inline_contract_literals_are_present`).
+        "brand_windows_setup = setup",
     ),
     (
         "{brand_allow_untested_env}",
@@ -1473,7 +1482,7 @@ fn brand_text_renders_the_frozen_saiai_bytes() {
             "{brand_binary}" => brand.binary_name,
             "{brand_skip_start_env}" => brand.env.skip_start,
             "{brand_desktop_bin_env}" => brand.env.desktop_bin,
-            "{brand_windows_setup}" => brand.update.windows_setup_command,
+            "{brand_windows_setup}" => brand.update.windows_setup_command.unwrap(),
             "{brand_allow_untested_env}" => brand.env.claude_desktop_allow_untested,
             other => panic!("unknown brand placeholder {other}"),
         };
