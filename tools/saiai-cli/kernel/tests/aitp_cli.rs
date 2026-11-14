@@ -678,9 +678,9 @@ fn only_the_known_build_paths_explain_the_name() {
 }
 
 /// The program itself carries no other distribution's name
-/// (`foreign_names`), wherever it is built. A build below a directory that spells the name (as the workspace's
-/// CI checkout does) embeds that directory in debug information, so exactly
-/// those build paths are set aside; every other occurrence, in any case,
+/// (`foreign_names`), wherever it is built. A build below a directory whose
+/// path contains such a name embeds that directory in debug information, so
+/// exactly those build paths are set aside; every other occurrence, in any case,
 /// fails the test.
 #[test]
 fn the_program_carries_no_other_distribution_name() {

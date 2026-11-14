@@ -69,7 +69,7 @@ pub static AITP_BRAND: Brand = Brand {
             // offline): primary (aitp-release.pub, key id F7823EF82178E6E0)
             // and recovery (aitp-recovery.pub, key id 30D8EBD4CDEAE8F0).
             // Changing them strands every installed copy that trusts only the
-            // old ones (see the maintainer manual on rotation).
+            // old ones.
             signing_keys: &[
                 "RWTg5ngh+D6C99dBN+56y4B/nIF4hSSNbCG86wuZr4Knpg+Lc4KxnAgr",
                 "RWTw6OrN1OvYMNRnHzX9mhZugihDvcDXMqqpCGfKAIOxZwUnQU1sba/L",
