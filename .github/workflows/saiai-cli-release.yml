@@ -1,7 +1,24 @@
 name: SAIAI CLI Release
 
+# Three runs, chosen by how the workflow starts (job "mode"):
+# - preview: run by hand on a branch with publish_confirmation empty. Builds,
+#   tests natively on all six platforms and uploads the validation bundle.
+# - draft: pushing a saiai-v* tag. The same build and native tests, then the
+#   assets go up as a verified DRAFT release; nothing is published.
+# - publish: run by hand on that tag with publish_confirmation set to
+#   "publish <tag>". Re-checks the draft and publishes it (immutable).
+# The confirmation is the release gate: environment approval does not apply
+# to a private repository on GitHub Free, so pushing a tag alone never
+# publishes anything. The public download mirror is updated by the
+# operator's own tooling, never by this workflow.
 on:
   workflow_dispatch:
+    inputs:
+      publish_confirmation:
+        description: 'Empty for a preview. To publish the draft of a saiai-v* tag, run on that tag and type: publish <tag>'
+        required: false
+        default: ''
+        type: string
   push:
     tags:
       - 'saiai-v*'
@@ -14,7 +31,57 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
+  mode:
+    name: Release gate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+    steps:
+      - name: Choose preview, draft or publish
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          CONFIRMATION: ${{ inputs.publish_confirmation }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "$EVENT:$REF" in
+            push:refs/tags/saiai-v*)
+              mode=draft ;;
+            workflow_dispatch:refs/tags/saiai-v*)
+              if [ "$CONFIRMATION" != "publish $REF_NAME" ]; then
+                echo "::error::to publish, run on the tag with publish_confirmation: publish $REF_NAME" >&2
+                exit 1
+              fi
+              mode=publish ;;
+            workflow_dispatch:refs/heads/*)
+              if [ -n "$CONFIRMATION" ]; then
+                echo "::error::only a run on a saiai-v* tag publishes; leave publish_confirmation empty for a preview" >&2
+                exit 1
+              fi
+              mode=preview ;;
+            *)
+              echo "::error::unsupported trigger $EVENT on $REF" >&2
+              exit 1 ;;
+          esac
+          if [ "$mode" != preview ]; then
+            # Without branch or tag protection, a release tag must point into main.
+            status="$(gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...main" --jq .status)"
+            case "$status" in
+              identical|ahead) ;;
+              *)
+                echo "::error::$REF_NAME ($GITHUB_SHA) is not on main (compare status: $status)" >&2
+                exit 1 ;;
+            esac
+          fi
+          echo "mode=$mode" >>"$GITHUB_OUTPUT"
+
   verify:
+    needs: mode
+    if: needs.mode.outputs.mode == 'preview' || needs.mode.outputs.mode == 'draft'
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
@@ -53,10 +120,15 @@ jobs:
       - name: Test contract entries
         run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test contract_entry --test saiai_render_contract --test kernel_consumer
 
+      - name: Install the workflow parser
+        run: python3 -m pip install --disable-pip-version-check --no-deps --only-binary pyyaml --require-hashes -r scripts/saiai-cli/requirements-verify.txt
+
       - name: Verify standalone release contract
         run: |
           node --test scripts/saiai-cli/test-vscode-certificates.js
           python3 scripts/saiai-cli/test-release-contract.py
+          python3 scripts/saiai-cli/test-github-release-draft.py
+          python3 scripts/saiai-cli/test-fetch-github-release.py
           python3 scripts/saiai-cli/test-installed-codex-desktop-probe.py
           python3 scripts/saiai-cli/test-windows-self-update-polling.py
           bash scripts/saiai-cli/test-setup-wrappers.sh
@@ -103,6 +175,11 @@ jobs:
       - name: Verify VSCode certificate guard
         run: node --test scripts/saiai-cli/test-vscode-certificates.js
 
+      - name: Verify read-only Windows certificate inventory
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: >-
+          python -c "import runpy; runpy.run_path('scripts/saiai-cli/test-initialization-scope.py')['windows_roots'](); print('Windows Root inventory read passed')"
+
       - name: Install musl build tools
         if: runner.os == 'Linux'
         run: |
@@ -120,12 +197,17 @@ jobs:
         if: runner.os != 'Linux'
         run: cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --bin saiai --release --target ${{ matrix.target }}
 
-      # The release itself checks the platform-gated SAIAI goldens (LaunchAgent
-      # plist, Windows update helper) through the contract entries, natively.
-      - name: Test contract entries on this platform
+      # Everyday CI runs on Linux only, so the release (every preview and tag)
+      # runs this distribution's own tests natively here: the shell crate and
+      # the platform-gated SAIAI goldens (LaunchAgent plist, Windows update
+      # helper) through the contract entries. The kernel's own tests on these
+      # platforms run in the kernel repository's CI.
+      - name: Test this distribution on this platform
         if: runner.os == 'macOS' || matrix.target == 'x86_64-pc-windows-msvc'
         shell: bash
-        run: cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test contract_entry --test saiai_render_contract --test kernel_consumer
+        run: |
+          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai
+          cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test contract_entry --test saiai_render_contract --test kernel_consumer
 
       - name: Verify native Windows Desktop runtime
         if: matrix.target == 'x86_64-pc-windows-msvc'
@@ -142,6 +224,12 @@ jobs:
         if: runner.os == 'macOS'
         run: >-
           python3 scripts/saiai-cli/test-macos-service.py
+          --binary tools/saiai-cli/target/${{ matrix.target }}/release/saiai
+
+      - name: Verify native macOS environment lifecycle isolation
+        if: runner.os == 'macOS'
+        run: >-
+          python3 scripts/saiai-cli/test-macos-environments.py
           --binary tools/saiai-cli/target/${{ matrix.target }}/release/saiai
 
       - name: Capture official macOS Codex through local proxy
@@ -165,18 +253,27 @@ jobs:
         if: matrix.target == 'x86_64-pc-windows-msvc'
         run: python scripts/saiai-cli/test-windows-log-encoding.py --binary tools/saiai-cli/target/${{ matrix.target }}/release/saiai.exe
 
+      - name: Verify native Windows environment lifecycle isolation
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        timeout-minutes: 5
+        run: python scripts/saiai-cli/test-windows-environments.py --binary tools/saiai-cli/target/${{ matrix.target }}/release/saiai.exe
+
+      - name: Verify Windows installer environment routing
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          & "$env:WINDIR/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -File scripts/saiai-cli/test-setup-environments.ps1 -WrapperPath "$PWD/scripts/saiai-cli/setup.ps1"
+
+      # Each native command's exit status counts, not only the last one.
       - name: Capture official Windows Codex through local proxy
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
-          foreach ($version in @("0.146.0", "0.153.4")) {
-            $prefix = Join-Path $env:RUNNER_TEMP "codex-$version"
-            npm install --global --prefix $prefix "@openai/codex@$version"
-            python scripts/saiai-cli/test-windows-codex-proxy.py `
-              --saiai tools/saiai-cli/target/${{ matrix.target }}/release/saiai.exe `
-              --codex-prefix $prefix `
-              --codex-version $version
-          }
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm install --global --prefix "$env:RUNNER_TEMP/codex-0.146.0" "@openai/codex@0.146.0"
+          python scripts/saiai-cli/test-windows-codex-proxy.py --saiai tools/saiai-cli/target/${{ matrix.target }}/release/saiai.exe --codex-prefix "$env:RUNNER_TEMP/codex-0.146.0" --codex-version 0.146.0
+          npm install --global --prefix "$env:RUNNER_TEMP/codex-0.153.4" "@openai/codex@0.153.4"
+          python scripts/saiai-cli/test-windows-codex-proxy.py --saiai tools/saiai-cli/target/${{ matrix.target }}/release/saiai.exe --codex-prefix "$env:RUNNER_TEMP/codex-0.153.4" --codex-version 0.153.4
 
       - name: Prepare release fixture
         shell: bash
@@ -216,25 +313,26 @@ jobs:
           python3 scripts/saiai-cli/test-linux-service.py
           --binary dist/${{ matrix.asset }}
 
+      - name: Verify concurrent environment isolation
+        if: runner.os == 'Linux'
+        run: >-
+          python3 scripts/saiai-cli/test-environment-isolation.py
+          --binary dist/${{ matrix.asset }}
+
+      - name: Verify uninstall removes only SAIAI-owned state
+        if: runner.os == 'Linux'
+        run: >-
+          python3 scripts/saiai-cli/test-uninstall.py
+          --binary dist/${{ matrix.asset }}
+
+      # Every Unix matrix entry builds for its own runner.
       - name: Smoke-test native Unix bundle
         if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          case "${{ runner.os }}-$(uname -m)" in
-            Linux-x86_64) native_asset=saiai-linux-x86_64 ;;
-            Linux-aarch64|Linux-arm64) native_asset=saiai-linux-aarch64 ;;
-            macOS-x86_64) native_asset=saiai-macos-x86_64 ;;
-            macOS-arm64) native_asset=saiai-macos-aarch64 ;;
-            *) echo "No native wrapper smoke for ${{ runner.os }} $(uname -m)"; exit 0 ;;
-          esac
-          if [ "${{ matrix.asset }}" != "$native_asset" ]; then
-            echo "Skipping cross-built ${{ matrix.asset }} on $(uname -m)"
-            exit 0
-          fi
-          python3 scripts/saiai-cli/test-release-bundle.py \
-            --bundle dist \
-            --setup-sh dist/setup.sh \
-            --asset "${{ matrix.asset }}"
+        run: >-
+          python3 scripts/saiai-cli/test-release-bundle.py
+          --bundle dist
+          --setup-sh dist/setup.sh
+          --asset "${{ matrix.asset }}"
 
       - name: Smoke-test native Windows bundle and Windows PowerShell 5.1 setup wrapper
         if: matrix.target == 'x86_64-pc-windows-msvc'
@@ -261,8 +359,8 @@ jobs:
 
   package-preview:
     name: Package validation bundle
-    needs: build
-    if: github.event_name == 'workflow_dispatch'
+    needs: [mode, build]
+    if: needs.mode.outputs.mode == 'preview'
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
@@ -275,6 +373,9 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: release-assets
+
+      - name: Install the workflow parser
+        run: python3 -m pip install --disable-pip-version-check --no-deps --only-binary pyyaml --require-hashes -r scripts/saiai-cli/requirements-verify.txt
 
       - name: Assemble and verify public bundle
         run: |
@@ -309,10 +410,10 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
-    environment: release
+  draft:
+    name: Upload verified release draft
+    needs: [mode, build]
+    if: needs.mode.outputs.mode == 'draft'
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     permissions:
@@ -353,8 +454,8 @@ jobs:
             --bundle dist \
             --setup-sh dist/setup.sh
 
-      - name: Verify immutable release preconditions
-        id: immutable_release_preflight
+      - name: Verify release preconditions
+        id: preflight
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -384,9 +485,9 @@ jobs:
             echo "already_published=false" >>"$GITHUB_OUTPUT"
           fi
 
-      - name: Upload immutable release draft
-        id: immutable_release_draft
-        if: steps.immutable_release_preflight.outputs.already_published != 'true'
+      - name: Upload release draft
+        id: upload
+        if: steps.preflight.outputs.already_published != 'true'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: SAIAI CLI ${{ github.ref_name }}
@@ -406,19 +507,19 @@ jobs:
             dist/setup.ps1
             dist/setup.sh
 
-      - name: Verify and publish immutable release
-        if: steps.immutable_release_preflight.outputs.already_published != 'true'
+      # The draft stays a draft: publishing is the separate, confirmed run.
+      - name: Verify the uploaded draft
+        if: steps.preflight.outputs.already_published != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_ID: ${{ steps.immutable_release_draft.outputs.id }}
+          RELEASE_ID: ${{ steps.upload.outputs.id }}
         run: |
           set -euo pipefail
           [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
           release_endpoint="repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}"
           release_json="$(mktemp)"
           trap 'rm -f "$release_json"' EXIT
-
           gh api "$release_endpoint" >"$release_json"
           if ! python3 scripts/saiai-cli/verify-github-release-draft.py \
             --dist dist \
@@ -430,6 +531,98 @@ jobs:
             fi
             exit 1
           fi
+          echo "::notice::draft ready; publish with: gh workflow run 'SAIAI CLI Release' --ref $GITHUB_REF_NAME -f publish_confirmation='publish $GITHUB_REF_NAME'"
+
+  publish:
+    name: Publish the verified draft
+    needs: mode
+    if: needs.mode.outputs.mode == 'publish'
+    # Not a gate on a private repository on GitHub Free (approval is ignored
+    # there); the confirmation checked by job "mode" is.
+    environment: release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install the workflow parser
+        run: python3 -m pip install --disable-pip-version-check --no-deps --only-binary pyyaml --require-hashes -r scripts/saiai-cli/requirements-verify.txt
+
+      # Only the release that a successful tag run of this commit uploaded.
+      - name: Fetch the release of this tag
+        id: fetch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(awk -F '"' '/^[[:space:]]*version[[:space:]]*=/{print $2; exit}' tools/saiai-cli/Cargo.toml)"
+          if [ "$GITHUB_REF_NAME" != "saiai-v$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match CLI version $version" >&2
+            exit 1
+          fi
+          python3 scripts/saiai-cli/fetch-github-release.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$GITHUB_REF_NAME" \
+            --sha "$GITHUB_SHA" \
+            --dist dist \
+            --release-json "$RUNNER_TEMP/release.json" \
+            --github-output "$GITHUB_OUTPUT"
+
+      # The downloaded draft is this tag's release: the wrappers and manifest
+      # this commit produces, six SAIAI programs without AITP brand data.
+      - name: Verify the release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for wrapper in setup.sh setup.ps1 setup.cmd; do
+            cmp "scripts/saiai-cli/$wrapper" "dist/$wrapper"
+          done
+          chmod +x dist/setup.sh dist/saiai-linux-* dist/saiai-macos-*
+          python3 scripts/saiai-cli/generate-manifest.py \
+            --dist dist \
+            --cargo-toml tools/saiai-cli/Cargo.toml \
+            --wrappers-dir dist \
+            --output "$RUNNER_TEMP/manifest.json"
+          cmp "$RUNNER_TEMP/manifest.json" dist/manifest.json
+          python3 scripts/saiai-cli/verify-linux-portability.py \
+            dist/saiai-linux-x86_64 \
+            dist/saiai-linux-aarch64
+          python3 scripts/saiai-cli/verify-release.py \
+            --artifact dist/saiai-linux-x86_64 \
+            --artifact dist/saiai-linux-aarch64 \
+            --artifact dist/saiai-macos-x86_64 \
+            --artifact dist/saiai-macos-aarch64 \
+            --artifact dist/saiai-windows-x86_64.exe \
+            --artifact dist/saiai-windows-aarch64.exe
+          python3 scripts/saiai-cli/test-release-bundle.py \
+            --bundle dist \
+            --setup-sh dist/setup.sh
+          python3 scripts/saiai-cli/verify-github-release-draft.py \
+            --dist dist \
+            --tag "$GITHUB_REF_NAME" \
+            --state "${{ steps.fetch.outputs.state }}" \
+            <"$RUNNER_TEMP/release.json"
+
+      - name: Publish immutable release
+        if: steps.fetch.outputs.state == 'draft'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.fetch.outputs.id }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
+          release_endpoint="repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}"
+          release_json="$(mktemp)"
+          trap 'rm -f "$release_json"' EXIT
 
           publish_status=0
           payload='{"draft":false,"prerelease":false}'

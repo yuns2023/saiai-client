@@ -630,87 +630,717 @@ def verify_manifest_and_wrappers() -> None:
     )
 
 
-def verify_workflows_and_docs() -> None:
-    release = text(".github/workflows/saiai-cli-release.yml")
-    ci = text(".github/workflows/ci.yml")
-    for path in (".github/workflows/ci.yml", ".github/workflows/saiai-cli-release.yml", "scripts/git-hooks/pre-push"):
+# ---------------------------------------------------------------------------
+# Workflows, read as GitHub reads them.
+#
+# Everyday "Client CI" runs on Linux only; the native macOS and Windows checks
+# of this distribution run in "SAIAI CLI Release" (every preview and release
+# tag); the kernel's own tests on every platform run in the kernel
+# repository's CI. The checks below hold that division by structure: a
+# required command counts only as a whole top-level command of a step that
+# runs for the platform in question (its `if` evaluated), in a shell that
+# stops on its failure, with nothing that masks the failure, and the kernel
+# tests see this distribution's name in their effective environment. A
+# comment, a heredoc line, `|| true`, `if: false`, `continue-on-error` or an
+# environment override no longer satisfies a check.
+
+CI_WORKFLOW = ".github/workflows/ci.yml"
+RELEASE_WORKFLOW = ".github/workflows/saiai-cli-release.yml"
+FOREIGN_NAMES_ENV = "AITP_TEST_FOREIGN_NAMES"
+WORKFLOW_PARSER_HINT = (
+    "python3 -m pip install --no-deps --only-binary pyyaml --require-hashes "
+    "-r scripts/saiai-cli/requirements-verify.txt"
+)
+ALLOWED_ACTIONS = frozenset(
+    {
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+        "dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30",
+        "Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae",
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+        "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+        "softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65",
+    }
+)
+RUNNER_SYSTEMS = (("ubuntu-", "Linux"), ("macos-", "macOS"), ("windows-", "Windows"))
+STATIC_LINUX_MATRIX = (
+    {"os": "ubuntu-22.04", "target": "x86_64-unknown-linux-musl", "asset": "saiai-linux-x86_64"},
+)
+RELEASE_MATRIX = (
+    {"os": "ubuntu-22.04", "target": "x86_64-unknown-linux-musl", "asset": "saiai-linux-x86_64"},
+    {"os": "ubuntu-22.04-arm", "target": "aarch64-unknown-linux-musl", "asset": "saiai-linux-aarch64"},
+    {"os": "macos-15-intel", "target": "x86_64-apple-darwin", "asset": "saiai-macos-x86_64"},
+    {"os": "macos-15", "target": "aarch64-apple-darwin", "asset": "saiai-macos-aarch64"},
+    {"os": "windows-latest", "target": "x86_64-pc-windows-msvc", "asset": "saiai-windows-x86_64.exe"},
+    {"os": "windows-latest", "target": "aarch64-pc-windows-msvc", "asset": "saiai-windows-aarch64.exe"},
+)
+# The release gate (job "mode"), word for word: changing it is a reviewed
+# change of this file too.
+RELEASE_MODE_ENV = {
+    "EVENT": "${{ github.event_name }}",
+    "REF": "${{ github.ref }}",
+    "REF_NAME": "${{ github.ref_name }}",
+    "CONFIRMATION": "${{ inputs.publish_confirmation }}",
+    "GH_TOKEN": "${{ github.token }}",
+}
+RELEASE_MODE_SCRIPT = """set -euo pipefail
+case "$EVENT:$REF" in
+  push:refs/tags/saiai-v*)
+    mode=draft ;;
+  workflow_dispatch:refs/tags/saiai-v*)
+    if [ "$CONFIRMATION" != "publish $REF_NAME" ]; then
+      echo "::error::to publish, run on the tag with publish_confirmation: publish $REF_NAME" >&2
+      exit 1
+    fi
+    mode=publish ;;
+  workflow_dispatch:refs/heads/*)
+    if [ -n "$CONFIRMATION" ]; then
+      echo "::error::only a run on a saiai-v* tag publishes; leave publish_confirmation empty for a preview" >&2
+      exit 1
+    fi
+    mode=preview ;;
+  *)
+    echo "::error::unsupported trigger $EVENT on $REF" >&2
+    exit 1 ;;
+esac
+if [ "$mode" != preview ]; then
+  # Without branch or tag protection, a release tag must point into main.
+  status="$(gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...main" --jq .status)"
+  case "$status" in
+    identical|ahead) ;;
+    *)
+      echo "::error::$REF_NAME ($GITHUB_SHA) is not on main (compare status: $status)" >&2
+      exit 1 ;;
+  esac
+fi
+echo "mode=$mode" >>"$GITHUB_OUTPUT"
+"""
+RELEASE_MODES = {
+    "preview": {"mode", "verify", "build", "package-preview"},
+    "draft": {"mode", "verify", "build", "draft"},
+    "publish": {"mode", "publish"},
+}
+
+
+def load_workflow(relative: str) -> dict:
+    """The workflow as GitHub reads it (YAML 1.2 booleans, so `on` stays a
+    key); repeated keys and merge keys are refused."""
+    try:
+        import yaml
+    except ImportError:
+        require(False, f"reading the workflows needs PyYAML: {WORKFLOW_PARSER_HINT}")
+
+    class Loader(yaml.SafeLoader):
+        pass
+
+    bool_tag = "tag:yaml.org,2002:bool"
+    Loader.yaml_implicit_resolvers = {
+        first: [(tag, pattern) for tag, pattern in resolvers if tag != bool_tag]
+        for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+    Loader.add_implicit_resolver(
+        bool_tag, re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"), list("tTfF")
+    )
+
+    def mapping(loader, node):
+        result = {}
+        for key_node, value_node in node.value:
+            require(key_node.tag != "tag:yaml.org,2002:merge", f"{relative} uses a YAML merge key")
+            key = loader.construct_object(key_node, deep=True)
+            require(isinstance(key, str), f"{relative} has a non-text key {key!r}")
+            require(key not in result, f"{relative} repeats the key {key!r}")
+            result[key] = loader.construct_object(value_node, deep=True)
+        return result
+
+    Loader.add_constructor("tag:yaml.org,2002:map", mapping)
+    try:
+        document = yaml.load(text(relative), Loader=Loader)
+    except yaml.YAMLError as error:
+        require(False, f"{relative} is not valid YAML: {error}")
+    require(isinstance(document, dict), f"{relative} is not a workflow")
+    require(isinstance(document.get("jobs"), dict) and document["jobs"], f"{relative} has no jobs")
+    return document
+
+
+EXPRESSION_TOKEN = re.compile(
+    r"\s*(?:(?P<op>==|!=|&&|\|\||!|\(|\)|,)|(?P<string>'(?:[^']|'')*')|(?P<word>[A-Za-z_][A-Za-z0-9_.-]*))"
+)
+
+
+def evaluate(expression, context: dict[str, str]):
+    """Value of an `if:` expression: literals, the context names given,
+    ==/!= (case-insensitive, as GitHub compares text), !, &&, ||,
+    parentheses, startsWith and the status functions (the success path).
+    Anything else is refused rather than guessed."""
+    if isinstance(expression, bool):
+        return expression
+    require(isinstance(expression, str), f"unsupported condition {expression!r}")
+    source = expression.strip()
+    wrapped = re.fullmatch(r"\$\{\{(.*)\}\}", source, re.DOTALL)
+    if wrapped:
+        source = wrapped.group(1)
+    tokens = []
+    position = 0
+    while position < len(source):
+        if source[position:].strip() == "":
+            break
+        match = EXPRESSION_TOKEN.match(source, position)
+        require(match is not None, f"unsupported condition {expression!r}")
+        tokens.append(match)
+        position = match.end()
+    index = 0
+
+    def peek():
+        return tokens[index] if index < len(tokens) else None
+
+    def take(op: str | None = None):
+        nonlocal index
+        token = peek()
+        require(token is not None, f"incomplete condition {expression!r}")
+        if op is not None:
+            require(token.group("op") == op, f"unsupported condition {expression!r}")
+        index += 1
+        return token
+
+    def truthy(value) -> bool:
+        return value not in (False, None, "", 0)
+
+    def equal(left, right) -> bool:
+        if isinstance(left, str) and isinstance(right, str):
+            return left.lower() == right.lower()
+        return left == right
+
+    def primary():
+        token = take()
+        if token.group("op") == "(":
+            value = either()
+            take(")")
+            return value
+        if token.group("string") is not None:
+            return token.group("string")[1:-1].replace("''", "'")
+        word = token.group("word")
+        require(word is not None, f"unsupported condition {expression!r}")
+        following = peek()
+        if following is not None and following.group("op") == "(":
+            take("(")
+            arguments = []
+            if not (peek() is not None and peek().group("op") == ")"):
+                arguments.append(either())
+                while peek() is not None and peek().group("op") == ",":
+                    take(",")
+                    arguments.append(either())
+            take(")")
+            status = {"success": True, "always": True, "failure": False, "cancelled": False}
+            if word in status and not arguments:
+                return status[word]
+            if word == "startsWith" and len(arguments) == 2 and all(isinstance(a, str) for a in arguments):
+                return arguments[0].lower().startswith(arguments[1].lower())
+            require(False, f"unsupported function {word} in {expression!r}")
+        if word in ("true", "false"):
+            return word == "true"
+        if word == "null":
+            return None
+        require(word in context, f"condition {expression!r} uses {word}, unknown here")
+        return context[word]
+
+    def comparison():
+        left = primary()
+        token = peek()
+        if token is not None and token.group("op") in ("==", "!="):
+            take()
+            right = primary()
+            return equal(left, right) == (token.group("op") == "==")
+        return left
+
+    def negation():
+        token = peek()
+        if token is not None and token.group("op") == "!":
+            take("!")
+            return not truthy(negation())
+        return comparison()
+
+    def both():
+        value = negation()
+        while peek() is not None and peek().group("op") == "&&":
+            take("&&")
+            right = negation()
+            value = right if truthy(value) else value
+        return value
+
+    def either():
+        value = both()
+        while peek() is not None and peek().group("op") == "||":
+            take("||")
+            right = both()
+            value = value if truthy(value) else right
+        return value
+
+    value = either()
+    require(index == len(tokens), f"unsupported condition {expression!r}")
+    return truthy(value)
+
+
+def substitute(script: str, context: dict[str, str]) -> str:
+    """`script` with the `${{ name }}` values the context knows filled in."""
+    def fill(match: re.Match) -> str:
+        name = match.group(1)
+        return context[name] if name in context else match.group(0)
+
+    return re.sub(r"\$\{\{\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\}\}", fill, script)
+
+
+# Commands that let a later failure pass (or end the script early), per shell.
+BASH_MASKS = re.compile(
+    r"^(?:exec|return|trap|alias|shopt|function|source|\.|eval|unset)\b|^set\b.*\s\+"
+    r"|^[A-Za-z_][A-Za-z0-9_]*\s*\(\)|\|\|\s*(?:true|:)(?:\s|;|$)|\bexit\s+0\b"
+)
+PWSH_MASKS = re.compile(
+    r"\b(?:try|catch|trap|return)\b|ErrorActionPreference|SilentlyContinue|-ErrorAction\b|\bexit\s+0\b",
+    re.IGNORECASE,
+)
+NATIVE_FAILURES_STOP = "$PSNativeCommandUseErrorActionPreference = $true"
+
+
+def logical_commands(script: str, shell: str) -> list[tuple[str, int]]:
+    """(command, nesting depth) of every logical line of a run script:
+    continuation lines joined, comments, blank lines and heredoc bodies
+    dropped, whitespace collapsed. Unbalanced nesting is refused."""
+    continuation = "`" if shell == "pwsh" else "\\"
+    lines = script.split("\n")
+    commands = []
+    depth = 0
+    pending = ""
+    heredoc = None
+    for line in lines:
+        if heredoc is not None:
+            if line.strip() == heredoc:
+                heredoc = None
+            continue
+        stripped = line.strip()
+        if not pending and (not stripped or stripped.startswith("#")):
+            continue
+        if stripped.endswith(continuation):
+            pending += stripped[:-1] + " "
+            continue
+        command = re.sub(r"\s+", " ", (pending + stripped).strip())
+        pending = ""
+        commands.append((command, depth))
+        if shell != "pwsh":
+            marker = re.search(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1", command)
+            if marker:
+                heredoc = marker.group(2)
+            words = [word for word in re.split(r"[\s;]+", command) if word]
+            depth += sum(word in ("if", "case", "for", "while", "until", "select", "{", "(") for word in words)
+            depth -= sum(word in ("fi", "esac", "done", "}", ")") for word in words)
+        else:
+            plain = re.sub(r"'[^']*'|\"(?:[^\"`]|`.)*\"", "", command)
+            depth += plain.count("{") - plain.count("}")
+        require(depth >= 0, f"unbalanced run script near {command!r}")
+    require(not pending and heredoc is None and depth == 0, "unbalanced run script")
+    return commands
+
+
+def step_shell(step: dict, system: str) -> str:
+    shell = step.get("shell")
+    if shell is None:
+        return "pwsh" if system == "Windows" else "bash"
+    require(shell in ("bash", "pwsh"), f"step {step.get('name')!r} uses the shell {shell!r}")
+    return shell
+
+
+def effective_commands(step: dict, system: str, context: dict[str, str]) -> list[str]:
+    """The commands of `step` whose failure fails the step."""
+    script = step.get("run")
+    if not isinstance(script, str):
+        return []
+    shell = step_shell(step, system)
+    commands = logical_commands(substitute(script, context), shell)
+    if shell == "pwsh":
+        first = 1 if commands and commands[0][0] == NATIVE_FAILURES_STOP else 0
+        if any(PWSH_MASKS.search(command) for command, _ in commands[first:]):
+            return []
+    elif any(BASH_MASKS.search(command) for command, _ in commands):
+        return []
+    top = [command for command, depth in commands if depth == 0]
+    if shell == "bash":
+        return top
+    # pwsh stops at a failing native command only with this preference set
+    # first; otherwise only the last command's status counts.
+    if commands and commands[0][0] == NATIVE_FAILURES_STOP:
+        return [command for command in top[1:] if not command.startswith("& ") or command == top[-1]]
+    return top[-1:] if commands and commands[-1][1] == 0 else []
+
+
+def runner_system(job: dict, entry: dict[str, str]) -> str:
+    runs_on = substitute(str(job.get("runs-on")), {f"matrix.{key}": value for key, value in entry.items()})
+    for prefix, system in RUNNER_SYSTEMS:
+        if runs_on.startswith(prefix):
+            return system
+    require(False, f"unknown runner {runs_on!r}")
+
+
+def matrix_entries(job: dict) -> list[dict[str, str]]:
+    strategy = job.get("strategy")
+    if strategy is None:
+        return [{}]
+    require(isinstance(strategy, dict) and set(strategy) <= {"fail-fast", "matrix", "max-parallel"}, "unsupported strategy")
+    matrix = strategy.get("matrix")
+    require(isinstance(matrix, dict) and set(matrix) == {"include"}, "a matrix must list its entries under include only")
+    entries = matrix["include"]
+    require(isinstance(entries, list) and entries, "empty matrix")
+    for entry in entries:
+        require(isinstance(entry, dict) and all(isinstance(v, str) for v in entry.values()), "unsupported matrix entry")
+    return entries
+
+
+def job_context(job: dict, entry: dict[str, str], base: dict[str, str]) -> dict[str, str]:
+    context = dict(base)
+    context["runner.os"] = runner_system(job, entry)
+    context.update({f"matrix.{key}": value for key, value in entry.items()})
+    return context
+
+
+def check_workflow_basics(relative: str, workflow: dict) -> None:
+    """What holds for every job and step of both workflows."""
+    require("defaults" not in workflow, f"{relative} must not change step defaults")
+    for name, value in (workflow.get("env") or {}).items():
+        require(name != FOREIGN_NAMES_ENV or value == "saiai", f"{relative} overrides {FOREIGN_NAMES_ENV}")
+    for job_id, job in workflow["jobs"].items():
+        require(isinstance(job, dict), f"{relative} job {job_id} is not a mapping")
+        require("uses" not in job, f"{relative} job {job_id} calls another workflow")
+        require("defaults" not in job, f"{relative} job {job_id} changes step defaults")
+        require(not job.get("continue-on-error"), f"{relative} job {job_id} continues on error")
+        for name, value in (job.get("env") or {}).items():
+            require(name != FOREIGN_NAMES_ENV or value == "saiai", f"{relative} job {job_id} overrides {FOREIGN_NAMES_ENV}")
+        steps = job.get("steps")
+        require(isinstance(steps, list) and steps, f"{relative} job {job_id} has no steps")
+        for step in steps:
+            require(isinstance(step, dict), f"{relative} job {job_id} has an unreadable step")
+            label = f"{relative} job {job_id} step {step.get('name') or step.get('uses')!r}"
+            require(not step.get("continue-on-error"), f"{label} continues on error")
+            require("working-directory" not in step, f"{label} changes the working directory")
+            uses = step.get("uses")
+            require(uses is None or uses in ALLOWED_ACTIONS, f"{label} uses an action that is not pinned here: {uses}")
+            require((uses is None) != ("run" not in step), f"{label} must either run or use")
+            for name, value in (step.get("env") or {}).items():
+                require(name != FOREIGN_NAMES_ENV or value == "saiai", f"{label} overrides {FOREIGN_NAMES_ENV}")
+            script = step.get("run")
+            if isinstance(script, str):
+                for forbidden in (FOREIGN_NAMES_ENV, "GITHUB_ENV", "GITHUB_PATH"):
+                    require(forbidden not in script, f"{label} touches {forbidden}")
+
+
+def runs_command(
+    relative: str,
+    workflow: dict,
+    job_id: str,
+    command: str,
+    *,
+    base: dict[str, str],
+    entries: list[dict[str, str]] | None = None,
+    foreign_names: bool = False,
+    purpose: str,
+) -> None:
+    """`command` fails job `job_id` when it fails, for every matrix entry in
+    `entries` (default: all), with the kernel tests' foreign names in its
+    effective environment when `foreign_names`. `command` may name the
+    entry's values as {target}, {asset}, {os}."""
+    job = workflow["jobs"].get(job_id)
+    require(isinstance(job, dict), f"{relative} has no job {job_id} ({purpose})")
+    available = matrix_entries(job)
+    for entry in available if entries is None else entries:
+        require(entry in available, f"{relative} job {job_id} lacks the matrix entry {entry} ({purpose})")
+        context = job_context(job, entry, base)
+        expected = re.sub(r"\s+", " ", command.format(**entry)).strip()
+        found = False
+        for step in job["steps"]:
+            if expected not in effective_commands(step, context["runner.os"], context):
+                continue
+            if not evaluate(step.get("if", True), context):
+                continue
+            if foreign_names:
+                names = {**(workflow.get("env") or {}), **(job.get("env") or {}), **(step.get("env") or {})}
+                if names.get(FOREIGN_NAMES_ENV) != "saiai":
+                    continue
+            found = True
+        where = f" on {entry.get('target') or entry.get('os')}" if entry else ""
+        require(found, f"{relative} job {job_id} does not run {purpose}{where}: {expected!r}")
+
+
+def jobs_that_run(workflow: dict, base: dict[str, str]) -> set[str]:
+    jobs = workflow["jobs"]
+    ran: dict[str, bool] = {}
+
+    def runs(job_id: str, trail: tuple[str, ...] = ()) -> bool:
+        require(job_id in jobs and job_id not in trail, f"job dependency on {job_id} is broken")
+        if job_id not in ran:
+            job = jobs[job_id]
+            needs = job.get("needs", [])
+            needs = [needs] if isinstance(needs, str) else needs
+            condition = job.get("if", True)
+            require(
+                not (isinstance(condition, str) and re.search(r"\b(?:always|failure|cancelled)\s*\(", condition)),
+                f"job {job_id} runs regardless of its needs",
+            )
+            ran[job_id] = all(runs(need, trail + (job_id,)) for need in needs) and evaluate(condition, base)
+        return ran[job_id]
+
+    return {job_id for job_id in jobs if runs(job_id)}
+
+
+def verify_ci_workflow() -> None:
+    relative = CI_WORKFLOW
+    workflow = load_workflow(relative)
+    check_workflow_basics(relative, workflow)
+    # Ops finds the release source's "Client CI" run by this name, event push
+    # and branch main.
+    require(workflow.get("name") == "Client CI", f"{relative} must stay named 'Client CI'")
+    require(
+        workflow.get("on") == {
+            "pull_request": {"branches": ["main"]},
+            "push": {"branches": ["main"]},
+            "workflow_dispatch": None,
+        },
+        f"{relative} must run on every pull request to main and every push to main",
+    )
+    require((workflow.get("env") or {}).get(FOREIGN_NAMES_ENV) == "saiai", f"{relative} does not name SAIAI to the kernel's tests")
+    for job_id, job in workflow["jobs"].items():
+        for entry in matrix_entries(job):
+            require(
+                runner_system(job, entry) == "Linux",
+                f"{relative} job {job_id} leaves Linux: native macOS and Windows checks belong to the release workflow",
+            )
+    for event in ("pull_request", "push"):
+        base = {"github.event_name": event, "github.ref": "refs/heads/main"}
+        require(jobs_that_run(workflow, base) == set(workflow["jobs"]), f"{relative} skips a job on {event}")
+
+        def check(job_id: str, command: str, purpose: str, **options) -> None:
+            runs_command(relative, workflow, job_id, command, base=base, purpose=purpose, **options)
+
+        check("client-linux", "python3 scripts/saiai-cli/test-scan-kernel-names.py", "the kernel name scan tests")
+        check("client-linux", "python3 scripts/saiai-cli/scan-kernel-names.py tools/saiai-cli/kernel", "the kernel name scan")
+        check("client-linux", "cargo fmt --manifest-path tools/saiai-cli/Cargo.toml --all --check", "the format check")
+        check("client-linux", "cargo clippy --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace --all-targets -- -D warnings", "the lint")
+        check(
+            "client-linux",
+            "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace",
+            "the workspace tests with SAIAI named to the kernel's tests",
+            foreign_names=True,
+        )
+        for command in (
+            "cargo clippy --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace --features contract --all-targets -- -D warnings",
+            "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test contract_entry --test saiai_render_contract --test kernel_consumer",
+            "python3 scripts/saiai-cli/test-codex-daemon.py --binary tools/saiai-cli/target/debug/saiai --codex dist/codex-daemon-regression/codex-x86_64-unknown-linux-musl",
+            "node --test scripts/saiai-cli/test-vscode-certificates.js",
+            "python3 scripts/saiai-cli/test-release-contract.py",
+            "python3 scripts/saiai-cli/test-github-release-draft.py",
+            "python3 scripts/saiai-cli/test-fetch-github-release.py",
+            "python3 scripts/saiai-cli/test-brand-contract.py",
+            "python3 tools/saiai-cli/kernel/scripts/test_release_manifest.py",
+            "python3 scripts/saiai-cli/test-installed-codex-desktop-probe.py",
+            "python3 scripts/saiai-cli/test-windows-self-update-polling.py",
+            "bash scripts/saiai-cli/test-setup-wrappers.sh",
+            "python3 scripts/saiai-cli/verify-release.py",
+        ):
+            check("client-linux", command, "the SAIAI contract and golden checks")
         require(
-            "python3 scripts/saiai-cli/test-release-contract.py" in text(path),
-            f"{path} does not run the optional Claude contract regressions",
+            tuple(matrix_entries(workflow["jobs"]["static-linux"])) == STATIC_LINUX_MATRIX,
+            f"{relative} static Linux matrix differs",
         )
-    # The kernel's tests name this distribution only through the
-    # environment, and the kernel source is scanned for its names.
+        for command in (
+            'bash scripts/saiai-cli/build-linux.sh "{target}"',
+            'python3 scripts/saiai-cli/verify-linux-portability.py "dist/{asset}"',
+            'python3 scripts/saiai-cli/verify-release.py --artifact "dist/{asset}"',
+            "python3 scripts/saiai-cli/test-linux-entropy.py --binary dist/{asset}",
+            "python3 scripts/saiai-cli/test-initialization-scope.py --binary dist/{asset}",
+            "python3 scripts/saiai-cli/test-linux-service.py --binary dist/{asset}",
+            "python3 scripts/saiai-cli/test-environment-isolation.py --binary dist/{asset}",
+            "python3 scripts/saiai-cli/test-uninstall.py --binary dist/{asset}",
+        ):
+            check("static-linux", command, "the static Linux client checks")
+
+
+def verify_release_workflow() -> None:
+    relative = RELEASE_WORKFLOW
+    workflow = load_workflow(relative)
+    check_workflow_basics(relative, workflow)
+    jobs = workflow["jobs"]
+    require(workflow.get("name") == "SAIAI CLI Release", f"{relative} must stay named 'SAIAI CLI Release'")
     require(
-        re.search(
-            r"^env:\n(?:(?:  .*|\s*#.*|\s*)\n)*  AITP_TEST_FOREIGN_NAMES: (['\"]?)saiai\1\s*(?:#.*)?$",
-            ci,
-            re.MULTILINE,
-        )
-        is not None,
-        "CI does not name SAIAI to the kernel's tests for the whole workflow",
+        workflow.get("on") == {
+            "workflow_dispatch": {
+                "inputs": {
+                    "publish_confirmation": {
+                        "description": workflow.get("on", {}).get("workflow_dispatch", {}).get("inputs", {}).get("publish_confirmation", {}).get("description"),
+                        "required": False,
+                        "default": "",
+                        "type": "string",
+                    }
+                }
+            },
+            "push": {"tags": ["saiai-v*"]},
+        },
+        f"{relative} must start only by hand or by a saiai-v* tag push",
     )
+    require(workflow.get("permissions") == {"contents": "read"}, f"{relative} must default to read-only")
+    require(set(jobs) == {"mode", "verify", "build", "package-preview", "draft", "publish"}, f"{relative} jobs differ")
+
+    # The gate: job "mode" decides preview, draft or publish, word for word.
+    mode = jobs["mode"]
+    gate = [step for step in mode["steps"] if step.get("id") == "mode"]
     require(
-        re.search(
-            r"^      - name: Test\n        run: cargo test [^\n]*--workspace\n        env:\n"
-            r"(?:\s*#.*\n)*          AITP_TEST_FOREIGN_NAMES: saiai$",
-            release,
-            re.MULTILINE,
-        )
-        is not None,
-        "the release workflow does not name SAIAI to the kernel's tests",
+        len(mode["steps"]) == 1 and len(gate) == 1
+        and "if" not in mode and "if" not in gate[0] and "needs" not in mode and "shell" not in gate[0]
+        and gate[0].get("env") == RELEASE_MODE_ENV and gate[0].get("run") == RELEASE_MODE_SCRIPT
+        and mode.get("outputs") == {"mode": "${{ steps.mode.outputs.mode }}"}
+        and runner_system(mode, {}) == "Linux",
+        f"{relative} release gate (job mode) differs from the reviewed gate",
     )
-    pre_push = text("scripts/git-hooks/pre-push")
-    require(
-        "AITP_TEST_FOREIGN_NAMES=saiai" in pre_push,
-        "the pre-push hook does not name SAIAI to the kernel's tests",
-    )
-    for path, workflow in (("ci.yml", ci), ("release workflow", release), ("pre-push", pre_push)):
-        require(
-            "python3 scripts/saiai-cli/test-scan-kernel-names.py" in workflow
-            and "python3 scripts/saiai-cli/scan-kernel-names.py tools/saiai-cli/kernel" in workflow,
-            f"{path} does not scan the kernel for distribution names",
+    for name, expected in RELEASE_MODES.items():
+        ran = jobs_that_run(workflow, {"needs.mode.outputs.mode": name})
+        require(ran == expected, f"{relative} runs {sorted(ran)} for a {name} run, not {sorted(expected)}")
+    # Only the draft and publish jobs write; only publish makes a release public.
+    for job_id, job in jobs.items():
+        writes = (job.get("permissions") or {}).get("contents") == "write"
+        require(writes == (job_id in ("draft", "publish")), f"{relative} job {job_id} has the wrong contents permission")
+        publishes = '"draft":false' in "\n".join(str(step.get("run", "")) for step in job["steps"])
+        require(publishes == (job_id == "publish"), f"{relative} job {job_id} must {'' if job_id == 'publish' else 'not '}publish")
+        for step in job["steps"]:
+            if str(step.get("uses", "")).startswith("softprops/action-gh-release@"):
+                require(job_id == "draft" and step.get("with", {}).get("draft") is True, f"{relative} uploads a non-draft release")
+                require(step.get("with", {}).get("prerelease") is False, f"{relative} release must not be a prerelease")
+                require(step.get("with", {}).get("name") == "SAIAI CLI ${{ github.ref_name }}", f"{relative} release name differs")
+                files = set(step.get("with", {}).get("files", "").split())
+                require(files == {f"dist/{name}" for name in ASSETS + WRAPPERS + ("manifest.json",)}, f"{relative} draft files differ")
+    require(jobs["publish"].get("environment") == "release", f"{relative} publish job lost its environment")
+
+    for mode_name in ("preview", "draft"):
+        base = {"needs.mode.outputs.mode": mode_name}
+
+        def check(job_id: str, command: str, purpose: str, **options) -> None:
+            runs_command(relative, workflow, job_id, command, base=base, purpose=purpose, **options)
+
+        for command in (
+            "cargo fmt --manifest-path tools/saiai-cli/Cargo.toml --all --check",
+            "cargo clippy --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace --all-targets -- -D warnings",
+            "python3 scripts/saiai-cli/test-scan-kernel-names.py",
+            "python3 scripts/saiai-cli/scan-kernel-names.py tools/saiai-cli/kernel",
+            "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test contract_entry --test saiai_render_contract --test kernel_consumer",
+            "node --test scripts/saiai-cli/test-vscode-certificates.js",
+            "python3 scripts/saiai-cli/test-release-contract.py",
+            "python3 scripts/saiai-cli/test-github-release-draft.py",
+            "python3 scripts/saiai-cli/test-fetch-github-release.py",
+            "python3 scripts/saiai-cli/test-installed-codex-desktop-probe.py",
+            "python3 scripts/saiai-cli/test-windows-self-update-polling.py",
+            "bash scripts/saiai-cli/test-setup-wrappers.sh",
+            "python3 scripts/saiai-cli/verify-release.py",
+        ):
+            check("verify", command, "the release verification")
+        check(
+            "verify",
+            "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml --workspace",
+            "the workspace tests with SAIAI named to the kernel's tests",
+            foreign_names=True,
         )
-    for asset in ASSETS:
-        require(asset in release, f"release workflow omits {asset}")
-    for required in (
-        "verify-release.py",
-        "test-release-bundle.py",
-        "test-linux-service.py",
-        "prerelease: false",
-        'name: SAIAI CLI ${{ github.ref_name }}',
-        "x86_64-unknown-linux-musl",
-        "aarch64-unknown-linux-musl",
+
+        require(tuple(matrix_entries(jobs["build"])) == RELEASE_MATRIX, f"{relative} build matrix differs")
+        linux = [entry for entry in RELEASE_MATRIX if entry["os"].startswith("ubuntu-")]
+        macos = [entry for entry in RELEASE_MATRIX if entry["os"].startswith("macos-")]
+        windows = [entry for entry in RELEASE_MATRIX if entry["os"].startswith("windows-")]
+        windows_x64 = [entry for entry in windows if entry["target"] == "x86_64-pc-windows-msvc"]
+        apple_silicon = [entry for entry in macos if entry["target"] == "aarch64-apple-darwin"]
+        native = [entry for entry in RELEASE_MATRIX if entry["target"] != "aarch64-pc-windows-msvc"]
+        program = "tools/saiai-cli/target/{target}/release/saiai"
+        for command, entries, purpose in (
+            ("node --test scripts/saiai-cli/test-vscode-certificates.js", None, "the VSCode certificate guard"),
+            ('bash scripts/saiai-cli/build-linux.sh "{target}"', linux, "the static Linux build"),
+            (
+                "cargo build --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --bin saiai --release --target {target}",
+                macos + windows, "the release build",
+            ),
+            ("cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai", macos + windows_x64, "this distribution's tests"),
+            (
+                "cargo test --locked --manifest-path tools/saiai-cli/Cargo.toml -p saiai --features contract --lib --test contract_entry --test saiai_render_contract --test kernel_consumer",
+                macos + windows_x64, "the platform SAIAI goldens",
+            ),
+            ("python3 scripts/saiai-cli/verify-linux-portability.py \"dist/{asset}\"", linux, "the Linux portability check"),
+            ("python3 scripts/saiai-cli/test-linux-entropy.py --binary dist/{asset}", linux, "the old-kernel TLS check"),
+            ("python3 scripts/saiai-cli/test-linux-service.py --binary dist/{asset}", linux, "the Linux service smoke"),
+            ("python3 scripts/saiai-cli/test-environment-isolation.py --binary dist/{asset}", linux, "the environment isolation check"),
+            ("python3 scripts/saiai-cli/test-uninstall.py --binary dist/{asset}", linux, "the uninstall check"),
+            ("python scripts/saiai-cli/test-initialization-scope.py --binary dist/{asset}", native, "the initialization scope check"),
+            (
+                'python3 scripts/saiai-cli/test-release-bundle.py --bundle dist --setup-sh dist/setup.sh --asset "{asset}"',
+                linux + macos, "the native Unix bundle smoke",
+            ),
+            (f"python3 scripts/saiai-cli/test-macos-service.py --binary {program}", macos, "the macOS LaunchAgent smoke"),
+            (f"python3 scripts/saiai-cli/test-macos-environments.py --binary {program}", macos, "the macOS environment isolation"),
+            (
+                f'python3 scripts/saiai-cli/test-windows-codex-proxy.py --saiai {program} --codex-prefix "$prefix/bin" --codex-version 0.153.4',
+                apple_silicon, "the official macOS Codex capture",
+            ),
+            (f"python scripts/saiai-cli/verify-windows-reproducibility.py {program}.exe", windows, "the reproducible Windows image check"),
+            (
+                "python -c \"import runpy; runpy.run_path('scripts/saiai-cli/test-initialization-scope.py')['windows_roots'](); print('Windows Root inventory read passed')\"",
+                windows_x64, "the read-only Windows certificate inventory",
+            ),
+            (
+                "bash scripts/saiai-cli/cargo-test-filtered.sh proxy-cli windows_desktop_runtime::tests -- --test-threads=1",
+                windows_x64, "the Windows Desktop runtime tests",
+            ),
+            (
+                f'& "$PWD/scripts/saiai-cli/test-windows-runtime.ps1" -BinaryPath "$PWD/{program}.exe"',
+                windows_x64, "the Windows local proxy runtime smoke",
+            ),
+            (f"python scripts/saiai-cli/test-windows-log-encoding.py --binary {program}.exe", windows_x64, "the Windows log encoding check"),
+            (f"python scripts/saiai-cli/test-windows-environments.py --binary {program}.exe", windows_x64, "the Windows environment isolation"),
+            (
+                '& "$env:WINDIR/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -File scripts/saiai-cli/test-setup-environments.ps1 -WrapperPath "$PWD/scripts/saiai-cli/setup.ps1"',
+                windows_x64, "the Windows installer environment routing",
+            ),
+            (
+                '& "$PWD/scripts/saiai-cli/test-windows-release.ps1" -BundleDir dist -SetupPs1 dist/setup.ps1 -SetupCmd dist/setup.cmd -AssetName "{asset}"',
+                windows_x64, "the Windows bundle and PowerShell 5.1 wrapper smoke",
+            ),
+            ("python scripts/saiai-cli/test-windows-self-update.py --binary dist/{asset}", windows_x64, "the Windows self-update smoke"),
+        ) + tuple(
+            (
+                f'python scripts/saiai-cli/test-windows-codex-proxy.py --saiai {program}.exe --codex-prefix "$env:RUNNER_TEMP/codex-{version}" --codex-version {version}',
+                windows_x64, f"the official Windows Codex {version} capture",
+            )
+            for version in ("0.146.0", "0.153.4")
+        ):
+            check("build", command, purpose, entries=entries)
+
+    preview = {"needs.mode.outputs.mode": "preview"}
+    every_artifact = " ".join(f"--artifact dist/{asset}" for asset in ASSETS)
+    for command in (
+        f"python3 scripts/saiai-cli/verify-release.py {every_artifact}",
+        "python3 scripts/saiai-cli/test-release-bundle.py --bundle dist --setup-sh dist/setup.sh",
     ):
-        require(required in release, f"release workflow is missing {required!r}")
-    require(
-        "test-linux-service.py" in ci,
-        "CI workflow does not exercise the Linux headless service fallback",
-    )
-    for workflow in (ci, release):
-        for required in ("build-linux.sh", "linux-libc-dev", "test-linux-entropy.py"):
-            require(required in workflow, f"Linux entropy contract is missing {required!r}")
-        require(
-            "test-windows-codex-proxy.py" in workflow
-            and '"0.146.0", "0.153.4"' in workflow,
-            "Windows workflows do not capture both supported official Codex versions",
-        )
-        require(
-            "Capture official macOS Codex through local proxy" in workflow
-            and 'codex-prefix "$prefix/bin"' in workflow,
-            "macOS workflows do not capture the official Apple Silicon Codex client",
-        )
-    require(
-        "Smoke-test Windows PowerShell 5.1 setup wrapper" in ci
-        and "test-windows-release.ps1" in ci,
-        "source CI does not execute the Windows PowerShell 5.1 setup-wrapper smoke",
-    )
-    require(
-        "test-windows-self-update.py" in ci and "test-windows-self-update.py" in release,
-        "Windows self-update smoke must run in source CI and release workflow",
-    )
-    # AITP release builds remap the build machine's paths and are checked
-    # with --aitp-artifact, both stand-alone and in this checkout (whose path
-    # names SAIAI); SAIAI release builds stay as they are.
+        runs_command(relative, workflow, "package-preview", command, base=preview, purpose="the six-platform validation bundle")
+    publish = {"needs.mode.outputs.mode": "publish"}
+    for command in (
+        'cmp "$RUNNER_TEMP/manifest.json" dist/manifest.json',
+        f"python3 scripts/saiai-cli/verify-release.py {every_artifact}",
+        "python3 scripts/saiai-cli/test-release-bundle.py --bundle dist --setup-sh dist/setup.sh",
+    ):
+        runs_command(relative, workflow, "publish", command, base=publish, purpose="the published release check")
+
+
+def verify_workflows_and_docs() -> None:
+    verify_ci_workflow()
+    verify_release_workflow()
+    pre_push = text("scripts/git-hooks/pre-push")
+    for required in (
+        "python3 scripts/saiai-cli/test-release-contract.py",
+        "AITP_TEST_FOREIGN_NAMES=saiai",
+        "python3 scripts/saiai-cli/test-scan-kernel-names.py",
+        "python3 scripts/saiai-cli/scan-kernel-names.py tools/saiai-cli/kernel",
+    ):
+        require(required in pre_push, f"the pre-push hook does not run {required!r}")
+    # The kernel's AITP release build script (built and checked by the
+    # kernel's own CI) keeps remapping the build machine's paths.
     remap = text(AITP_RELEASE_BUILD)
     for required in (
         "--remap-path-prefix=",
@@ -726,29 +1356,6 @@ def verify_workflows_and_docs() -> None:
             re.search(r'^add_mapping "\$\w+" ' + re.escape(prefix) + r"$", remap, re.MULTILINE) is not None,
             f"AITP release build script does not map to {prefix}",
         )
-    for required in (
-        'aitp="$(CARGO_TARGET_DIR="$standalone/target" bash scripts/build-release.sh --locked)"',
-        '--aitp-artifact "$aitp"',
-        'aitp="$(bash tools/saiai-cli/kernel/scripts/build-release.sh --locked)"',
-        'echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"',
-        '--aitp-artifact "$AITP_PROGRAM"',
-        'grep "update signing keys are placeholders" "$RUNNER_TEMP/build.log"',
-        'grep "carries placeholder signing keys" "$RUNNER_TEMP/keys.log"',
-        "the path check accepted an ordinary release build",
-        "the release build accepted placeholder signing keys",
-        "the release check accepted placeholder signing keys",
-        "python3 scripts/test_release_manifest.py",
-        "python3 tools/saiai-cli/kernel/scripts/test_release_manifest.py",
-    ):
-        require(required in ci, f"CI does not check the remapped AITP release: {required!r}")
-    # The placeholder exception is gone: no workflow may bring it back.
-    for workflow in (ci, release):
-        require(
-            "ALLOW_PLACEHOLDER" not in workflow and "allow-placeholder" not in workflow,
-            "a workflow allows placeholder signing keys",
-        )
-    for forbidden in ("build-release.sh", "remap-path-prefix", "--aitp-artifact"):
-        require(forbidden not in release, f"SAIAI release workflow must not use {forbidden!r}")
     linux_service = text("scripts/saiai-cli/test-linux-service.py")
     for required in (
         "test-forced headless mode",
@@ -771,9 +1378,14 @@ def verify_workflows_and_docs() -> None:
         "init-codex retained a direct-provider compatibility route",
     ):
         require(required in macos_service, f"macOS service smoke is missing {required!r}")
-    for withdrawn in ("test-v2-", "V2 Preview", "saiai-core/Cargo.toml"):
-        require(withdrawn not in release, f"release workflow still contains {withdrawn!r}")
-        require(withdrawn not in ci, f"CI workflow still contains {withdrawn!r}")
+    for relative in (CI_WORKFLOW, RELEASE_WORKFLOW):
+        workflow = text(relative)
+        for withdrawn in ("test-v2-", "V2 Preview", "saiai-core/Cargo.toml"):
+            require(withdrawn not in workflow, f"{relative} still contains {withdrawn!r}")
+        # The placeholder exception is gone, and AITP releases are built and
+        # checked by the kernel's own CI, not here.
+        for forbidden in ("ALLOW_PLACEHOLDER", "allow-placeholder", "build-release.sh", "remap-path-prefix", "--aitp-artifact"):
+            require(forbidden not in workflow, f"{relative} must not use {forbidden!r}")
     require(not (ROOT / ".github/workflows/saiai-desktop-preview.yml").exists(), "V2 desktop publisher still exists")
 
     combined_docs = "\n".join(

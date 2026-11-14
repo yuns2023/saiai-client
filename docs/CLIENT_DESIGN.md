@@ -1157,7 +1157,7 @@ Linux musl 资产通过 `scripts/saiai-cli/build-linux.sh` 构建。构建机需
 时回退到 `/dev/urandom` 的 Linux 实现。缺少 `linux/random.h` 会使其选择
 无此回退的 `getentropy` 实现，可能导致 TLS 握手期间进程直接终止。
 
-CI 和 release 对两种 Linux 架构运行 `test-linux-entropy.py`：仅在测试进程
+日常 CI 对 x86_64、preview 与 release 对两种 Linux 架构运行 `test-linux-entropy.py`：仅在测试进程
 及其子进程中用 seccomp 将 `getrandom` 返回值设为 `ENOSYS`，验证初始化、
 后台代理、doctor 的本地 TLS 握手及服务生命周期。该测试不改变宿主策略，
 不发送模型请求，也不代表已验证旧内核的所有系统调用兼容性。系统随机数源
@@ -1166,3 +1166,20 @@ CI 和 release 对两种 Linux 架构运行 `test-linux-entropy.py`：仅在测�
 Windows MSVC 的两种 release 目标使用 `/Brepro`，避免链接时间戳和调试标识
 导致相同源码的 preview/tag 构建产生不同字节。正式 Release 的完整 manifest
 必须与实机验证过的 preview 一致；哈希不同的构建不能复用验证凭据。
+
+### CI 分工与发布闸门
+
+- 日常 `Client CI`（每个 PR 与 main 推送）只在 Linux 上运行：壳的格式、lint、
+  测试（`AITP_TEST_FOREIGN_NAMES=saiai`）、契约与金标准、内核名字扫描、静态
+  x86_64 构建及其 Linux 验证。内核在各平台的测试由内核仓库的公开 CI 负责。
+- `SAIAI CLI Release` 的每次 preview 与 release 构建，在六个平台上原生运行本发行版
+  的 macOS/Windows/aarch64 检查（壳测试与平台金标准、LaunchAgent、环境隔离、
+  Windows 安装器/PS 5.1/自更新、官方 Codex 抓包等）。
+- `verify-release.py` 解析两个工作流的结构来核对这一分工：命令须是会因失败而让
+  步骤失败的顶层命令，步骤条件按平台求值，注释、heredoc、`|| true`、`if: false`、
+  `continue-on-error` 和环境变量覆盖都不算数。
+- 发布分三种运行：在分支上手动运行（`publish_confirmation` 留空）= preview；
+  推送 `saiai-v*` tag = 构建并上传**草稿**，不公开；在该 tag 上手动运行并填写
+  `publish <tag>` = 复核草稿后发布（immutable）。私有仓库在 GitHub Free 上不执行
+  `release` 环境审批，确认短语才是闸门；公开下载镜像由运维脚本在本机同步，
+  不在 CI 中。tag 必须指向 main 上的提交。

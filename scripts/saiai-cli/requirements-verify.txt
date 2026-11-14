@@ -1,0 +1,5 @@
+# verify-release.py reads the workflows with PyYAML (Python 3.12, Linux
+# x86_64 and aarch64 runners). Install with --require-hashes.
+pyyaml==6.0.3 \
+    --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc \
+    --hash=sha256:9149cad251584d5fb4981be1ecde53a1ca46c891a79788c0df828d2f166bda28
