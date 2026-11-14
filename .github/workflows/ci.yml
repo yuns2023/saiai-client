@@ -83,14 +83,14 @@ jobs:
           cargo test --locked --target-dir "$standalone/target"
           # The AITP program: its brand installs and renders its services
           # (contract entries), and a release build (paths remapped, as
-          # published) runs and names no build path. It is never published,
-          # so it may still carry the placeholder update signing keys.
+          # published) runs, names no build path and carries the brand's
+          # real update signing keys.
           cargo test --locked --target-dir "$standalone/target" --features contract --bin aitp
           python3 scripts/test_release_manifest.py
-          aitp="$(CARGO_TARGET_DIR="$standalone/target" AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1 bash scripts/build-release.sh --locked)"
+          aitp="$(CARGO_TARGET_DIR="$standalone/target" bash scripts/build-release.sh --locked)"
           "$aitp" --version
           python3 "$GITHUB_WORKSPACE/scripts/saiai-cli/verify-release.py" \
-            --aitp-artifact "$aitp" --allow-placeholder-signing-key \
+            --aitp-artifact "$aitp" \
             --build-dir "$standalone" --build-dir "$GITHUB_WORKSPACE"
 
       - name: Verify official Codex daemon initialization without model turns
@@ -150,38 +150,53 @@ jobs:
             *saiai*) ;;
             *) echo "::error::the checkout path no longer names the other distribution"; exit 1 ;;
           esac
-          # Never published: the placeholder signing keys are allowed here.
-          aitp="$(AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1 bash tools/saiai-cli/kernel/scripts/build-release.sh --locked)"
+          aitp="$(bash tools/saiai-cli/kernel/scripts/build-release.sh --locked)"
           "$aitp" --version
           echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"
 
       - name: Verify the AITP release names no build path
         run: >-
           python3 scripts/saiai-cli/verify-release.py
-          --aitp-artifact "$AITP_PROGRAM" --allow-placeholder-signing-key
+          --aitp-artifact "$AITP_PROGRAM"
           --build-dir "$GITHUB_WORKSPACE"
 
-      # Without the exception, both the build and the release check refuse
-      # a program that trusts the placeholder keys.
+      # The build and the release check refuse placeholder keys: a kernel
+      # copy whose brand carries the placeholders does not build, and a
+      # program that carries one fails the check.
       - name: Control - placeholder signing keys are refused for a release
         run: |
-          keys="$(python3 tools/saiai-cli/kernel/scripts/release_manifest.py keys)"
-          case "$keys" in
-            *PLACEHOLDER*) ;;
-            *) echo "the brand carries real signing keys; the placeholder control does not apply"; exit 0 ;;
-          esac
-          if bash tools/saiai-cli/kernel/scripts/build-release.sh --locked 2> "$RUNNER_TEMP/build.log"; then
+          copy="$RUNNER_TEMP/placeholder-kernel"
+          cp -R tools/saiai-cli/kernel "$copy"
+          python3 - "$copy" <<'PY'
+          import importlib.util, pathlib, sys
+          sys.dont_write_bytecode = True
+          copy = pathlib.Path(sys.argv[1])
+          spec = importlib.util.spec_from_file_location("rm", copy / "scripts/release_manifest.py")
+          rm = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(rm)
+          brand = copy / "src/bin/aitp/brand.rs"
+          text = brand.read_text(encoding="utf-8")
+          keys = rm.brand_keys(text)
+          assert len(keys) == len(rm.PLACEHOLDER_KEYS), keys
+          for key, placeholder in zip(keys, rm.PLACEHOLDER_KEYS):
+              assert text.count(key) >= 1, key
+              text = text.replace(key, placeholder)
+          brand.write_text(text, encoding="utf-8")
+          PY
+          if bash "$copy/scripts/build-release.sh" --locked 2> "$RUNNER_TEMP/build.log"; then
             echo "::error::the release build accepted placeholder signing keys"
             exit 1
           fi
           grep "update signing keys are placeholders" "$RUNNER_TEMP/build.log"
+          cp "$AITP_PROGRAM" "$RUNNER_TEMP/aitp-placeholder"
+          printf '%s' RWQAITPxPRIMARYxPLACEHOLDERxKEYxNOTxFORxRELEASE222222222 >> "$RUNNER_TEMP/aitp-placeholder"
           if python3 scripts/saiai-cli/verify-release.py \
-              --aitp-artifact "$AITP_PROGRAM" \
+              --aitp-artifact "$RUNNER_TEMP/aitp-placeholder" \
               --build-dir "$GITHUB_WORKSPACE" 2> "$RUNNER_TEMP/keys.log"; then
             echo "::error::the release check accepted placeholder signing keys"
             exit 1
           fi
-          grep "still placeholders" "$RUNNER_TEMP/keys.log"
+          grep "carries placeholder signing keys" "$RUNNER_TEMP/keys.log"
 
       - name: Control - an ordinary release build fails the check
         env:
@@ -190,7 +205,7 @@ jobs:
         run: |
           cargo build --locked --manifest-path tools/saiai-cli/kernel/Cargo.toml --release --bin aitp
           if python3 scripts/saiai-cli/verify-release.py \
-              --aitp-artifact "$CARGO_TARGET_DIR/release/aitp" --allow-placeholder-signing-key \
+              --aitp-artifact "$CARGO_TARGET_DIR/release/aitp" \
               --build-dir "$GITHUB_WORKSPACE" 2> "$RUNNER_TEMP/control.log"; then
             echo "::error::the path check accepted an ordinary release build"
             exit 1

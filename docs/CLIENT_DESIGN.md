@@ -1024,7 +1024,7 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
 - **任何对外发布**（D4，以及向 `2742zdz/AITP` 的任何推送）须同时满足：
   - D2 已完成；
   - 用户明确批准；
-  - 首次公开发布前完成 manifest 签名评估。（已完成并实现，见"AITP 更新签名"；首次发布前还须把品牌里的占位公钥换成维护者的真实公钥。）
+  - 首次公开发布前完成 manifest 签名评估。（已完成并实现，见"AITP 更新签名"；维护者的真实主钥与恢复钥已填入品牌。）
 - **D4 前必须完成的跟进**（独立复核登记）：
   - ~~候选探测只回收直接子进程~~：已完成，进程组/Job Object，删除错误会报告；Windows 原生测试覆盖后代占住 stdout 时按时结束、候选可删除（见上文"候选二进制"）。
   - ~~受控 HTTPS 的 Fixed 下载测试~~：已完成（`kernel/src/update_fixed_https_tests.rs`）。本地 TLS 服务用测试 CA 签发，只有测试自己的客户端信任它（`Egress::test_ca_pem`，仅测试构建存在），系统和进程的信任不变；覆盖跨主机重定向、主机白名单（含已签证书但不在白名单的主机、白名单内但证书不含的主机）、降级 HTTP、换端口、userinfo、重定向 5 跳上限、大小上限（声明长度/流式）和总时限，并验证系统根和另一张 CA 都握手失败、请求到不了 HTTP 层。
@@ -1048,7 +1048,16 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
 
 只接受 legacy（算法 `Ed`）：minisign 默认的预哈希格式（`ED`，先做 BLAKE2b-512）需要 `ring` 没有的 BLAKE2b；忘了加 `-l` 时，客户端和上传前检查都会明确提示"用 `minisign -S -l` 重签"。签名文件里的 trusted comment 也会验签（与 `minisign -V` 一致），但内容不参与判断；版本和发行版只看 manifest 本身。
 
-**信任根**：品牌 `update.source = Fixed { distribution, signing_keys, … }`。AITP 是 `distribution: "aitp"`，`signing_keys` 是两把 minisign 公钥（`.pub` 文件第二行，56 个字符）：主钥和恢复钥。在维护者提供真实公钥之前是两把**明显的占位公钥**（文本含 `PLACEHOLDER`，其字节不是曲线上的点，任何签名都验不过）；`kernel/scripts/build-release.sh` 和 `verify-release.py --aitp-artifact` 都会拒绝含占位公钥的发布构建，只有从不发布的 CI 路径检查显式放行（`AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1` / `--allow-placeholder-signing-key`），另有对照步骤确认不放行时会失败；`verify-release.py` 核对 CI 里构建放行恰好两处、SAIAI 发布工作流里没有放行（AITP 自己的发布工作流在 D4 建立时再加同样的检查）。真实公钥由单独的 PR 填入（同时改 `aitp_values_are_frozen`）。注意：普通的 `cargo build --release` 仍会产出带占位钥（或任意当前源码里公钥）的 `aitp`，程序本身不拒绝；唯一的门禁是 `build-release.sh` + `verify-release.py`（含 `--aitp-manifest`），D4 发布工作流必须强制走这两步，不得用其他方式构建或上传发布产物。SAIAI 走 `GatewayChannel`，没有这些字段，更新行为不变。
+**信任根**：品牌 `update.source = Fixed { distribution, signing_keys, … }`。AITP 是 `distribution: "aitp"`，`signing_keys` 是维护者的两把 minisign 公钥（`.pub` 文件第二行，56 个字符），主钥在前，私钥由维护者离线保管：
+
+| 用途 | 文件 | key id | 公钥（minisign 公钥文本，即指纹） |
+|---|---|---|---|
+| 主钥 | `aitp-release.pub` | `F7823EF82178E6E0` | `RWTg5ngh+D6C99dBN+56y4B/nIF4hSSNbCG86wuZr4Knpg+Lc4KxnAgr` |
+| 恢复钥 | `aitp-recovery.pub` | `30D8EBD4CDEAE8F0` | `RWTw6OrN1OvYMNRnHzX9mhZugihDvcDXMqqpCGfKAIOxZwUnQU1sba/L` |
+
+**核对方式**：以上面完整的 56 字符公钥文本为准（key id 只有 64 位，只用来快速对照，不能代替完整公钥）。维护者核对自己的 `.pub`：第一行是 `untrusted comment: minisign public key <key id>`，第二行逐字等于表中公钥；`python3 tools/saiai-cli/kernel/scripts/release_manifest.py keys` 打印当前品牌源码声明的 key id 和公钥（它读源码，不证明某个已下载或旧构建的程序用的是这些钥；程序是否内含它们由 `verify-release.py --aitp-artifact` 检查）；对已下载的 manifest 可用 `minisign -V -P <表中公钥> -m aitp-manifest.json` 独立验证。用户首次安装时，应通过与下载渠道独立控制的渠道核对这两段公钥文本：同一 GitHub 仓库的 README、Release 说明与下载地址属于同一控制渠道，不算独立来源；需要维护者另行在独立控制的地方（例如其他账号/站点）公布。
+
+**占位公钥与发布门禁**：`kernel/scripts/release_manifest.py` 的 `PLACEHOLDER_KEYS` 列出首发前用过的两把占位公钥（文本含 `PLACEHOLDER`，字节不是曲线上的点）。`kernel/scripts/build-release.sh` 在品牌含占位或不可用公钥时拒绝构建；`verify-release.py --aitp-artifact` 要求品牌公钥都是真实可用的、每个程序内含品牌全部公钥且不含占位公钥。真实公钥填入后已不再有放行开关；CI 用一份把公钥换回占位的内核副本确认 `build-release.sh` 拒绝，用一个追加了占位公钥的程序副本确认 `verify-release.py` 拒绝，`verify-release.py` 还核对 CI 和 SAIAI 发布工作流里没有任何放行（AITP 自己的发布工作流在 D4 建立时再加同样的检查）。注意：普通的 `cargo build --release` 产出的 `aitp` 带的是当前源码里的公钥，程序本身不做发布检查；唯一的门禁是 `build-release.sh` + `verify-release.py`（含 `--aitp-manifest`），D4 发布工作流必须强制走这两步，不得用其他方式构建或上传发布产物。SAIAI 走 `GatewayChannel`，没有这些字段，更新行为不变。
 
 **一次性准备（维护者自己的电脑，离线）**：
 

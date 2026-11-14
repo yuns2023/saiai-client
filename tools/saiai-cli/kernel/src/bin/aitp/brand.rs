@@ -65,14 +65,14 @@ pub static AITP_BRAND: Brand = Brand {
                 "objects.githubusercontent.com",
             ],
             distribution: "aitp",
-            // PLACEHOLDERS, not keys: their key bytes are no curve point, so
-            // nothing verifies with them. The maintainer's real primary and
-            // recovery public keys replace them before the first release;
-            // `scripts/release_manifest.py` and `scripts/build-release.sh`
-            // refuse a release while they are here.
+            // The maintainer's minisign public keys (the private keys are kept
+            // offline): primary (aitp-release.pub, key id F7823EF82178E6E0)
+            // and recovery (aitp-recovery.pub, key id 30D8EBD4CDEAE8F0).
+            // Changing them strands every installed copy that trusts only the
+            // old ones (see the maintainer manual on rotation).
             signing_keys: &[
-                "RWQAITPxPRIMARYxPLACEHOLDERxKEYxNOTxFORxRELEASE222222222",
-                "RWQAITPxRECOVERYxPLACEHOLDERxKEYxNOTxFORxRELEASEXXXXXXXX",
+                "RWTg5ngh+D6C99dBN+56y4B/nIF4hSSNbCG86wuZr4Knpg+Lc4KxnAgr",
+                "RWTw6OrN1OvYMNRnHzX9mhZugihDvcDXMqqpCGfKAIOxZwUnQU1sba/L",
             ],
         }),
         asset_prefix: "aitp-",
@@ -204,8 +204,8 @@ mod tests {
         assert_eq!(
             fixed.signing_keys,
             [
-                "RWQAITPxPRIMARYxPLACEHOLDERxKEYxNOTxFORxRELEASE222222222",
-                "RWQAITPxRECOVERYxPLACEHOLDERxKEYxNOTxFORxRELEASEXXXXXXXX",
+                "RWTg5ngh+D6C99dBN+56y4B/nIF4hSSNbCG86wuZr4Knpg+Lc4KxnAgr",
+                "RWTw6OrN1OvYMNRnHzX9mhZugihDvcDXMqqpCGfKAIOxZwUnQU1sba/L",
             ]
         );
         assert_eq!(update.asset_prefix, "aitp-");

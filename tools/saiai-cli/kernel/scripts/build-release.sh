@@ -13,7 +13,7 @@
 #
 # Usage: build-release.sh [cargo build arguments, e.g. --locked --target T]
 # It refuses to build while the brand's update signing keys are the
-# placeholders (see below).
+# placeholders or unusable (see below).
 # The target directory is CARGO_TARGET_DIR or <workspace>/target; set
 # CARGO_TARGET_DIR instead of passing --target-dir. The build always names
 # its one target explicitly (so a `build.target` in a configuration file
@@ -81,18 +81,15 @@ kernel="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 manifest="$kernel/Cargo.toml"
 
 # A published program must trust the maintainer's real update signing keys,
-# never the placeholders the brand carries until they are filled in. Builds
-# that are only checked and never published (CI) may set
-# AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1.
-if [[ "${AITP_ALLOW_PLACEHOLDER_SIGNING_KEY:-}" != "1" ]]; then
-  status=0
-  python3 -B "$kernel/scripts/release_manifest.py" keys --require-real >&2 || status=$?
-  case "$status" in
-    0) ;;
-    3) fail "the update signing keys are placeholders or unusable (AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1 only for builds that are never published)" ;;
-    *) fail "cannot read the update signing keys (release_manifest.py exited $status)" ;;
-  esac
-fi
+# never the placeholder keys (release_manifest.py PLACEHOLDER_KEYS) or an
+# unusable key.
+status=0
+python3 -B "$kernel/scripts/release_manifest.py" keys --require-real >&2 || status=$?
+case "$status" in
+  0) ;;
+  3) fail "the update signing keys are placeholders or unusable" ;;
+  *) fail "cannot read the update signing keys (release_manifest.py exited $status)" ;;
+esac
 workspace_manifest="$(cargo locate-project --workspace --manifest-path "$manifest" --message-format plain)"
 workspace="$(dirname "$workspace_manifest")"
 
