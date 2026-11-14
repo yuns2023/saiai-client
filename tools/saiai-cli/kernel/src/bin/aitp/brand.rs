@@ -324,5 +324,28 @@ mod tests {
             );
             assert!(plist.contains("<key>AITP_HOME</key>"), "{plist}");
         }
+        // The Windows replacement helper of a fixed-source brand takes the
+        // installation's helper lock before anything else.
+        #[cfg(windows)]
+        {
+            let directory = std::path::Path::new(r"C:\Users\u\AppData\Local\AITP\bin");
+            let script = proxy_cli::contract::scripts::windows_update(
+                &AITP_BRAND,
+                1,
+                &directory.join("aitp.exe"),
+                &directory.join(".aitp-update-1.exe"),
+                &directory.join(".aitp-update-1.ps1"),
+                &directory.join(".aitp-update-status.txt"),
+                true,
+                &"0".repeat(64),
+            )
+            .unwrap();
+            let lock = script
+                .find(r"$helperLockPath = 'C:\Users\u\AppData\Local\AITP\bin\.aitp-update-helper-lock'")
+                .unwrap_or_else(|| panic!("{script}"));
+            let main = script.find("\r\ntry {\r\n").unwrap();
+            assert!(lock < main, "{script}");
+            assert!(script.contains("foreach ($attempt in 1..600)"), "{script}");
+        }
     }
 }

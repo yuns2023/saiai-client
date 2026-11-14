@@ -704,7 +704,12 @@ fn update_and_uninstall_wait_for_a_held_installation() {
         let (success, text) = sandbox.output(&mut sandbox.command(&["uninstall", "--yes"]));
         assert!(!success, "{text}");
         assert!(text.contains(expected), "{file}: {text}");
-        assert!(text.contains("uninstall did not change anything"), "{text}");
+        assert!(
+            text.contains(
+                "uninstall stopped before changing any configuration, service or program file"
+            ),
+            "{text}"
+        );
         assert_eq!(snapshot(&config), config_before, "{file}");
         assert_eq!(snapshot(&sandbox.program), program_before, "{file}");
         drop(lock);

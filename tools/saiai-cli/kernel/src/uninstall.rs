@@ -1718,8 +1718,9 @@ fn lock_install_dirs(plan: &Plan) -> Result<InstallLocks> {
     }
     dirs.into_iter()
         .map(|dir| {
-            crate::lock_installation(dir, BRAND.update.candidate_prefix, BRAND.binary_name)
-                .context("uninstall did not change anything")
+            crate::lock_installation(dir, BRAND.update.candidate_prefix, BRAND.binary_name).context(
+                "uninstall stopped before changing any configuration, service or program file",
+            )
         })
         .collect()
 }
@@ -2901,15 +2902,47 @@ fn gate_blocked(items: &[Item], area: Area) -> bool {
                 .any(|other| other.area == Area::Data && !other.outcome.succeeded()))
 }
 
-/// Whether removing `path` needs the installation locks released first.
+/// Whether `path` is an installation lock file of this brand (Windows,
+/// brands that serialize installation changes).
+fn is_install_lock_file(path: &Path) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    if crate::serializes_installation_changes() {
+        return path.parent().is_some_and(|dir| {
+            crate::update_candidate::installation_lock_files(dir, BRAND.update.candidate_prefix)
+                .iter()
+                .any(|lock| lock == path)
+        });
+    }
+    let _ = path;
+    false
+}
+
+/// Releases the lock (of one installation directory) that holds `path`;
+/// the other directories stay locked.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn held_lock_file(locks: &InstallLocks, path: &Path) -> bool {
-    locks.iter().any(|lock| lock.holds(path))
+fn release_lock_of(locks: &mut InstallLocks, path: &Path) {
+    locks.retain(|lock| !lock.holds(path));
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn held_lock_file(_locks: &InstallLocks, _path: &Path) -> bool {
-    false
+fn release_lock_of(_locks: &mut InstallLocks, _path: &Path) {}
+
+/// Removes a lock file after its lock was released. Another update or
+/// uninstall that took it meanwhile keeps it: reported, so a rerun after
+/// that one finishes removes it.
+fn execute_remove_lock_file(path: &Path) -> Result<Outcome> {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(Outcome::Done),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(Outcome::Absent),
+        Err(error) if cfg!(windows) && error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+            Ok(Outcome::Kept(
+                "in use by another update or uninstall; run uninstall again after it finishes"
+                    .into(),
+            ))
+        }
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
 }
 
 fn execute(plan: &mut Plan, args: &Args, locks: &mut InstallLocks) {
@@ -2925,14 +2958,18 @@ fn execute(plan: &mut Plan, args: &Args, locks: &mut InstallLocks) {
             let outcome = if dependency_failed || (gated && gate_blocked(&plan.items, item.area)) {
                 Outcome::Skipped
             } else {
-                // The lock files go last; nothing else of the installation
-                // remains to protect by then.
-                if let Action::RemoveFile(path) = &item.action
-                    && held_lock_file(locks, path)
-                {
-                    locks.clear();
-                }
-                match execute_item(&item.action, args) {
+                let result = match &item.action {
+                    // A directory's lock files go after its program files:
+                    // its lock is released just before, and a lock file
+                    // that another update or uninstall holds by then is
+                    // kept (reported), not a failure.
+                    Action::RemoveFile(path) if is_install_lock_file(path) => {
+                        release_lock_of(locks, path);
+                        execute_remove_lock_file(path)
+                    }
+                    action => execute_item(action, args),
+                };
+                match result {
                     Ok(outcome) => outcome,
                     Err(error) => Outcome::Failed(format!("{error:#}")),
                 }
@@ -3400,6 +3437,28 @@ mod tests {
             remove_path_entries(r"C:\Tools;;C:\Users\u\AppData\Local\KTEST\bin2", dir),
             None
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_lock_file_in_use_is_kept_not_failed() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".ktest-update-lock");
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        assert!(matches!(
+            execute_remove_lock_file(&path).unwrap(),
+            Outcome::Kept(reason) if reason.contains("run uninstall again")
+        ));
+        drop(held);
+        assert_eq!(execute_remove_lock_file(&path).unwrap(), Outcome::Done);
+        assert_eq!(execute_remove_lock_file(&path).unwrap(), Outcome::Absent);
     }
 
     #[test]
