@@ -19,11 +19,12 @@ signs the same way with aitp-recovery.key / aitp-recovery.pub.)
       Before upload: the signature verifies with a key the AITP program
       trusts (never a placeholder), the manifest names this distribution,
       the package version and exactly the release assets in DIR with their
-      size and SHA-256, and every built program carries the trusted keys.
+      size and SHA-256, and each of those assets (and every --artifact)
+      carries the trusted keys and no placeholder.
 
   release_manifest.py keys [--require-real]
-      Lists the trusted keys of the AITP brand; with --require-real, fails
-      while a placeholder key is still in place.
+      Lists the trusted keys of the AITP brand; with --require-real, exits
+      with status 3 while a placeholder (or unusable) key is in place.
 
 Ed25519 verification below is a plain implementation of RFC 8032
 (section 5.1.7, cofactorless) with the libsodium checks minisign relies on:
@@ -69,6 +70,11 @@ PLACEHOLDER_KEYS = (
     "RWQAITPxPRIMARYxPLACEHOLDERxKEYxNOTxFORxRELEASE222222222",
     "RWQAITPxRECOVERYxPLACEHOLDERxKEYxNOTxFORxRELEASEXXXXXXXX",
 )
+
+
+# Exit status of `keys --require-real` when a key is a placeholder (or not
+# usable); other failures exit 1.
+PLACEHOLDER_EXIT = 3
 
 
 class CheckError(Exception):
@@ -201,13 +207,19 @@ def parse_public_key(text: str) -> tuple[bytes, bytes]:
 def parse_signature_file(data: bytes) -> dict:
     require(len(data) <= SIGNATURE_LIMIT, f"the signature file is larger than {SIGNATURE_LIMIT} bytes")
     require(b"\0" not in data, "the signature file contains a NUL byte")
+    # Each LF may be preceded by one CR, which belongs to the line break.
     body = data
     if body.endswith(b"\n"):
         body = body[:-1]
         if body.endswith(b"\r"):
             body = body[:-1]
-    lines = [line[:-1] if line.endswith(b"\r") else line for line in body.split(b"\n")]
+    lines = body.split(b"\n")
+    lines = [line[:-1] if line.endswith(b"\r") else line for line in lines[:-1]] + lines[-1:]
     require(not any(b"\r" in line for line in lines), "the signature file has a line break that is not LF or CRLF")
+    require(
+        not any((byte < 0x20 and byte != 0x09) or byte == 0x7F for line in lines for byte in line),
+        "the signature file contains a control character",
+    )
     require(len(lines) == 4, f"the signature file has {len(lines)} lines, a minisign signature has 4")
     untrusted, envelope, trusted, global_line = lines
     require(untrusted.startswith(b"untrusted comment: "), "the signature file does not start with an untrusted comment line")
@@ -268,7 +280,8 @@ def _is_integer(value) -> bool:
 
 
 def parse_manifest(data: bytes, distribution: str) -> dict:
-    """The manifest as the client reads it (same rules, same refusals)."""
+    """The manifest as the client reads it, at least as strictly: the
+    client checks only its own platform's asset, this checks every one."""
     require(len(data) <= MANIFEST_LIMIT, f"the manifest is larger than {MANIFEST_LIMIT} bytes")
     try:
         manifest = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_object)
@@ -342,12 +355,33 @@ def brand_distribution(source: str | None = None) -> str:
 
 
 def brand_keys(source: str | None = None) -> list[str]:
-    """The trusted signing keys of the AITP brand source, in order."""
+    """The trusted signing keys of the AITP brand source, in order: the
+    string literals of `signing_keys: &[ ... ]`, with line comments between
+    them skipped (base64 itself may contain `//`)."""
     body = _brand_body(source if source is not None else BRAND_SOURCE.read_text(encoding="utf-8"))
-    found = re.findall(r"\bsigning_keys:\s*&\[(.*?)\]", body, re.DOTALL)
-    require(len(found) == 1, f"cannot read the update signing keys from {BRAND_SOURCE}")
-    without_comments = re.sub(r"//[^\n]*", "", found[0])
-    keys = re.findall(r'"([^"\\]*)"', without_comments)
+    starts = [match.end() for match in re.finditer(r"\bsigning_keys:\s*&\[", body)]
+    require(len(starts) == 1, f"cannot read the update signing keys from {BRAND_SOURCE}")
+    keys = []
+    index = starts[0]
+    while True:
+        require(index < len(body), f"the update signing key list in {BRAND_SOURCE} is not closed")
+        char = body[index]
+        if char in " \t\r\n,":
+            index += 1
+        elif body.startswith("//", index):
+            end = body.find("\n", index)
+            index = len(body) if end < 0 else end
+        elif char == '"':
+            end = body.find('"', index + 1)
+            require(end > index, f"unterminated string in {BRAND_SOURCE}")
+            literal = body[index + 1:end]
+            require("\\" not in literal, f"escaped signing key in {BRAND_SOURCE}")
+            keys.append(literal)
+            index = end + 1
+        elif char == "]":
+            break
+        else:
+            raise CheckError(f"unexpected {char!r} in the update signing key list of {BRAND_SOURCE}")
     require(keys, f"the update signing key list in {BRAND_SOURCE} is empty")
     for key in keys:
         parse_public_key(key)
@@ -365,8 +399,8 @@ def require_real_keys(keys: list[str]) -> None:
     for key in keys:
         key_id, material = parse_public_key(key)
         require(usable_public_key(material), f"signing key {key_id_text(key_id)} is not a usable Ed25519 key")
-        require(material not in seen, f"signing key {key_id_text(key_id)} repeats another key")
-        seen.add(material)
+        require(material not in seen and key_id not in seen, f"signing key {key_id_text(key_id)} repeats another key or key id")
+        seen.update((material, key_id))
 
 
 def cargo_version() -> str:
@@ -404,21 +438,39 @@ def command_generate(args) -> int:
     print("Sign it on the offline signing machine, in the directory holding the key and the manifest:")
     print(f"  {sign_command(output, version, digest)}")
     print("Then copy back only the signature file; check it before upload with:")
-    print(f"  python3 {Path(__file__).name} verify --manifest {output} --dist {args.dist} --artifact <program> ...")
+    print(f"  python3 {Path(__file__)} verify --manifest {output} --dist {args.dist}")
     return 0
 
 
-def verify_release(manifest_path: Path, signature_path: Path, dist: Path | None, artifacts: list[Path],
+def read_bounded(path: Path, limit: int, what: str) -> bytes:
+    require(path.is_file(), f"{what} is missing: {path}")
+    with path.open("rb") as handle:
+        data = handle.read(limit + 1)
+    require(len(data) <= limit, f"{what} is larger than {limit} bytes: {path}")
+    return data
+
+
+def require_program_keys(path: Path, keys: list[str]) -> None:
+    """A release program carries every trusted key and no placeholder."""
+    data = path.read_bytes()
+    missing = [key for key in keys if key.encode() not in data]
+    require(not missing, f"{path} does not carry the trusted keys {missing}")
+    found = [key for key in PLACEHOLDER_KEYS if key.encode() in data]
+    require(not found, f"{path} carries placeholder signing keys")
+
+
+def verify_release(manifest_path: Path, signature_path: Path, dist: Path, artifacts: list[Path] = (),
                    version: str | None = None, assets: tuple[str, ...] = ASSETS, keys: list[str] | None = None,
                    distribution: str | None = None) -> str:
-    """All pre-upload checks; returns the signing key id."""
+    """All pre-upload checks; returns the signing key id. The release assets
+    in `dist` (exactly the manifest's, by size and SHA-256) must each carry
+    the trusted keys; `artifacts` are further programs checked the same way."""
     keys = brand_keys() if keys is None else keys
     distribution = brand_distribution() if distribution is None else distribution
     require_real_keys(keys)
-    require(manifest_path.is_file(), f"manifest is missing: {manifest_path}")
-    require(signature_path.is_file(), f"signature is missing: {signature_path}")
-    manifest_bytes = manifest_path.read_bytes()
-    key_id = verify_signature(manifest_bytes, signature_path.read_bytes(), keys)
+    manifest_bytes = read_bounded(manifest_path, MANIFEST_LIMIT, "manifest")
+    signature_bytes = read_bounded(signature_path, SIGNATURE_LIMIT, "signature")
+    key_id = verify_signature(manifest_bytes, signature_bytes, keys)
     manifest = parse_manifest(manifest_bytes, distribution)
     expected_version = version or cargo_version()
     require(manifest["version"] == expected_version, f"the manifest names {manifest['version']}, the package is {expected_version}")
@@ -426,22 +478,18 @@ def verify_release(manifest_path: Path, signature_path: Path, dist: Path | None,
         sorted(manifest["assets"]) == sorted(assets),
         f"the manifest lists {sorted(manifest['assets'])}, the release has {sorted(assets)}",
     )
-    if dist is not None:
-        for name in assets:
-            require(file_metadata(dist / name) == manifest["assets"][name], f"{dist / name} does not match the manifest")
+    for name in assets:
+        require(file_metadata(dist / name) == manifest["assets"][name], f"{dist / name} does not match the manifest")
+        require_program_keys(dist / name, keys)
     for artifact in artifacts:
         require(artifact.is_file(), f"program is missing: {artifact}")
-        data = artifact.read_bytes()
-        missing = [key for key in keys if key.encode() not in data]
-        require(not missing, f"{artifact} does not carry the trusted keys {missing}")
-        found = [key for key in PLACEHOLDER_KEYS if key.encode() in data]
-        require(not found, f"{artifact} carries placeholder signing keys")
+        require_program_keys(artifact, keys)
     return key_id
 
 
 def command_verify(args) -> int:
     signature = args.signature or args.manifest.with_name(args.manifest.name + SIGNATURE_SUFFIX)
-    key_id = verify_release(args.manifest, signature, args.dist, args.artifact, args.version)
+    key_id = verify_release(args.manifest, signature, args.dist, args.artifact)
     print(f"{args.manifest} is signed by trusted key {key_id} and matches the release")
     return 0
 
@@ -453,7 +501,11 @@ def command_keys(args) -> int:
         state = "PLACEHOLDER" if key in PLACEHOLDER_KEYS else "key"
         print(f"{key_id_text(key_id)} {state} {key}")
     if args.require_real:
-        require_real_keys(keys)
+        try:
+            require_real_keys(keys)
+        except CheckError as error:
+            print(f"release_manifest.py: {error}", file=sys.stderr)
+            return PLACEHOLDER_EXIT
     return 0
 
 
@@ -471,7 +523,6 @@ def main(argv=None) -> int:
     verify.add_argument("--signature", type=Path)
     verify.add_argument("--dist", required=True, type=Path)
     verify.add_argument("--artifact", action="append", default=[], type=Path)
-    verify.add_argument("--version")
     verify.set_defaults(run=command_verify)
     keys = commands.add_parser("keys")
     keys.add_argument("--require-real", action="store_true")

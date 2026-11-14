@@ -85,8 +85,13 @@ manifest="$kernel/Cargo.toml"
 # that are only checked and never published (CI) may set
 # AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1.
 if [[ "${AITP_ALLOW_PLACEHOLDER_SIGNING_KEY:-}" != "1" ]]; then
-  python3 "$kernel/scripts/release_manifest.py" keys --require-real >&2 ||
-    fail "the update signing keys are placeholders (AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1 only for builds that are never published)"
+  status=0
+  python3 -B "$kernel/scripts/release_manifest.py" keys --require-real >&2 || status=$?
+  case "$status" in
+    0) ;;
+    3) fail "the update signing keys are placeholders (AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1 only for builds that are never published)" ;;
+    *) fail "cannot read the update signing keys (release_manifest.py exited $status)" ;;
+  esac
 fi
 workspace_manifest="$(cargo locate-project --workspace --manifest-path "$manifest" --message-format plain)"
 workspace="$(dirname "$workspace_manifest")"

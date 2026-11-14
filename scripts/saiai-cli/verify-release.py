@@ -808,7 +808,12 @@ def load_release_manifest():
     spec = importlib.util.spec_from_file_location("aitp_release_manifest", ROOT / AITP_RELEASE_MANIFEST)
     require(spec is not None and spec.loader is not None, "cannot load the AITP release manifest tool")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # No bytecode cache inside the kernel directory (it must never name SAIAI).
+    previous, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
     return module
 
 
@@ -829,10 +834,11 @@ def verify_aitp_signing_keys(artifacts: list[Path], allow_placeholder: bool) -> 
         require(not found, f"{artifact} carries placeholder update signing keys")
 
 
-def verify_aitp_signed_manifest(manifest: Path, signature: Path | None, dist: Path | None, artifacts: list[Path]) -> None:
+def verify_aitp_signed_manifest(manifest: Path, signature: Path | None, dist: Path, artifacts: list[Path]) -> None:
     """Before upload: the maintainer's signature over the AITP manifest
-    verifies with a key the programs carry (never a placeholder), and the
-    manifest matches the release assets."""
+    verifies with a key the brand trusts (never a placeholder), the manifest
+    matches the release assets in `dist`, and those assets (and the
+    artifacts) carry the trusted keys."""
     tool = load_release_manifest()
     signature = signature or manifest.with_name(manifest.name + tool.SIGNATURE_SUFFIX)
     try:

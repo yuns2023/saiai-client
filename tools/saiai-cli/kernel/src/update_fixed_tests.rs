@@ -1665,7 +1665,7 @@ async fn a_release_of_the_same_version_with_other_content_is_refused() {
         .unwrap();
     let text = format!("{error:#}");
     assert!(
-        text.contains("differs from the published ktest 9.9.9")
+        text.contains("differs from the published release of the same version 9.9.9")
             && text.contains("never replaced by other content of the same version"),
         "{text}"
     );

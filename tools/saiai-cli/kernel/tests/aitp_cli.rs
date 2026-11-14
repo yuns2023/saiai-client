@@ -1087,17 +1087,30 @@ fn brand_signing_keys() -> Vec<String> {
     )
     .unwrap();
     let body = source.split("#[cfg(test)]").next().unwrap();
-    let list = body
-        .split("signing_keys: &[")
-        .nth(1)
-        .and_then(|rest| rest.split(']').next())
-        .expect("the brand declares its signing keys");
-    let keys: Vec<String> = list
-        .lines()
-        .map(|line| line.split("//").next().unwrap().trim())
-        .filter_map(|line| line.strip_prefix('"'))
-        .map(|line| line.trim_end_matches(',').trim_end_matches('"').to_string())
-        .collect();
+    let mut parts = body.split("signing_keys: &[");
+    let rest = parts.nth(1).expect("the brand declares its signing keys");
+    assert!(parts.next().is_none(), "one signing key list");
+    // String literals, with line comments between them skipped (a base64
+    // key may itself contain `//`).
+    let mut keys = Vec::new();
+    let mut rest = rest;
+    loop {
+        rest = rest.trim_start_matches([' ', '\t', '\r', '\n', ',']);
+        if let Some(comment) = rest.strip_prefix("//") {
+            rest = comment.split_once('\n').map_or("", |(_, after)| after);
+        } else if let Some(literal) = rest.strip_prefix('"') {
+            let (key, after) = literal.split_once('"').expect("a closed string");
+            keys.push(key.to_string());
+            rest = after;
+        } else {
+            assert!(
+                rest.starts_with(']'),
+                "unexpected {:?}",
+                &rest[..rest.len().min(20)]
+            );
+            break;
+        }
+    }
     assert!(
         !keys.is_empty() && keys.iter().all(|key| key.len() == 56),
         "{keys:?}"
@@ -1106,8 +1119,8 @@ fn brand_signing_keys() -> Vec<String> {
 }
 
 /// `program` with every occurrence of `from` replaced by `to` (same
-/// length); `expected` occurrences must be found.
-fn replace_bytes(program: &mut [u8], from: &[u8], to: &[u8], expected: Option<usize>) {
+/// length); exactly `expected` occurrences must be found.
+fn replace_bytes(program: &mut [u8], from: &[u8], to: &[u8], expected: usize) {
     assert_eq!(from.len(), to.len());
     let mut found = 0;
     let mut at = 0;
@@ -1123,16 +1136,18 @@ fn replace_bytes(program: &mut [u8], from: &[u8], to: &[u8], expected: Option<us
             at = start + 1;
         }
     }
-    assert!(found > 0, "{} not found", String::from_utf8_lossy(from));
-    if let Some(expected) = expected {
-        assert_eq!(found, expected, "{}", String::from_utf8_lossy(from));
-    }
+    assert_eq!(found, expected, "{}", String::from_utf8_lossy(from));
 }
 
-/// Writes a changed program and (macOS) signs it ad hoc again, as the
-/// change invalidated the linker's signature.
+/// Writes a changed program (executable) and (macOS) signs it ad hoc
+/// again, as the change invalidated the linker's signature.
 fn write_program(path: &Path, bytes: &[u8]) {
     std::fs::write(path, bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     #[cfg(target_os = "macos")]
     for args in [
         &["--force", "--sign", "-"][..],
@@ -1166,7 +1181,7 @@ impl Sandbox {
                     replacement.public_text()
                 }
             };
-            replace_bytes(&mut program, from.as_bytes(), to.as_bytes(), Some(1));
+            replace_bytes(&mut program, from.as_bytes(), to.as_bytes(), 1);
         }
         write_program(&self.program, &program);
         std::fs::read(&self.program).unwrap()
@@ -1178,18 +1193,87 @@ impl Sandbox {
     }
 }
 
-/// The next version with as many characters (so it can replace this one
-/// in a program).
+/// A later version with as many characters (so it can replace this one in
+/// a program): the last component that can grow without a longer number,
+/// later components reset to the smallest number of their length.
 fn next_version() -> String {
     let version = env!("CARGO_PKG_VERSION");
-    let mut parts: Vec<u64> = version
-        .split('.')
-        .map(|part| part.parse().unwrap())
-        .collect();
-    parts[2] += 1;
-    let next = format!("{}.{}.{}", parts[0], parts[1], parts[2]);
-    assert_eq!(next.len(), version.len(), "pick another test version");
-    next
+    let parts: Vec<&str> = version.split('.').collect();
+    for index in (0..parts.len()).rev() {
+        let grown = (parts[index].parse::<u64>().unwrap() + 1).to_string();
+        if grown.len() != parts[index].len() {
+            continue;
+        }
+        let mut next: Vec<String> = parts.iter().map(|part| part.to_string()).collect();
+        next[index] = grown;
+        for later in &mut next[index + 1..] {
+            *later = if later.len() == 1 {
+                "0".to_string()
+            } else {
+                format!("1{}", "0".repeat(later.len() - 1))
+            };
+        }
+        let next = next.join(".");
+        assert_eq!(next.len(), version.len());
+        return next;
+    }
+    panic!("no later version as long as {version}")
+}
+
+/// Replaces `from` with `to` where it stands alone (no digit or dot right
+/// before or after), as the program's version text does.
+#[cfg(not(target_os = "linux"))]
+fn replace_version(program: &mut [u8], from: &str, to: &str) {
+    let (from, to) = (from.as_bytes(), to.as_bytes());
+    assert_eq!(from.len(), to.len());
+    let part_of_version = |byte: u8| byte.is_ascii_digit() || byte == b'.';
+    let mut found = 0;
+    let mut at = 0;
+    while at + from.len() <= program.len() {
+        if program[at] == from[0]
+            && program[at..].starts_with(from)
+            && (at == 0 || !part_of_version(program[at - 1]))
+            && program
+                .get(at + from.len())
+                .is_none_or(|byte| !part_of_version(*byte))
+        {
+            program[at..at + from.len()].copy_from_slice(to);
+            found += 1;
+            at += from.len();
+        } else {
+            at += 1;
+        }
+    }
+    assert!(found > 0, "the version text is not in the program");
+}
+
+/// `--version` of `path`, within 60 s.
+#[cfg(not(target_os = "linux"))]
+fn version_output(path: &Path) -> String {
+    let output = path.with_extension("version.txt");
+    let file = std::fs::File::create(&output).unwrap();
+    let mut child = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(file)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{} --version did not finish within 60 s", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let text = std::fs::read_to_string(&output).unwrap();
+    assert!(status.success(), "{} --version: {status}", path.display());
+    text.trim().to_string()
 }
 
 /// A program for this platform that reports `aitp <version>`: on Linux a
@@ -1206,19 +1290,19 @@ fn candidate_program(sandbox: &Sandbox, version: &str) -> Vec<u8> {
         let mut program = std::fs::read(BINARY).unwrap();
         let current = env!("CARGO_PKG_VERSION");
         if version != current {
-            replace_bytes(&mut program, current.as_bytes(), version.as_bytes(), None);
+            replace_version(&mut program, current, version);
         }
-        let path = sandbox
-            .root
+        // Checked outside the sandbox (which is scanned for names).
+        let _ = sandbox;
+        let check = tempfile::tempdir().unwrap();
+        let path = check
+            .path()
             .join(format!("candidate-check{}", std::env::consts::EXE_SUFFIX));
         write_program(&path, &program);
-        let output = Command::new(&path).arg("--version").output().unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
-            format!("aitp {version}")
-        );
+        assert_eq!(version_output(&path), format!("aitp {version}"));
         let program = std::fs::read(&path).unwrap();
-        std::fs::remove_file(&path).unwrap();
+        // A scanner may still hold it briefly on Windows; then it stays.
+        let _ = check.close();
         assert!(
             program.len() <= 64 * 1024 * 1024,
             "the test program ({} bytes) exceeds the 64 MiB release limit",

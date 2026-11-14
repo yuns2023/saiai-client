@@ -7788,8 +7788,7 @@ async fn fetch_fixed_update(
     .await?
     else {
         bail!(
-            "the {brand_product} update manifest has no signature (HTTP 404 at {signature_url}); an unsigned update is never installed",
-            brand_product = BRAND.product_name
+            "the update manifest has no signature (HTTP 404 at {signature_url}); an unsigned update is never installed"
         );
     };
     // Nothing in the manifest is used before its signature verifies.
@@ -7840,8 +7839,7 @@ async fn fetch_fixed_update(
     }
     if ordering == Ordering::Equal {
         bail!(
-            "this {brand_binary} {current_version} differs from the published {brand_binary} {version} (sha256 {current_sha256}, published {expected}); a release is never replaced by other content of the same version, so nothing is installed",
-            brand_binary = BRAND.binary_name
+            "the installed program differs from the published release of the same version {version} (sha256 {current_sha256}, published {expected}); a release is never replaced by other content of the same version, so nothing is installed"
         );
     }
     let url = fixed_asset_url(source.asset_url_template, version, asset);

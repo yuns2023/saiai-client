@@ -97,18 +97,23 @@ const MANIFEST: &[u8] =
     br#"{"assets":{},"distribution":"ktest","manifest_schema":1,"version":"9.9.9"}
 "#;
 
-// Written by minisign 0.11 (`minisign -G -W`, then `-S -l` for the legacy
-// format and plain `-S` for the prehashed one, verified with `minisign -V`);
-// the secret keys were discarded. The recovery signature carries minisign's
-// default trusted comment (with a tab).
-const FIXTURE_MANIFEST: &[u8] = include_bytes!("../tests/fixtures/minisign/manifest.json");
-const FIXTURE_PRIMARY: &str = include_str!("../tests/fixtures/minisign/primary.pub");
-const FIXTURE_RECOVERY: &str = include_str!("../tests/fixtures/minisign/recovery.pub");
-const FIXTURE_SIGNED: &[u8] = include_bytes!("../tests/fixtures/minisign/manifest.primary.minisig");
-const FIXTURE_RECOVERY_SIGNED: &[u8] =
-    include_bytes!("../tests/fixtures/minisign/manifest.recovery.minisig");
-const FIXTURE_PREHASHED: &[u8] =
-    include_bytes!("../tests/fixtures/minisign/manifest.prehashed.minisig");
+/// Files written by minisign 0.11 (`minisign -G -W`, then `-S -l` for the
+/// legacy format and plain `-S` for the prehashed one, verified with
+/// `minisign -V`; the secret keys were discarded), shared with the release
+/// tool's tests. The recovery signature carries minisign's default trusted
+/// comment (with a tab).
+fn fixture(name: &str) -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("minisign")
+        .join(name);
+    std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+}
+
+fn fixture_text(name: &str) -> String {
+    String::from_utf8(fixture(name)).unwrap()
+}
 
 fn fixture_key(file: &str) -> String {
     let lines: Vec<_> = file.lines().collect();
@@ -119,20 +124,18 @@ fn fixture_key(file: &str) -> String {
 
 #[test]
 fn minisign_signatures_verify_and_name_their_key() {
-    let primary = fixture_key(FIXTURE_PRIMARY);
-    let recovery = fixture_key(FIXTURE_RECOVERY);
+    let fixture_primary = fixture_text("primary.pub");
+    let fixture_recovery = fixture_text("recovery.pub");
+    let fixture_manifest = fixture("manifest.json");
+    let fixture_signed = fixture("manifest.primary.minisig");
+    let fixture_recovery_signed = fixture("manifest.recovery.minisig");
+    let fixture_prehashed = fixture("manifest.prehashed.minisig");
+    let primary = fixture_key(fixture_primary.as_str());
+    let recovery = fixture_key(fixture_recovery.as_str());
     let both = [primary.clone(), recovery.clone()];
     // minisign prints the key id in the public key's comment.
-    let id = FIXTURE_PRIMARY
-        .lines()
-        .next()
-        .unwrap()
-        .rsplit(' ')
-        .next()
-        .unwrap();
-    assert_eq!(check(FIXTURE_MANIFEST, FIXTURE_SIGNED, &both).unwrap(), id);
-    assert_eq!(parse_public_key(&primary).unwrap().id_text(), id);
-    let recovery_id = FIXTURE_RECOVERY
+    let id = fixture_primary
+        .as_str()
         .lines()
         .next()
         .unwrap()
@@ -140,30 +143,43 @@ fn minisign_signatures_verify_and_name_their_key() {
         .next()
         .unwrap();
     assert_eq!(
-        check(FIXTURE_MANIFEST, FIXTURE_RECOVERY_SIGNED, &both).unwrap(),
+        check(&fixture_manifest, &fixture_signed, &both).unwrap(),
+        id
+    );
+    assert_eq!(parse_public_key(&primary).unwrap().id_text(), id);
+    let recovery_id = fixture_recovery
+        .as_str()
+        .lines()
+        .next()
+        .unwrap()
+        .rsplit(' ')
+        .next()
+        .unwrap();
+    assert_eq!(
+        check(&fixture_manifest, &fixture_recovery_signed, &both).unwrap(),
         recovery_id
     );
     // The recovery key's signature means nothing to a program that trusts
     // only the primary key.
     refused(
-        FIXTURE_MANIFEST,
-        FIXTURE_RECOVERY_SIGNED,
+        &fixture_manifest,
+        &fixture_recovery_signed,
         std::slice::from_ref(&primary),
         "which this program does not trust",
     );
     // minisign's default (prehashed) format is refused with a hint.
     refused(
-        FIXTURE_MANIFEST,
-        FIXTURE_PREHASHED,
+        &fixture_manifest,
+        &fixture_prehashed,
         &both,
         "sign with `minisign -S -l`",
     );
     // A changed manifest no longer verifies.
-    let mut changed = FIXTURE_MANIFEST.to_vec();
+    let mut changed = fixture_manifest.clone();
     changed.pop();
-    refused(&changed, FIXTURE_SIGNED, &both, "does not verify");
+    refused(&changed, &fixture_signed, &both, "does not verify");
     // The fixture manifest itself is a schema-1 manifest.
-    let manifest = parse_manifest(FIXTURE_MANIFEST, "ktest").unwrap();
+    let manifest = parse_manifest(&fixture_manifest, "ktest").unwrap();
     assert_eq!(manifest.version, "9.9.9");
 }
 
@@ -336,15 +352,47 @@ fn signature_files_follow_the_minisign_layout_exactly() {
             "{length}"
         );
     }
-    // Non-zero trailing bits in the last base64 character.
-    let last = lines[3].trim_end_matches('=');
-    let mut bits = last.as_bytes().to_vec();
-    let end = bits.len() - 1;
-    bits[end] = if bits[end] == b'A' { b'B' } else { b'A' };
-    let bits = String::from_utf8(bits).unwrap() + "==";
-    if bits != lines[3] {
-        let variant = signed.replace(lines[3], &bits);
-        assert!(check(MANIFEST, variant.as_bytes(), &keys).is_err());
+    // Non-zero padding bits in the last base64 character (the same data
+    // bytes, written non-canonically): 64 bytes end in a character whose
+    // two high bits are data and four low bits must be zero.
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    {
+        let line = lines[3];
+        let data = line.trim_end_matches("==");
+        let last = *data.as_bytes().last().unwrap();
+        let value = ALPHABET.iter().position(|byte| *byte == last).unwrap();
+        assert_eq!(value & 0x0f, 0);
+        let noisy = format!(
+            "{}{}==",
+            &data[..data.len() - 1],
+            ALPHABET[value | 0x01] as char
+        );
+        refused(
+            MANIFEST,
+            signed.replace(line, &noisy).as_bytes(),
+            &keys,
+            "not canonical base64",
+        );
+    }
+    // A CR that ends no line: after the last line (without LF), doubled
+    // before the final LF, or inside a line; and other control characters.
+    for (variant, expected) in [
+        (format!("{}\r", lines.join("\n")), "not LF or CRLF"),
+        (format!("{}\r\r\n", lines.join("\n")), "not LF or CRLF"),
+        (
+            format!("{}\r\r\n{}", lines[0], lines[1..].join("\n")),
+            "not LF or CRLF",
+        ),
+        (
+            signed.replace("trusted comment: aitp", "trusted comment: \u{1b}aitp"),
+            "control character",
+        ),
+        (
+            signed.replace("from minisign", "from\u{7f}minisign"),
+            "control character",
+        ),
+    ] {
+        refused(MANIFEST, variant.as_bytes(), &keys, expected);
     }
 }
 
@@ -401,6 +449,21 @@ fn trusted_keys_must_be_distinct_minisign_ed25519_keys() {
     let same_key = one.public_text_with(*b"Ed", two.id);
     let prehashed = one.public_text_with(*b"ED", one.id);
     let short = one.public_text()[..52].to_string();
+    // A small-order point as key (signatures could be made without any
+    // secret), in either sign: refused at installation.
+    let small_order = |key: [u8; 32]| {
+        let mut raw = b"Ed".to_vec();
+        raw.extend(one.id);
+        raw.extend(key);
+        b64(&raw)
+    };
+    let mut identity = [0_u8; 32];
+    identity[0] = 1;
+    let mut negative_identity = identity;
+    negative_identity[31] = 0x80;
+    let mut minus_one = [0xff_u8; 32];
+    minus_one[0] = 0xec;
+    minus_one[31] = 0x7f;
     for (keys, expected) in [
         (vec![], "at least one"),
         (vec![ok[0].clone(), same_id], "repeats"),
@@ -408,6 +471,10 @@ fn trusted_keys_must_be_distinct_minisign_ed25519_keys() {
         (vec![prehashed], "not a minisign Ed25519 key"),
         (vec![short], "not 42"),
         (vec![format!(" {}", ok[0])], "not canonical base64"),
+        (vec![small_order(identity)], "small-order"),
+        (vec![small_order(negative_identity)], "small-order"),
+        (vec![small_order([0; 32])], "small-order"),
+        (vec![small_order(minus_one)], "small-order"),
     ] {
         let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
         let error = parse_trusted_keys(&keys).unwrap_err();

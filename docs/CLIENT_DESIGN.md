@@ -1048,7 +1048,7 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
 
 只接受 legacy（算法 `Ed`）：minisign 默认的预哈希格式（`ED`，先做 BLAKE2b-512）需要 `ring` 没有的 BLAKE2b；忘了加 `-l` 时，客户端和上传前检查都会明确提示"用 `minisign -S -l` 重签"。签名文件里的 trusted comment 也会验签（与 `minisign -V` 一致），但内容不参与判断；版本和发行版只看 manifest 本身。
 
-**信任根**：品牌 `update.source = Fixed { distribution, signing_keys, … }`。AITP 是 `distribution: "aitp"`，`signing_keys` 是两把 minisign 公钥（`.pub` 文件第二行，56 个字符）：主钥和恢复钥。在维护者提供真实公钥之前是两把**明显的占位公钥**（文本含 `PLACEHOLDER`，其字节不是曲线上的点，任何签名都验不过）；`kernel/scripts/build-release.sh` 和 `verify-release.py --aitp-artifact` 都会拒绝含占位公钥的发布构建，只有从不发布的 CI 路径检查显式放行（`AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1` / `--allow-placeholder-signing-key`），另有对照步骤确认不放行时会失败。真实公钥由单独的 PR 填入（同时改 `aitp_values_are_frozen`）。SAIAI 走 `GatewayChannel`，没有这些字段，更新行为不变。
+**信任根**：品牌 `update.source = Fixed { distribution, signing_keys, … }`。AITP 是 `distribution: "aitp"`，`signing_keys` 是两把 minisign 公钥（`.pub` 文件第二行，56 个字符）：主钥和恢复钥。在维护者提供真实公钥之前是两把**明显的占位公钥**（文本含 `PLACEHOLDER`，其字节不是曲线上的点，任何签名都验不过）；`kernel/scripts/build-release.sh` 和 `verify-release.py --aitp-artifact` 都会拒绝含占位公钥的发布构建，只有从不发布的 CI 路径检查显式放行（`AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1` / `--allow-placeholder-signing-key`），另有对照步骤确认不放行时会失败；`verify-release.py` 核对 CI 里构建放行恰好两处、SAIAI 发布工作流里没有放行（AITP 自己的发布工作流在 D4 建立时再加同样的检查）。真实公钥由单独的 PR 填入（同时改 `aitp_values_are_frozen`）。SAIAI 走 `GatewayChannel`，没有这些字段，更新行为不变。
 
 **一次性准备（维护者自己的电脑，离线）**：
 
@@ -1077,10 +1077,11 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
 3. 上传前检查（开发侧）：
    ```sh
    python3 scripts/saiai-cli/verify-release.py \
-     --aitp-artifact <各平台 aitp 程序> --build-dir <构建目录> \
+     --aitp-artifact dist/aitp-linux-x86_64 --aitp-artifact dist/aitp-linux-aarch64 …（每个程序一个 --aitp-artifact） \
+     --build-dir <构建目录> \
      --aitp-manifest dist/aitp-manifest.json --aitp-dist dist
    ```
-   或只用公开内核里的工具：`release_manifest.py verify --manifest dist/aitp-manifest.json --dist dist --artifact <程序> …`。检查：签名用的是品牌信任的钥（非占位）、只接受 legacy 格式、trusted comment 签名正确；manifest 的 schema、发行版、版本（等于包版本）、资产集合（恰好六个）与 `dist/` 中每个文件的 size/sha256 一致；每个程序都内含品牌的全部公钥、不含占位公钥。这里的 Ed25519 验证是 RFC 8032 的独立 Python 实现（拒绝非规范编码、S ≥ L、小阶公钥和 R），与客户端用同一组真实 minisign 输出做测试。
+   或只用公开内核里的工具：`release_manifest.py verify --manifest dist/aitp-manifest.json --dist dist`。检查：签名用的是品牌信任的钥（非占位）、只接受 legacy 格式、trusted comment 签名正确；manifest 的 schema、发行版、版本（等于 `kernel/Cargo.toml` 的包版本）、资产集合（恰好六个）与 `dist/` 中每个文件（不能是符号链接）的 size/sha256 一致；`dist/` 里这六个资产本身（以及额外给出的程序）都内含品牌的全部公钥、不含占位公钥。这里的 Ed25519 验证是 RFC 8032 的独立 Python 实现（拒绝非规范编码、S ≥ L、小阶公钥和 R），与客户端用同一组真实 minisign 输出做测试；manifest 规则至少与客户端一样严（客户端只查本平台资产，这里查全部）。客户端在品牌安装时也拒绝小阶公钥（libsodium 的列表）。
 4. 草稿 release 里上传全部资产、`aitp-manifest.json` 和 `aitp-manifest.json.minisig` 后再发布（D4 工作流届时细化）。
 
 **轮换、丢失与泄露**（客户端接受 `signing_keys` 里任一把签的 manifest；一个已安装的版本只认它自己内置的那组公钥）：

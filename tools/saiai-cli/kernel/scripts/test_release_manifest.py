@@ -17,6 +17,8 @@ import unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# Nothing is written next to the kernel's sources.
+sys.dont_write_bytecode = True
 SPEC = importlib.util.spec_from_file_location("release_manifest", HERE / "release_manifest.py")
 rm = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(rm)
@@ -117,6 +119,15 @@ class Ed25519Tests(unittest.TestCase):
             self.assertIsNone(rm.decode_point(material), placeholder)
 
 
+def noisy_padding(line: bytes) -> bytes:
+    """The same 64 bytes with non-zero padding bits (not canonical)."""
+    alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    data = line[:-2]
+    value = alphabet.index(data[-1:])
+    assert value & 0x0F == 0
+    return data[:-1] + alphabet[value | 1:value | 1 + 1] + b"=="
+
+
 MANIFEST = b'{"assets":{},"distribution":"aitp","manifest_schema":1,"version":"9.9.9"}\n'
 
 
@@ -146,6 +157,7 @@ class SignatureTests(unittest.TestCase):
         rm.verify_signature(MANIFEST, signed, keys)
         rm.verify_signature(MANIFEST, recovery.sign(MANIFEST), keys)
         rm.verify_signature(MANIFEST, signed.replace(b"\n", b"\r\n"), keys)
+        rm.verify_signature(MANIFEST, signed.replace(b"\n", b"\r\n", 2), keys)
         rm.verify_signature(MANIFEST, signed[:-1], keys)
         rm.verify_signature(MANIFEST, primary.sign(MANIFEST, comment=b""), keys)
         rm.verify_signature(MANIFEST, signed.replace(b"from minisign secret key", b"x"), keys)
@@ -164,6 +176,15 @@ class SignatureTests(unittest.TestCase):
             (signed.replace(lines[1], b" " + lines[1]), "not canonical base64"),
             (signed.replace(lines[1], lines[1][4:]), "not 74"),
             (signed.replace(b"trusted comment: ", b"untrusted comment: " + b"x" * 4096, 1), "larger than 4096"),
+            # A CR that ends no line, and other control characters.
+            (signed[:-1] + b"\r", "not LF or CRLF"),
+            (signed[:-1] + b"\r\r\n", "not LF or CRLF"),
+            (signed.replace(b"\n", b"\r\r\n", 1), "not LF or CRLF"),
+            (signed.replace(b"trusted comment: a", b"trusted comment: \x1ba"), "control character"),
+            (signed.replace(b"from minisign", b"from\x7fminisign"), "control character"),
+            # Non-zero padding bits in the last character before "==".
+            (signed.replace(lines[3], noisy_padding(lines[3])), "not canonical base64"),
+            (signed.replace(lines[1], lines[1] + b"=="), "not canonical base64"),
         ]
         for variant, expected in cases:
             with self.assertRaisesRegex(rm.CheckError, expected):
@@ -215,6 +236,23 @@ class ManifestTests(unittest.TestCase):
 
 
 class BrandAndReleaseTests(unittest.TestCase):
+    def test_key_lists_are_read_as_string_literals(self):
+        a, b = TestKey(key_id=b"\xff" * 8), TestKey()
+        # Base64 with "//" inside a literal, and comments between literals.
+        text_a = a.public_text()
+        self.assertIn("//", text_a)
+        source = (
+            'distribution: "aitp",\n'
+            f'signing_keys: &[\n    // primary\n    "{text_a}", // trailing\n    "{b.public_text()}",\n],\n'
+            '#[cfg(test)]\nsigning_keys: &["ignored"]'
+        )
+        self.assertEqual(rm.brand_keys(source), [text_a, b.public_text()])
+        self.assertEqual(rm.brand_distribution(source), "aitp")
+        with self.assertRaisesRegex(rm.CheckError, "repeats another key or key id"):
+            rm.require_real_keys([a.public_text(), TestKey(key_id=a.key_id).public_text()])
+        with self.assertRaisesRegex(rm.CheckError, "not a usable Ed25519 key"):
+            rm.require_real_keys([base64.b64encode(b"Ed" + a.key_id + (1).to_bytes(32, "little")).decode()])
+
     def test_the_brand_declares_aitp_and_two_keys(self):
         self.assertEqual(rm.brand_distribution(), "aitp")
         keys = rm.brand_keys()
@@ -226,7 +264,7 @@ class BrandAndReleaseTests(unittest.TestCase):
                 [sys.executable, "-I", str(HERE / "release_manifest.py"), "keys", "--require-real"],
                 capture_output=True, text=True,
             )
-            self.assertEqual(result.returncode, 1, result)
+            self.assertEqual(result.returncode, rm.PLACEHOLDER_EXIT, result)
             self.assertIn("still placeholders", result.stderr)
         else:
             rm.require_real_keys(keys)
@@ -236,8 +274,9 @@ class BrandAndReleaseTests(unittest.TestCase):
         keys = [primary.public_text(), recovery.public_text()]
         with tempfile.TemporaryDirectory() as temporary:
             dist = Path(temporary)
+            carried = b"\0".join(key.encode() for key in keys)
             for index, name in enumerate(rm.ASSETS):
-                (dist / name).write_bytes(bytes([index]) * (1024 * 1024 + index))
+                (dist / name).write_bytes(carried + bytes([index]) * (1024 * 1024 + index))
             result = subprocess.run(
                 [sys.executable, "-I", str(HERE / "release_manifest.py"), "generate", "--dist", str(dist), "--version", "1.2.3"],
                 capture_output=True, text=True, check=True,
@@ -286,9 +325,29 @@ class BrandAndReleaseTests(unittest.TestCase):
             other.write_bytes(program.read_bytes() + rm.PLACEHOLDER_KEYS[0].encode())
             with self.assertRaisesRegex(rm.CheckError, "placeholder"):
                 check(artifacts=[other])
+            # A release asset (even one of six) without the keys, or with a
+            # placeholder key, is refused although it matches the manifest:
+            # the published programs themselves are checked.
+            for content, expected in [
+                (b"x" * (1024 * 1024 + 7), "does not carry the trusted keys"),
+                (carried + rm.PLACEHOLDER_KEYS[1].encode() + b"x" * (1024 * 1024), "placeholder"),
+            ]:
+                (dist / rm.ASSETS[5]).write_bytes(content)
+                rendered = rm.render_manifest(
+                    "aitp", "1.2.3", {name: rm.file_metadata(dist / name) for name in rm.ASSETS}
+                )
+                manifest_path.write_bytes(rendered)
+                signature_path.write_bytes(primary.sign(rendered))
+                with self.assertRaisesRegex(rm.CheckError, expected):
+                    check(artifacts=[])
             # A changed asset.
             (dist / rm.ASSETS[0]).write_bytes(b"x" * (1024 * 1024))
             with self.assertRaisesRegex(rm.CheckError, "does not match the manifest"):
+                check()
+            # A symbolic link instead of an asset.
+            (dist / rm.ASSETS[0]).unlink()
+            (dist / rm.ASSETS[0]).symlink_to(dist / rm.ASSETS[1])
+            with self.assertRaisesRegex(rm.CheckError, "not a regular file"):
                 check()
             # No signature.
             signature_path.unlink()

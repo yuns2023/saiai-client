@@ -75,10 +75,58 @@ pub(crate) fn parse_public_key(text: &str) -> Result<PublicKey> {
     if &raw[..2] != ALGORITHM {
         bail!("the update signing key is not a minisign Ed25519 key");
     }
-    Ok(PublicKey {
+    let key = PublicKey {
         id: raw[2..10].try_into().expect("8 bytes"),
         key: raw[10..].try_into().expect("32 bytes"),
-    })
+    };
+    if is_small_order_encoding(&key.key) {
+        bail!(
+            "update signing key {} is a small-order point, not a usable Ed25519 key",
+            key.id_text()
+        );
+    }
+    Ok(key)
+}
+
+/// The encodings of the points of order 1, 2, 4 and 8 (and the
+/// non-canonical encodings of y = 0 and y = 1), sign bit ignored: libsodium's
+/// list. With such a key, signatures can be made without its secret.
+fn is_small_order_encoding(key: &[u8; 32]) -> bool {
+    const SMALL_ORDER: [[u8; 32]; 7] = [
+        [0; 32],
+        [
+            1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0,
+        ],
+        [
+            0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef,
+            0x98, 0xf0, 0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88,
+            0x6d, 0x53, 0xfc, 0x05,
+        ],
+        [
+            0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10,
+            0x67, 0x0f, 0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77,
+            0x92, 0xac, 0x03, 0x7a,
+        ],
+        [
+            0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0x7f,
+        ],
+        [
+            0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0x7f,
+        ],
+        [
+            0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0x7f,
+        ],
+    ];
+    SMALL_ORDER
+        .iter()
+        .any(|small| small[..31] == key[..31] && small[31] == key[31] & 0x7f)
 }
 
 /// A brand's trusted keys: at least one, valid, with distinct key ids and
@@ -114,8 +162,9 @@ struct SignatureFile<'a> {
 
 /// The four lines of a minisign signature file, each ending in LF or CRLF
 /// (the last one may end without). Anything else is refused: a fifth or
-/// empty line, a lone CR, NUL, a byte order mark (the first line then does
-/// not start with the comment prefix).
+/// empty line, a CR that does not end a line, NUL or another control
+/// character (TAB aside, which minisign's default comment uses), a byte
+/// order mark (the first line then does not start with the comment prefix).
 fn parse_signature_file(bytes: &[u8]) -> Result<SignatureFile<'_>> {
     if bytes.len() as u64 > SIGNATURE_LIMIT {
         bail!("the signature file is larger than {SIGNATURE_LIMIT} bytes");
@@ -123,16 +172,24 @@ fn parse_signature_file(bytes: &[u8]) -> Result<SignatureFile<'_>> {
     if bytes.contains(&0) {
         bail!("the signature file contains a NUL byte");
     }
+    // Each LF may be preceded by one CR, which belongs to the line break.
     let body = bytes
         .strip_suffix(b"\n")
         .map(|rest| rest.strip_suffix(b"\r").unwrap_or(rest))
         .unwrap_or(bytes);
-    let lines: Vec<&[u8]> = body
-        .split(|byte| *byte == b'\n')
-        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
-        .collect();
+    let mut lines: Vec<&[u8]> = body.split(|byte| *byte == b'\n').collect();
+    let last = lines.len() - 1;
+    for line in &mut lines[..last] {
+        *line = line.strip_suffix(b"\r").unwrap_or(line);
+    }
     if lines.iter().any(|line| line.contains(&b'\r')) {
         bail!("the signature file has a line break that is not LF or CRLF");
+    }
+    if lines.iter().any(|line| {
+        line.iter()
+            .any(|byte| (*byte < 0x20 && *byte != b'\t') || *byte == 0x7f)
+    }) {
+        bail!("the signature file contains a control character");
     }
     let [untrusted, envelope, trusted, global] = lines.as_slice() else {
         bail!(

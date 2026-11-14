@@ -165,10 +165,11 @@ jobs:
       # a program that trusts the placeholder keys.
       - name: Control - placeholder signing keys are refused for a release
         run: |
-          if [ "$(python3 tools/saiai-cli/kernel/scripts/release_manifest.py keys | grep -c PLACEHOLDER)" = 0 ]; then
-            echo "the brand carries real signing keys; the placeholder control does not apply"
-            exit 0
-          fi
+          keys="$(python3 tools/saiai-cli/kernel/scripts/release_manifest.py keys)"
+          case "$keys" in
+            *PLACEHOLDER*) ;;
+            *) echo "the brand carries real signing keys; the placeholder control does not apply"; exit 0 ;;
+          esac
           if bash tools/saiai-cli/kernel/scripts/build-release.sh --locked 2> "$RUNNER_TEMP/build.log"; then
             echo "::error::the release build accepted placeholder signing keys"
             exit 1
