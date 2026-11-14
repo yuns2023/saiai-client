@@ -695,11 +695,13 @@ def verify_workflows_and_docs() -> None:
             f"AITP release build script does not map to {prefix}",
         )
     for required in (
-        'aitp="$(CARGO_TARGET_DIR="$standalone/target" AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1 bash scripts/build-release.sh --locked)"',
-        '--aitp-artifact "$aitp" --allow-placeholder-signing-key',
-        'aitp="$(AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1 bash tools/saiai-cli/kernel/scripts/build-release.sh --locked)"',
+        'aitp="$(CARGO_TARGET_DIR="$standalone/target" bash scripts/build-release.sh --locked)"',
+        '--aitp-artifact "$aitp"',
+        'aitp="$(bash tools/saiai-cli/kernel/scripts/build-release.sh --locked)"',
         'echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"',
-        '--aitp-artifact "$AITP_PROGRAM" --allow-placeholder-signing-key',
+        '--aitp-artifact "$AITP_PROGRAM"',
+        'grep "update signing keys are placeholders" "$RUNNER_TEMP/build.log"',
+        'grep "carries placeholder signing keys" "$RUNNER_TEMP/keys.log"',
         "the path check accepted an ordinary release build",
         "the release build accepted placeholder signing keys",
         "the release check accepted placeholder signing keys",
@@ -707,15 +709,12 @@ def verify_workflows_and_docs() -> None:
         "python3 tools/saiai-cli/kernel/scripts/test_release_manifest.py",
     ):
         require(required in ci, f"CI does not check the remapped AITP release: {required!r}")
-    # The placeholder exception is for builds that are never published.
-    require(
-        ci.count("AITP_ALLOW_PLACEHOLDER_SIGNING_KEY=1") == 2,
-        "CI allows the placeholder signing keys outside the two path-check builds",
-    )
-    require(
-        "AITP_ALLOW_PLACEHOLDER_SIGNING_KEY" not in release and "--allow-placeholder-signing-key" not in release,
-        "the release workflow must not allow placeholder signing keys",
-    )
+    # The placeholder exception is gone: no workflow may bring it back.
+    for workflow in (ci, release):
+        require(
+            "ALLOW_PLACEHOLDER" not in workflow and "allow-placeholder" not in workflow,
+            "a workflow allows placeholder signing keys",
+        )
     for forbidden in ("build-release.sh", "remap-path-prefix", "--aitp-artifact"):
         require(forbidden not in release, f"SAIAI release workflow must not use {forbidden!r}")
     linux_service = text("scripts/saiai-cli/test-linux-service.py")
@@ -817,12 +816,11 @@ def load_release_manifest():
     return module
 
 
-def verify_aitp_signing_keys(artifacts: list[Path], allow_placeholder: bool) -> None:
+def verify_aitp_signing_keys(artifacts: list[Path]) -> None:
     """AITP release programs trust the maintainer's real update signing keys:
-    the brand names no placeholder key, and every program carries each of
-    the brand's keys and no placeholder. Builds that are only checked and
-    never published may keep the placeholders."""
-    if not artifacts or allow_placeholder:
+    the brand names no placeholder or unusable key, and every program
+    carries each of the brand's keys and no placeholder."""
+    if not artifacts:
         return
     tool = load_release_manifest()
     try:
@@ -1007,11 +1005,6 @@ def main() -> int:
         help="built AITP release program to check (repeatable; needs --build-dir)",
     )
     parser.add_argument(
-        "--allow-placeholder-signing-key",
-        action="store_true",
-        help="accept the AITP placeholder update signing keys (CI builds that are never published)",
-    )
-    parser.add_argument(
         "--aitp-manifest",
         type=Path,
         help="signed AITP release manifest to check before upload (needs --aitp-artifact and --aitp-dist)",
@@ -1028,13 +1021,9 @@ def main() -> int:
     arguments = parser.parse_args()
     if arguments.build_dir and not arguments.aitp_artifact:
         parser.error("--build-dir is only used with --aitp-artifact")
-    if arguments.allow_placeholder_signing_key and not arguments.aitp_artifact:
-        parser.error("--allow-placeholder-signing-key is only used with --aitp-artifact")
     if arguments.aitp_manifest is not None:
         if not arguments.aitp_artifact or arguments.aitp_dist is None:
             parser.error("--aitp-manifest needs --aitp-artifact and --aitp-dist")
-        if arguments.allow_placeholder_signing_key:
-            parser.error("a signed release is never checked with --allow-placeholder-signing-key")
     elif arguments.aitp_signature is not None or arguments.aitp_dist is not None:
         parser.error("--aitp-signature and --aitp-dist are only used with --aitp-manifest")
     verify_cli()
@@ -1043,7 +1032,7 @@ def main() -> int:
     verify_no_non_test_credentials()
     verify_artifacts_carry_no_aitp_brand(arguments.artifact)
     verify_aitp_artifacts(arguments.aitp_artifact, arguments.build_dir)
-    verify_aitp_signing_keys(arguments.aitp_artifact, arguments.allow_placeholder_signing_key)
+    verify_aitp_signing_keys(arguments.aitp_artifact)
     if arguments.aitp_manifest is not None:
         verify_aitp_signed_manifest(
             arguments.aitp_manifest, arguments.aitp_signature, arguments.aitp_dist, arguments.aitp_artifact
