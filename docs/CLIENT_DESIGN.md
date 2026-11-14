@@ -1037,7 +1037,7 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
 
 **所有品牌都生效**：
 
-- 启动时的迁移写入：Claude 设置满足 E1、Codex `.env` 满足 E2/E3 时跳过。
+- 启动时的迁移写入：Claude 设置满足 E1、Codex 配置满足 E2/E3/E4 时跳过。
 - `uninstall`：Claude 设置满足 E1 时整个文件不编辑，并提示用户自行核对其中是否还有本品牌的值。
 - Windows 卸载与 Desktop 启动时的旧 lease 恢复：
   - 代理是否恢复，沿用原有的归属判断，与证书无关；

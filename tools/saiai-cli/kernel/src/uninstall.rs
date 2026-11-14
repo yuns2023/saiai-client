@@ -2077,15 +2077,19 @@ foreach($file in ($env:@@ENV@@CA_FILES -split "`n")){
   if([string]::IsNullOrWhiteSpace($file)){continue}
   if(-not (Test-Path -LiteralPath $file -PathType Leaf)){continue}
   try{ $pem=[IO.File]::ReadAllText($file) }catch{ $errors.Add("${file}: $($_.Exception.Message)"); continue }
+  # A file with any problem contributes no certificate (as before, when
+  # the first failure ended the file); it is reported instead.
   $blocks=[regex]::Matches($pem,'-----BEGIN CERTIFICATE-----(?<der>.*?)-----END CERTIFICATE-----',[Text.RegularExpressions.RegexOptions]::Singleline)
-  if(([regex]::Matches($pem,'-----BEGIN CERTIFICATE-----')).Count -ne $blocks.Count){ $errors.Add("${file}: unterminated certificate block") }
-  foreach($m in $blocks){
-    try{
+  if(([regex]::Matches($pem,'-----BEGIN CERTIFICATE-----')).Count -ne $blocks.Count){ $errors.Add("${file}: unterminated certificate block"); continue }
+  $mine=@{}
+  try{
+    foreach($m in $blocks){
       $raw=[Convert]::FromBase64String($m.Groups['der'].Value)
       $c=[Security.Cryptography.X509Certificates.X509Certificate2]::new($raw)
-      $found[$c.Thumbprint.ToUpperInvariant()]=[Convert]::ToBase64String($raw); $c.Dispose()
-    }catch{ $errors.Add("${file}: $($_.Exception.Message)") }
-  }
+      $mine[$c.Thumbprint.ToUpperInvariant()]=[Convert]::ToBase64String($raw); $c.Dispose()
+    }
+  }catch{ $errors.Add("${file}: $($_.Exception.Message)"); continue }
+  foreach($k in $mine.Keys){ $found[$k]=$mine[$k] }
 }
 $present=@($found.Keys | Sort-Object | Where-Object { Test-Path -LiteralPath ('Cert:\CurrentUser\Root\'+$_) } | ForEach-Object { [pscustomobject]@{t=$_;der=$found[$_]} })
 ConvertTo-Json -Compress -Depth 3 -InputObject ([pscustomobject]@{present=$present;errors=@($errors)})
