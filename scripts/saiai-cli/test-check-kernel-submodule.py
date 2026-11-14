@@ -21,8 +21,12 @@ CHECK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CHECK)
 
 
+class ReachedNetwork(BaseException):
+    """Not an Exception: the checker's error handling cannot swallow it."""
+
+
 def no_network(*arguments, **options):
-    raise AssertionError("a test reached the network (inject runs=...)")
+    raise ReachedNetwork("a test reached the network (inject runs=...)")
 
 
 # No test may call the real GitHub API.
