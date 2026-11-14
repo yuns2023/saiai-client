@@ -2637,9 +2637,11 @@ fn run_windows_packaged_desktop(
     }
     if matches!(decision, windows_desktop_runtime::Decision::Cold) {
         let settled = restore_legacy_windows_packaged_proxy_lease()?;
+        // A failed removal stops the launch, as before; the lease keeps the
+        // certificates for the next attempt.
         if !settled.pending.is_empty() {
-            eprintln!(
-                "warning: could not inspect or remove CA(s) {} of a legacy {brand_product} Desktop lease; they are kept and retried next time",
+            bail!(
+                "could not remove CA(s) {} of a legacy {brand_product} Desktop lease from Windows CurrentUser\\Root; retry the launch",
                 settled.pending.join(", "),
                 brand_product = BRAND.product_name
             );
@@ -2893,17 +2895,21 @@ struct LegacyWindowsPackagedProxyLeaseMarker {
 #[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct LeaseCertificates {
-    /// Kept because their identity could not be read or their removal
-    /// failed; the lease keeps them for a later retry.
+    /// Their removal failed (the removal command failed, or the certificate
+    /// is confirmed still installed): a failure as before, and the lease
+    /// keeps them for a retry.
     pub(crate) pending: Vec<String>,
     /// Kept because they are another local proxy program's installation CA.
     pub(crate) foreign: Vec<String>,
 }
 
-/// Decides each certificate on its own: `read` returns its DER (None: not
-/// installed), `remove` removes it and reports whether it is gone. Another
-/// program's installation CA is kept; one whose identity cannot be read, or
-/// that is still present after removal, is kept for a retry.
+/// Decides each certificate on its own. Only a certificate confirmed to be
+/// another program's installation CA is kept; anything else is removed by
+/// thumbprint as before, including one whose identity cannot be read or
+/// parsed (`read` returns its DER, None when not installed). `remove`
+/// removes it: an error is a failed removal command, `false` a certificate
+/// confirmed still installed (both failures, as before); `true` is gone or
+/// not confirmable (no new failure).
 #[cfg(any(target_os = "windows", test))]
 pub(crate) fn settle_lease_certificates(
     thumbprints: &[String],
@@ -2912,20 +2918,21 @@ pub(crate) fn settle_lease_certificates(
 ) -> LeaseCertificates {
     let mut settled = LeaseCertificates::default();
     for thumbprint in thumbprints {
-        match read(thumbprint).and_then(|der| match der {
+        let owner = read(thumbprint).and_then(|der| match der {
             None => Ok(None),
             Some(der) => coexistence::classify_certificate(&der).map(Some),
-        }) {
+        });
+        match owner {
             Ok(None) => {}
             Ok(Some(coexistence::CertificateOwner::Foreign(_))) => {
                 settled.foreign.push(thumbprint.clone())
             }
-            Ok(Some(_)) => {
+            // Ours, unknown, or not identifiable: removed as before.
+            Ok(Some(_)) | Err(_) => {
                 if !matches!(remove(thumbprint), Ok(true)) {
                     settled.pending.push(thumbprint.clone());
                 }
             }
-            Err(_) => settled.pending.push(thumbprint.clone()),
         }
     }
     settled
@@ -3054,7 +3061,9 @@ fn windows_root_ca_der(thumbprint: &str) -> Result<Option<Vec<u8>>> {
 #[cfg(target_os = "windows")]
 fn windows_remove_root_ca_checked(thumbprint: &str) -> Result<bool> {
     windows_remove_user_ca(Some(thumbprint))?;
-    Ok(windows_root_ca_der(thumbprint)?.is_none())
+    // Only a certificate confirmed still installed is a failure; a check
+    // that cannot run is not (the removal was not checked before either).
+    Ok(!matches!(windows_root_ca_der(thumbprint), Ok(Some(_))))
 }
 
 #[cfg(target_os = "windows")]
@@ -11895,7 +11904,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     }
 
     /// A lease retry touches certificates only: the first run restores the
-    /// proxy and keeps a certificate it cannot read; after the user sets a
+    /// proxy and keeps a certificate it fails to remove; after the user sets a
     /// proxy of their own, the second run removes the certificate and leaves
     /// the user's proxy as it is.
     #[test]
@@ -11904,7 +11913,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         struct Fake {
             proxy: RefCell<LegacyWindowsInternetProxySettings>,
             proxy_writes: Cell<usize>,
-            readable: Cell<bool>,
+            removable: Cell<bool>,
             installed: RefCell<Vec<String>>,
             der: Vec<u8>,
         }
@@ -11918,9 +11927,6 @@ HTTPS_PROXY="http://127.0.0.1:1111"
                 Ok(())
             }
             fn certificate(&self, thumbprint: &str) -> Result<Option<Vec<u8>>> {
-                if !self.readable.get() {
-                    bail!("access denied");
-                }
                 Ok(self
                     .installed
                     .borrow()
@@ -11929,10 +11935,12 @@ HTTPS_PROXY="http://127.0.0.1:1111"
                     .then(|| self.der.clone()))
             }
             fn remove_certificate(&self, thumbprint: &str) -> Result<bool> {
-                self.installed
-                    .borrow_mut()
-                    .retain(|installed| installed != thumbprint);
-                Ok(true)
+                if self.removable.get() {
+                    self.installed
+                        .borrow_mut()
+                        .retain(|installed| installed != thumbprint);
+                }
+                Ok(self.removable.get())
             }
         }
         let proxy = |enable: i32, server: &str| LegacyWindowsInternetProxySettings {
@@ -11968,7 +11976,7 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         let system = Fake {
             proxy: RefCell::new(proxy(1, "127.0.0.1:64196")),
             proxy_writes: Cell::new(0),
-            readable: Cell::new(false),
+            removable: Cell::new(false),
             installed: RefCell::new(vec!["AA".to_string()]),
             der,
         };
@@ -11983,9 +11991,9 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert!(kept.proxy_handled);
         assert_eq!(kept.added_ca_thumbprints, ["AA"]);
 
-        // The user sets their own proxy; the certificate becomes readable.
+        // The user sets their own proxy; the certificate can be removed now.
         *system.proxy.borrow_mut() = proxy(1, "corp.example:8080");
-        system.readable.set(true);
+        system.removable.set(true);
         let second = restore_lease_with(&marker, &system).unwrap();
         assert_eq!(second, LeaseCertificates::default());
         assert_eq!(system.proxy_writes.get(), 1);
@@ -12264,9 +12272,10 @@ HTTPS_PROXY="http://127.0.0.1:1111"
         assert!(branch.contains("target.as_deref()"));
     }
 
-    /// Lease certificates are decided one by one: another program's CA and
-    /// unreadable or unremovable ones are kept (the latter for a retry);
-    /// ours and unknown ones are removed; missing ones need nothing.
+    /// Lease certificates are decided one by one: only a confirmed foreign
+    /// CA is kept; ours, unknown, unreadable and unparsable ones are removed
+    /// by thumbprint as before; a removal that fails (command error, or the
+    /// certificate confirmed still installed) is a failure, kept for retry.
     #[test]
     fn lease_certificates_are_settled_one_by_one() {
         use rcgen::{
@@ -12306,33 +12315,39 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             "UNREADABLE",
             "GARBAGE",
             "STUCK",
+            "BROKEN",
         ]
         .map(String::from)
         .to_vec();
         let settled = settle_lease_certificates(
             &thumbprints,
-            |thumbprint| {
-                store[thumbprint]
+            |thumbprint| match thumbprint {
+                "BROKEN" => Ok(Some(store["OURS"].clone().unwrap().unwrap())),
+                _ => store[thumbprint]
                     .clone()
-                    .map_err(|()| anyhow::anyhow!("access denied"))
+                    .map_err(|()| anyhow::anyhow!("access denied")),
             },
             |thumbprint| {
                 removed.borrow_mut().push(thumbprint.to_string());
-                Ok(thumbprint != "STUCK")
+                match thumbprint {
+                    "STUCK" => Ok(false),
+                    "BROKEN" => bail!("removal command failed"),
+                    _ => Ok(true),
+                }
             },
         );
         assert_eq!(
             settled,
             LeaseCertificates {
-                pending: vec![
-                    "UNREADABLE".to_string(),
-                    "GARBAGE".to_string(),
-                    "STUCK".to_string()
-                ],
+                pending: vec!["STUCK".to_string(), "BROKEN".to_string()],
                 foreign: vec!["FOREIGN".to_string()],
             }
         );
-        assert_eq!(*removed.borrow(), ["OURS", "CORP", "STUCK"]);
+        // Identity that cannot be read or parsed: removed as before.
+        assert_eq!(
+            *removed.borrow(),
+            ["OURS", "CORP", "UNREADABLE", "GARBAGE", "STUCK", "BROKEN"]
+        );
     }
 
     /// Leases written before `proxy_handled` read as not handled; a lease

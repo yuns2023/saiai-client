@@ -2077,8 +2077,9 @@ foreach($file in ($env:@@ENV@@CA_FILES -split "`n")){
   if([string]::IsNullOrWhiteSpace($file)){continue}
   if(-not (Test-Path -LiteralPath $file -PathType Leaf)){continue}
   try{ $pem=[IO.File]::ReadAllText($file) }catch{ $errors.Add("${file}: $($_.Exception.Message)"); continue }
-  # A file with any problem contributes no certificate (as before, when
-  # the first failure ended the file); it is reported instead.
+  # A file with any problem contributes no certificate and is reported
+  # (main stopped reading such a file at its first failure but kept what
+  # it had collected; dropping the whole file removes at most less).
   $blocks=[regex]::Matches($pem,'-----BEGIN CERTIFICATE-----(?<der>.*?)-----END CERTIFICATE-----',[Text.RegularExpressions.RegexOptions]::Singleline)
   if(([regex]::Matches($pem,'-----BEGIN CERTIFICATE-----')).Count -ne $blocks.Count){ $errors.Add("${file}: unterminated certificate block"); continue }
   $mine=@{}
@@ -2127,7 +2128,6 @@ ConvertTo-Json -Compress -Depth 3 -InputObject ([pscustomobject]@{present=$prese
 enum RootCertificate {
     Remove(String),
     Foreign(String, String),
-    Unidentified(String, String),
 }
 
 /// Reads the inspection script's output: installed certificates of the
@@ -2185,12 +2185,13 @@ fn root_certificates(
             })
             .context("certificate data is missing")
             .and_then(|der| crate::coexistence::classify_certificate(&der));
+        // Only a confirmed foreign CA is kept; ours, unknown and
+        // unidentifiable ones are removed by thumbprint as before.
         certificates.push(match owner {
             Ok(crate::coexistence::CertificateOwner::Foreign(organization)) => {
                 RootCertificate::Foreign(thumbprint, organization)
             }
-            Ok(_) => RootCertificate::Remove(thumbprint),
-            Err(error) => RootCertificate::Unidentified(thumbprint, format!("{error:#}")),
+            Ok(_) | Err(_) => RootCertificate::Remove(thumbprint),
         });
     }
     Ok((certificates, errors))
@@ -2237,11 +2238,6 @@ fn plan_root_certificates(output: &str, leased: &[String], plan: &mut Plan) {
                 Outcome::Kept(format!(
                     "installation CA of \"{organization}\", another local proxy program"
                 )),
-            ),
-            RootCertificate::Unidentified(thumbprint, error) => plan.note(
-                Area::Certificates,
-                format!("CA {thumbprint} in Windows CurrentUser\\Root"),
-                Outcome::Kept(format!("WARN could not be identified ({error}); kept")),
             ),
         }
     }
@@ -2765,7 +2761,7 @@ fn execute_item(action: &Action, args: &Args) -> Result<Outcome> {
                 // Keeps the lease (and, through the gate, the data and the
                 // program) so that rerunning uninstall retries them.
                 Outcome::Failed(format!(
-                    "CA(s) {} could not be inspected or removed; they and the lease are kept, rerun uninstall",
+                    "CA(s) {} could not be removed; they and the lease are kept, rerun uninstall",
                     settled.pending.join(", ")
                 ))
             } else if !settled.foreign.is_empty() {
@@ -3044,7 +3040,8 @@ mod tests {
             certificates[1],
             RootCertificate::Foreign("BBBB".to_string(), "OTHER".to_string())
         );
-        assert!(matches!(&certificates[2], RootCertificate::Unidentified(t, _) if t == "CCCC"));
+        // Not identifiable: removed by thumbprint, as before.
+        assert_eq!(certificates[2], RootCertificate::Remove("CCCC".to_string()));
         // PowerShell collapses one-element arrays and empty ones.
         let single = json!({"present": {"t": "AAAA", "der": ours}, "errors": null}).to_string();
         assert_eq!(
