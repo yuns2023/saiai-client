@@ -1076,12 +1076,15 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
    只把 `aitp-manifest.json.minisig` 交回；manifest 不要在签名电脑上改动（改一个字节签名就作废）。
 3. 上传前检查（开发侧）：
    ```sh
+   # POSIX shell，在仓库根目录；<构建目录> 换成实际构建所在的绝对路径
    python3 scripts/saiai-cli/verify-release.py \
-     --aitp-artifact dist/aitp-linux-x86_64 --aitp-artifact dist/aitp-linux-aarch64 …（每个程序一个 --aitp-artifact） \
+     --aitp-artifact dist/aitp-linux-x86_64 --aitp-artifact dist/aitp-linux-aarch64 \
+     --aitp-artifact dist/aitp-macos-x86_64 --aitp-artifact dist/aitp-macos-aarch64 \
+     --aitp-artifact dist/aitp-windows-x86_64.exe --aitp-artifact dist/aitp-windows-aarch64.exe \
      --build-dir <构建目录> \
      --aitp-manifest dist/aitp-manifest.json --aitp-dist dist
    ```
-   或只用公开内核里的工具：`release_manifest.py verify --manifest dist/aitp-manifest.json --dist dist`。检查：签名用的是品牌信任的钥（非占位）、只接受 legacy 格式、trusted comment 签名正确；manifest 的 schema、发行版、版本（等于 `kernel/Cargo.toml` 的包版本）、资产集合（恰好六个）与 `dist/` 中每个文件（不能是符号链接）的 size/sha256 一致；`dist/` 里这六个资产本身（以及额外给出的程序）都内含品牌的全部公钥、不含占位公钥。这里的 Ed25519 验证是 RFC 8032 的独立 Python 实现（拒绝非规范编码、S ≥ L、小阶公钥和 R），与客户端用同一组真实 minisign 输出做测试；manifest 规则至少与客户端一样严（客户端只查本平台资产，这里查全部）。客户端在品牌安装时也拒绝小阶公钥（libsodium 的列表）。
+   或只用公开内核里的工具（不做构建路径检查）：`python3 tools/saiai-cli/kernel/scripts/release_manifest.py verify --manifest dist/aitp-manifest.json --dist dist`（Windows 上把 `python3` 换成 `py -3`）。检查：签名用的是品牌信任的钥（非占位）、只接受 legacy 格式、trusted comment 签名正确；manifest 的 schema、发行版、版本（等于 `kernel/Cargo.toml` 的包版本）、资产集合（恰好六个）与 `dist/` 中每个文件（不能是符号链接）的 size/sha256 一致；`dist/` 里这六个资产本身（以及额外给出的程序）都内含品牌的全部公钥、不含占位公钥。这里的 Ed25519 验证是 RFC 8032 的独立 Python 实现（拒绝非规范编码、S ≥ L、小阶公钥和 R），与客户端用同一组真实 minisign 输出做测试；manifest 规则至少与客户端一样严（客户端只查本平台资产，这里查全部）。客户端在品牌安装时也拒绝小阶公钥（libsodium 的列表）。
 4. 草稿 release 里上传全部资产、`aitp-manifest.json` 和 `aitp-manifest.json.minisig` 后再发布（D4 工作流届时细化）。
 
 **轮换、丢失与泄露**（客户端接受 `signing_keys` 里任一把签的 manifest；一个已安装的版本只认它自己内置的那组公钥）：

@@ -819,19 +819,20 @@ def load_release_manifest():
 
 def verify_aitp_signing_keys(artifacts: list[Path], allow_placeholder: bool) -> None:
     """AITP release programs trust the maintainer's real update signing keys:
-    the brand names no placeholder key and no program carries one. Builds
-    that are only checked and never published may keep the placeholders."""
+    the brand names no placeholder key, and every program carries each of
+    the brand's keys and no placeholder. Builds that are only checked and
+    never published may keep the placeholders."""
     if not artifacts or allow_placeholder:
         return
     tool = load_release_manifest()
     try:
-        tool.require_real_keys(tool.brand_keys())
+        keys = tool.brand_keys()
+        tool.require_real_keys(keys)
+        # Every program carries all of the brand's keys and no placeholder.
+        for artifact in artifacts:
+            tool.require_program_keys(artifact, keys)
     except tool.CheckError as error:
         raise AssertionError(str(error)) from error
-    for artifact in artifacts:
-        data = artifact.read_bytes()
-        found = [key for key in tool.PLACEHOLDER_KEYS if key.encode() in data]
-        require(not found, f"{artifact} carries placeholder update signing keys")
 
 
 def verify_aitp_signed_manifest(manifest: Path, signature: Path | None, dist: Path, artifacts: list[Path]) -> None:
