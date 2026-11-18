@@ -162,8 +162,15 @@ def main():
             assert Path(selected["ca_key_path"]).parent.resolve() == path.parent.resolve()
         assert default_path.read_bytes() == default_bytes
         assert all(path.read_bytes() == data for path, data in protected.items())
+        # Both product variables: service commands run once in each
+        # environment; commands that cannot run twice still ask for a choice.
         code, output = invoke(binary, ["stop"], project)
+        assert code == 0, "stop in each environment failed; raw output withheld"
+        assert "== Claude environment: saiai --environment claude stop ==" in output
+        assert "== Codex environment: saiai --environment codex stop ==" in output
+        code, output = invoke(binary, ["logs"], project)
         assert code != 0 and "both Claude and Codex" in output
+        assert "saiai --environment codex logs" in output
         code, _ = invoke(binary, ["init-codex", "http://127.0.0.1:9", "TEST_ONLY_SCOPE_KEY"],
                          {**project, "CODEX_HOME": " "})
         assert code != 0
