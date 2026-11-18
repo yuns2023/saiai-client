@@ -144,13 +144,17 @@ def main():
             request(refreshed, servers[1], "TEST_ENV_KEY_A_CHANGED")
             assert pid(default_path) == default_pid and default_path.read_bytes() == default_bytes
             assert pid(path_b) == b_pid and path_b.read_bytes() == b_bytes
-            # Both variables: product initialization is unambiguous; generic stop is not.
+            # Both variables: product initialization is unambiguous; status runs
+            # in each environment; logs (and the foreground proxy) still ask.
             invoke(both, "init", urls[1], "TEST_ENV_KEY_A_CLAUDE")
             initialized.append((both, "claude"))
             claude_path, claude = config_for(both, "claude")
             assert claude["listen"] not in {default["listen"], cfg_a["listen"], cfg_b["listen"]}
             request(claude, servers[1], "TEST_ENV_KEY_A_CLAUDE", "claude")
-            assert "both Claude and Codex" in invoke(both, "stop", success=False)
+            both_status = invoke(both, "status")
+            assert "== Claude environment: saiai --environment claude status ==" in both_status
+            assert "== Codex environment: saiai --environment codex status ==" in both_status
+            assert "both Claude and Codex" in invoke(both, "logs", success=False)
             assert "service active: yes" in invoke(both, "--environment", "codex", "status")
             # Explicit default aliases must not allocate a second environment.
             aliases = {**environment, "CODEX_HOME": str(home / ".codex"), "CLAUDE_CONFIG_DIR": str(home / ".claude")}

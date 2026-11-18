@@ -28,9 +28,16 @@
 规范化解析已有符号链接及相对路径，显式指向默认目录时归并默认环境。
 空白、无效目录和不可解析路径拒绝执行，不回退写默认配置。
 
-命令在产生副作用之前一次性解析环境。产品命令只看对应产品变量；通用管理命令
-在两个自定义环境同时存在时拒绝猜测，可用前置参数
-`--environment claude|codex|default` 明确选择。内部服务和 launcher 的 start 子命令
+命令在产生副作用之前一次性解析环境。产品命令只看对应产品变量。当前 shell 的
+`CLAUDE_CONFIG_DIR` 与 `CODEX_HOME` 同时选中两个非默认目录、且没有前置选择器时
+（磁盘上存在两个环境本身不触发），`doctor`（不带目标）、`status`、`start`、`stop`、`restart` 依次在
+Claude、Codex 环境各运行一次（子进程带 `--environment`，doctor 只查对应产品），
+两段都会执行，任一失败则整体非零；前台运行、`logs`、`update`、`upstream-proxy`
+仍拒绝猜测，报错给出变量原值和可直接复制的 `--environment claude|codex|default`
+命令（代理 URL 显示为 `<proxy-url>`，需自行替换）。start/stop/restart/status/logs
+提示在裸命令可能选到别的环境时带上唯一指向当前环境的选择器（隐式选择也写明产品；
+legacy 共享路由回退写 `default`；服务管理器和后台进程用带引号的 `--instance-dir`），
+复制后不会作用到两个环境；没有覆盖变量、也未显式指定选择器的默认环境仍提示裸命令。内部服务和 launcher 的 start 子命令
 固定使用已解析的配置目录，不因继承另一个产品变量而重新选错实例。
 
 每个自定义环境独立拥有凭据、CA、loopback 端口、进程、日志、PID/锁文件，以及
@@ -38,8 +45,12 @@ systemd unit / launchd label。默认服务名称保留。Windows 进程状态�
 和创建时间，停止时持有精确进程句柄验证身份，禁止按可执行文件路径批量杀进程；
 日志跟随进程也按环境注册和清理。默认旧版 PID 仅在核实旧 worker 命令和路径后兼容。初始化通过根目录文件锁串行化，
 分配端口时排除其他环境（包括已停止环境）的已保存端口；端口被外部程序占用时
-不接管它。启动器还通过所选环境 CA 验证监听者的 TLS 身份，支持前台与后台代理，
-该握手不发送 Gateway 或模型请求。
+不接管它。隔离环境的启动器还通过所选环境 CA 验证监听者的 TLS 身份，支持前台与
+后台代理，该握手不发送 Gateway 或模型请求。用户手动前台运行（非 `--instance-dir`、
+非后台进程）且监听预检返回地址已占用（`AddrInUse`）时，同样对确切地址做该握手
+（限时 5 秒）：该地址已有使用本环境 CA 的代理即以 0 退出；只有 Linux 上受管进程
+确实占用该地址时才称为服务并提示 `stop`，否则只提示 `status`。服务管理器和后台
+进程遇到占用仍失败退出，非 loopback 等其他错误在探测前失败。
 
 初始化只更新所选产品配置目录；隔离 CA 留在相应 SAIAI 环境目录，不使用共享
 Claude CA，也不默认导入用户 NSS。显式编辑器设置仍是用户级选项，不因项目
@@ -667,6 +678,10 @@ Codex 0.162.1 的普通 CLI 会复用共享 app-server daemon。若它在 SAIAI 
 查询以缩短竞争窗口。`SAIAI_SKIP_START=1` 同时跳过代理启动和 daemon 重启。
 
 `doctor` / `doctor codex` 只查询现有 daemon，不启动、重启或刷新 token。
+Unix 上 `daemon version` 失败且控制 socket 的符号链接目标已消失时：记录的 PID
+仍存在则警告 daemon 可能仍在运行但不可达（直接运行 `codex` 可能报
+`app server did not become ready`）；PID 已退出按未运行处理；PID 无法确认时给出
+条件性警告。`init-codex` 的 daemon 刷新复用这一判断。
 文件认证有效但后台 `account/read` 没有 ChatGPT 账户时，明确提示该状态可能导致
 登录菜单，并给出 `codex app-server daemon restart` 与临时 `saiai codex` 指引。
 这些检查不发送模型请求，也不能证明模型权限、生成或计费已通过。
@@ -1072,7 +1087,7 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
 
 **每次发布**：
 
-1. 开发侧在发布构建的产物目录 `dist/` 里放齐六个 `aitp-<平台>` 资产（签名、strip 等改动二进制的步骤都要在此之前完成），然后生成未签名的 manifest：
+1. 开发侧在发布构建的产物目录 `dist/` 里放齐六个 `aitp-<平台>` 程序和 `setup.sh`、`setup.ps1` 两个安装脚本（签名、strip 等改动二进制的步骤都要在此之前完成），然后生成未签名的 manifest：
    ```sh
    python3 tools/saiai-cli/kernel/scripts/release_manifest.py generate --dist dist
    ```
@@ -1093,7 +1108,7 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
      --build-dir <构建目录> \
      --aitp-manifest dist/aitp-manifest.json --aitp-dist dist
    ```
-   或只用公开内核里的工具（不做构建路径检查）：`python3 tools/saiai-cli/kernel/scripts/release_manifest.py verify --manifest dist/aitp-manifest.json --dist dist`（Windows 上把 `python3` 换成 `py -3`）。检查：签名用的是品牌信任的钥（非占位）、只接受 legacy 格式、trusted comment 签名正确；manifest 的 schema、发行版、版本（等于 `kernel/Cargo.toml` 的包版本）、资产集合（恰好六个）与 `dist/` 中每个文件（不能是符号链接）的 size/sha256 一致；`dist/` 里这六个资产本身（以及额外给出的程序）都内含品牌的全部公钥、不含占位公钥。这里的 Ed25519 验证是 RFC 8032 的独立 Python 实现（拒绝非规范编码、S ≥ L、小阶公钥和 R），与客户端用同一组真实 minisign 输出做测试；manifest 规则至少与客户端一样严（客户端只查本平台资产，这里查全部）。客户端在品牌安装时也拒绝小阶公钥（libsodium 的列表）。
+   或只用公开内核里的工具（不做构建路径检查）：`python3 tools/saiai-cli/kernel/scripts/release_manifest.py verify --manifest dist/aitp-manifest.json --dist dist`（Windows 上把 `python3` 换成 `py -3`）。检查：签名用的是品牌信任的钥（非占位）、只接受 legacy 格式、trusted comment 签名正确；manifest 的 schema、发行版、版本（等于 `kernel/Cargo.toml` 的包版本）、资产集合（恰好八个：六个程序加两个安装脚本）与 `dist/` 中每个文件（不能是符号链接）的 size/sha256 一致；`dist/` 里六个程序本身（以及额外给出的程序）都内含品牌的全部公钥、不含占位公钥。这里的 Ed25519 验证是 RFC 8032 的独立 Python 实现（拒绝非规范编码、S ≥ L、小阶公钥和 R），与客户端用同一组真实 minisign 输出做测试；manifest 规则至少与客户端一样严（客户端只查本平台资产，这里查全部）。客户端在品牌安装时也拒绝小阶公钥（libsodium 的列表）。
 4. 草稿 release 里上传全部资产、`aitp-manifest.json` 和 `aitp-manifest.json.minisig` 后再发布（D4 工作流届时细化）。
 
 **轮换、丢失与泄露**（客户端接受 `signing_keys` 里任一把签的 manifest；一个已安装的版本只认它自己内置的那组公钥）：
@@ -1133,10 +1148,13 @@ AITP 是公开内核（`tools/saiai-cli/kernel/`）自带的通用发行版：
   - 卸载计划阶段：CA 文件读不出、证书块损坏或未闭合、检查脚本输出异常时只给出 WARN，该文件不提供删除候选，也不阻止卸载；无法识别的证书按指纹删除（与之前一致）。
   - lease 待重试只覆盖证书；若在恢复代理后、写回 lease 前崩溃，下一次可能再看一次代理，不保证只执行一次。
 - `doctor`：上游代理是本机回环地址时给出提示，不改退出码。
+- `init`（Claude）遇到 E1：最后一次运行的安装为准，照常备份后改写，并在标准输出
+  说明接管自哪个程序、备份位置和切回方式（重新运行那个程序的安装）。后台服务的
+  迁移写入和 `uninstall` 仍不改另一程序的设置。
 
 **仅当品牌开启 `refuse_foreign_profiles` 时生效**（AITP 开，SAIAI 关）：
 
-- `init`、`init-codex`、`vscode`，以及准备 Codex profile 的启动器，在写入任何东西之前检查 E1–E5，命中即拒绝；
+- 命中即拒绝，按入口：`init-codex` 在写入前检查 E2–E4，请求编辑器配置或信任时加查 E5；`vscode` 检查 E2–E5；准备 Codex profile 的启动器在改写目标 profile 前检查 E2–E4（此前可能已确保代理运行、创建目录）；`init` 只在请求编辑器级设置时检查 E5，Claude 设置（E1）改为接管（见上）；
 - 读取或复用运行时 CA 的入口拒绝外来 CA。
 
 **已知边界**：
