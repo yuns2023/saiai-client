@@ -283,14 +283,15 @@ fi
 # that user's login session; root has neither (`launchctl bootstrap gui/0`
 # fails with "Domain does not support specified action"). Uninstall above may
 # still run as root to clean up an earlier root setup.
-if [ "$(uname -s)" = "Darwin" ] && [ "$(id -u 2>/dev/null)" = "0" ]; then
-  cat >&2 <<'EOF'
-Do not run SAIAI setup as root (or with sudo) on macOS.
-SAIAI configures the current user's Claude Code / Codex and runs its local proxy
-as that user's LaunchAgent; root has no login session for it.
-Leave the root shell (exit) or drop sudo, then run the same command again as your
-normal macOS user. Nothing was changed.
-EOF
+# Without a working `id`, bash's own EUID decides (never "not root"). The
+# message uses printf: a here-document may need a writable temporary directory.
+if [ "$(uname -s)" = "Darwin" ] && [ "$(id -u 2>/dev/null || printf '%s' "${EUID}")" = "0" ]; then
+  printf '%s\n' \
+    "Do not run SAIAI setup as root (or with sudo) on macOS." \
+    "SAIAI configures the current user's Claude Code / Codex and runs its local proxy" \
+    "as that user's LaunchAgent; root has no login session for it." \
+    "Leave the root shell (exit) or drop sudo, then run the same command again as the" \
+    "user signed in to the Mac desktop. Nothing was changed." >&2
   exit 1
 fi
 
