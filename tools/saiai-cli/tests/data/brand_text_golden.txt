@@ -101,6 +101,7 @@
 ["lib.rs","\"SAIAI local proxy start skipped (SAIAI_SKIP_START=1).\""]
 ["lib.rs","\"SAIAI local proxy started or refreshed after configuration update.\""]
 ["lib.rs","\"SAIAI local-proxy OAuth configuration is ready; run `saiai codex`. Fully quit and reopen VSCode after its editor setup succeeds.\""]
+["lib.rs","\"SAIAI must not run this command as root (or with sudo) on macOS: \\\n         it sets up the current user's profile and runs its local proxy as that \\\n         user's LaunchAgent, and root has no login session for it. \\\n         Leave the root shell (`exit`) or drop `sudo`, then run the command again \\\n         as the user signed in to the Mac desktop.\""]
 ["lib.rs","\"SAIAI service is not running.\""]
 ["lib.rs","\"SAIAI service was not active; run `saiai{selector} start` when needed.\""]
 ["lib.rs","\"SAIAI user service started or refreshed.\""]
