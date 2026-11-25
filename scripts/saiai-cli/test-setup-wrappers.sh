@@ -142,6 +142,24 @@ test "${#reused_invocation[@]}" -eq 5
 test "$(grep -Fc '/manifest.json' "${curl_log}")" -eq 4
 test "$(grep -Fc '/saiai-linux-x86_64' "${curl_log}")" -eq 1
 
+# macOS as root: refused before any download or client call.
+root_bin="${temporary}/root-bin"
+mkdir -p "${root_bin}"
+printf '#!/usr/bin/env bash\necho 0\n' >"${root_bin}/id"
+chmod +x "${root_bin}/id"
+curl_calls_before="$(wc -l <"${curl_log}")"
+if SAIAI_TEST_UNAME_S=Darwin SAIAI_TEST_UNAME_M=arm64 SAIAI_TEST_PATH="${root_bin}:${fake_bin}:${PATH}" \
+  run_setup "https://gateway.example.test" "TEST_ONLY_ROOT_KEY"; then
+  echo "setup ran as root on macOS" >&2
+  exit 1
+fi
+grep -Fq 'Do not run SAIAI setup as root' "${output}"
+test ! -e "${invoked}"
+test "$(wc -l <"${curl_log}")" -eq "${curl_calls_before}"
+# Linux root is unaffected by this check.
+SAIAI_TEST_PATH="${root_bin}:${fake_bin}:${PATH}" run_setup "https://gateway.example.test" "TEST_ONLY_ROOT_KEY"
+test -s "${invoked}"
+
 # macOS without the Command Line Tools: /usr/bin/python3 is an installer stub
 # and must not run. With Node available the wrapper uses Node.
 real_node="$(command -v node)"

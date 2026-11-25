@@ -279,6 +279,21 @@ EOF
   exit "${uninstall_status}"
 fi
 
+# macOS: setup writes the current user's profile and loads a LaunchAgent in
+# that user's login session; root has neither (`launchctl bootstrap gui/0`
+# fails with "Domain does not support specified action"). Uninstall above may
+# still run as root to clean up an earlier root setup.
+if [ "$(uname -s)" = "Darwin" ] && [ "$(id -u 2>/dev/null)" = "0" ]; then
+  cat >&2 <<'EOF'
+Do not run SAIAI setup as root (or with sudo) on macOS.
+SAIAI configures the current user's Claude Code / Codex and runs its local proxy
+as that user's LaunchAgent; root has no login session for it.
+Leave the root shell (exit) or drop sudo, then run the same command again as your
+normal macOS user. Nothing was changed.
+EOF
+  exit 1
+fi
+
 if [ "$#" -eq 1 ] && [ "$1" = "init-codex" ]; then
   codex_mode=1
   config_path="${SAIAI_HOME:-${HOME:?HOME is required}/.saiai}/config.json"
