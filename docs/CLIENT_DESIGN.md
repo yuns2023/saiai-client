@@ -568,6 +568,11 @@ bootstrap、旧 setup/revoke 等路径，同时要求现有 local-proxy/OAuth、
   进程。状态和日志权限为 `0600`。该 fallback 不提供跨宿主重启或崩溃自动拉起。
 - macOS 使用用户 LaunchAgent；服务管理直接调用系统自带的 `/bin/launchctl`，
   日志跟随使用 `/usr/bin/tail`，不以不兼容的 GNU `--version` 参数探测命令。
+  root（root shell 或 sudo）没有 GUI 登录域，`launchctl bootstrap gui/0` 会失败，
+  且会把配置写进 `/var/root`；因此 macOS 上 euid 为 0 时只允许
+  help/version/status/stop/logs/doctor/update/uninstall 与无参数 `upstream-proxy`，
+  其余命令（init、start、启动器、前台代理等）在写入任何文件前拒绝并提示改用桌面
+  登录用户；一键 `setup.sh` 在下载前同样拒绝，`uninstall` 仍可用于清理 root 残留。
 - Windows 使用用户进程与 PID/日志状态文件，不要求管理员权限。
 
 `init` 与 `init-codex` 都会在成功写入配置后启动或刷新同一个受管本地代理；因此
